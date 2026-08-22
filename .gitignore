@@ -1,0 +1,15 @@
+# Build outputs
+build*/
+.deps/
+
+# IDE / editor state
+.vs/
+.vscode/
+.idea/
+*.user
+CMakeUserPresets.json
+
+# Compiler / test artifacts
+*.obj
+*.lib
+*.pdb
