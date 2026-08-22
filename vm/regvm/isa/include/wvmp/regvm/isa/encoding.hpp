@@ -2,6 +2,7 @@
 #include "vm_op.hpp"
 #include "vm_reg.hpp"
 #include "wvmp/common/types.hpp"
+#include "wvmp/ir/insn.hpp"
 
 #include <cstdint>
 #include <vector>
@@ -19,11 +20,21 @@ struct VmInsn {
     VmOp op = VmOp::Nop;
     OpKind a_kind = OpKind::None;
     OpKind b_kind = OpKind::None;
-    u8 cond = 0;      // ir::Cond 值，仅 Jcc 等条件类操作使用
+    // 4 位字段的双重语义（位图见下）：Jcc 存 ir::Cond 条件码（0..15）；
+    // 其余所有操作存 ir::Size 操作数宽度（0..3），携带 sub-register 语义。
+    u8 cond_or_size = 0;
     u8 reg_a = 0;     // 5 位 VM 寄存器号（kInvalidReg 表示未用）
     u8 reg_b = 0;
     u32 aux = 0;      // 立即数 / 相对偏移；>32 位立即数由翻译器拆条合成
 };
+
+// cond_or_size 字段的读写辅助。
+[[nodiscard]] constexpr u8 size_field(ir::Size s) {
+    return static_cast<u8>(s);  // ir::Size 枚举值 0..3
+}
+[[nodiscard]] constexpr ir::Size field_size(u8 f) {
+    return static_cast<ir::Size>(f & 3);
+}
 
 // 8 字节定长编码：单条指令即一个 LE u64，64 位恰好用尽、无保留位。
 //
@@ -42,7 +53,7 @@ struct VmInsn {
 
 [[nodiscard]] VmInsn make_insn(VmOp op, OpKind a_kind, u8 reg_a,
                                OpKind b_kind, u8 reg_b,
-                               u32 aux = 0, u8 cond = 0);
+                               u32 aux = 0, u8 cond_or_size = 0);
 
 // 指令流便捷操作：按 LE 追加 / 逐条读取。
 void append_insn(std::vector<u8>& stream, const VmInsn& insn);

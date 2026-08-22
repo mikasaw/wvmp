@@ -50,7 +50,7 @@ TEST(Encoding, AllFieldsRoundtrip) {
     EXPECT_EQ(back.op, isa::VmOp::Jcc);
     EXPECT_EQ(back.a_kind, isa::OpKind::Imm);
     EXPECT_EQ(back.b_kind, isa::OpKind::Reg);
-    EXPECT_EQ(back.cond, 15);
+    EXPECT_EQ(back.cond_or_size, 15);
     EXPECT_EQ(back.reg_a, 31);
     EXPECT_EQ(back.reg_b, 17);
     EXPECT_EQ(back.aux, 0xDEAD'BE00u);
@@ -64,7 +64,7 @@ TEST(Encoding, FuzzRoundtripTenThousand) {
         insn.op = kAllOps[rng.uniform(0, kAllOpsCount - 1)];
         insn.a_kind = kinds[rng.uniform(0, 2)];
         insn.b_kind = kinds[rng.uniform(0, 2)];
-        insn.cond = static_cast<wvmp::u8>(rng.uniform(0, 15));
+        insn.cond_or_size = static_cast<wvmp::u8>(rng.uniform(0, 15));
         insn.reg_a = static_cast<wvmp::u8>(rng.uniform(0, isa::kRegCount - 1));
         insn.reg_b = static_cast<wvmp::u8>(rng.uniform(0, isa::kRegCount - 1));
         insn.aux = static_cast<wvmp::u32>(rng.next());
@@ -72,7 +72,7 @@ TEST(Encoding, FuzzRoundtripTenThousand) {
         ASSERT_EQ(back.op, insn.op);
         ASSERT_EQ(back.a_kind, insn.a_kind);
         ASSERT_EQ(back.b_kind, insn.b_kind);
-        ASSERT_EQ(back.cond, insn.cond);
+        ASSERT_EQ(back.cond_or_size, insn.cond_or_size);
         ASSERT_EQ(back.reg_a, insn.reg_a);
         ASSERT_EQ(back.reg_b, insn.reg_b);
         ASSERT_EQ(back.aux, insn.aux) << "iteration " << i;
