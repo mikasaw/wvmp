@@ -5,4 +5,6 @@ add_library(wvmp::sdk ALIAS wvmp_sdk)
 target_include_directories(wvmp_sdk PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
 )
+# markers.hpp 使用契约头 common/types.hpp（仅类型别名，无链接产物）。
+target_link_libraries(wvmp_sdk PUBLIC wvmp::common)
 wvmp_target_warnings(wvmp_sdk)
