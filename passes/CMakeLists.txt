@@ -36,3 +36,13 @@ target_link_libraries(wvmp_passes_all PUBLIC
     wvmp::common
     wvmp::vm
 )
+
+# OBJECT 库作为 SOURCES（$<TARGET_OBJECTS:...>）消费时不传播 usage
+# requirements，lifter 挂在自身 INTERFACE 上的 capstone 对象到这里就断了。
+# 显式把 capstone 对象挂到聚合库接口：任何 wvmp_passes_all 的消费者
+# （cli / 测试，含 WHOLE_ARCHIVE 整包链接形态）都能在链接行拿到它们；
+# 对象不在归档内部，不会重复打包。
+if(TARGET wvmp::capstone)
+    target_link_libraries(wvmp_passes_all INTERFACE
+        $<BUILD_INTERFACE:$<TARGET_OBJECTS:capstone>>)
+endif()
