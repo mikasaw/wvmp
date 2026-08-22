@@ -1,0 +1,22 @@
+# WVmp 默认保护配置（P8 泳道示例；schema 见 cli/include/wvmp/cli/config.hpp）。
+#
+# input  / output : 输入与输出 PE 路径（必填）
+# seed            : 保护随机种子（可省略，默认 0）
+# [[passes]]      : 按 Phase 语义书写即可（Load -> Analyze -> Transform ->
+#                   Emit -> Write）；Pipeline 装配时按 Phase 稳定排序，
+#                   同一 Phase 内保持此处的配置顺序。
+
+input  = "target.exe"
+output = "target_protected.exe"
+seed   = 12345
+
+[[passes]]
+name = "pe_loader"
+[[passes]]
+name = "marker_scan"
+[[passes]]
+name = "lifter"
+[[passes]]
+name = "virtualize"
+[[passes]]
+name = "pe_writer"
