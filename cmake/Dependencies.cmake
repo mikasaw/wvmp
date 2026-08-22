@@ -9,10 +9,18 @@
 
 include(FetchContent)
 
-set(FETCHCONTENT_BASE_DIR "${CMAKE_SOURCE_DIR}/.deps")
+# Parallel development lanes each configure their own build tree; giving them
+# a per-tree FetchContent cache (via -DWVMP_FETCHCONTENT_DIR=...) keeps their
+# populates from racing on the shared .deps directory. The tarball mirror
+# directory (WVMP_DEPS_CACHE, below) still dedupes the actual downloads.
+set(WVMP_FETCHCONTENT_DIR "${CMAKE_SOURCE_DIR}/.deps" CACHE PATH
+    "FetchContent download/build cache (per build tree for parallel lanes)")
+set(FETCHCONTENT_BASE_DIR "${WVMP_FETCHCONTENT_DIR}")
 
 # Everything we consume is static; keeps the MSVC runtime story uniform.
 set(BUILD_SHARED_LIBS OFF)
+
+option(WVMP_WITH_CAPSTONE "Fetch and build capstone 5.0.6 (disassembler)" ON)
 
 # Some networks block the TLS revocation endpoints that CMake's schannel-based
 # curl insists on checking (CRYPT_E_NO_REVOCATION_CHECK), which breaks
@@ -45,16 +53,18 @@ if(WVMP_BUILD_TESTS)
 endif()
 
 # --- capstone 5.0.6 (disassembler) -------------------------------------------
-set(CAPSTONE_BUILD_TESTS OFF CACHE BOOL "" FORCE)
-set(CAPSTONE_BUILD_CSTOOL OFF CACHE BOOL "" FORCE)
-set(CAPSTONE_ARCHITECTURE_DEFAULT OFF CACHE BOOL "" FORCE)
-set(CAPSTONE_X86_SUPPORT ON CACHE BOOL "" FORCE)
-wvmp_dep_url(WVMP_CAPSTONE_URL
-    "${WVMP_DEPS_CACHE}/capstone-5.0.6.tar.gz"
-    "https://github.com/capstone-engine/capstone/archive/refs/tags/5.0.6.tar.gz")
-FetchContent_Declare(capstone URL ${WVMP_CAPSTONE_URL})
-FetchContent_MakeAvailable(capstone)
-add_library(wvmp::capstone ALIAS capstone)
+if(WVMP_WITH_CAPSTONE)
+    set(CAPSTONE_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+    set(CAPSTONE_BUILD_CSTOOL OFF CACHE BOOL "" FORCE)
+    set(CAPSTONE_ARCHITECTURE_DEFAULT OFF CACHE BOOL "" FORCE)
+    set(CAPSTONE_X86_SUPPORT ON CACHE BOOL "" FORCE)
+    wvmp_dep_url(WVMP_CAPSTONE_URL
+        "${WVMP_DEPS_CACHE}/capstone-5.0.6.tar.gz"
+        "https://github.com/capstone-engine/capstone/archive/refs/tags/5.0.6.tar.gz")
+    FetchContent_Declare(capstone URL ${WVMP_CAPSTONE_URL})
+    FetchContent_MakeAvailable(capstone)
+    add_library(wvmp::capstone ALIAS capstone)
+endif()
 
 # --- keystone 0.9.2 (assembler) ----------------------------------------------
 if(WVMP_WITH_KEYSTONE)
