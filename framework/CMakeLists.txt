@@ -11,3 +11,14 @@ target_link_libraries(wvmp_framework PUBLIC
     wvmp::common
 )
 wvmp_target_warnings(wvmp_framework)
+
+if(WVMP_BUILD_TESTS)
+    add_executable(wvmp_framework_tests tests/test_framework.cpp)
+    target_link_libraries(wvmp_framework_tests PRIVATE
+        wvmp::framework
+        wvmp::gtest
+        gtest_main
+    )
+    wvmp_target_warnings(wvmp_framework_tests)
+    add_test(NAME framework_tests COMMAND wvmp_framework_tests)
+endif()
