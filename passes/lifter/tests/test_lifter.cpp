@@ -1,0 +1,718 @@
+// Lifter lane 单元测试：寄存器/指令映射、ALU+内存约定、基本块划分、
+// RVA↔文件偏移映射与 LifterPass::run() 端到端（合成 PE）。
+
+#include "capstone_session.hpp"
+#include "lifter_core.hpp"
+#include "pe_map.hpp"
+#include "x86_translate.hpp"
+
+#include "wvmp/common/bytes.hpp"
+#include "wvmp/framework/context.hpp"
+#include "wvmp/framework/keys.hpp"
+#include "wvmp/ir/insn.hpp"
+#include "wvmp/ir/operand.hpp"
+#include "wvmp/ir/reg.hpp"
+#include "wvmp/passes/lifter/lifter_pass.hpp"
+
+#include <gtest/gtest.h>
+
+#include <cstdint>
+#include <span>
+#include <vector>
+
+namespace {
+
+namespace lifter = wvmp::passes::lifter;
+namespace ir = wvmp::ir;
+
+// 反汇编 bytes 的第一条指令；失败返回 nullptr。
+const cs_insn* decode_first(lifter::CapstoneSession& s, std::span<const wvmp::u8> bytes,
+                            wvmp::u64 at = 0) {
+    const wvmp::u8* p = bytes.data();
+    size_t left = bytes.size();
+    wvmp::u64 addr = at;
+    return s.next(p, left, addr);
+}
+
+lifter::TranslateResult translate_bytes(lifter::CapstoneSession& s,
+                                        std::span<const wvmp::u8> bytes, ir::Arch arch,
+                                        wvmp::u64 at = 0) {
+    const cs_insn* ci = decode_first(s, bytes, at);
+    if (ci == nullptr) {
+        ADD_FAILURE() << "capstone 无法反汇编测试字节";
+        return lifter::TranslateResult{};
+    }
+    return lifter::translate_insn(*ci, arch);
+}
+
+TEST(LifterRegMap, SubRegistersFoldToFullReg) {
+    EXPECT_EQ(lifter::map_reg(X86_REG_RAX), ir::Reg::Rax);
+    EXPECT_EQ(lifter::map_reg(X86_REG_EAX), ir::Reg::Rax);
+    EXPECT_EQ(lifter::map_reg(X86_REG_AX), ir::Reg::Rax);
+    EXPECT_EQ(lifter::map_reg(X86_REG_AL), ir::Reg::Rax);
+    EXPECT_EQ(lifter::map_reg(X86_REG_AH), ir::Reg::Rax);
+    EXPECT_EQ(lifter::map_reg(X86_REG_R15D), ir::Reg::R15);
+    EXPECT_EQ(lifter::map_reg(X86_REG_R10W), ir::Reg::R10);
+    EXPECT_EQ(lifter::map_reg(X86_REG_R8B), ir::Reg::R8);
+    EXPECT_EQ(lifter::map_reg(X86_REG_RSP), ir::Reg::Rsp);
+    EXPECT_EQ(lifter::map_reg(X86_REG_BPL), ir::Reg::Rbp);
+    EXPECT_EQ(lifter::map_reg(X86_REG_RIP), ir::Reg::Rip);
+    EXPECT_EQ(lifter::map_reg(X86_REG_EIP), ir::Reg::Rip);
+    EXPECT_EQ(lifter::map_reg(X86_REG_XMM0), std::nullopt);
+    EXPECT_EQ(lifter::map_reg(X86_REG_FS), std::nullopt);
+    EXPECT_EQ(lifter::map_reg(X86_REG_EFLAGS), std::nullopt);
+}
+
+TEST(LifterCondMap, AllSixteenJcc) {
+    EXPECT_EQ(lifter::map_cond(X86_INS_JO), ir::Cond::O);
+    EXPECT_EQ(lifter::map_cond(X86_INS_JNO), ir::Cond::No);
+    EXPECT_EQ(lifter::map_cond(X86_INS_JB), ir::Cond::B);
+    EXPECT_EQ(lifter::map_cond(X86_INS_JAE), ir::Cond::Ae);
+    EXPECT_EQ(lifter::map_cond(X86_INS_JE), ir::Cond::E);
+    EXPECT_EQ(lifter::map_cond(X86_INS_JNE), ir::Cond::Ne);
+    EXPECT_EQ(lifter::map_cond(X86_INS_JBE), ir::Cond::Be);
+    EXPECT_EQ(lifter::map_cond(X86_INS_JA), ir::Cond::A);
+    EXPECT_EQ(lifter::map_cond(X86_INS_JS), ir::Cond::S);
+    EXPECT_EQ(lifter::map_cond(X86_INS_JNS), ir::Cond::Ns);
+    EXPECT_EQ(lifter::map_cond(X86_INS_JP), ir::Cond::P);
+    EXPECT_EQ(lifter::map_cond(X86_INS_JNP), ir::Cond::Np);
+    EXPECT_EQ(lifter::map_cond(X86_INS_JL), ir::Cond::L);
+    EXPECT_EQ(lifter::map_cond(X86_INS_JGE), ir::Cond::Ge);
+    EXPECT_EQ(lifter::map_cond(X86_INS_JLE), ir::Cond::Le);
+    EXPECT_EQ(lifter::map_cond(X86_INS_JG), ir::Cond::G);
+    EXPECT_EQ(lifter::map_cond(X86_INS_JECXZ), std::nullopt);
+}
+
+// ---------------- 指令映射：每类至少一条 ----------------
+
+class LifterTranslate : public ::testing::Test {
+protected:
+    lifter::CapstoneSession x64{ir::Arch::X64};
+    lifter::CapstoneSession x86{ir::Arch::X86};
+};
+
+TEST_F(LifterTranslate, MovImmToReg) {
+    // B8 01 00 00 00: mov eax, 1
+    const wvmp::u8 b[] = {0xB8, 0x01, 0x00, 0x00, 0x00};
+    auto r = translate_bytes(x64, b, ir::Arch::X64);
+    ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r.insn.op, ir::Op::Mov);
+    EXPECT_EQ(r.insn.size, ir::Size::S32); // 子寄存器宽度由 size 携带
+    EXPECT_FALSE(r.insn.updates_flags);
+    ASSERT_EQ(r.insn.dst.kind, ir::Operand::Kind::Reg);
+    EXPECT_EQ(r.insn.dst.reg, ir::Reg::Rax); // EAX 折叠到 Rax
+    ASSERT_EQ(r.insn.src.kind, ir::Operand::Kind::Imm);
+    EXPECT_EQ(r.insn.src.imm, 1);
+    EXPECT_EQ(r.insn.addr, 0u);
+}
+
+TEST_F(LifterTranslate, MovRegToReg64) {
+    // 48 89 C1: mov rcx, rax
+    const wvmp::u8 b[] = {0x48, 0x89, 0xC1};
+    auto r = translate_bytes(x64, b, ir::Arch::X64);
+    ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r.insn.op, ir::Op::Mov);
+    EXPECT_EQ(r.insn.size, ir::Size::S64);
+    EXPECT_FALSE(r.insn.updates_flags);
+    EXPECT_EQ(r.insn.dst.reg, ir::Reg::Rcx);
+    EXPECT_EQ(r.insn.src.reg, ir::Reg::Rax);
+}
+
+TEST_F(LifterTranslate, AddRegReg) {
+    // 01 D8: add eax, ebx
+    const wvmp::u8 b[] = {0x01, 0xD8};
+    auto r = translate_bytes(x64, b, ir::Arch::X64);
+    ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r.insn.op, ir::Op::Add);
+    EXPECT_EQ(r.insn.size, ir::Size::S32);
+    EXPECT_TRUE(r.insn.updates_flags);
+    EXPECT_EQ(r.insn.dst.reg, ir::Reg::Rax);
+    EXPECT_EQ(r.insn.src.reg, ir::Reg::Rbx);
+}
+
+TEST_F(LifterTranslate, AluSrcMemKeepsAluOp) {
+    // 03 06: add eax, dword ptr [rsi]
+    // v1 约定：ALU 的 src 为内存时不拆 Load，op 保持 Add，src.mem 原样保留，
+    // 由后端（vm translator）翻译时展开。
+    const wvmp::u8 b[] = {0x03, 0x06};
+    auto r = translate_bytes(x64, b, ir::Arch::X64);
+    ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r.insn.op, ir::Op::Add);
+    EXPECT_EQ(r.insn.size, ir::Size::S32);
+    EXPECT_TRUE(r.insn.updates_flags);
+    EXPECT_EQ(r.insn.dst.kind, ir::Operand::Kind::Reg);
+    EXPECT_EQ(r.insn.dst.reg, ir::Reg::Rax);
+    ASSERT_EQ(r.insn.src.kind, ir::Operand::Kind::Mem);
+    EXPECT_EQ(r.insn.src.mem.base, ir::Reg::Rsi);
+    EXPECT_EQ(r.insn.src.mem.index, ir::Reg::Flags); // 哨兵=无 index
+    EXPECT_EQ(r.insn.src.mem.scale, 0);
+    EXPECT_EQ(r.insn.src.mem.disp, 0);
+}
+
+TEST_F(LifterTranslate, AluDstMem) {
+    // 01 00: add dword ptr [rax], eax
+    const wvmp::u8 b[] = {0x01, 0x00};
+    auto r = translate_bytes(x64, b, ir::Arch::X64);
+    ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r.insn.op, ir::Op::Add);
+    ASSERT_EQ(r.insn.dst.kind, ir::Operand::Kind::Mem);
+    EXPECT_EQ(r.insn.dst.mem.base, ir::Reg::Rax);
+    ASSERT_EQ(r.insn.src.kind, ir::Operand::Kind::Reg);
+    EXPECT_EQ(r.insn.src.reg, ir::Reg::Rax);
+    EXPECT_TRUE(r.insn.updates_flags);
+}
+
+TEST_F(LifterTranslate, LoadFromAbsoluteAddress) {
+    // 48 8B 04 25 00 10 00 00: mov rax, qword ptr [0x1000]
+    const wvmp::u8 b[] = {0x48, 0x8B, 0x04, 0x25, 0x00, 0x10, 0x00, 0x00};
+    auto r = translate_bytes(x64, b, ir::Arch::X64);
+    ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r.insn.op, ir::Op::Load); // 内存 → 寄存器
+    EXPECT_EQ(r.insn.size, ir::Size::S64);
+    EXPECT_FALSE(r.insn.updates_flags);
+    EXPECT_EQ(r.insn.dst.kind, ir::Operand::Kind::Reg);
+    EXPECT_EQ(r.insn.dst.reg, ir::Reg::Rax);
+    ASSERT_EQ(r.insn.src.kind, ir::Operand::Kind::Mem);
+    EXPECT_EQ(r.insn.src.mem.base, ir::Reg::Flags); // 无 base
+    EXPECT_EQ(r.insn.src.mem.index, ir::Reg::Flags); // 无 index
+    EXPECT_EQ(r.insn.src.mem.scale, 0);
+    EXPECT_EQ(r.insn.src.mem.disp, 0x1000);
+}
+
+TEST_F(LifterTranslate, LoadWithIndexScale) {
+    // 8B 04 83: mov eax, dword ptr [rbx + rax*4]
+    const wvmp::u8 b[] = {0x8B, 0x04, 0x83};
+    auto r = translate_bytes(x64, b, ir::Arch::X64);
+    ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r.insn.op, ir::Op::Load);
+    EXPECT_EQ(r.insn.size, ir::Size::S32);
+    ASSERT_EQ(r.insn.src.kind, ir::Operand::Kind::Mem);
+    EXPECT_EQ(r.insn.src.mem.base, ir::Reg::Rbx);
+    EXPECT_EQ(r.insn.src.mem.index, ir::Reg::Rax);
+    EXPECT_EQ(r.insn.src.mem.scale, 4);
+    EXPECT_EQ(r.insn.src.mem.disp, 0);
+}
+
+TEST_F(LifterTranslate, StoreImmToMem) {
+    // C6 00 01: mov byte ptr [rax], 1
+    const wvmp::u8 b[] = {0xC6, 0x00, 0x01};
+    auto r = translate_bytes(x64, b, ir::Arch::X64);
+    ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r.insn.op, ir::Op::Store); // 寄存器/立即数 → 内存
+    EXPECT_EQ(r.insn.size, ir::Size::S8);
+    EXPECT_FALSE(r.insn.updates_flags);
+    ASSERT_EQ(r.insn.dst.kind, ir::Operand::Kind::Mem);
+    EXPECT_EQ(r.insn.dst.mem.base, ir::Reg::Rax);
+    EXPECT_EQ(r.insn.dst.mem.index, ir::Reg::Flags);
+    ASSERT_EQ(r.insn.src.kind, ir::Operand::Kind::Imm);
+    EXPECT_EQ(r.insn.src.imm, 1);
+}
+
+TEST_F(LifterTranslate, StoreRegToMem) {
+    // 48 89 08: mov qword ptr [rax], rcx
+    const wvmp::u8 b[] = {0x48, 0x89, 0x08};
+    auto r = translate_bytes(x64, b, ir::Arch::X64);
+    ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r.insn.op, ir::Op::Store);
+    EXPECT_EQ(r.insn.size, ir::Size::S64);
+    ASSERT_EQ(r.insn.dst.kind, ir::Operand::Kind::Mem);
+    ASSERT_EQ(r.insn.src.kind, ir::Operand::Kind::Reg);
+    EXPECT_EQ(r.insn.src.reg, ir::Reg::Rcx);
+}
+
+TEST_F(LifterTranslate, LeaRipRelativeKeepsRawDisp) {
+    // 48 8D 0D 34 12 00 00: lea rcx, [rip + 0x1234]
+    const wvmp::u8 b[] = {0x48, 0x8D, 0x0D, 0x34, 0x12, 0x00, 0x00};
+    auto r = translate_bytes(x64, b, ir::Arch::X64, 0x401000);
+    ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r.insn.op, ir::Op::Lea);
+    EXPECT_EQ(r.insn.size, ir::Size::S64);
+    EXPECT_FALSE(r.insn.updates_flags);
+    EXPECT_EQ(r.insn.dst.reg, ir::Reg::Rcx);
+    ASSERT_EQ(r.insn.src.kind, ir::Operand::Kind::Mem);
+    EXPECT_EQ(r.insn.src.mem.base, ir::Reg::Rip);
+    EXPECT_EQ(r.insn.src.mem.disp, 0x1234); // 保留原始位移（未加绝对地址）
+    EXPECT_EQ(r.insn.addr, 0x401000u);
+}
+
+TEST_F(LifterTranslate, JccRelative) {
+    // 74 05: je +5（@0 → 目标 7）
+    const wvmp::u8 b[] = {0x74, 0x05};
+    auto r = translate_bytes(x64, b, ir::Arch::X64);
+    ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r.insn.op, ir::Op::Jcc);
+    EXPECT_EQ(r.insn.cond, ir::Cond::E);
+    EXPECT_EQ(r.insn.size, ir::Size::S64); // 控制流指令按 arch 取指针宽
+    ASSERT_EQ(r.insn.dst.kind, ir::Operand::Kind::Imm);
+    EXPECT_EQ(r.insn.dst.imm, 7);
+    EXPECT_FALSE(r.insn.updates_flags);
+}
+
+TEST_F(LifterTranslate, JmpRelative) {
+    // E9 01 00 00 00: jmp +1（@0 → 目标 6）
+    const wvmp::u8 b[] = {0xE9, 0x01, 0x00, 0x00, 0x00};
+    auto r = translate_bytes(x64, b, ir::Arch::X64);
+    ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r.insn.op, ir::Op::Jmp);
+    ASSERT_EQ(r.insn.dst.kind, ir::Operand::Kind::Imm);
+    EXPECT_EQ(r.insn.dst.imm, 6);
+}
+
+TEST_F(LifterTranslate, JmpRegister) {
+    // FF E0: jmp rax
+    const wvmp::u8 b[] = {0xFF, 0xE0};
+    auto r = translate_bytes(x64, b, ir::Arch::X64);
+    ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r.insn.op, ir::Op::Jmp);
+    ASSERT_EQ(r.insn.dst.kind, ir::Operand::Kind::Reg);
+    EXPECT_EQ(r.insn.dst.reg, ir::Reg::Rax);
+}
+
+TEST_F(LifterTranslate, CallRelative) {
+    // E8 00 00 00 00: call +0（@0 → 目标 5）
+    const wvmp::u8 b[] = {0xE8, 0x00, 0x00, 0x00, 0x00};
+    auto r = translate_bytes(x64, b, ir::Arch::X64);
+    ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r.insn.op, ir::Op::Call);
+    EXPECT_EQ(r.insn.size, ir::Size::S64);
+    ASSERT_EQ(r.insn.dst.kind, ir::Operand::Kind::Imm);
+    EXPECT_EQ(r.insn.dst.imm, 5);
+}
+
+TEST_F(LifterTranslate, Ret) {
+    // C3: ret
+    const wvmp::u8 b[] = {0xC3};
+    auto r = translate_bytes(x64, b, ir::Arch::X64);
+    ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r.insn.op, ir::Op::Ret);
+    EXPECT_EQ(r.insn.size, ir::Size::S64);
+    EXPECT_EQ(r.insn.dst.kind, ir::Operand::Kind::None);
+    EXPECT_EQ(r.insn.src.kind, ir::Operand::Kind::None);
+}
+
+TEST_F(LifterTranslate, RetImm) {
+    // C2 08 00: ret 8
+    const wvmp::u8 b[] = {0xC2, 0x08, 0x00};
+    auto r = translate_bytes(x64, b, ir::Arch::X64);
+    ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r.insn.op, ir::Op::Ret);
+    ASSERT_EQ(r.insn.src.kind, ir::Operand::Kind::Imm);
+    EXPECT_EQ(r.insn.src.imm, 8);
+}
+
+TEST_F(LifterTranslate, PushPop) {
+    // 50: push rax
+    const wvmp::u8 pb[] = {0x50};
+    auto p = translate_bytes(x64, pb, ir::Arch::X64);
+    ASSERT_EQ(p.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(p.insn.op, ir::Op::Push);
+    EXPECT_FALSE(p.insn.updates_flags);
+    ASSERT_EQ(p.insn.dst.kind, ir::Operand::Kind::Reg);
+    EXPECT_EQ(p.insn.dst.reg, ir::Reg::Rax);
+
+    // 5B: pop rbx
+    const wvmp::u8 qb[] = {0x5B};
+    auto q = translate_bytes(x64, qb, ir::Arch::X64);
+    ASSERT_EQ(q.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(q.insn.op, ir::Op::Pop);
+    ASSERT_EQ(q.insn.dst.kind, ir::Operand::Kind::Reg);
+    EXPECT_EQ(q.insn.dst.reg, ir::Reg::Rbx);
+}
+
+TEST_F(LifterTranslate, CmpTest) {
+    // 39 C8: cmp eax, ecx
+    const wvmp::u8 cb[] = {0x39, 0xC8};
+    auto c = translate_bytes(x64, cb, ir::Arch::X64);
+    ASSERT_EQ(c.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(c.insn.op, ir::Op::Cmp);
+    EXPECT_TRUE(c.insn.updates_flags);
+    EXPECT_EQ(c.insn.dst.reg, ir::Reg::Rax);
+    EXPECT_EQ(c.insn.src.reg, ir::Reg::Rcx);
+
+    // 85 C0: test eax, eax
+    const wvmp::u8 tb[] = {0x85, 0xC0};
+    auto t = translate_bytes(x64, tb, ir::Arch::X64);
+    ASSERT_EQ(t.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(t.insn.op, ir::Op::Test);
+    EXPECT_TRUE(t.insn.updates_flags);
+    EXPECT_EQ(t.insn.dst.reg, ir::Reg::Rax);
+    EXPECT_EQ(t.insn.src.reg, ir::Reg::Rax);
+}
+
+TEST_F(LifterTranslate, ShiftsAndUnary) {
+    // C1 E0 03: shl eax, 3
+    const wvmp::u8 sb[] = {0xC1, 0xE0, 0x03};
+    auto s = translate_bytes(x64, sb, ir::Arch::X64);
+    ASSERT_EQ(s.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(s.insn.op, ir::Op::Shl);
+    EXPECT_TRUE(s.insn.updates_flags);
+    EXPECT_EQ(s.insn.dst.reg, ir::Reg::Rax);
+    ASSERT_EQ(s.insn.src.kind, ir::Operand::Kind::Imm);
+    EXPECT_EQ(s.insn.src.imm, 3);
+
+    // D1 E0: shl eax（隐式计数 1）
+    const wvmp::u8 ib[] = {0xD1, 0xE0};
+    auto i = translate_bytes(x64, ib, ir::Arch::X64);
+    ASSERT_EQ(i.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(i.insn.op, ir::Op::Shl);
+    ASSERT_EQ(i.insn.src.kind, ir::Operand::Kind::Imm);
+    EXPECT_EQ(i.insn.src.imm, 1);
+
+    // F7 D8: neg eax（一元）
+    const wvmp::u8 nb[] = {0xF7, 0xD8};
+    auto n = translate_bytes(x64, nb, ir::Arch::X64);
+    ASSERT_EQ(n.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(n.insn.op, ir::Op::Neg);
+    EXPECT_TRUE(n.insn.updates_flags);
+    EXPECT_EQ(n.insn.dst.reg, ir::Reg::Rax);
+
+    // F7 D0: not eax（NOT 不影响标志）
+    const wvmp::u8 ob[] = {0xF7, 0xD0};
+    auto o = translate_bytes(x64, ob, ir::Arch::X64);
+    ASSERT_EQ(o.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(o.insn.op, ir::Op::Not);
+    EXPECT_FALSE(o.insn.updates_flags);
+
+    // 48 FF C1: inc rcx
+    const wvmp::u8 ub[] = {0x48, 0xFF, 0xC1};
+    auto u = translate_bytes(x64, ub, ir::Arch::X64);
+    ASSERT_EQ(u.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(u.insn.op, ir::Op::Inc);
+    EXPECT_TRUE(u.insn.updates_flags);
+    EXPECT_EQ(u.insn.dst.reg, ir::Reg::Rcx);
+
+    // 90: nop
+    const wvmp::u8 pb[] = {0x90};
+    auto p = translate_bytes(x64, pb, ir::Arch::X64);
+    ASSERT_EQ(p.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(p.insn.op, ir::Op::Nop);
+    EXPECT_FALSE(p.insn.updates_flags);
+}
+
+TEST_F(LifterTranslate, SkippedInstructions) {
+    // D3 E0: shl eax, cl —— cl 变体 v1 记 TODO 跳过
+    const wvmp::u8 cl[] = {0xD3, 0xE0};
+    EXPECT_EQ(translate_bytes(x64, cl, ir::Arch::X64).status, lifter::TranslateStatus::Todo);
+
+    // C1 C0 04: rol eax, 4 —— rol/ror v1 记 TODO 跳过
+    const wvmp::u8 rol[] = {0xC1, 0xC0, 0x04};
+    EXPECT_EQ(translate_bytes(x64, rol, ir::Arch::X64).status, lifter::TranslateStatus::Todo);
+    const wvmp::u8 ror[] = {0xC1, 0xC8, 0x04};
+    EXPECT_EQ(translate_bytes(x64, ror, ir::Arch::X64).status, lifter::TranslateStatus::Todo);
+
+    // 0F A2: cpuid —— 超出白名单
+    const wvmp::u8 cpuid[] = {0x0F, 0xA2};
+    EXPECT_EQ(translate_bytes(x64, cpuid, ir::Arch::X64).status,
+              lifter::TranslateStatus::Unsupported);
+
+    // F0 01 00: lock add [rax], eax —— 带前缀的 ALU v1 跳过
+    //（注：lock 加在寄存器目标上的编码非法，capstone 直接拒绝解码）
+    const wvmp::u8 lock[] = {0xF0, 0x01, 0x00};
+    EXPECT_EQ(translate_bytes(x64, lock, ir::Arch::X64).status,
+              lifter::TranslateStatus::Unsupported);
+}
+
+TEST_F(LifterTranslate, X86Mode32) {
+    // B8 01 00 00 00: mov eax, 1（CS_MODE_32）
+    const wvmp::u8 mb[] = {0xB8, 0x01, 0x00, 0x00, 0x00};
+    auto m = translate_bytes(x86, mb, ir::Arch::X86);
+    ASSERT_EQ(m.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(m.insn.op, ir::Op::Mov);
+    EXPECT_EQ(m.insn.size, ir::Size::S32);
+    EXPECT_EQ(m.insn.dst.reg, ir::Reg::Rax);
+
+    // 89 04 24: mov [esp], eax —— SIB index=100 在 32 位下表示"无 index"
+    //（index 字段为 100 是 ESP 占位/无 index，REX.X 置位才是 r12）
+    const wvmp::u8 sb[] = {0x89, 0x04, 0x24};
+    auto s = translate_bytes(x86, sb, ir::Arch::X86);
+    ASSERT_EQ(s.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(s.insn.op, ir::Op::Store);
+    EXPECT_EQ(s.insn.size, ir::Size::S32);
+    ASSERT_EQ(s.insn.dst.kind, ir::Operand::Kind::Mem);
+    EXPECT_EQ(s.insn.dst.mem.base, ir::Reg::Rsp);
+    EXPECT_EQ(s.insn.dst.mem.index, ir::Reg::Flags); // 哨兵=无 index
+    EXPECT_EQ(s.insn.dst.mem.scale, 0);
+
+    // 74 05: je +5 —— 32 位下控制流指令取 S32
+    const wvmp::u8 jb[] = {0x74, 0x05};
+    auto j = translate_bytes(x86, jb, ir::Arch::X86);
+    ASSERT_EQ(j.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(j.insn.op, ir::Op::Jcc);
+    EXPECT_EQ(j.insn.size, ir::Size::S32);
+    EXPECT_EQ(j.insn.dst.imm, 7);
+}
+
+// ---------------- 基本块划分 ----------------
+
+// 综合用例：
+//   0:  48 89 C1     mov rcx,rax
+//   3:  74 06        je 11
+//   5:  48 83 C1 02  add rcx,2
+//   9:  EB 03        jmp 14
+//   11: 90 90 90     nop ×3
+//   14: 31 C0        xor eax,eax
+//   16: C3           ret
+constexpr wvmp::u8 kBlockBytes[] = {
+    0x48, 0x89, 0xC1,             // 0
+    0x74, 0x06,                   // 3
+    0x48, 0x83, 0xC1, 0x02,       // 5
+    0xEB, 0x03,                   // 9
+    0x90, 0x90, 0x90,             // 11,12,13
+    0x31, 0xC0,                   // 14
+    0xC3,                         // 16
+};
+
+TEST(LifterBlocks, JeJmpSplitsIntoFourBlocks) {
+    lifter::CapstoneSession session(ir::Arch::X64);
+    ir::FunctionRegion fr;
+    fr.name = "blocky";
+    fr.arch = ir::Arch::X64;
+    fr.begin_rva = 0;
+    fr.end_rva = sizeof(kBlockBytes);
+
+    wvmp::Diagnostics diag;
+    const wvmp::u64 decoded = lifter::disassemble_and_lift(
+        session, kBlockBytes, sizeof(kBlockBytes), 0, fr.end_rva, fr.name, "lifter", diag, fr);
+    EXPECT_EQ(decoded, 9u);
+    EXPECT_TRUE(diag.items().empty());
+
+    ASSERT_EQ(fr.blocks.size(), 4u);
+    // 块地址按升序：0, 5, 11, 14
+    EXPECT_EQ(fr.blocks[0].addr, 0u);
+    EXPECT_EQ(fr.blocks[1].addr, 5u);
+    EXPECT_EQ(fr.blocks[2].addr, 11u);
+    EXPECT_EQ(fr.blocks[3].addr, 14u);
+
+    // 块 0: mov + je → 出口 {跳转目标 11, fallthrough 5}
+    ASSERT_EQ(fr.blocks[0].insns.size(), 2u);
+    EXPECT_EQ(fr.blocks[0].insns[0].op, ir::Op::Mov);
+    EXPECT_EQ(fr.blocks[0].insns[1].op, ir::Op::Jcc);
+    EXPECT_EQ(fr.blocks[0].succs, (std::vector<wvmp::u64>{11, 5}));
+    EXPECT_TRUE(fr.blocks[0].preds.empty());
+
+    // 块 1: add + jmp → 出口 {14}
+    ASSERT_EQ(fr.blocks[1].insns.size(), 2u);
+    EXPECT_EQ(fr.blocks[1].insns[0].op, ir::Op::Add);
+    EXPECT_EQ(fr.blocks[1].insns[1].op, ir::Op::Jmp);
+    EXPECT_EQ(fr.blocks[1].succs, (std::vector<wvmp::u64>{14}));
+    EXPECT_EQ(fr.blocks[1].preds, (std::vector<wvmp::u64>{0}));
+
+    // 块 2: nop×3 → 顺序落入 14
+    ASSERT_EQ(fr.blocks[2].insns.size(), 3u);
+    EXPECT_EQ(fr.blocks[2].insns[0].op, ir::Op::Nop);
+    EXPECT_EQ(fr.blocks[2].succs, (std::vector<wvmp::u64>{14}));
+    EXPECT_EQ(fr.blocks[2].preds, (std::vector<wvmp::u64>{0}));
+
+    // 块 3: xor + ret → 无出口；前驱 {5, 11}
+    ASSERT_EQ(fr.blocks[3].insns.size(), 2u);
+    EXPECT_EQ(fr.blocks[3].insns[0].op, ir::Op::Xor);
+    EXPECT_EQ(fr.blocks[3].insns[1].op, ir::Op::Ret);
+    EXPECT_TRUE(fr.blocks[3].succs.empty());
+    EXPECT_EQ(fr.blocks[3].preds, (std::vector<wvmp::u64>{5, 11}));
+}
+
+TEST(LifterBlocks, UnsupportedInsnRecordedButNotFatal) {
+    // 51 0F A2 59 C3: push rcx; cpuid; pop rcx; ret
+    constexpr wvmp::u8 b[] = {0x51, 0x0F, 0xA2, 0x59, 0xC3};
+    lifter::CapstoneSession session(ir::Arch::X64);
+    ir::FunctionRegion fr;
+    fr.name = "cpuidy";
+    fr.arch = ir::Arch::X64;
+    fr.begin_rva = 0x1000;
+    fr.end_rva = 0x1000 + sizeof(b);
+
+    wvmp::Diagnostics diag;
+    const wvmp::u64 decoded =
+        lifter::disassemble_and_lift(session, b, sizeof(b), fr.begin_rva, fr.end_rva, fr.name,
+                                     "lifter", diag, fr);
+    EXPECT_EQ(decoded, 4u); // cpuid 也被解码（计入），但不进入 insns
+    ASSERT_EQ(fr.blocks.size(), 1u);
+    ASSERT_EQ(fr.blocks[0].insns.size(), 3u); // push/pop/ret
+    EXPECT_EQ(fr.blocks[0].insns[0].op, ir::Op::Push);
+    EXPECT_EQ(fr.blocks[0].insns[1].op, ir::Op::Pop);
+    EXPECT_EQ(fr.blocks[0].insns[2].op, ir::Op::Ret);
+    EXPECT_EQ(fr.blocks[0].insns[0].addr, 0x1000u); // addr 为 RVA
+
+    // 记 Note（函数名 + 地址 + 未支持指令），不产生 Error
+    ASSERT_EQ(diag.items().size(), 1u);
+    EXPECT_EQ(diag.items()[0].severity, wvmp::Severity::Note);
+    EXPECT_EQ(diag.items()[0].pass, "lifter");
+    EXPECT_NE(diag.items()[0].message.find("cpuidy"), std::string::npos);
+    EXPECT_NE(diag.items()[0].message.find("cpuid"), std::string::npos);
+    EXPECT_NE(diag.items()[0].message.find("4097"), std::string::npos); // 0x1001 的十进制
+    EXPECT_FALSE(diag.has_errors());
+}
+
+TEST(LifterBlocks, CallTargetAndReturnPointAreLeaders) {
+    // 0: E8 04 00 00 00  call 9
+    // 5: 31 C0            xor eax,eax
+    // 7: C3               ret
+    // 8: 90               nop（填充，使 call 目标落在 9）
+    // 9: C3               ret
+    constexpr wvmp::u8 b[] = {
+        0xE8, 0x04, 0x00, 0x00, 0x00, // 0: call 9
+        0x31, 0xC0,                   // 5
+        0xC3,                         // 7
+        0x90,                         // 8
+        0xC3,                         // 9
+    };
+    lifter::CapstoneSession session(ir::Arch::X64);
+    ir::FunctionRegion fr;
+    fr.name = "callish";
+    fr.arch = ir::Arch::X64;
+    fr.begin_rva = 0;
+    fr.end_rva = sizeof(b);
+
+    wvmp::Diagnostics diag;
+    lifter::disassemble_and_lift(session, b, sizeof(b), 0, fr.end_rva, fr.name, "lifter", diag, fr);
+    ASSERT_TRUE(diag.items().empty());
+
+    // leader：0（起点）、9（call 目标）、5（返回点）。9 之后单独成块。
+    ASSERT_EQ(fr.blocks.size(), 3u);
+    EXPECT_EQ(fr.blocks[0].addr, 0u);  // call：块末是 call → succ = fallthrough
+    EXPECT_EQ(fr.blocks[0].succs, (std::vector<wvmp::u64>{5}));
+    EXPECT_EQ(fr.blocks[0].insns.size(), 1u);
+    EXPECT_EQ(fr.blocks[1].addr, 5u);  // xor + ret
+    EXPECT_TRUE(fr.blocks[1].succs.empty());
+    EXPECT_EQ(fr.blocks[1].preds, (std::vector<wvmp::u64>{0}));
+    EXPECT_EQ(fr.blocks[2].addr, 9u);  // call 目标块
+    EXPECT_TRUE(fr.blocks[2].preds.empty()); // call 不产生 CFG 边（目标块仅被识别为 leader）
+}
+
+// ---------------- PE 映射 + 端到端 run() ----------------
+
+// 构造最小 PE32+ 镜像：单节 .text（RVA 0x1000，文件偏移 0x400）。
+std::vector<wvmp::u8> make_min_pe(std::span<const wvmp::u8> code) {
+    std::vector<wvmp::u8> img;
+    wvmp::ByteWriter w(img);
+    // DOS 头（64 字节，e_lfanew=0x40）
+    w.write_u8('M');
+    w.write_u8('Z');
+    for (int i = 2; i < 60; ++i) w.write_u8(0);
+    w.write_u32(0x40);
+    // NT 头
+    w.write_u8('P');
+    w.write_u8('E');
+    w.write_u8(0);
+    w.write_u8(0);
+    w.write_u16(0x8664); // Machine = AMD64
+    w.write_u16(1);      // NumberOfSections
+    w.write_u32(0);      // TimeDateStamp
+    w.write_u32(0);      // PointerToSymbolTable
+    w.write_u32(0);      // NumberOfSymbols
+    w.write_u16(240);    // SizeOfOptionalHeader（PE32+）
+    w.write_u16(0x0022); // Characteristics: EXECUTABLE_IMAGE | LARGEADDRESSAWARE
+    // 可选头 PE32+（240 字节；ImageBase @24）
+    w.write_u16(0x020B);
+    for (int i = 2; i < 24; ++i) w.write_u8(0);
+    w.write_u64(0x140000000);
+    for (int i = 32; i < 240; ++i) w.write_u8(0);
+    // 节表（40 字节）
+    const wvmp::u8 name[8] = {'.', 't', 'e', 'x', 't', 0, 0, 0};
+    w.write_bytes(name);
+    w.write_u32(static_cast<wvmp::u32>(code.size())); // VirtualSize
+    w.write_u32(0x1000);                              // VirtualAddress
+    w.write_u32(static_cast<wvmp::u32>(code.size())); // SizeOfRawData
+    w.write_u32(0x400);                               // PointerToRawData
+    for (int i = 0; i < 16; ++i) w.write_u8(0);
+    while (img.size() < 0x400) img.push_back(0);
+    w.write_bytes(code);
+    return img;
+}
+
+TEST(LifterPeMap, SectionMapping) {
+    const auto img = make_min_pe(std::span<const wvmp::u8>(kBlockBytes));
+    const lifter::PeSectionMap pe = lifter::PeSectionMap::parse(img);
+    ASSERT_TRUE(pe.valid);
+    ASSERT_EQ(pe.sections.size(), 1u);
+    EXPECT_EQ(pe.image_base, 0x140000000u);
+    EXPECT_EQ(pe.rva_to_offset(0x1000).value_or(0), 0x400u);
+    EXPECT_EQ(pe.rva_to_offset(0x1004).value_or(0), 0x404u);
+    EXPECT_FALSE(pe.rva_to_offset(0x1000 + sizeof(kBlockBytes)).has_value()); // 越界
+    EXPECT_FALSE(pe.rva_to_offset(0x2000).has_value());
+
+    const auto range = pe.map_rva_range(0x1000, 0x1000 + sizeof(kBlockBytes));
+    ASSERT_TRUE(range.has_value());
+    EXPECT_EQ(range->first, 0x400u);
+    EXPECT_EQ(range->second, sizeof(kBlockBytes));
+
+    // 非 PE 镜像
+    const std::vector<wvmp::u8> junk{1, 2, 3};
+    EXPECT_FALSE(lifter::PeSectionMap::parse(junk).valid);
+}
+
+TEST(LifterPass, RunLiftsFunctionsFromImage) {
+    wvmp::ProtectionContext ctx;
+    ctx.image = make_min_pe(std::span<const wvmp::u8>(kBlockBytes));
+
+    ir::FunctionRegion good;
+    good.name = "fn_good";
+    good.arch = ir::Arch::X64;
+    good.begin_rva = 0x1000;
+    good.end_rva = 0x1000 + sizeof(kBlockBytes);
+    ctx.functions.push_back(good);
+
+    ir::FunctionRegion bad;
+    bad.name = "fn_bad";
+    bad.arch = ir::Arch::X64;
+    bad.begin_rva = 0x3000; // 不在任何节内
+    bad.end_rva = 0x3010;
+    ctx.functions.push_back(bad);
+
+    wvmp::passes::LifterPass pass;
+    pass.run(ctx);
+
+    // kLiftedIr = 成功 lift 的函数个数（fn_bad 无法映射 RVA，不计入）
+    // 槽类型契约是 size_t（注：MSVC 上 size_t 即 unsigned long long）
+    const size_t* lifted_sz = ctx.find_slot<size_t>(wvmp::kLiftedIr);
+    ASSERT_NE(lifted_sz, nullptr);
+    EXPECT_EQ(*lifted_sz, 1u);
+
+    // fn_good 的块结构 = 综合用例 + 0x1000 基址
+    const ir::FunctionRegion& out = ctx.functions[0];
+    ASSERT_EQ(out.blocks.size(), 4u);
+    EXPECT_EQ(out.blocks[0].addr, 0x1000u);
+    EXPECT_EQ(out.blocks[1].addr, 0x1005u);
+    EXPECT_EQ(out.blocks[2].addr, 0x100Bu);
+    EXPECT_EQ(out.blocks[3].addr, 0x100Eu);
+    EXPECT_EQ(out.blocks[0].succs, (std::vector<wvmp::u64>{0x100B, 0x1005}));
+    EXPECT_EQ(out.blocks[1].succs, (std::vector<wvmp::u64>{0x100E}));
+    EXPECT_EQ(out.blocks[2].succs, (std::vector<wvmp::u64>{0x100E}));
+    EXPECT_TRUE(out.blocks[3].succs.empty());
+    EXPECT_EQ(out.blocks[3].preds, (std::vector<wvmp::u64>{0x1005, 0x100B}));
+
+    // fn_bad：无块 + 一条 Note
+    EXPECT_TRUE(ctx.functions[1].blocks.empty());
+    ASSERT_EQ(ctx.diag.items().size(), 1u);
+    EXPECT_EQ(ctx.diag.items()[0].severity, wvmp::Severity::Note);
+    EXPECT_NE(ctx.diag.items()[0].message.find("fn_bad"), std::string::npos);
+    EXPECT_FALSE(ctx.diag.has_errors()); // 未识别/无法映射不视为失败
+}
+
+TEST(LifterPass, InvalidImageReportsError) {
+    wvmp::ProtectionContext ctx;
+    ctx.image = {1, 2, 3};
+    ir::FunctionRegion fr;
+    fr.name = "fn";
+    fr.arch = ir::Arch::X64;
+    fr.begin_rva = 0x1000;
+    fr.end_rva = 0x1010;
+    ctx.functions.push_back(fr);
+
+    wvmp::passes::LifterPass pass;
+    pass.run(ctx);
+    EXPECT_TRUE(ctx.diag.has_errors());
+    EXPECT_EQ(ctx.find_slot<size_t>(wvmp::kLiftedIr) != nullptr, true);
+    EXPECT_EQ(*ctx.find_slot<size_t>(wvmp::kLiftedIr), 0u);
+}
+
+TEST(LifterPass, EmptyFunctionsLiftsNothing) {
+    wvmp::ProtectionContext ctx;
+    wvmp::passes::LifterPass pass;
+    pass.run(ctx);
+    ASSERT_NE(ctx.find_slot<size_t>(wvmp::kLiftedIr), nullptr);
+    EXPECT_EQ(*ctx.find_slot<size_t>(wvmp::kLiftedIr), 0u);
+    EXPECT_TRUE(ctx.diag.items().empty());
+}
+
+} // namespace
