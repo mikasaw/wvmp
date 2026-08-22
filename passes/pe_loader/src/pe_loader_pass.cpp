@@ -13,7 +13,7 @@
 namespace wvmp::passes {
 
 std::span<const std::string_view> PeLoaderPass::provides_keys() const {
-    static constexpr std::string_view kProvides[] = {kImage};
+    static constexpr std::string_view kProvides[] = {kImage, kPeImage};
     return kProvides;
 }
 

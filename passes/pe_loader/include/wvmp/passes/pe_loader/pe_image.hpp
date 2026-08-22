@@ -10,6 +10,7 @@
 #pragma once
 
 #include "wvmp/common/types.hpp"
+#include "wvmp/framework/keys.hpp"
 
 #include <cstdint>
 #include <optional>
@@ -68,8 +69,9 @@ public:
 // 及节表边界；结构不合法抛 PeParseError（含可读原因）。
 PeImage parse_pe_image(std::span<const u8> image);
 
-// context 扩展槽 key（P2 泳道私有，不属于冻结契约）：
-// pe_loader 存入 PeImage 模型，pe_writer 等下游 pass 读取。
-inline constexpr std::string_view kImageMeta = "pe.image_meta";
+// context 扩展槽 key：pe_loader 存入 PeImage 模型，marker_scan/lifter 等
+// 下游 pass 读取。M1 起提升为框架共享 key（framework/keys.hpp 的 kPeImage），
+// 此处别名保持旧调用点不变。
+inline constexpr std::string_view kImageMeta = wvmp::kPeImage;
 
 } // namespace wvmp::passes

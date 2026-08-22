@@ -133,6 +133,15 @@ int cmd_protect(const wvmp::cli::ArgsResult& args) {
         return 2;
     }
 
+    // M1 决策（P8 遗留项）：run 正常返回但 diag 含 Error 级条目时视为失败——
+    // "没抛但报过错"的 pass 不应被静默放过。
+    if (ctx.diag.has_errors()) {
+        std::fprintf(stderr, "[wvmp] 管道完成但诊断含 %zu 条 Error：\n",
+                     ctx.diag.items().size());
+        print_diag_tail(ctx.diag);
+        return 2;
+    }
+
     print_diag_notes(ctx.diag);
     std::printf("[wvmp] 完成: %s -> %s\n", config.input.c_str(), output.c_str());
     return 0;

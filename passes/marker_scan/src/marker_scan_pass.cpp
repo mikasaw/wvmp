@@ -5,6 +5,7 @@
 #include "wvmp/framework/registry.hpp"
 #include "wvmp/ir/region.hpp"
 #include "wvmp/passes/marker_scan/scan_core.hpp"
+#include "wvmp/passes/pe_loader/pe_image.hpp"
 
 #include <algorithm>
 #include <cstdio>
@@ -68,7 +69,7 @@ std::string hex_off(size_t v) {
 } // namespace
 
 std::span<const std::string_view> MarkerScanPass::requires_keys() const {
-    static constexpr std::string_view kRequires[] = {kImage};
+    static constexpr std::string_view kRequires[] = {kImage, kPeImage};
     return kRequires;
 }
 
@@ -142,7 +143,24 @@ void MarkerScanPass::run(ProtectionContext& ctx) {
         ctx.diag.report(Severity::Warning, "marker_scan",
                         "end@0x" + hex_off(e) + " 没有配对的 begin（区域被丢弃）");
 
-    // 5) 每对区域生成一个 FunctionRegion。
+    // 5) 每对区域生成一个 FunctionRegion（M1：文件偏移 → RVA 统一换算）。
+    //    PeImage 缺失时（如泳道单测直接构造 context）退化为保持文件偏移并
+    //    记 Note，不失败。
+    const PeImage* pe = ctx.find_slot<PeImage>(kPeImage);
+    if (pe == nullptr)
+        ctx.diag.report(Severity::Note, "marker_scan",
+                        "PeImage 模型缺失（pe_loader 未运行？），区域保持文件偏移");
+    auto to_rva = [&](size_t off, const char* what, const std::string& name) -> u64 {
+        if (pe == nullptr) return off;
+        const auto rva = pe->offset_to_rva(off);
+        if (!rva.has_value()) {
+            ctx.diag.report(Severity::Warning, "marker_scan",
+                            name + " 的 " + what + " 偏移 0x" + hex_off(off) +
+                                " 无法换算为 RVA（越界？），保持原值");
+            return off;
+        }
+        return *rva;
+    };
     auto& regions = paired.regions;
     std::sort(regions.begin(), regions.end(),
               [](const ms::Region& a, const ms::Region& b) { return a.begin_off < b.begin_off; });
@@ -153,9 +171,8 @@ void MarkerScanPass::run(ProtectionContext& ctx) {
         fr.name = "(marker@0x" + hex_off(r.begin_off) + ")";
         // TODO(P7-x86): x86 目标上 magic 会拆成两条 imm32（不连续），v1 仅 x64。
         fr.arch = ir::Arch::X64;
-        // TODO(M1-integration): 当前是文件偏移；RVA 换算待并入 pe_loader 节表。
-        fr.begin_rva = r.begin_off;
-        fr.end_rva = r.end_off;
+        fr.begin_rva = to_rva(r.begin_off, "begin", fr.name);
+        fr.end_rva = to_rva(r.end_off, "end", fr.name);
         ctx.functions.push_back(std::move(fr));
     }
 }

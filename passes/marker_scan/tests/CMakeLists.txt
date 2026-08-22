@@ -26,6 +26,7 @@ add_executable(wvmp_marker_scan_tests
 )
 target_link_libraries(wvmp_marker_scan_tests PRIVATE
     wvmp_pass_marker_scan # OBJECT 库：传播其 PUBLIC include 并链入对象
+    wvmp_pass_pe_loader   # marker_scan 的 run() 消费 PeImage（offset_to_rva），对象需直链
     wvmp::framework
     wvmp::ir
     wvmp::common

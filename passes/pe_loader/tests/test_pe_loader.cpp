@@ -216,8 +216,9 @@ TEST(PeLoaderPass, LoadsFileIntoImageAndSlot) {
 
     wvmp::passes::PeLoaderPass pass;
     const auto provides = pass.provides_keys();
-    ASSERT_EQ(provides.size(), 1u);
+    ASSERT_EQ(provides.size(), 2u);
     EXPECT_EQ(provides[0], wvmp::kImage);
+    EXPECT_EQ(provides[1], wvmp::kPeImage);
 
     pass.run(ctx);
 

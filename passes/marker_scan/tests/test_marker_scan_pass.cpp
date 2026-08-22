@@ -9,6 +9,7 @@
 #include "wvmp/ir/region.hpp"
 #include "wvmp/passes/marker_scan/marker_scan_pass.hpp"
 #include "wvmp/passes/marker_scan/scan_core.hpp"
+#include "wvmp/passes/pe_loader/pe_image.hpp"
 #include "wvmp/sdk/markers.hpp"
 
 #include <gtest/gtest.h>
@@ -38,8 +39,8 @@ u32 rd32(const u8* p) {
            (static_cast<u32>(p[2]) << 16) | (static_cast<u32>(p[3]) << 24);
 }
 
-// 测试侧独立的最小节表解析（宽松：只找名为 .text 的节的文件偏移范围）。
-bool text_range(const std::vector<u8>& img, size_t& lo, size_t& hi) {
+// 测试侧独立的最小节表解析（宽松：只找名为 .text 的节的 RVA 范围）。
+bool text_rva_range(const std::vector<u8>& img, size_t& lo, size_t& hi) {
     if (img.size() < 0x40) return false;
     const size_t lfanew = rd32(&img[0x3C]);
     if (lfanew + 24 > img.size()) return false;
@@ -51,8 +52,8 @@ bool text_range(const std::vector<u8>& img, size_t& lo, size_t& hi) {
     for (u16 i = 0; i < num_sections; ++i) {
         const size_t sh = sec_base + static_cast<size_t>(i) * 40;
         if (std::strncmp(reinterpret_cast<const char*>(&img[sh]), ".text", 5) != 0) continue;
-        lo = rd32(&img[sh + 20]); // PointerToRawData
-        hi = std::min<size_t>(lo + rd32(&img[sh + 16]), img.size());
+        lo = rd32(&img[sh + 12]); // VirtualAddress
+        hi = lo + std::max<u32>(rd32(&img[sh + 8]), 1); // VirtualSize
         return lo < hi;
     }
     return false;
@@ -116,6 +117,9 @@ TEST(MarkerScanPass, ScansSampleExecutable) {
 
     wvmp::ProtectionContext ctx;
     ctx.image = image;
+    // M1：与真实管道一致——先由 pe_loader 产出 PeImage 模型，marker_scan 做
+    // 文件偏移 → RVA 换算。
+    ctx.slot<wvmp::passes::PeImage>(wvmp::kPeImage) = wvmp::passes::parse_pe_image(image);
     wvmp::passes::MarkerScanPass().run(ctx);
 
     ASSERT_EQ(ctx.functions.size(), static_cast<size_t>(2));
@@ -126,16 +130,15 @@ TEST(MarkerScanPass, ScansSampleExecutable) {
         EXPECT_EQ(f.arch, wvmp::ir::Arch::X64);
         EXPECT_NE(f.name.find("marker@"), std::string::npos);
         EXPECT_GT(f.end_rva, f.begin_rva);       // 长度 > 0
-        EXPECT_LT(f.end_rva, image.size());      // 在文件内
         EXPECT_TRUE(f.blocks.empty());           // Analyze 阶段不产出块
     }
     // 地址有序且不重叠
     EXPECT_LT(ctx.functions[0].begin_rva, ctx.functions[1].begin_rva);
     EXPECT_LE(ctx.functions[0].end_rva, ctx.functions[1].begin_rva);
 
-    // 宽松：区域落在 .text 的文件偏移范围内
+    // 宽松：区域（RVA）落在 .text 的 RVA 范围内
     size_t lo = 0, hi = 0;
-    ASSERT_TRUE(text_range(image, lo, hi));
+    ASSERT_TRUE(text_rva_range(image, lo, hi));
     for (const auto& f : ctx.functions) {
         EXPECT_GE(f.begin_rva, lo);
         EXPECT_LE(f.end_rva, hi);
@@ -177,7 +180,9 @@ TEST(MarkerScanPass, SyntheticPairProducesRegion) {
     EXPECT_EQ(f.begin_rva, static_cast<wvmp::u64>(0x85));
     EXPECT_EQ(f.end_rva, static_cast<wvmp::u64>(0xA0));
     EXPECT_FALSE(ctx.diag.has_errors());
-    EXPECT_TRUE(ctx.diag.items().empty());
+    // 无 PE 头：PeImage 槽缺失 → 恰好一条回退 Note（保持文件偏移）。
+    ASSERT_EQ(ctx.diag.items().size(), static_cast<size_t>(1));
+    EXPECT_EQ(ctx.diag.items()[0].severity, wvmp::Severity::Note);
 }
 
 TEST(MarkerScanPass, SyntheticUnpairedBeginWarns) {
