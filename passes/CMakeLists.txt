@@ -42,7 +42,19 @@ target_link_libraries(wvmp_passes_all PUBLIC
 # 显式把 capstone 对象挂到聚合库接口：任何 wvmp_passes_all 的消费者
 # （cli / 测试，含 WHOLE_ARCHIVE 整包链接形态）都能在链接行拿到它们；
 # 对象不在归档内部，不会重复打包。
+# 同理：virtualize 消费 regvm 的全部对象（M2-1 起）。
 if(TARGET wvmp::capstone)
     target_link_libraries(wvmp_passes_all INTERFACE
         $<BUILD_INTERFACE:$<TARGET_OBJECTS:capstone>>)
+endif()
+if(TARGET wvmp_regvm_backend)
+    target_link_libraries(wvmp_passes_all INTERFACE
+        $<BUILD_INTERFACE:$<TARGET_OBJECTS:wvmp_regvm_isa>>
+        $<BUILD_INTERFACE:$<TARGET_OBJECTS:wvmp_regvm_translator>>
+        $<BUILD_INTERFACE:$<TARGET_OBJECTS:wvmp_regvm_runtime>>
+        $<BUILD_INTERFACE:$<TARGET_OBJECTS:wvmp_regvm_backend>>)
+    # runtime 对象引用 ks_*：OBJECT 依赖的 keystone 链接同样不自动传播。
+    if(TARGET wvmp::keystone)
+        target_link_libraries(wvmp_passes_all INTERFACE wvmp::keystone)
+    endif()
 endif()
