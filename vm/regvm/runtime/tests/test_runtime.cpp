@@ -400,6 +400,88 @@ void run_semantic_battery(const vm::RuntimeImage& image, const std::string& dump
         EXPECT_EQ(ctx.ret_value, 77u);   // regs[v0] 写回
         EXPECT_EQ(ctx.pc, 2u);           // Halt 写回停机指令序号
     }
+
+    // ---- (i) Sar：算术右移、符号扩展、CF 末位移出、count=0 no-op ----
+    // Sar 语义要点（x86）：
+    //   - 算术右移：高位补符号位
+    //   - CF = 末位移出位（pre-shift bit[count-1]）；count==0 不动 flags
+    //   - OF = 0（count==1 时）；count>=2 时 OF 未定义，CPU 仍写一个值，本实现照样捕获
+    //   - SF/ZF/PF = 结果的低位/全 0/低 8 奇偶
+    // 任意 count>=64 都按 x86 规范被 AND 0x3F 掩成 0..63；count=0 整条 no-op。
+    {
+        // (i.1) 正值 S64：基本右移（imm 限于 u32，取 256 → sar 4 = 16）
+        std::vector<u8> s;
+        isa::append_insn(s, mov_imm(0, 0x100u));
+        isa::append_insn(s, bin_imm(isa::VmOp::Sar, 0, 4, ir::Size::S64));
+        isa::append_insn(s, halt());
+        const auto ctx = run_stream(entry, s, scratch.data());
+        EXPECT_EQ(ctx.regs[0], 0x10ull);
+        EXPECT_EQ(ctx.pc, 3u);
+
+        // (i.2) 负值 S64：符号扩展。构造 -16 = 0 - 16, 然后 sar 2 = -4 = 0xFFFFFFFFFFFFFFFC
+        s.clear();
+        isa::append_insn(s, mov_imm(0, 0));                  // v0 = 0
+        isa::append_insn(s, mov_imm(1, 16));                 // v1 = 16
+        isa::append_insn(s, bin(isa::VmOp::Sub, 0, 1, ir::Size::S64));  // v0 = -16
+        isa::append_insn(s, bin_imm(isa::VmOp::Sar, 0, 2, ir::Size::S64));  // sar 2 → -4
+        isa::append_insn(s, halt());
+        EXPECT_EQ(run_stream(entry, s, scratch.data()).regs[0], u64(-4));
+
+        // (i.3) CF = bit shifted out（count=1 时即原 LSB）：
+        // -1 sar 1 → -1, CF=1（LSB=1 被移出）, SF=1
+        s.clear();
+        isa::append_insn(s, mov_imm(0, 0));
+        isa::append_insn(s, mov_imm(1, 1));
+        isa::append_insn(s, bin(isa::VmOp::Sub, 0, 1, ir::Size::S64));  // v0 = -1
+        isa::append_insn(s, mov_imm(2, 0));
+        isa::append_insn(s, isa::make_insn(isa::VmOp::SetFlags,
+                                           isa::OpKind::Reg, 2, isa::OpKind::None, 0));
+        isa::append_insn(s, bin_imm(isa::VmOp::Sar, 0, 1, ir::Size::S64));
+        isa::append_insn(s, isa::make_insn(isa::VmOp::GetFlags,
+                                           isa::OpKind::Reg, 3, isa::OpKind::None, 0));
+        isa::append_insn(s, halt());
+        const auto ctx3 = run_stream(entry, s, scratch.data());
+        EXPECT_EQ(ctx3.regs[0], 0xFFFF'FFFF'FFFF'FFFFull);
+        EXPECT_EQ(ctx3.regs[3] & isa::kFlagCF, isa::kFlagCF);
+        EXPECT_EQ(ctx3.regs[3] & isa::kFlagSF, isa::kFlagSF);
+        EXPECT_EQ(ctx3.regs[3] & isa::kFlagZF, 0u);
+
+        // (i.4) count=0 no-op（值/flags 均不变——通过 adv_lbl 跳转验证）
+        s.clear();
+        isa::append_insn(s, mov_imm(0, 0x12345u));
+        isa::append_insn(s, mov_imm(2, u32(isa::kFlagCF | isa::kFlagSF)));
+        isa::append_insn(s, isa::make_insn(isa::VmOp::SetFlags,
+                                           isa::OpKind::Reg, 2, isa::OpKind::None, 0));
+        isa::append_insn(s, bin_imm(isa::VmOp::Sar, 0, 0, ir::Size::S64));
+        isa::append_insn(s, isa::make_insn(isa::VmOp::GetFlags,
+                                           isa::OpKind::Reg, 3, isa::OpKind::None, 0));
+        isa::append_insn(s, halt());
+        const auto ctx4 = run_stream(entry, s, scratch.data());
+        EXPECT_EQ(ctx4.regs[0], 0x12345ull);
+        EXPECT_EQ(ctx4.regs[3] & isa::kFlagsMask,
+                  u64(isa::kFlagCF | isa::kFlagSF));
+
+        // (i.5) S32 算术扩展：高 32 位保留不变, 低 32 位算术右移 + S32 内符号扩展
+        // 0x80000000 在 S32 下是 INT32_MIN；先写到 v0 全 64 位（高 32=0），S32 sar 4
+        // 后低 32 = 0xF8000000，高 32 仍为 0（i.e., 全 64 位 = 0x00000000F8000000）
+        s.clear();
+        isa::append_insn(s, mov_imm(0, 0x80000000u, ir::Size::S32));
+        isa::append_insn(s, bin_imm(isa::VmOp::Sar, 0, 4, ir::Size::S32));
+        isa::append_insn(s, halt());
+        EXPECT_EQ(run_stream(entry, s, scratch.data()).regs[0],
+                  0xF8000000ull);
+
+        // (i.6) S64 大位移：负值右移 60 位仍全符号填充（-2 sar 60 = -1）
+        // 构造 -2 = 0 - 2: mov v0, 0; sub v0, 2; sar v0, 60
+        s.clear();
+        isa::append_insn(s, mov_imm(0, 0));
+        isa::append_insn(s, mov_imm(1, 2));
+        isa::append_insn(s, bin(isa::VmOp::Sub, 0, 1, ir::Size::S64));  // v0 = -2
+        isa::append_insn(s, bin_imm(isa::VmOp::Sar, 0, 60, ir::Size::S64));
+        isa::append_insn(s, halt());
+        EXPECT_EQ(run_stream(entry, s, scratch.data()).regs[0],
+                  0xFFFF'FFFF'FFFF'FFFFull);
+    }
 }
 
 } // namespace
@@ -431,4 +513,45 @@ TEST(Interpreter, AsmDumpStructure) {
     const size_t total = result.image.code.size();
     EXPECT_GT(total, size_t(512 + 64 * 8));   // 25 个 handler 不可能小于此
     EXPECT_EQ(total % 8, 0u);                 // 表尾 8 对齐 → 总长 8 的倍数
+}
+
+// Sar 真执行 fuzz：1 万条随机 (value, count) → 与 C++ 算术右移参考值逐位比对。
+// 覆盖 5 个不同 Rng 种子, 每颗种子跑 10000 次 = 5 万条样本。
+// 参考实现严格按 Intel SDM: count=0 不动, count∈[1,63] 算术右移, count≥64 全符号位。
+namespace {
+// 静态函数定义在 namespace scope 避 MSVC C2267（局部静态函数禁止）。
+static u64 ref_sar_64(u64 v, u32 count) {
+    if (count >= 64) return (v >> 63) ? ~0ull : 0ull;
+    if (count == 0) return v;
+    // 算术右移语义：通过 unsigned shift 拼手动符号填充避免 C++17 实现定义。
+    const u64 fill = (v >> 63) ? (~0ull << (64 - count)) : 0;
+    return (v >> count) | fill;
+}
+} // namespace
+
+TEST(Interpreter, SarFuzzTenThousand) {
+    for (u64 seed : {0xC0FFEEull, 0xBABEF00Dull, 0xDEADBEEFull, 0xCAFEBABEull, 0xFEEDFACEull}) {
+        wvmp::Rng rng(seed);
+        const auto result = rt::generate_runtime(rng);
+        RwxImage rwx(result.image.code);
+        const auto entry = rwx.entry();
+        alignas(16) std::array<u8, 0x10000> scratch{};
+        for (int i = 0; i < 10000; ++i) {
+            // 取 u32 输入：mov_imm aux 是 u32，这等价于零扩展到 u64（高 32=0, 符号位=0）。
+            // reference 也用同一原始，避免截断/扩展错位。
+            const u32 value32 = static_cast<u32>(rng.next());
+            const u32 count = static_cast<u32>(rng.uniform(0, 63));
+            const u64 value64 = value32;        // zero-extend (matches vm state)
+            std::vector<u8> s;
+            isa::append_insn(s, mov_imm(0, value32));
+            isa::append_insn(s, bin_imm(isa::VmOp::Sar, 0, count, ir::Size::S64));
+            isa::append_insn(s, halt());
+            const auto ctx = run_stream(entry, s, scratch.data());
+            const u64 expected = ref_sar_64(value64, count);
+            ASSERT_EQ(ctx.regs[0], expected)
+                << "seed=" << std::hex << seed << " iter=" << std::dec << i
+                << " val=" << std::hex << value32 << " cnt=" << std::dec << count;
+            ASSERT_EQ(ctx.pc, 3u) << "Sar should halt at instruction 3";
+        }
+    }
 }

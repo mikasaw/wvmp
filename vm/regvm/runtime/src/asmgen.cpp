@@ -828,6 +828,10 @@ public:
     std::string build_dec(u64 d) const { return build_incdec("dec", d); }
     std::string build_shl(u64 d) const { return build_shift("shl", d); }
     std::string build_shr(u64 d) const { return build_shift("shr", d); }
+    // Sar 复用 build_shift：x86 sar 与 shr 的写值差异仅在符号扩展；
+    // flags 统一由 setcc5 捕获（CF=末位移出位、OF/SF/ZF/PF 按结果）。
+    // count=0 走 adv_lbl 不动值/flags（与 shr/shl 一致）。
+    std::string build_sar(u64 d) const { return build_shift("sar", d); }
 
 private:
     Rng& rng_;
@@ -863,8 +867,8 @@ RuntimeGenResult generate_runtime(wvmp::Rng& rng) {
         ks.assemble(g.build_dispatch(kDummyTableOff), dispatch_addr, "dispatch pass1");
     const u64 dispatch_size = dispatch1.size();
 
-    // —— handler 清单（v1 覆盖集；Adc/Sbb/Sar/Rol/Ror/Call/Ret 的表项指向
-    //    Halt——遇到即停机，语义保守且不越界）——
+    // —— handler 清单（v1 覆盖集；Adc/Sbb/Rol/Ror/Call/Ret 的表项指向
+    //    Halt——遇到即停机，语义保守且不越界。Sar 在 MIT-244 已接管。）——
     std::vector<HandlerDef> handlers = {
         {int(VmOp::Mov), "mov", &AsmGen::build_mov},
         {int(VmOp::Lea), "lea", &AsmGen::build_mov},
@@ -879,6 +883,7 @@ RuntimeGenResult generate_runtime(wvmp::Rng& rng) {
         {int(VmOp::Dec), "dec", &AsmGen::build_dec},
         {int(VmOp::Shl), "shl", &AsmGen::build_shl},
         {int(VmOp::Shr), "shr", &AsmGen::build_shr},
+        {int(VmOp::Sar), "sar", &AsmGen::build_sar},
         {int(VmOp::Cmp), "cmp", &AsmGen::build_cmp},
         {int(VmOp::Test), "test", &AsmGen::build_test},
         {int(VmOp::Load), "load", &AsmGen::build_load},

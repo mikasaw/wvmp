@@ -63,3 +63,15 @@ target_compile_options(wvmp_whitelist_sample PRIVATE
 target_link_options(wvmp_whitelist_sample PRIVATE
     $<$<CXX_COMPILER_ID:MSVC>:/INCREMENTAL:NO>
 )
+
+# MIT-244：端到端正路径样本——区域内含 sar（白名单内），验证 C2-Sar 修复后
+# 翻译成功、运行时走真 Sar handler、行为与原生逐字节一致。
+add_executable(wvmp_sar_sample sar_sample_main.cpp)
+target_link_libraries(wvmp_sar_sample PRIVATE wvmp::sdk)
+target_compile_options(wvmp_sar_sample PRIVATE
+    $<$<CXX_COMPILER_ID:MSVC>:/Od;/Ob0;/utf-8>
+    $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-O0>
+)
+target_link_options(wvmp_sar_sample PRIVATE
+    $<$<CXX_COMPILER_ID:MSVC>:/INCREMENTAL:NO>
+)
