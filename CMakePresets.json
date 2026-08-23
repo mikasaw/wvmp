@@ -1,0 +1,44 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": { "major": 3, "minor": 24, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "ninja-debug",
+      "displayName": "Ninja Debug（命令行 / scripts/build.bat 同款）",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "WVMP_WITH_KEYSTONE": "ON",
+        "WVMP_WITH_CAPSTONE": "ON"
+      }
+    },
+    {
+      "name": "vs-debug",
+      "displayName": "Visual Studio 18 2026 x64（生成 wvmp.sln）",
+      "generator": "Visual Studio 18 2026",
+      "architecture": "x64",
+      "binaryDir": "${sourceDir}/build/vs",
+      "cacheVariables": {
+        "WVMP_WITH_KEYSTONE": "ON",
+        "WVMP_WITH_CAPSTONE": "ON",
+        "WVMP_FETCHCONTENT_DIR": "${sourceDir}/.deps-vs"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "vs-debug-build",
+      "configurePreset": "vs-debug",
+      "configuration": "Debug"
+    }
+  ],
+  "testPresets": [
+    {
+      "name": "vs-debug-test",
+      "configurePreset": "vs-debug",
+      "configuration": "Debug",
+      "output": { "outputOnFailure": true }
+    }
+  ]
+}

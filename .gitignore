@@ -1,6 +1,7 @@
 # Build outputs
 build*/
 .deps/
+.deps-vs/
 
 # IDE / editor state
 .vs/
