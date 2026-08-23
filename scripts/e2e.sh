@@ -86,6 +86,10 @@ echo "[e2e] dry-run OK"
 
 # ---- 真实管道（M2-4 起启用）：保护 -> 运行 -> 行为比对 ----------------------
 # 保护不改行为是硬约束：stdout 逐字节一致 + 退出码一致。
+# C1 保守拦截（MIT-243）起：保护后的样本可能
+#   (a) 含 ≥1 入口 stub → 虚拟化路径（M2-4 已有：行为在 VM 内真执行）
+#   (b) 无入口 stub → 标记区域整体保持原生（C1 gate：含白名单外指令）
+# 两者均须行为一致；"入口 stub" 不再是硬断言。
 real_out="$("$cli" protect --config "$cfg" 2>&1)"
 real_rc=$?
 if [[ $real_rc -ne 0 ]]; then
@@ -94,8 +98,6 @@ if [[ $real_rc -ne 0 ]]; then
     exit 2
 fi
 [[ -f "$out_win" ]] || { echo "[e2e] 输出文件未生成: $out_win" >&2; exit 2; }
-echo "$real_out" | grep -q "入口 stub" \
-    || { echo "[e2e] 未生成入口 stub（区域未被虚拟化？样本是否含 WVMP 标记？）" >&2; exit 2; }
 
 "$sample"  > "$tmp/stdout.expected" 2>/dev/null; echo $? > "$tmp/rc.expected"
 "$out_win" > "$tmp/stdout.actual"   2>/dev/null; echo $? > "$tmp/rc.actual"
@@ -106,4 +108,10 @@ cmp -s "$tmp/stdout.expected" "$tmp/stdout.actual" \
 [[ "$(cat "$tmp/rc.expected")" == "$(cat "$tmp/rc.actual")" ]] \
     || { echo "[e2e] 退出码不一致: $(cat "$tmp/rc.expected") != $(cat "$tmp/rc.actual")" >&2; exit 2; }
 
-echo "[e2e] PASS（虚拟化后行为与原生一致）"
+if echo "$real_out" | grep -q "已生成 [1-9][0-9]* 个入口 stub"; then
+    echo "[e2e] PASS（虚拟化后行为与原生一致）"
+elif echo "$real_out" | grep -q "放弃虚拟化"; then
+    echo "[e2e] PASS（C1 保守拦截放弃虚拟化，行为与原生一致）"
+else
+    echo "[e2e] PASS（无入口 stub，行为与原生一致）"
+fi

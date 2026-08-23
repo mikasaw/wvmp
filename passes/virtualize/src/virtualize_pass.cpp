@@ -51,6 +51,22 @@ void VirtualizePass::run(ProtectionContext& ctx) {
             vf.begin_rva = fn.begin_rva;
             vf.end_rva = fn.end_rva;
             vf.program = backend->compile(fn, ctx);
+
+            // C1 保守拦截（MIT-243）：后端经扩展槽回传本次翻译的 skip
+            // notes（key 见 regvm_backend.hpp）。任一 note 即放弃该函数的
+            // 虚拟化、保持原生执行——否则字节码缺一块而原区域已被 stub_link
+            // 覆写，产出静默行为错误的 PE。Note 级而非 throw：保持原生继续
+            // 是正常路径，Error 会让 CLI 把整次保护判失败（rc=2）。
+            const std::vector<std::string>* notes =
+                ctx.find_slot<std::vector<std::string>>(regvm::kLastTranslateNotes);
+            if (notes != nullptr && !notes->empty()) {
+                for (const std::string& n : *notes)
+                    ctx.diag.report(Severity::Note, name(),
+                                    "函数 " + fn.name + " 含不可翻译指令，跳过虚拟化" +
+                                        "（保持原生）: " + n);
+                continue;
+            }
+
             virtualized.push_back(std::move(vf));
         } catch (const std::exception& e) {
             // 单函数失败不拖垮整条管道：记 Error 并跳过该函数（其区域保持原生）。

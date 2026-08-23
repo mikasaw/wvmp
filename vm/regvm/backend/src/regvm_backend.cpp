@@ -4,6 +4,10 @@
 #include "wvmp/regvm/translator/translator.hpp"
 #include "wvmp/vm/backend_registry.hpp"
 
+#include <memory>
+#include <string>
+#include <vector>
+
 namespace wvmp::regvm {
 namespace {
 
@@ -17,9 +21,13 @@ public:
         codec_ = codec;
     }
 
-    vm::VmProgram compile(const ir::FunctionRegion& fn, ProtectionContext& /*ctx*/) override {
-        // 翻译是纯函数；诊断级 notes 由调用方（virtualize pass）转 diag。
-        return translator::translate_function(fn).program;
+    vm::VmProgram compile(const ir::FunctionRegion& fn, ProtectionContext& ctx) override {
+        // 翻译是纯函数；诊断级 notes 经扩展槽传回调用方（virtualize pass）
+        // 转 diag 并做 C1 保守拦截（key 见 regvm_backend.hpp）。契约签名
+        // 冻结，无法改返回值——槽是框架预留的跨 pass 通道。
+        translator::TranslateResult result = translator::translate_function(fn);
+        ctx.slot<std::vector<std::string>>(kLastTranslateNotes) = std::move(result.notes);
+        return std::move(result.program);
     }
 
     vm::RuntimeImage generate_runtime(const vm::VmProgram& /*prog*/,

@@ -51,3 +51,15 @@ target_compile_options(wvmp_virt_sample PRIVATE
 target_link_options(wvmp_virt_sample PRIVATE
     $<$<CXX_COMPILER_ID:MSVC>:/INCREMENTAL:NO>
 )
+
+# MIT-243：端到端正路径样本——区域内**无 loop、无条件跳转、无 rip-relative**，
+# 完全白名单直算，验证 C1 保守拦截未误杀可虚拟化区域。
+add_executable(wvmp_whitelist_sample whitelist_sample_main.cpp)
+target_link_libraries(wvmp_whitelist_sample PRIVATE wvmp::sdk)
+target_compile_options(wvmp_whitelist_sample PRIVATE
+    $<$<CXX_COMPILER_ID:MSVC>:/Od;/Ob0;/utf-8>
+    $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-O0>
+)
+target_link_options(wvmp_whitelist_sample PRIVATE
+    $<$<CXX_COMPILER_ID:MSVC>:/INCREMENTAL:NO>
+)

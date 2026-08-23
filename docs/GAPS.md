@@ -24,13 +24,29 @@
 
 **修复方案（两步）**
 
-1. 保守拦截（半天级）：backend 把 notes 传回；virtualize 凡发现该函数有
-   任一 skip note 即放弃虚拟化（保持原生）。立刻消灭静默破坏。
+1. **保守拦截（MIT-243，已落地）**：backend 把 notes 经 `ctx` 扩展槽
+   `regvm.last_translate_notes` 传回；virtualize 凡发现该函数有任一 skip
+   note 即放弃虚拟化（保持原生）。立刻消灭静默破坏。
 2. 完整方案：VMProtect 式 native gate——区域按"可翻译段 / 不可翻译段"
    切块，不可翻译段回退原生执行后再 re-enter VM。工作量大，独立排期。
 
-**验收**：含白名单外指令的标记函数保护后，输出 PE 行为与原生一致
-（该函数整体保持原生），且 diag 有明确 Note。
+**验收**（MIT-243 全部命中）：
+- 含白名单外指令的标记函数保护后，输出 PE 行为与原生一致（该函数整体
+  保持原生），PE 差异仅剩 checksum 重算；
+- diag 出现 `Severity::Note`：函数名 + 跳过原因（来自翻译器 notes）；
+- 现有 15/15 单元测试 + E2E 全部仍绿；
+- 新增正路径样本 `wvmp_whitelist_sample`（区域内纯 Mov/Add，无 loop/jcc/
+  rip-relative），虚拟化正确生成 stub、行为在 VM 内执行、与原生逐字节一致。
+
+**已知遗留 / 范围外**
+- SDK 桩函数去参清理（`marker_begin/end()` 不再带 `const char* name`）：
+  因带参版本在每次 E8 调用点之前会生成 `lea rcx,[rip+name]`，该 lea 是
+  rip-relative、白名单外，会被 C1 gate 拦下整段区域；带参实参从未被使用
+  （见 `sdk/src/sdk.cpp` 原 `(void)name`），去参零行为差清理。
+- 翻译器遇到越区 jcc（jcc 目标落在保护区域外，比如 `jge` 跳到 end E8）
+  仍记 note 并被 gate 拦下——这是翻译器层面的待改进点（C1 已正确兜底，
+  实际行为"行为正确但区域不虚拟化"，符合保守策略）。MIT-248（C4）
+  或后续 native-gate 任务（M3+）可一并处理。
 
 ## C2 运行时 handler 与翻译器能力不匹配：Sar/Adc/Sbb/Rol/Ror 是地雷
 

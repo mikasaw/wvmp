@@ -8,6 +8,7 @@
 #include "wvmp/ir/region.hpp"
 #include "wvmp/passes/virtualize/virtualize_pass.hpp"
 #include "wvmp/regvm/backend/regvm_backend.hpp"
+#include "wvmp/regvm/translator/translator.hpp"
 #include "wvmp/vm/backend.hpp"
 
 #include <gtest/gtest.h>
@@ -57,8 +58,8 @@ ir::FunctionRegion make_sample_function(const std::string& name) {
     b0.insns.push_back(dec);                                 // i--
     ir::Insn jne;
     jne.op = ir::Op::Jcc; jne.size = ir::Size::S64; jne.cond = ir::Cond::Ne;
-    jne.dst = ir::Operand::imm_(0);                          // 目标块序号由 lifter 语义给地址，
-    jne.updates_flags = false;                               // 翻译器按块地址解析
+    jne.dst = ir::Operand::imm_(0x1000);                     // 回跳块 0（按块地址解析）；
+    jne.updates_flags = false;                               // 占位值会触发 C1 gate（正确行为）
     b0.insns.push_back(jne);
     b0.succs = {0x1000, 0x1080};
 
@@ -135,6 +136,72 @@ TEST(VirtualizePass, SkipsUnliftedAndWarnsWhenNothingVirtualized) {
     for (const auto& d : ctx.diag.items())
         if (d.severity == wvmp::Severity::Warning) has_warn = true;
     EXPECT_TRUE(has_warn);
+}
+
+// ---- C1 保守拦截（MIT-243）----
+
+namespace {
+
+// 含一条 call（翻译器必记 note）的函数。
+ir::FunctionRegion make_call_function(const std::string& name) {
+    ir::FunctionRegion fn = make_sample_function(name);
+    ir::Insn call;
+    call.op = ir::Op::Call;
+    call.size = ir::Size::S64;
+    call.dst = ir::Operand::imm_(0x900); // 区域外目标
+    call.updates_flags = false;
+    fn.blocks.at(0).insns.insert(fn.blocks.at(0).insns.begin(), std::move(call));
+    return fn;
+}
+
+} // namespace
+
+// 翻译器对 call 记 note 的前提成立（否则 gate 测试本身失真）。
+TEST(TranslateGate, CallProducesNote) {
+    const auto fn = make_call_function("call_note");
+    const auto result = wvmp::regvm::translator::translate_function(fn);
+    ASSERT_FALSE(result.notes.empty());
+}
+
+TEST(VirtualizePass, GateSkipsFunctionWithTranslateNotes) {
+    wvmp::ProtectionContext ctx;
+    ctx.functions.push_back(make_sample_function("clean"));
+    ctx.functions.push_back(make_call_function("has_call"));
+
+    wvmp::passes::VirtualizePass pass;
+    pass.run(ctx);
+
+    // 干净函数入槽；含 note 的函数被保守拦截、保持原生。
+    const auto* vfs = ctx.find_slot<std::vector<wvmp::passes::VirtualizedFunction>>(wvmp::kVmProgram);
+    ASSERT_NE(vfs, nullptr);
+    ASSERT_EQ(vfs->size(), static_cast<size_t>(1));
+    EXPECT_EQ(vfs->at(0).name, "clean");
+
+    // 每个 skip note 都有一条对应 diag Note，指名函数与原因；无 Error
+    // （保持原生是正常路径，不得判整次保护失败）。
+    EXPECT_FALSE(ctx.diag.has_errors());
+    size_t notes = 0;
+    for (const auto& d : ctx.diag.items()) {
+        if (d.severity == wvmp::Severity::Note && d.message.find("has_call") != std::string::npos &&
+            d.message.find("保持原生") != std::string::npos)
+            ++notes;
+    }
+    EXPECT_GE(notes, static_cast<size_t>(1));
+}
+
+TEST(VirtualizePass, GateNotStickyAcrossFunctions) {
+    // 槽语义 = 最近一次 compile 的 notes：干净函数不得被前一函数的 note 误杀。
+    wvmp::ProtectionContext ctx;
+    ctx.functions.push_back(make_call_function("first_bad"));
+    ctx.functions.push_back(make_sample_function("second_clean"));
+
+    wvmp::passes::VirtualizePass pass;
+    pass.run(ctx);
+
+    const auto* vfs = ctx.find_slot<std::vector<wvmp::passes::VirtualizedFunction>>(wvmp::kVmProgram);
+    ASSERT_NE(vfs, nullptr);
+    ASSERT_EQ(vfs->size(), static_cast<size_t>(1));
+    EXPECT_EQ(vfs->at(0).name, "second_clean");
 }
 
 } // namespace

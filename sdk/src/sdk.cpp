@@ -22,14 +22,12 @@
 
 namespace wvmp::sdk {
 
-WVMP_SDK_NOINLINE void marker_begin(const char* name) {
-    (void)name; // TODO(P7-names): 字符串名解析（当前仅用作扫描锚的调用参数）
+WVMP_SDK_NOINLINE void marker_begin() {
     volatile unsigned long long m = kBeginMagic;
     (void)m;
 }
 
-WVMP_SDK_NOINLINE void marker_end(const char* name) {
-    (void)name;
+WVMP_SDK_NOINLINE void marker_end() {
     volatile unsigned long long m = kEndMagic;
     (void)m;
 }

@@ -22,8 +22,8 @@
 //  - 优化（O2+）下编译器可能把尾部 marker 调用变成 jmp（尾调用），配对
 //    会失败；建议对含标记的翻译单元关闭优化或固定 /Od。
 
-#define WVMP_BEGIN(fn) ::wvmp::sdk::marker_begin(#fn)
-#define WVMP_END(fn)   ::wvmp::sdk::marker_end(#fn)
+#define WVMP_BEGIN(fn) ::wvmp::sdk::marker_begin()
+#define WVMP_END(fn)   ::wvmp::sdk::marker_end()
 
 namespace wvmp::sdk {
 
@@ -40,8 +40,11 @@ inline constexpr u64 kBeginMagic = 0x3147'4542'504D'5657ull; // "WVMPBEG1"
 inline constexpr u64 kEndMagic   = 0x3144'4E45'504D'5657ull; // "WVMPEND1"
 
 // 桩函数（禁止内联：magic 所在函数体必须作为独立实体存活到最终链接）。
-void marker_begin(const char* name);
-void marker_end(const char* name);
+// 无参：marker_scan 通过 magic 字节做锚点，与函数名无关；带 const char* 参数
+// 会在 E8 调用点之前生成 `lea rcx,[rip+str]`，该 lea 是白名单外的 rip-relative
+// 指令——C1 保守拦截会把含它的整段区域拦下，让虚拟化无法落地。
+void marker_begin();
+void marker_end();
 
 // 非内联锚点，保证 SDK 总是作为真实库被链接。
 int api_version();
