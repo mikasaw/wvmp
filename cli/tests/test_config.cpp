@@ -8,6 +8,11 @@
 #include <fstream>
 #include <string>
 #include <string_view>
+#include <system_error>
+
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 namespace {
 
@@ -115,6 +120,97 @@ TEST(ConfigParse, MissingConfigFile) {
     EXPECT_FALSE(result.ok);
     EXPECT_TRUE(contains(result.error, "不存在")) << result.error;
 }
+
+#ifdef _WIN32
+// ---- MSYS/Git-Bash 路径 fallback (fix(cli)) --------------------------------
+//
+// 背景: scripts/e2e.sh 用 mktemp -d 生成 /tmp/xxx, wvmp_cli.exe 拿到 POSIX
+// 风格路径后 std::filesystem::exists 找不到. fallback 在 parse_config 里尝试
+// 转换为 Windows 路径, 这两组测试固定该行为.
+//
+// 测试方法: 在 std::filesystem::temp_directory_path() 下手动创建一个 toml,
+// 拿到它的绝对 Windows 路径, 然后用 MSYS 风格 (POSIX) 形式当 key, 验证
+// parse_config 仍能识别.
+
+// 把一个 Windows 路径转换为对应的 MSYS POSIX 表达. 仅适用本测试环境.
+static std::filesystem::path to_msys_posix(const std::filesystem::path& win) {
+    std::string s = win.string();
+    if (s.size() < 3 || s[1] != ':') return {};
+    char drive = static_cast<char>(std::tolower(static_cast<unsigned char>(s[0])));
+    std::string rest = s.substr(2);
+    if (!rest.empty() && (rest[0] == '\\' || rest[0] == '/')) rest[0] = '/';
+    for (auto& c : rest) if (c == '\\') c = '/';
+    return std::filesystem::path(std::string("/") + drive + rest);
+}
+
+TEST(ConfigParse, MsysTmpPathFallback) {
+    std::error_code ec;
+    auto win_dir = std::filesystem::temp_directory_path() /
+                   "wvmp_cli_config_msys_tmp_test";
+    std::filesystem::create_directories(win_dir, ec);
+    auto win_file = win_dir / "e2e.toml";
+    {
+        std::ofstream out(win_file, std::ios::binary | std::ios::trunc);
+        out << "input  = \"in.exe\"\noutput = \"out.exe\"\n";
+    }
+    char buf[MAX_PATH];
+    DWORD n = GetEnvironmentVariableA("TEMP", buf, sizeof(buf));
+    ASSERT_GT(n, 0u);
+    std::string rest = "\\wvmp_cli_config_msys_tmp_test\\e2e.toml";
+    for (auto& c : rest) if (c == '\\') c = '/';
+    std::filesystem::path msys_path = std::string("/tmp") + rest;
+
+    const auto result = wvmp::cli::parse_config(msys_path);
+    ASSERT_TRUE(result.ok) << result.error << " | msys=" << msys_path.string();
+    EXPECT_EQ(result.value.input, "in.exe");
+
+    std::filesystem::remove_all(win_dir, ec);
+}
+
+TEST(ConfigParse, MsysMountPathFallback) {
+    std::error_code ec;
+    auto win_dir = std::filesystem::temp_directory_path() /
+                   "wvmp_cli_config_msys_mount_test";
+    std::filesystem::create_directories(win_dir, ec);
+    auto win_file = win_dir / "cfg.toml";
+    {
+        std::ofstream out(win_file, std::ios::binary | std::ios::trunc);
+        out << "input = \"a.exe\"\noutput = \"b.exe\"\n";
+    }
+    auto msys_path = to_msys_posix(win_file);
+    ASSERT_FALSE(msys_path.empty());
+
+    const auto result = wvmp::cli::parse_config(msys_path);
+    ASSERT_TRUE(result.ok) << result.error << " | msys=" << msys_path.string();
+    EXPECT_EQ(result.value.input, "a.exe");
+
+    std::filesystem::remove_all(win_dir, ec);
+}
+
+TEST(ConfigParse, WindowsPathUntouched) {
+    std::error_code ec;
+    auto win_dir = std::filesystem::temp_directory_path() /
+                   "wvmp_cli_config_native_test";
+    std::filesystem::create_directories(win_dir, ec);
+    auto win_file = win_dir / "n.toml";
+    {
+        std::ofstream out(win_file, std::ios::binary | std::ios::trunc);
+        out << "input = \"n.exe\"\noutput = \"m.exe\"\n";
+    }
+    const auto result = wvmp::cli::parse_config(win_file);
+    ASSERT_TRUE(result.ok) << result.error;
+    EXPECT_EQ(result.value.input, "n.exe");
+
+    std::filesystem::remove_all(win_dir, ec);
+}
+
+TEST(ConfigParse, MsysFallbackNotFound) {
+    const auto result = wvmp::cli::parse_config(
+        std::filesystem::path("/tmp/wvmp_does_not_exist_12345.toml"));
+    EXPECT_FALSE(result.ok);
+    EXPECT_TRUE(contains(result.error, "不存在")) << result.error;
+}
+#endif  // _WIN32
 
 TEST(ConfigParse, BadSeedType) {
     const TempToml toml("input = \"a.exe\"\noutput = \"b.exe\"\nseed = \"not a number\"\n");

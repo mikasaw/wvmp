@@ -2,8 +2,16 @@
 
 #include <toml++/toml.hpp>
 
+#include <cctype>
 #include <cstdint>
+#include <cstdlib>
+#include <filesystem>
+#include <string>
 #include <system_error>
+
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 namespace wvmp::cli {
 namespace {
@@ -19,20 +27,83 @@ std::string describe_parse_error(const toml::parse_error& err) {
     return msg;
 }
 
+// 把 MSYS/Git-Bash 风格 POSIX 路径转换为 Windows 路径。返回空 path 表示
+// "看起来不像 MSYS 风格，调用方应保留原路径"。
+//
+// 背景：std::filesystem 在 Windows 上不识别 MSYS mount (e.g. /c/Users/...)
+// 也不识别 POSIX /tmp（实际指向 $TEMP）。当脚本（如 scripts/e2e.sh）
+// 把 MSYS 风格路径通过命令行传给 wvmp_cli.exe 时，需要在这里 fallback。
+//   /tmp/xxx/foo.toml          -> $TEMP\xxx\foo.toml
+//   /tmp/foo.toml              -> $TEMP\foo.toml
+//   /c/Users/foo/bar.toml      -> C:/Users/foo/bar.toml
+//   C:/Windows/path            -> {} (已 Windows)
+//   D:\foo                     -> {} (已 Windows)
+//   foo.toml (相对)            -> {} (由 std::filesystem 处理)
+std::filesystem::path msys_to_windows_path(const std::filesystem::path& p) {
+#ifdef _WIN32
+    std::string s = p.string();
+    if (s.empty()) return {};
+    // 已是 Windows 路径: "C:/..." 或 "C:\" 或 "\\server\share"
+    if (s.size() >= 2 && s[1] == ':') return {};
+    if (s.size() >= 2 && s[0] == '\\' && s[1] == '\\') return {};
+    if (s[0] != '/') return {};  // 相对路径, std::filesystem 会处理
+
+    // /tmp 风格 -> $TEMP
+    if (s.size() >= 4 && s.compare(0, 4, "/tmp") == 0) {
+        char buf[MAX_PATH];
+        DWORD n = GetEnvironmentVariableA("TEMP", buf, sizeof(buf));
+        if (n == 0 || n >= sizeof(buf)) return {};
+        std::string rest = s.substr(4);
+        // 去前缀的 '/'
+        if (!rest.empty() && rest[0] == '/') rest.erase(0, 1);
+        // 把 POSIX '/' 全部转 Windows '\'
+        for (auto& c : rest) if (c == '/') c = '\\';
+        if (rest.empty()) return std::filesystem::path(buf);
+        return std::filesystem::path(std::string(buf) + "\\" + rest);
+    }
+    // /c/, /d/ 等单字母 mount 前缀
+    if (s.size() >= 3 && s[2] == '/') {
+        char drive = static_cast<char>(std::toupper(static_cast<unsigned char>(s[1])));
+        if (drive < 'A' || drive > 'Z') return {};
+        std::string rest = s.substr(2);  // 形如 "/Users/foo"
+        return std::filesystem::path(std::string(1, drive) + ":" + rest);
+    }
+    return {};
+#else
+    (void)p;
+    return {};
+#endif
+}
+
 } // namespace
 
 ConfigResult parse_config(const std::filesystem::path& file) {
     ConfigResult result;
 
-    std::error_code ec;
-    if (!std::filesystem::exists(file, ec)) {
-        result.error = "config 文件不存在: " + file.string();
-        return result;
+    // MSYS/Git-Bash 路径 fallback: 原路径不存在时, 尝试转换为 Windows 路径.
+    // 适用场景: scripts/e2e.sh 用 mktemp -d 生成 /tmp/xxx, wvmp_cli.exe 拿到
+    // 这条 POSIX 路径在 std::filesystem::exists 失败. fallback 不修改原 file
+    // 引用 (caller 拿到的 result.value.input/output 仍是 TOML 里的字符串),
+    // 只影响"是否能打开文件"这一关.
+    std::filesystem::path actual = file;
+    {
+        std::error_code ec;
+        if (!std::filesystem::exists(actual, ec)) {
+            ec.clear();
+            std::filesystem::path converted = msys_to_windows_path(file);
+            if (!converted.empty() && std::filesystem::exists(converted, ec)) {
+                actual = converted;
+                ec.clear();
+            } else {
+                result.error = "config 文件不存在: " + file.string();
+                return result;
+            }
+        }
     }
 
     toml::table tbl;
     try {
-        tbl = toml::parse_file(file.string());
+        tbl = toml::parse_file(actual.string());
     } catch (const toml::parse_error& err) {
         result.error = describe_parse_error(err);
         return result;
