@@ -249,10 +249,23 @@ public:
     std::string build_entry() const {
         std::string o;
         o += "vm_entry:\n";
-        o += std::string("    lea ") + r64(base_) + ", [rip - 7]\n";
-        // Win64 callee-saved 全量保存（随机分配可能选中其中任意几个）。
-        o += "    push rbx\n    push rbp\n    push rdi\n    push rsi\n";
-        o += "    push r12\n    push r13\n    push r14\n    push r15\n";
+        // base 寄存器的原值必须先压栈再被 lea 覆盖——否则 halt 的 pop 恢复的是
+        // 码基址，调用方现场被毁（callee-saved 契约破坏）。压栈序 = 其余 7 个
+        // callee-saved 保持在后，halt 按完全逆序弹出，对称成立。
+        // push 编码 1 字节（非 REX 寄存器）或 2 字节（r8-r15），lea 的 rip 位移
+        // 必须据此回指镜像起点。
+        const unsigned push_bytes = base_ < 6 ? 1 : 2;
+        o += std::string("    push ") + r64(base_) + "\n";
+        o += std::string("    lea ") + r64(base_) + ", [rip - " +
+             std::to_string(push_bytes + 7) + "]\n";
+        // 其余 Win64 callee-saved 全量保存（随机分配可能选中其中任意几个）。
+        {
+            const char* rest[] = {"rbx", "rbp", "rdi", "rsi", "r12", "r13", "r14", "r15"};
+            for (const char* r : rest) {
+                if (std::string_view(r) == std::string_view(kPhys[base_].r64)) continue;
+                o += std::string("    push ") + r + "\n";
+            }
+        }
         o += std::string("    mov ") + r64(ctx_) + ", rcx\n";
         o += std::string("    mov ") + r64(pc_) + ", qword ptr [" + r64(ctx_) + " + 0x8]\n";
         o += std::string("    mov ") + r64(flags_) + ", qword ptr [" + r64(ctx_) + " + 0x98]\n";
@@ -351,11 +364,13 @@ public:
     }
 
     // 从指令字（T8 仍存活）重提 reg_a 到 T[reg]（写回前 T4 可能已被清零）。
+    // 22/31 必须经 imm()：裸数字被 keystone 按 16 进制解析（22→0x22=34、
+    // 31→0x31=49），写回目标寄存器算错——aux=0 时恒写 reg0，dec/jne 死循环（已踩）。
     std::string reextract_a(int reg) const {
         std::string o;
         o += std::string("    mov ") + r64(t_[reg]) + ", " + r64(t_[8]) + "\n";
-        o += std::string("    shr ") + r64(t_[reg]) + ", 22\n";
-        o += std::string("    and ") + r64(t_[reg]) + ", 31\n";
+        o += std::string("    shr ") + r64(t_[reg]) + ", " + imm(22) + "\n";
+        o += std::string("    and ") + r64(t_[reg]) + ", " + imm(31) + "\n";
         return o;
     }
 
@@ -651,9 +666,11 @@ public:
     std::string emit_jump_taken() const {
         std::string o;
         o += std::string("    mov ") + r64(t_[0]) + ", " + r64(t_[8]) + "\n";
-        o += std::string("    shr ") + r64(t_[0]) + ", 32\n";
-        o += std::string("    shl ") + r64(t_[0]) + ", 32\n";
-        o += std::string("    sar ") + r64(t_[0]) + ", 32\n";
+        // 32 必须经 imm()（→"0x20"）：裸 "32" 被按 16 进制解析成 0x32=50，
+        // sext 退化为移 50 位——taken 跳转量恒 0，jcc 原地死循环（已踩）。
+        o += std::string("    shr ") + r64(t_[0]) + ", " + imm(32) + "\n";
+        o += std::string("    shl ") + r64(t_[0]) + ", " + imm(32) + "\n";
+        o += std::string("    sar ") + r64(t_[0]) + ", " + imm(32) + "\n";
         o += std::string("    add ") + r64(pc_) + ", " + r64(t_[0]) + "\n";
         o += "    jmp {DISPATCH}\n";
         return o;
@@ -731,9 +748,11 @@ public:
         const std::string fall_lbl = "jfall" + tag;
         std::string out = decode_prelude();
         // 链式分派（顺序随机；末条件 perm[15] 为链尾顺延跌入，其块最先排放）。
+        // imm() 必须用：keystone Intel 裸数字按 16 进制解析（"14"→0x14=20），
+        // 十进制字符串会让条件 10..15 永远错配到链尾。
         for (int i = 0; i < 15; ++i) {
             const int c = cond_perm_[i];
-            out += std::string("    cmp ") + r64(t_[2]) + ", " + std::to_string(c) + "\n";
+            out += std::string("    cmp ") + r64(t_[2]) + ", " + imm(c) + "\n";
             out += "    je cc" + std::to_string(c) + "_" + tag + "\n";
         }
         out += "cc" + std::to_string(cond_perm_[15]) + "_" + tag + ":\n" +
@@ -753,14 +772,22 @@ public:
         return out;
     }
 
-    // Halt：写回 pc 与 ret_value(=regs[v0])，恢复现场，ret。
+    // Halt：写回 pc（指向 halt 之后，便于将来恢复执行）与 ret_value(=regs[v0])，
+    // 恢复现场，ret。弹出序 = 入口压栈序的严格镜像：base 最先压、最后弹。
     std::string build_halt(u64 /*dispatch*/) const {
         std::string o;
+        o += std::string("    add ") + r64(pc_) + ", 1\n";
         o += std::string("    mov qword ptr [") + r64(ctx_) + " + 0x8], " + r64(pc_) + "\n";
         o += std::string("    mov ") + r64(t_[0]) + ", qword ptr [" + r64(ctx_) + " + 0x10]\n";
         o += std::string("    mov qword ptr [") + r64(ctx_) + " + 0x118], " + r64(t_[0]) + "\n";
-        o += "    pop r15\n    pop r14\n    pop r13\n    pop r12\n";
-        o += "    pop rsi\n    pop rdi\n    pop rbp\n    pop rbx\n";
+        {
+            const char* rest[] = {"r15", "r14", "r13", "r12", "rsi", "rdi", "rbp", "rbx"};
+            for (const char* r : rest) {
+                if (std::string_view(r) == std::string_view(kPhys[base_].r64)) continue;
+                o += std::string("    pop ") + r + "\n";
+            }
+            o += std::string("    pop ") + r64(base_) + "\n";
+        }
         o += "    ret\n";
         return o;
     }

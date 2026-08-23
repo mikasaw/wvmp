@@ -39,6 +39,10 @@
 #include <string>
 #include <vector>
 
+// 调试期：禁 WER 弹窗，崩溃直接以退出码显形（排查 g 段疑似 AV）。
+struct DisableWerBox { DisableWerBox() { ::SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX); } };
+static const DisableWerBox kNoWerBox;
+
 namespace {
 
 namespace isa = wvmp::regvm::isa;
@@ -200,11 +204,13 @@ void run_semantic_battery(const vm::RuntimeImage& image, const std::string& dump
         const auto ctx = run_stream(entry, s, scratch.data());
         // 低 8 位 0x88+0x61=0xE9（进位丢弃），高 56 位保留。
         EXPECT_EQ(ctx.regs[0], 0x1122'3344'5566'77E9ull);
-        // S8 add 的 flags：CF=1（无符号进位）、SF=1（0xE9 bit7）、OF=0、ZF=0、
-        // PF=0（0xE9 有 5 个 1，奇）。kFlag 布局：CF=bit1、SF=bit3。
-        EXPECT_EQ(ctx.regs[2], (isa::kFlagCF | isa::kFlagSF));
-        EXPECT_EQ(ctx.regs[17] & isa::kFlagsMask, (isa::kFlagCF | isa::kFlagSF));
+        // 低 8 位 0x88+0x61=0xE9=233<256，无进位：CF=0（原期望 CF=1 是算错——
+        // 233 未超 255）；SF=1（0xE9 bit7）、OF=0（-120+97=-23 不溢出）、ZF=0、
+        // PF=0（0xE9 有 5 个 1，奇）。kFlag 布局：CF=bit1、SF=bit3 → 仅 SF。
+        EXPECT_EQ(ctx.regs[2], isa::kFlagSF);
+        EXPECT_EQ(ctx.regs[17] & isa::kFlagsMask, isa::kFlagSF);
     }
+
 
     // ---- (c) flags + jcc：两路终值 ----
     {
@@ -259,6 +265,7 @@ void run_semantic_battery(const vm::RuntimeImage& image, const std::string& dump
         EXPECT_EQ(run_stream(entry, s, scratch.data()).regs[2], 222u);
     }
 
+
     // ---- (d) 循环：jne 回跳求和 1..10 ----
     {
         std::vector<u8> s;
@@ -271,7 +278,7 @@ void run_semantic_battery(const vm::RuntimeImage& image, const std::string& dump
         const auto ctx = run_stream(entry, s, scratch.data());
         EXPECT_EQ(ctx.regs[0], 55u);
         EXPECT_EQ(ctx.regs[1], 0u);
-        EXPECT_EQ(ctx.pc, 5u);
+        EXPECT_EQ(ctx.pc, 6u);   // halt+1 语义：pc 指向 halt 之后
     }
 
     // ---- (e) Load/Store：经 scratch_mem，Size 缩放 ----
@@ -309,12 +316,13 @@ void run_semantic_battery(const vm::RuntimeImage& image, const std::string& dump
                                            isa::OpKind::None, 0));
         isa::append_insn(s, isa::make_insn(isa::VmOp::Pop, isa::OpKind::Reg, 3,
                                            isa::OpKind::None, 0));
-        isa::append_insn(s, isa::make_insn(isa::VmOp::Pop, isa::OpKind::Reg, 4,
+        isa::append_insn(s, // 弹出目的用 v10：v4 是 Rsp 槽位，弹入 v4 会覆盖栈指针（原测试自摆乌龙）。
+        isa::make_insn(isa::VmOp::Pop, isa::OpKind::Reg, 10,
                                            isa::OpKind::None, 0));
         isa::append_insn(s, halt());
         const auto ctx = run_stream(entry, s, scratch.data(), 0x800);
         EXPECT_EQ(ctx.regs[3], 0xBBull);   // LIFO：后进先出
-        EXPECT_EQ(ctx.regs[4], 0xAAull);
+        EXPECT_EQ(ctx.regs[10], 0xAAull);
         EXPECT_EQ(ctx.regs[isa::vm_reg_of(ir::Reg::Rsp)], 0x800ull);   // 栈回原位
         EXPECT_EQ(*reinterpret_cast<u64*>(&scratch[0x800 - 8]), 0xAAull);
         EXPECT_EQ(*reinterpret_cast<u64*>(&scratch[0x800 - 16]), 0xBBull);
@@ -361,14 +369,16 @@ void run_semantic_battery(const vm::RuntimeImage& image, const std::string& dump
             "mov rcx, r8\n"
             "call rdx\n"
             "pop rcx\n"
+            // 位移必须 0x 前缀：keystone Intel 裸数字按 16 进制解析（16→0x16=22），
+            // 错位写穿 store 数组（slot2-7 全坏而 0/1 幸存的根因）。
             "mov [rcx], rbx\n"
             "mov [rcx+8], rbp\n"
-            "mov [rcx+16], r12\n"
-            "mov [rcx+24], r13\n"
-            "mov [rcx+32], r14\n"
-            "mov [rcx+40], r15\n"
-            "mov [rcx+48], rdi\n"
-            "mov [rcx+56], rsi\n"
+            "mov [rcx+0x10], r12\n"
+            "mov [rcx+0x18], r13\n"
+            "mov [rcx+0x20], r14\n"
+            "mov [rcx+0x28], r15\n"
+            "mov [rcx+0x30], rdi\n"
+            "mov [rcx+0x38], rsi\n"
             "ret\n";
         RwxImage driver(assemble_or_throw(driver_asm));
         using DriverFn = void (*)(u64*, void*, void*);
