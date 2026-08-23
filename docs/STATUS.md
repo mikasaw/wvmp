@@ -64,7 +64,18 @@ E2E：`scripts/e2e.sh build/m2_e2e/sample.exe` → PASS
 - Halt 写回 pc+1（恢复友好）；flags 位布局 ZF/CF/OF/SF/PF = bit0..4。
 - `kPeImage` 为框架共享 key；marker_scan 经 PeImage 做偏移→RVA 换算。
 
+## 正确性缺口（开工前必读 → docs/GAPS.md）
+
+M2 验收通过 ≠ 完整加壳器。逐项核查确认的缺口按严重度记录在
+`docs/GAPS.md`：C1 无 gate 回退（不支持指令被静默丢弃后原区域已被覆写）、
+C2 运行时缺 Sar/Adc/Sbb handler（翻译成功但运行时中途 Halt）、
+C3 区域内 call、C4 rip-relative、C5 x86 扫描不可用。
+**当前仅"纯白名单指令、无调用、栈上计算"的区域可安全虚拟化。**
+
 ## M3 待办（下次开工清单）
+
+前置：先做 GAPS.md 的 C1 保守拦截 + C2 handler 补齐（工作量小、
+消灭静默破坏），再进入插件池：
 
 按依赖与风险排序：
 
@@ -79,12 +90,12 @@ E2E：`scripts/e2e.sh build/m2_e2e/sample.exe` → PASS
    （TOML 已有基础）。
 6. **多 VM 实例 / flags 活跃性消除**：性能与强度优化，最后做。
 
-## 技术债（规划内，非缺陷）
+## 技术债（规划内，非缺陷；正确性问题见 docs/GAPS.md）
 
 - lifter：cl 变体移位、rol/ror v1 跳过（`x86_translate.cpp` 记 TODO）。
-- call / rip-relative 走 gate 回退路径（native 执行）。
+- call / rip-relative 走 gate 回退路径（native 执行）——gate 本身未实现，见 GAPS C3/C4。
 - flags 跨指令污染：待 M3 活跃性分析消除。
-- marker_scan：仅 x64；O2 尾调用编成 E9 jmp（不产生 E8）不覆盖；
+- marker_scan：仅 x64（GAPS C5）；O2 尾调用编成 E9 jmp（不产生 E8）不覆盖；
   函数名解析 TODO(P7-names)。
 - x86 目标整体对齐仍在 backlog（当前主攻 x64）。
 
