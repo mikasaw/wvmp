@@ -74,4 +74,23 @@ PeImage parse_pe_image(std::span<const u8> image);
 // 此处别名保持旧调用点不变。
 inline constexpr std::string_view kImageMeta = wvmp::kPeImage;
 
+// —— 新节请求/落位（M2：stub_link 产出 → pe_writer 落盘）——
+//
+// 请求方（stub_link）填充 NewSection 放入 kNewSections 槽；pe_writer 的
+// add_sections 负责实际落位并返回 SectionPlacement（RVA 一旦定下，payload
+// 内的 rip 相对引用即自洽——请求方按 placement 生成对外部 .text 的引用）。
+struct NewSection {
+    std::string name;      // <= 8 字节（PE 节名上限）
+    std::vector<u8> data;  // 节内容（raw 数据，落盘时按 file_alignment 补齐）
+    u32 characteristics = 0;
+    u32 requested_rva = 0; // 0 = 自动分配（最后一个节末端对齐后）；非 0 则
+                           // 校验无冲突后按请求落位（供 payload 预计算地址）。
+};
+
+struct SectionPlacement {
+    u32 rva = 0;         // 落位后的 VirtualAddress
+    u32 file_offset = 0; // 落盘 PointerToRawData
+    u32 raw_size = 0;    // 对齐后的 SizeOfRawData
+};
+
 } // namespace wvmp::passes

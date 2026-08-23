@@ -18,3 +18,20 @@ target_include_directories(wvmp_pe_writer_tests PRIVATE
 wvmp_target_warnings(wvmp_pe_writer_tests)
 
 add_test(NAME pe_writer_tests COMMAND wvmp_pe_writer_tests)
+
+# M2-2：新节追加（section_builder）。
+add_executable(wvmp_section_builder_tests test_section_builder.cpp)
+target_link_libraries(wvmp_section_builder_tests PRIVATE
+    wvmp_pass_pe_writer
+    wvmp_pass_pe_loader
+    wvmp::framework
+    wvmp::ir
+    wvmp::common
+    wvmp::gtest
+    gtest_main
+)
+target_include_directories(wvmp_section_builder_tests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src
+)
+wvmp_target_warnings(wvmp_section_builder_tests)
+add_test(NAME section_builder_tests COMMAND wvmp_section_builder_tests)

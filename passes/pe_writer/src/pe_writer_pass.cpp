@@ -1,6 +1,7 @@
 #include "wvmp/passes/pe_writer/pe_writer_pass.hpp"
 
 #include "pe_checksum.hpp"
+#include "section_builder.hpp"
 
 #include "wvmp/common/bytes.hpp"
 #include "wvmp/framework/context.hpp"
@@ -13,6 +14,7 @@
 #include <stdexcept>
 #include <string>
 #include <system_error>
+#include <vector>
 
 namespace wvmp::passes {
 namespace {
@@ -39,7 +41,27 @@ void PeWriterPass::run(ProtectionContext& ctx) {
     if (ctx.image.empty()) fail(ctx, "镜像为空，没有可写出的内容");
     if (ctx.output_path.empty()) fail(ctx, "输出路径为空");
 
-    // 1) 定位 NT 头：优先用 pe_loader 存入的模型；缺失（镜像来自其他
+    // 1) 落位新节（kNewSections 槽；stub_link 等 Emit 阶段产出）——必须在
+    //    checksum 之前，校验失败则整体失败（镜像不被部分修改）。
+    if (auto* new_sections = ctx.find_slot<std::vector<NewSection>>(kNewSections);
+        new_sections != nullptr && !new_sections->empty()) {
+        u32 sec_align = 0x1000, file_align = 0x200; // PE 规范默认值兜底
+        if (const PeImage* meta = ctx.find_slot<PeImage>(kImageMeta)) {
+            sec_align = meta->section_alignment != 0 ? meta->section_alignment : sec_align;
+            file_align = meta->file_alignment != 0 ? meta->file_alignment : file_align;
+        }
+        try {
+            const auto placed = add_sections(ctx.image, *new_sections, sec_align, file_align);
+            ctx.diag.report(Severity::Note, name(),
+                            "已追加 " + std::to_string(placed.size()) + " 个新节");
+        } catch (const std::exception& e) {
+            fail(ctx, std::string("追加新节失败: ") + e.what());
+        }
+        // 节表变化后 NT 头偏移不变（只动表项与文件尾），但保险起见重取模型
+        // 中的对齐/偏移用于后续 checksum。
+    }
+
+    // 2) 定位 NT 头：优先用 pe_loader 存入的模型；缺失（镜像来自其他
     //    来源 / 中途被整体替换）时对当前镜像现场重解析。
     u32 nt_off = 0;
     if (const PeImage* meta = ctx.find_slot<PeImage>(kImageMeta)) {
@@ -63,9 +85,7 @@ void PeWriterPass::run(ProtectionContext& ctx) {
     w.patch_u32(chk_off, 0);
     w.patch_u32(chk_off, pe_checksum(ctx.image, chk_off));
 
-    // 3) TODO(M2): add .wvmp section（附加节表项 + 重排镜像，属 Transform 阶段职责）
-
-    // 4) 临时文件 + rename 原子替换，防止半写文件暴露给用户。
+    // 3) 临时文件 + rename 原子替换，防止半写文件暴露给用户。
     std::filesystem::path tmp = ctx.output_path;
     tmp += ".wvmp-tmp";
     {
