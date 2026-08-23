@@ -3,6 +3,9 @@ build*/
 .deps/
 .deps-vs/
 
+# Multica local cache (issue descriptions, agent instructions, helpers)
+.multica/
+
 # IDE / editor state
 .vs/
 .vscode/
