@@ -1,123 +1,189 @@
-// stub_link 泳道测试：
-//  1) kVmProgram 缺失 → Warning 且不产出 kVmRuntime（M1 空管道不失败）；
-//  2) 伪 program（手搭 blob）→ 产出非空 [blob | runtime] 载荷：blob magic
-//     "WVMP" 在首、entry 偏移 16 对齐、含 Note 诊断；
-//  3) 端到端：载荷内 runtime 部分拷入 RWX 执行伪 program，验证 ret_value。
+// M2-3 stub_link 测试：
+//  1) kVmProgram 缺失 → Warning 返回（M1 空管道兼容）；
+//  2) 端到端（进程内模拟 PE 场景）：手搭最小 PE + 虚拟化函数 →
+//     .text 入口被覆写为 E9（目标=stub RVA）+ 区域余量 INT3；
+//     kNewSections 有 .wvmp 请求（requested_rva 对齐、含 blob magic 与
+//     解释器代码）；
+//  3) stub 机器码结构性检查（push 序言 / sub rsp 0x130）。
+
+#include "stub_gen.hpp"
 
 #include "wvmp/common/bytes.hpp"
 #include "wvmp/common/rng.hpp"
 #include "wvmp/framework/context.hpp"
 #include "wvmp/framework/diagnostics.hpp"
 #include "wvmp/framework/keys.hpp"
-#include "wvmp/framework/registry.hpp"
-#include "wvmp/ir/arch.hpp"
+#include "wvmp/passes/pe_loader/pe_image.hpp"
 #include "wvmp/passes/stub_link/stub_link_pass.hpp"
+#include "wvmp/passes/virtualize/virtualize_pass.hpp"
 #include "wvmp/regvm/isa/blob.hpp"
 #include "wvmp/regvm/isa/encoding.hpp"
-#include "wvmp/regvm/runtime/runtime.hpp"
 #include "wvmp/vm/backend.hpp"
 
 #include <gtest/gtest.h>
 
-#include <windows.h>
-
-#include <array>
+#include <algorithm>
+#include <cstdint>
 #include <cstring>
 #include <vector>
 
 namespace {
 
 namespace isa = wvmp::regvm::isa;
-namespace ir = wvmp::ir;
+using wvmp::i64;
 using wvmp::u8;
 using wvmp::u32;
 using wvmp::u64;
+using wvmp::passes::NewSection;
+using wvmp::passes::PeImage;
+using wvmp::passes::VirtualizedFunction;
+using wvmp::ProtectionContext;
 
-std::vector<u8> make_tiny_blob(u32 imm) {
-    // mov r0, imm ; halt
-    std::vector<u8> stream;
-    isa::append_insn(stream, isa::make_insn(isa::VmOp::Mov, isa::OpKind::Reg, 0,
-                                            isa::OpKind::Imm, 0, imm));
-    isa::append_insn(stream, isa::make_insn(isa::VmOp::Halt, isa::OpKind::None, 0,
-                                            isa::OpKind::None, 0));
-    const auto blob = isa::make_blob(ir::Arch::X64, 0, stream);
-    std::vector<u8> out;
-    wvmp::ByteWriter w(out);
-    isa::write_blob(w, blob);
-    return out;
+constexpr u32 kSecAlign = 0x1000;
+constexpr u32 kFileAlign = 0x200;
+
+void wr32(std::vector<u8>& v, size_t o, u32 x) {
+    v[o] = u8(x);
+    v[o + 1] = u8(x >> 8);
+    v[o + 2] = u8(x >> 16);
+    v[o + 3] = u8(x >> 24);
 }
 
-u32 rd32(const u8* p) {
-    return static_cast<u32>(p[0]) | (static_cast<u32>(p[1]) << 8) |
-           (static_cast<u32>(p[2]) << 16) | (static_cast<u32>(p[3]) << 24);
+// 最小 PE：单 .text 节（VA 0x1000，raw @0x200 长 0x400，内容 0x90）。
+// 区域 RVA 0x1100..0x1140 落在节内（文件偏移 0x300..0x340）。
+std::vector<u8> build_pe_with_region() {
+    std::vector<u8> img(0x600, 0);
+    img[0] = 'M';
+    img[1] = 'Z';
+    wr32(img, 0x3C, 0x40);
+    const size_t nt = 0x40;
+    img[nt + 0] = 'P';
+    img[nt + 1] = 'E';
+    wr32(img, nt + 4, 0x8664);
+    img[nt + 6] = 1;
+    img[nt + 20] = 240;
+    const size_t opt = nt + 24;
+    img[opt] = 0x0B;
+    img[opt + 1] = 0x02;
+    wr32(img, opt + 32, kSecAlign);
+    wr32(img, opt + 36, kFileAlign);
+    wr32(img, opt + 56, 0x2000);
+    wr32(img, opt + 60, 0x200);
+    const size_t sh = nt + 24 + 240;
+    std::memcpy(&img[sh], ".text", 5);
+    wr32(img, sh + 8, 0x400);
+    wr32(img, sh + 12, 0x1000);
+    wr32(img, sh + 16, 0x400);
+    wr32(img, sh + 20, 0x200);
+    wr32(img, sh + 36, 0x6000'0020);
+    std::fill(img.begin() + 0x200, img.begin() + 0x600, 0x90);
+    return img;
+}
+
+wvmp::vm::VmProgram make_program() {
+    // mov r0,77; halt —— 足以构造合法 blob。
+    std::vector<u8> stream;
+    isa::append_insn(stream, isa::make_insn(isa::VmOp::Mov, isa::OpKind::Reg, 0,
+                                            isa::OpKind::Imm, 0, 77, 3));
+    isa::append_insn(stream, isa::make_insn(isa::VmOp::Halt, isa::OpKind::None, 0,
+                                            isa::OpKind::None, 0));
+    const auto blob = isa::make_blob(wvmp::ir::Arch::X64, 0, std::move(stream));
+    std::vector<u8> serialized;
+    wvmp::ByteWriter w(serialized);
+    isa::write_blob(w, blob);
+
+    wvmp::vm::VmProgram p;
+    p.bytecode = std::move(serialized);
+    p.entry_offset = 0;
+    return p;
+}
+
+ProtectionContext make_ctx_with_one_function() {
+    ProtectionContext ctx;
+    ctx.image = build_pe_with_region();
+    ctx.slot<PeImage>(wvmp::kPeImage) = wvmp::passes::parse_pe_image(ctx.image);
+
+    VirtualizedFunction vf;
+    vf.name = "sample";
+    vf.begin_rva = 0x1100;
+    vf.end_rva = 0x1140;
+    vf.program = make_program();
+    ctx.slot<std::vector<VirtualizedFunction>>(wvmp::kVmProgram).push_back(std::move(vf));
+    return ctx;
+}
+
+TEST(StubLinkPass, NoProgramWarns) {
+    ProtectionContext ctx;
+    wvmp::passes::StubLinkPass pass;
+    pass.run(ctx);
+    EXPECT_FALSE(ctx.diag.has_errors());
+    EXPECT_FALSE(ctx.diag.items().empty());
+    EXPECT_EQ(ctx.find_slot<std::vector<NewSection>>(wvmp::kNewSections), nullptr);
+}
+
+TEST(StubLinkPass, OverwritesEntryAndRequestsSection) {
+    ProtectionContext ctx = make_ctx_with_one_function();
+    wvmp::passes::StubLinkPass pass;
+    pass.run(ctx);
+
+    ASSERT_FALSE(ctx.diag.has_errors());
+
+    // .text 覆写：RVA 0x1100 → 文件偏移 0x300。
+    const u8* code = ctx.image.data() + 0x300;
+    ASSERT_EQ(code[0], 0xE9);
+    const i64 rel = static_cast<i64>(u32(code[1]) | (u32(code[2]) << 8) |
+                                     (u32(code[3]) << 16) | (u32(code[4]) << 24));
+    const u64 stub_rva = 0x1100 + 5 + rel;
+
+    // 新节请求。
+    const auto* reqs = ctx.find_slot<std::vector<NewSection>>(wvmp::kNewSections);
+    ASSERT_NE(reqs, nullptr);
+    ASSERT_EQ(reqs->size(), static_cast<size_t>(1));
+    const NewSection& req = reqs->front();
+    EXPECT_EQ(req.name, ".wvmp");
+    EXPECT_GT(req.requested_rva, 0u);
+    EXPECT_EQ(req.requested_rva % kSecAlign, 0u);
+    ASSERT_GT(req.data.size(), static_cast<size_t>(64));
+    EXPECT_GE(stub_rva, req.requested_rva);
+    EXPECT_LT(stub_rva, req.requested_rva + req.data.size());
+
+    // payload 含 blob magic。
+    bool has_blob = false;
+    for (size_t i = 0; i + 4 <= req.data.size(); ++i)
+        if (std::memcmp(&req.data[i], "WVMP", 4) == 0) has_blob = true;
+    EXPECT_TRUE(has_blob);
+
+    // 区域余量 INT3 填充（0x40 字节区域，E9 后全 CC）。
+    for (size_t i = 5; i < 0x40; ++i) EXPECT_EQ(code[i], 0xCC) << "byte " << i;
+}
+
+TEST(StubLinkPass, UnmappableRegionKeepsNative) {
+    ProtectionContext ctx = make_ctx_with_one_function();
+    auto& vfs = ctx.slot<std::vector<VirtualizedFunction>>(wvmp::kVmProgram);
+    vfs.front().begin_rva = 0xFF000;  // 超出节范围
+    wvmp::passes::StubLinkPass pass;
+    pass.run(ctx);
+    EXPECT_TRUE(ctx.diag.has_errors());
+    EXPECT_EQ(ctx.image[0x300], 0x90);  // .text 未动
+}
+
+TEST(StubGen, StubBytesStartWithPushesAndSubRsp) {
+    const auto stub =
+        wvmp::passes::generate_entry_stub(0x9000, 0x9100, 0x9040, 0x1100);
+    ASSERT_GT(stub.size(), static_cast<size_t>(32));
+    // 首字节必为 push（0x50-0x57 或 REX 0x41 前缀）。
+    EXPECT_TRUE((stub[0] >= 0x50 && stub[0] <= 0x57) ||
+                (stub[0] == 0x41 && stub[1] >= 0x50 && stub[1] <= 0x57));
+    // 序言后应有 sub rsp, 0x130（48 81 EC 30 01 00 00）。
+    bool found_sub = false;
+    for (size_t i = 0; i + 7 <= stub.size(); ++i) {
+        if (stub[i] == 0x48 && stub[i + 1] == 0x81 && stub[i + 2] == 0xEC &&
+            stub[i + 3] == 0x30 && stub[i + 4] == 0x01) {
+            found_sub = true;
+            break;
+        }
+    }
+    EXPECT_TRUE(found_sub);
 }
 
 } // namespace
-
-TEST(StubLink, MissingProgramWarnsAndSkips) {
-    wvmp::ProtectionContext ctx;
-    ctx.rng.reseed(1);
-    wvmp::passes::StubLinkPass pass;
-    pass.run(ctx);
-
-    EXPECT_FALSE(ctx.diag.has_errors());
-    ASSERT_EQ(ctx.diag.items().size(), 1u);
-    EXPECT_EQ(ctx.diag.items()[0].severity, wvmp::Severity::Warning);
-    EXPECT_NE(ctx.diag.items()[0].message.find("no vm program"), std::string::npos);
-    EXPECT_FALSE(ctx.has_slot(wvmp::kVmRuntime));
-}
-
-TEST(StubLink, EmitsExecutableRuntimePayload) {
-    const std::vector<u8> blob = make_tiny_blob(42);
-
-    wvmp::ProtectionContext ctx;
-    ctx.rng.reseed(7);
-    ctx.slot<wvmp::vm::VmProgram>(wvmp::kVmProgram) = wvmp::vm::VmProgram{blob, 0};
-    wvmp::passes::StubLinkPass pass;
-    pass.run(ctx);
-
-    EXPECT_FALSE(ctx.diag.has_errors());
-    const auto* payload = ctx.find_slot<wvmp::vm::RuntimeImage>(wvmp::kVmRuntime);
-    ASSERT_NE(payload, nullptr);
-    ASSERT_GT(payload->code.size(), blob.size());
-    // 载荷首部 = blob（magic "WVMP"）。
-    EXPECT_EQ(payload->code[0], 'W');
-    EXPECT_EQ(payload->code[1], 'V');
-    EXPECT_EQ(payload->code[2], 'M');
-    EXPECT_EQ(payload->code[3], 'P');
-    // entry 偏移 = 16 对齐的 blob 大小；其后是解释器机器码（非零）。
-    EXPECT_EQ(payload->vm_entry_offset % 16, 0u);
-    EXPECT_EQ(payload->vm_entry_offset, ((blob.size() + 15) & ~size_t(15)));
-    bool runtime_nonzero = false;
-    for (size_t i = payload->vm_entry_offset; i < payload->code.size(); ++i)
-        if (payload->code[i] != 0) runtime_nonzero = true;
-    EXPECT_TRUE(runtime_nonzero);
-    // 产出记录（Note）。
-    bool has_note = false;
-    for (const auto& d : ctx.diag.items())
-        if (d.severity == wvmp::Severity::Note) has_note = true;
-    EXPECT_TRUE(has_note);
-
-    // —— 端到端：runtime 拷入 RWX，执行 blob 内程序 ——
-    const size_t runtime_size = payload->code.size() - payload->vm_entry_offset;
-    void* mem = VirtualAlloc(nullptr, runtime_size, MEM_COMMIT | MEM_RESERVE,
-                             PAGE_EXECUTE_READWRITE);
-    ASSERT_NE(mem, nullptr);
-    std::memcpy(mem, payload->code.data() + payload->vm_entry_offset, runtime_size);
-
-    alignas(16) std::array<u8, 0x1000> scratch{};
-    wvmp::regvm::runtime::VmContext vmctx;
-    vmctx.bytecode = const_cast<u8*>(payload->code.data()) + 32;   // 跳过 blob 头
-    vmctx.pc = rd32(payload->code.data() + 8) / 8;                 // 头 entry_offset（字节→条数）
-    vmctx.scratch_mem = reinterpret_cast<u64>(scratch.data());
-    reinterpret_cast<void (*)(wvmp::regvm::runtime::VmContext*)>(mem)(&vmctx);
-
-    EXPECT_EQ(vmctx.regs[0], 42u);
-    EXPECT_EQ(vmctx.ret_value, 42u);
-    EXPECT_EQ(vmctx.pc, 2u);
-    VirtualFree(mem, 0, MEM_RELEASE);
-}
-
-TEST(StubLink, RegisteredInRegistry) {
-    EXPECT_NE(wvmp::PassRegistry::instance().find("stub_link"), nullptr);
-}

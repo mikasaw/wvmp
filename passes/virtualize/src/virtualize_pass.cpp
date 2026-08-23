@@ -36,8 +36,8 @@ void VirtualizePass::run(ProtectionContext& ctx) {
         throw std::runtime_error(std::string(name()) + ": regvm backend not registered");
     }
 
-    auto& programs = ctx.slot<std::vector<vm::VmProgram>>(kVmProgram);
-    programs.clear();
+    auto& virtualized = ctx.slot<std::vector<VirtualizedFunction>>(kVmProgram);
+    virtualized.clear();
 
     for (const auto& fn : ctx.functions) {
         if (fn.blocks.empty()) {
@@ -46,8 +46,12 @@ void VirtualizePass::run(ProtectionContext& ctx) {
             continue;
         }
         try {
-            vm::VmProgram program = backend->compile(fn, ctx);
-            programs.push_back(std::move(program));
+            VirtualizedFunction vf;
+            vf.name = fn.name;
+            vf.begin_rva = fn.begin_rva;
+            vf.end_rva = fn.end_rva;
+            vf.program = backend->compile(fn, ctx);
+            virtualized.push_back(std::move(vf));
         } catch (const std::exception& e) {
             // 单函数失败不拖垮整条管道：记 Error 并跳过该函数（其区域保持原生）。
             ctx.diag.report(Severity::Error, name(),
@@ -55,7 +59,7 @@ void VirtualizePass::run(ProtectionContext& ctx) {
         }
     }
 
-    if (programs.empty())
+    if (virtualized.empty())
         ctx.diag.report(Severity::Warning, name(), "没有任何函数被虚拟化");
 }
 

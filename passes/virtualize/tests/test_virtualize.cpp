@@ -99,17 +99,19 @@ TEST(VirtualizePass, CompilesLiftedFunctionsIntoSlot) {
     wvmp::passes::VirtualizePass pass;
     pass.run(ctx);
 
-    const auto* programs = ctx.find_slot<std::vector<wvmp::vm::VmProgram>>(wvmp::kVmProgram);
-    ASSERT_NE(programs, nullptr);
-    ASSERT_EQ(programs->size(), static_cast<size_t>(2));
+    const auto* vfs = ctx.find_slot<std::vector<wvmp::passes::VirtualizedFunction>>(wvmp::kVmProgram);
+    ASSERT_NE(vfs, nullptr);
+    ASSERT_EQ(vfs->size(), static_cast<size_t>(2));
+    EXPECT_EQ(vfs->at(0).name, "sample");
+    EXPECT_EQ(vfs->at(0).begin_rva, 0x1000u);
 
     // 每个程序都是合法 blob：magic "WVMP" + 非空指令流。
-    for (const auto& p : *programs) {
-        ASSERT_GE(p.bytecode.size(), static_cast<size_t>(32));
-        EXPECT_EQ(std::memcmp(p.bytecode.data(), "WVMP", 4), 0);
+    for (const auto& p : *vfs) {
+        ASSERT_GE(p.program.bytecode.size(), static_cast<size_t>(32));
+        EXPECT_EQ(std::memcmp(p.program.bytecode.data(), "WVMP", 4), 0);
         // 头 32 字节后是 8 字节对齐的指令流。
-        EXPECT_EQ((p.bytecode.size() - 32) % 8, static_cast<size_t>(0));
-        EXPECT_GT(p.bytecode.size(), static_cast<size_t>(32));  // 至少一条指令
+        EXPECT_EQ((p.program.bytecode.size() - 32) % 8, static_cast<size_t>(0));
+        EXPECT_GT(p.program.bytecode.size(), static_cast<size_t>(32));  // 至少一条指令
     }
     EXPECT_FALSE(ctx.diag.has_errors());
 }
@@ -124,9 +126,9 @@ TEST(VirtualizePass, SkipsUnliftedAndWarnsWhenNothingVirtualized) {
     wvmp::passes::VirtualizePass pass;
     pass.run(ctx);
 
-    const auto* programs = ctx.find_slot<std::vector<wvmp::vm::VmProgram>>(wvmp::kVmProgram);
-    ASSERT_NE(programs, nullptr);
-    EXPECT_TRUE(programs->empty());
+    const auto* vfs = ctx.find_slot<std::vector<wvmp::passes::VirtualizedFunction>>(wvmp::kVmProgram);
+    ASSERT_NE(vfs, nullptr);
+    EXPECT_TRUE(vfs->empty());
     // 一条 Note（跳过）+ 一条 Warning（无函数虚拟化），无 Error。
     EXPECT_FALSE(ctx.diag.has_errors());
     bool has_warn = false;
