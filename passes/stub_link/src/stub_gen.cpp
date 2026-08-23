@@ -52,7 +52,10 @@ std::string build_stub_asm(u64 rt_entry_rva, u64 resume_rva) {
             o += std::string("mov [rsp + ") + hex(kCtxRegs + u64(i) * 8) + "], " + src + "\n";
         }
     }
-    o += "mov [rsp + " + hex(kCtxRsp) + "], rsp\n";          // v4 = 当前栈指针
+    // v4 = 原始 rsp（区域代码按原函数帧的 rsp 相对寻址）：当前 rsp 比原始值
+    // 低 8*push(0x40) + 0x130，用 lea 还原。rax 的原值已在 slot0 保存，可复用。
+    o += "lea rax, [rsp + 0x170]\n";
+    o += "mov [rsp + " + hex(kCtxRsp) + "], rax\n";
     o += "mov qword ptr [rsp + " + hex(kCtxScratch) + "], 0\n"; // scratch=0：绝对地址空间
     o += "mov qword ptr [rsp + 0x8], 0\n";                   // pc = 0
     o += "lea rax, [rip + " + hex(kBlobDispDummy) + "]\n";   // blob 指令流（回填）
@@ -88,6 +91,19 @@ std::vector<u8> generate_entry_stub(u64 stub_rva, u64 blob_stream_rva, u64 rt_en
     ks_option(ks, KS_OPT_SYNTAX, KS_OPT_SYNTAX_INTEL);
 
     const std::string src = build_stub_asm(rt_entry_rva, resume_rva);
+    // 调试钩子（排查用）：WVMP_STUB_DUMP=<win 路径> 时落盘汇编文本。
+    {
+        char* dp = nullptr;
+        size_t dp_len = 0;
+        if (_dupenv_s(&dp, &dp_len, "WVMP_STUB_DUMP") == 0 && dp && dp_len > 1) {
+            FILE* f = nullptr;
+            if (fopen_s(&f, dp, "wb") == 0 && f) {
+                std::fwrite(src.data(), 1, src.size(), f);
+                std::fclose(f);
+            }
+        }
+        std::free(dp);
+    }
     unsigned char* enc = nullptr;
     size_t size = 0, count = 0;
     const int rc = ks_asm(ks, src.c_str(), stub_rva, &enc, &size, &count);

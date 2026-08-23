@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdio>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -140,12 +141,15 @@ void StubLinkPass::run(ProtectionContext& ctx) {
     req.data = std::move(payload);
     req.characteristics = kWvmpChars;
     req.requested_rva = static_cast<u32>(section_rva);
+    const size_t payload_size = req.data.size();
     ctx.slot<std::vector<NewSection>>(kNewSections).push_back(std::move(req));
 
+    char rva_buf[24];
+    std::snprintf(rva_buf, sizeof(rva_buf), "%llX",
+                  static_cast<unsigned long long>(section_rva));
     ctx.diag.report(Severity::Note, name(),
                     "已生成 " + std::to_string(patches.size()) + " 个入口 stub，.wvmp 节 " +
-                        std::to_string(req.data.size()) + " 字节 @ RVA 0x" +
-                        std::to_string(section_rva));
+                        std::to_string(payload_size) + " 字节 @ RVA 0x" + rva_buf);
 }
 
 WVMP_REGISTER_PASS(StubLinkPass)

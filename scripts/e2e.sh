@@ -63,6 +63,8 @@ name = "lifter"
 [[passes]]
 name = "virtualize"
 [[passes]]
+name = "stub_link"
+[[passes]]
 name = "pe_writer"
 EOF
 
@@ -82,13 +84,26 @@ echo "$dry_out" | grep -q "Load: pe_loader" \
     || { echo "[e2e] dry-run 输出缺少 'Load: pe_loader'" >&2; exit 2; }
 echo "[e2e] dry-run OK"
 
-# ---- 真实管道（M1 联调启用）-------------------------------------------------
-# 前提：pe_loader/pe_writer（P2 泳道）等占位 pass 全部真实化。启用后：
-#   1) out_exe="$tmp/wvmp_e2e_out.exe"; "$cli" protect --config "$cfg"
-#        -> 断言退出码 0 且 $out_exe 存在
-#   2) "$sample" > "$tmp/stdout.expected"; echo $? > "$tmp/rc.expected"
-#      "$out_exe" > "$tmp/stdout.actual";  echo $? > "$tmp/rc.actual"
-#   3) 比对 rc 与 stdout 逐字节一致（保护不改行为是硬约束）
-# ---------------------------------------------------------------------------
+# ---- 真实管道（M2-4 起启用）：保护 -> 运行 -> 行为比对 ----------------------
+# 保护不改行为是硬约束：stdout 逐字节一致 + 退出码一致。
+real_out="$("$cli" protect --config "$cfg" 2>&1)"
+real_rc=$?
+if [[ $real_rc -ne 0 ]]; then
+    echo "[e2e] protect 失败 (rc=$real_rc):" >&2
+    echo "$real_out" >&2
+    exit 2
+fi
+[[ -f "$out_win" ]] || { echo "[e2e] 输出文件未生成: $out_win" >&2; exit 2; }
+echo "$real_out" | grep -q "入口 stub" \
+    || { echo "[e2e] 未生成入口 stub（区域未被虚拟化？样本是否含 WVMP 标记？）" >&2; exit 2; }
 
-echo "[e2e] PASS"
+"$sample"  > "$tmp/stdout.expected" 2>/dev/null; echo $? > "$tmp/rc.expected"
+"$out_win" > "$tmp/stdout.actual"   2>/dev/null; echo $? > "$tmp/rc.actual"
+
+cmp -s "$tmp/stdout.expected" "$tmp/stdout.actual" \
+    || { echo "[e2e] stdout 不一致（虚拟化改变了行为）" >&2
+         diff "$tmp/stdout.expected" "$tmp/stdout.actual" >&2; exit 2; }
+[[ "$(cat "$tmp/rc.expected")" == "$(cat "$tmp/rc.actual")" ]] \
+    || { echo "[e2e] 退出码不一致: $(cat "$tmp/rc.expected") != $(cat "$tmp/rc.actual")" >&2; exit 2; }
+
+echo "[e2e] PASS（虚拟化后行为与原生一致）"

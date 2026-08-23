@@ -30,7 +30,7 @@ TEST(DefaultConfig, ParsesWithExpectedFields) {
     EXPECT_EQ(result.value.seed, uint64_t{12345});
 
     const std::vector<std::string> expected_names = {
-        "pe_loader", "marker_scan", "lifter", "virtualize", "pe_writer",
+        "pe_loader", "marker_scan", "lifter", "virtualize", "stub_link", "pe_writer",
     };
     ASSERT_EQ(result.value.passes.size(), expected_names.size());
     for (size_t i = 0; i < expected_names.size(); ++i)
@@ -53,7 +53,7 @@ TEST(DefaultConfig, AssemblesPipelineInPhaseOrder) {
     }
 
     const auto& stages = pipeline.stages();
-    ASSERT_EQ(stages.size(), size_t{5});
+    ASSERT_EQ(stages.size(), size_t{6});
 
     // from_names 按 Phase 稳定排序：marker_scan 与 lifter 同为 Analyze，
     // 保持配置给定顺序（marker_scan 在前）。
@@ -62,11 +62,11 @@ TEST(DefaultConfig, AssemblesPipelineInPhaseOrder) {
         wvmp::Phase phase;
     };
     const Expected expected[] = {
-        {"pe_loader", wvmp::Phase::Load},   {"marker_scan", wvmp::Phase::Analyze},
-        {"lifter", wvmp::Phase::Analyze},   {"virtualize", wvmp::Phase::Transform},
-        {"pe_writer", wvmp::Phase::Write},
+        {"pe_loader", wvmp::Phase::Load},     {"marker_scan", wvmp::Phase::Analyze},
+        {"lifter", wvmp::Phase::Analyze},     {"virtualize", wvmp::Phase::Transform},
+        {"stub_link", wvmp::Phase::Emit},     {"pe_writer", wvmp::Phase::Write},
     };
-    for (size_t i = 0; i < 5; ++i) {
+    for (size_t i = 0; i < 6; ++i) {
         EXPECT_EQ(stages[i]->name(), expected[i].name) << "index " << i;
         EXPECT_EQ(stages[i]->phase(), expected[i].phase) << "index " << i;
     }

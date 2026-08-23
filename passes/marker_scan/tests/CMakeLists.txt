@@ -40,3 +40,14 @@ target_compile_definitions(wvmp_marker_scan_tests PRIVATE
 wvmp_target_warnings(wvmp_marker_scan_tests)
 
 add_test(NAME marker_scan COMMAND wvmp_marker_scan_tests)
+
+# M2-4：端到端虚拟化样例（区域仅含白名单指令）。
+add_executable(wvmp_virt_sample virtual_sample_main.cpp)
+target_link_libraries(wvmp_virt_sample PRIVATE wvmp::sdk)
+target_compile_options(wvmp_virt_sample PRIVATE
+    $<$<CXX_COMPILER_ID:MSVC>:/Od;/Ob0;/utf-8>
+    $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-O0>
+)
+target_link_options(wvmp_virt_sample PRIVATE
+    $<$<CXX_COMPILER_ID:MSVC>:/INCREMENTAL:NO>
+)
