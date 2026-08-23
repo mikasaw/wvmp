@@ -1,0 +1,929 @@
+// P6：regvm 运行时生成器。
+//
+// 保护期用 Keystone（KS_ARCH_X86 + KS_MODE_64，Intel 语法）汇编出一段
+// **位置无关**的 x64 解释器机器码，可在 RWX 内存中执行 regvm 字节码。
+//
+// ============================== 机器码布局 ==============================
+//
+//   [entry][dispatch][handler..（码序随机）][0x90 垫片至 8 对齐][跳转表 64xu64]
+//    ^入口    ^取指/跳表   ^各自独立 ks_asm          ^表项=handler 相对码基址偏移
+//
+//   - 入口在 code 偏移 0：`lea BASE,[rip-7]` 取得码基址（位置无关），
+//     保存 Win64 callee-saved（rbx/rbp/rdi/rsi/r12-r15 共 8 个），RCX 的
+//     VmContext* 存入随机指派的 CTX 寄存器，初始化后跌入 dispatch 循环；
+//   - dispatch：fetch `T8=[BYTE+PC*8]` → `and T0,0x3F` →
+//     `T1=[BASE+T0*8+表偏移]` → `add T1,BASE` → `jmp T1`（表偏移为 disp32）；
+//   - 每个 handler 末尾 `add PC,1; jmp dispatch`（Jmp/Jcc 直接改写 PC）；
+//   - Halt：写回 ctx->pc 与 ctx->ret_value(=regs[v0])，恢复现场 ret。
+//
+// ============================ 两遍法（跳转表） ===========================
+//
+//   表项是 handler 相对码基址的偏移，只有全部 handler 汇编完才知道；而表
+//   的位置（=码尾）作为 disp32 编码在 dispatch 的访存指令里。故：
+//     第 1 遍：dispatch 以哑位移 0x40000000 汇编（强制 disp32 编码）→ 尺寸；
+//     逐 handler 以“运行地址 = 入口+dispatch 尺寸+已累计尺寸”独立汇编，
+//     各自内部标签互不冲突，天然拿到精确偏移；
+//     第 2 遍：dispatch 以真实表偏移重汇编——disp32 定宽，尺寸与第 1 遍
+//     一致（生成后断言校验），最后把 64 个 u64 表项原样追加进码尾。
+//
+// ============================ 寄存器随机化 ==============================
+//
+//   可分配池 = 16 GPR - rsp（宿主栈）- rcx（保留：shl/shr 的 cl 计数）= 14。
+//   每次生成 shuffle 后指派：
+//     持久（跨指令存活）：CTX(上下文) PC FLAGS BYTE(字节码基址) BASE(码基址)
+//     临时 T0..T9：T8=当前指令字、T2=尺寸/条件、T3..T7/T9=handler 内暂存
+//   callee-saved 无论是否被选中一律入口保存/出口恢复，随机分配永不出错。
+//   handler 内尺寸分支顺序、Jcc 条件分派顺序、handler 码序亦随机。
+//
+// ============================== codec 织入点 ============================
+//
+//   dispatch 的 fetch 之后、跳表之前是流解密钩子的织入位置。v1 为直通
+//   （asm_dump 中 “codec: none” 注释行标注）；M3 只需在该处插入对 T8 的
+//   解密指令序列（密钥经 VmContext 扩展字段传入），机器码布局不变。
+//
+// ============================== Size 语义 ===============================
+//
+//   计算类 handler 按 cond_or_size 的 ir::Size 四路展开：
+//   读操作数 = alias_read（零扩展截取），写回 = alias_write——直接用 x86
+//   子寄存器写实现别名合并：
+//     mov T5,[slot]; mov T5b,T0b; mov [slot],T5   （等价 alias_write）
+//   flags 由对应宽度的本机运算产生（CF=无符号进位/OF=有符号溢出/ZF/SF/PF，
+//   位布局同 isa::kFlag*），setcc 抽取后装配进 FLAGS 缓存并同步 regs[v17]。
+//   Inc/Dec 按 x86 规则保留 CF；Shl/Shr 计数为 0 时整条等价 no-op（不更新
+//   flags），计数掩码沿用本机规则（8/16 位 &31，32/64 位 &63）。
+// ========================================================================
+
+#include "wvmp/regvm/runtime/runtime.hpp"
+
+#include "wvmp/ir/insn.hpp"
+#include "wvmp/regvm/isa/vm_op.hpp"
+#include "wvmp/regvm/isa/vm_reg.hpp"
+
+#include <keystone/keystone.h>
+
+#include <array>
+#include <cinttypes>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <map>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+namespace wvmp::regvm::runtime {
+namespace {
+
+// ---------------------------------------------------------------------------
+// Keystone 会话（RAII）。Intel 语法、x86-64。
+// ---------------------------------------------------------------------------
+class KsSession {
+public:
+    KsSession() {
+        if (ks_open(KS_ARCH_X86, KS_MODE_64, &ks_) != KS_ERR_OK)
+            throw std::runtime_error("regvm runtime: ks_open(KS_ARCH_X86, KS_MODE_64) failed");
+        if (ks_option(ks_, KS_OPT_SYNTAX, KS_OPT_SYNTAX_INTEL) != KS_ERR_OK) {
+            ks_close(ks_);
+            throw std::runtime_error("regvm runtime: ks_option(KS_OPT_SYNTAX_INTEL) failed");
+        }
+    }
+    ~KsSession() {
+        if (ks_) ks_close(ks_);
+    }
+    KsSession(const KsSession&) = delete;
+    KsSession& operator=(const KsSession&) = delete;
+
+    // 汇编一段文本到地址 at；失败抛 std::runtime_error（含 errno + 定位行）。
+    std::vector<u8> assemble(std::string_view text, u64 at, std::string_view what) {
+        const std::string src(text);
+        unsigned char* enc = nullptr;
+        size_t size = 0, count = 0;
+        if (ks_asm(ks_, src.c_str(), at, &enc, &size, &count) != 0) {
+            const ks_err err = ks_errno(ks_);
+            if (enc) ks_free(enc);
+            // 定位失败语句（count = 已成功的语句数）。
+            std::string failing = "?";
+            size_t seen = 0, pos = 0;
+            while (pos < src.size()) {
+                const size_t nl = src.find('\n', pos);
+                const std::string line = src.substr(pos, nl == std::string::npos ? nl : nl - pos);
+                pos = nl == std::string::npos ? src.size() : nl + 1;
+                if (line.empty() || line.find_first_not_of(" \t") == std::string::npos) continue;
+                if (seen++ == count) {
+                    failing = line;
+                    break;
+                }
+            }
+            // 调试：失败全文落盘（ks_asm 失败时 count 恒 0，逐行定位需外部二分）。
+            char* dbg = nullptr;
+            size_t dbg_len = 0;
+            if (_dupenv_s(&dbg, &dbg_len, "WVMP_ASM_FAIL_DUMP") == 0 && dbg && dbg_len > 1) {
+                FILE* f = nullptr;
+                if (fopen_s(&f, dbg, "wb") == 0 && f) {
+                    std::fwrite(src.data(), 1, src.size(), f);
+                    std::fclose(f);
+                }
+            }
+            std::free(dbg);
+            throw std::runtime_error("regvm runtime: ks_asm failed (" + std::string(what) +
+                                     "), ks_errno=" + std::to_string(int(err)) +
+                                     ", stmt#" + std::to_string(count) + ": [" + failing + "]");
+        }
+        std::vector<u8> out(enc, enc + size);
+        if (enc) ks_free(enc);
+        if (out.empty()) {
+            char* dbg = nullptr;
+            size_t dbg_len = 0;
+            if (_dupenv_s(&dbg, &dbg_len, "WVMP_ASM_FAIL_DUMP") == 0 && dbg && dbg_len > 1) {
+                FILE* f = nullptr;
+                if (fopen_s(&f, dbg, "wb") == 0 && f) {
+                    std::fwrite(src.data(), 1, src.size(), f);
+                    std::fclose(f);
+                }
+            }
+            std::free(dbg);
+            throw std::runtime_error("regvm runtime: ks_asm produced no code (" +
+                                     std::string(what) + "), stmts=" +
+                                     std::to_string(count) + ", src_bytes=" +
+                                     std::to_string(src.size()));
+        }
+        return out;
+    }
+
+private:
+    ks_engine* ks_ = nullptr;
+};
+
+// ---------------------------------------------------------------------------
+// 物理寄存器名表（64/32/16/8 位形式）。池内序号即分配单位。
+// rsp 恒不参与；rcx 保留为移位计数寄存器（不进池）。
+// ---------------------------------------------------------------------------
+struct PhysNames {
+    const char* r64;
+    const char* r32;
+    const char* r16;
+    const char* r8;
+};
+constexpr PhysNames kPhys[14] = {
+    {"rax", "eax", "ax", "al"},      {"rdx", "edx", "dx", "dl"},
+    {"rbx", "ebx", "bx", "bl"},      {"rbp", "ebp", "bp", "bpl"},
+    {"rsi", "esi", "si", "sil"},     {"rdi", "edi", "di", "dil"},
+    {"r8", "r8d", "r8w", "r8b"},     {"r9", "r9d", "r9w", "r9b"},
+    {"r10", "r10d", "r10w", "r10b"}, {"r11", "r11d", "r11w", "r11b"},
+    {"r12", "r12d", "r12w", "r12b"}, {"r13", "r13d", "r13w", "r13b"},
+    {"r14", "r14d", "r14w", "r14b"}, {"r15", "r15d", "r15w", "r15b"},
+};
+constexpr int kPersistent = 4;
+static_assert(kPersistent + 10 == 14, "4 持久 + 10 临时 = 14 可分配");
+
+// 跳转表：opcode 低 6 位索引（合法 opcode 1..32；0/越界折叠到 Halt=非法停机）。
+constexpr u64 kTableEntries = 64;
+
+// 立即数一律 0x 十六进制书写：keystone 的 Intel 语法把裸数字按 16 进制
+// 解析（`and r15, 15` 会编码成 0x15），十进制值必须显式 0x 换算。
+std::string imm(u64 v) {
+    char buf[24];
+    std::snprintf(buf, sizeof(buf), "0x%llX", static_cast<unsigned long long>(v));
+    return buf;
+}
+
+std::string hex(u64 v) {
+    char buf[24];
+    std::snprintf(buf, sizeof(buf), "0x%llX", static_cast<unsigned long long>(v));
+    return buf;
+}
+
+// ---------------------------------------------------------------------------
+// 生成器主体。
+// ---------------------------------------------------------------------------
+class AsmGen {
+public:
+    explicit AsmGen(Rng& rng) : rng_(rng) {}
+
+    void roll() {
+        std::array<int, 14> pool{};
+        for (int i = 0; i < 14; ++i) pool[i] = i;
+        rng_.shuffle(pool.begin(), pool.end());
+        ctx_ = pool[0];
+        pc_ = pool[1];
+        flags_ = pool[2];
+        base_ = pool[3];
+        for (int i = 0; i < 10; ++i) t_[i] = pool[4 + i];
+        for (int i = 0; i < 4; ++i) size_perm_[i] = i;
+        rng_.shuffle(size_perm_.begin(), size_perm_.end());
+        for (int i = 0; i < 16; ++i) cond_perm_[i] = i;
+        rng_.shuffle(cond_perm_.begin(), cond_perm_.end());
+    }
+
+    // ---- 名字辅助 -------------------------------------------------------
+    const char* r64(int r) const { return kPhys[r].r64; }
+    // 尺寸化寄存器名：size 0..3 → byte/word/dword/qword 形式。
+    const char* rs(int r, int size) const {
+        switch (size) {
+            case 0: return kPhys[r].r8;
+            case 1: return kPhys[r].r16;
+            case 2: return kPhys[r].r32;
+            default: return kPhys[r].r64;
+        }
+    }
+    // 尺寸关键字。keystone 0.9.2（Intel 语法）的两个坑：
+    //   1) 裸 `byte/word/dword/qword`（无 ptr）被静默吞掉——rc=0 且零编码，
+    //      故 " ptr" 后缀必须保留；
+    //   2) `mov/movzx r64, dword ptr [SIB/REX 基址]`（32 位读→64 位目的）
+    //      直接报 KS_ERR_ASM_ARCH；改用 32 位目的寄存器（`mov r8d, dword ptr
+    //      [...]`）——写 32 位寄存器本机即零扩展，语义恰为 alias_read(S32)。
+    //      byte/word（movzx）与 qword（mov r64）形式均正常。
+    static const char* mptr(int size) {
+        switch (size) {
+            case 0: return "byte ptr";
+            case 1: return "word ptr";
+            case 2: return "dword ptr";
+            default: return "qword ptr";
+        }
+    }
+    // 每次调用递增的标签序号：保证同一生成内所有标签全局唯一（即使
+    // keystone 引擎把符号表维持在多次 ks_asm 之间也不冲突）。
+    int seq() const { return seq_++; }
+
+    // ---- 入口块（地址 0；跌入 dispatch，无跨块跳转；位置无关取码基址） ----
+    std::string build_entry() const {
+        std::string o;
+        o += "vm_entry:\n";
+        o += std::string("    lea ") + r64(base_) + ", [rip - 7]\n";
+        // Win64 callee-saved 全量保存（随机分配可能选中其中任意几个）。
+        o += "    push rbx\n    push rbp\n    push rdi\n    push rsi\n";
+        o += "    push r12\n    push r13\n    push r14\n    push r15\n";
+        o += std::string("    mov ") + r64(ctx_) + ", rcx\n";
+        o += std::string("    mov ") + r64(pc_) + ", qword ptr [" + r64(ctx_) + " + 0x8]\n";
+        o += std::string("    mov ") + r64(flags_) + ", qword ptr [" + r64(ctx_) + " + 0x98]\n";
+        return o;
+    }
+
+    // ---- dispatch 块（table_off 为码内偏移；哑值 0x40000000 强制 disp32）。
+    // 无标签（避免两遍汇编时符号重定义；dump 侧另行注释标注）。
+    // 字节码基址不占持久寄存器：每次 fetch 从 [CTX] 重取（每条指令多一 mov）。
+    std::string build_dispatch(u64 table_off) const {
+        std::string o;
+        o += std::string("    mov ") + r64(t_[0]) + ", qword ptr [" + r64(ctx_) + "]\n";
+        o += std::string("    mov ") + r64(t_[8]) + ", qword ptr [" + r64(t_[0]) + " + " +
+             r64(pc_) + "*8]\n";
+        o += std::string("    mov ") + r64(t_[0]) + ", " + r64(t_[8]) + "\n";
+        o += std::string("    and ") + r64(t_[0]) + ", 0x3F\n";
+        o += std::string("    mov ") + r64(t_[1]) + ", qword ptr [" + r64(base_) + " + " +
+             r64(t_[0]) + "*8 + " + hex(table_off) + "]\n";
+        o += std::string("    add ") + r64(t_[1]) + ", " + r64(base_) + "\n";
+        o += std::string("    jmp ") + r64(t_[1]) + "\n";
+        return o;
+    }
+
+    // ---- 公共构件 --------------------------------------------------------
+    // 指令字（T8）→ T2=尺寸/条件 T3=a_kind T4=reg_a T5=aux(零扩展) T6=b_kind T7=reg_b。
+    // 首条固定为 `mov Tn, T8`（从指令字取），随后 shr/and 逐步抽取位域。
+    std::string decode_prelude() const {
+        struct F {
+            const char* op;   // "mov" = 从 T8 取字；"shr"/"and" = 移位掩码
+            int dst;          // T 寄存器下标
+            int imm;          // shr/and 的立即数
+        };
+        const F fields[] = {
+            {"mov", 2, 0},  {"shr", 2, 18}, {"and", 2, 15},  // T2 = (w>>18)&15
+            {"mov", 3, 0},  {"shr", 3, 14}, {"and", 3, 3},   // T3 = (w>>14)&3
+            {"mov", 4, 0},  {"shr", 4, 22}, {"and", 4, 31},  // T4 = (w>>22)&31
+            {"mov", 5, 0},  {"shr", 5, 32},                  // T5 = w>>32（零扩展）
+            {"mov", 6, 0},  {"shr", 6, 16}, {"and", 6, 3},   // T6 = (w>>16)&3
+            {"mov", 7, 0},  {"shr", 7, 27}, {"and", 7, 31},  // T7 = (w>>27)&31
+        };
+        std::string o;
+        for (const auto& f : fields) {
+            o += std::string("    ") + f.op + " " + r64(t_[f.dst]) + ", ";
+            if (f.op == std::string("mov"))
+                o += r64(t_[8]);
+            else
+                o += imm(f.imm);   // 一律 0x 前缀：keystone Intel 裸数字按 16 进制解析！
+            o += "\n";
+        }
+        return o;
+    }
+
+    // 取操作数：kind==1 → 寄存器槽（按尺寸零扩展=alias_read）；否则立即数
+    //（T5=aux 零扩展，按尺寸截取）。结果放 T[dst]（0 或 1）。
+    // S32 读用 32 位目的寄存器（mov r8d, dword ptr [...]，写 32 位寄存器本机
+    // 即零扩展）；S8/S16 用 movzx；S64 全宽（见 mptr 的坑位注记）。
+    std::string load_operand(int size, int kind, int idx, int dst, const std::string& tag) const {
+        const std::string l_imm = "limm" + std::to_string(kind) + "_" + tag;
+        const std::string l_done = "ldone" + std::to_string(kind) + "_" + tag;
+        std::string o;
+        o += std::string("    cmp ") + r64(t_[kind]) + ", 1\n";
+        o += "    jne " + l_imm + "\n";
+        if (size == 3)
+            o += std::string("    mov ") + r64(t_[dst]) + ", qword ptr [" + r64(ctx_) + " + " +
+                 r64(t_[idx]) + "*8 + 0x10]\n";
+        else if (size == 2)
+            o += std::string("    mov ") + rs(t_[dst], 2) + ", dword ptr [" + r64(ctx_) + " + " +
+                 r64(t_[idx]) + "*8 + 0x10]\n";
+        else
+            o += std::string("    movzx ") + r64(t_[dst]) + ", " + mptr(size) + " [" + r64(ctx_) +
+                 " + " + r64(t_[idx]) + "*8 + 0x10]\n";
+        o += "    jmp " + l_done + "\n";
+        o += l_imm + ":\n";
+        if (size == 3)
+            o += std::string("    mov ") + r64(t_[dst]) + ", " + r64(t_[5]) + "\n";
+        else
+            o += std::string("    mov ") + rs(t_[dst], size) + ", " + rs(t_[5], size) + "\n";
+        o += l_done + ":\n";
+        return o;
+    }
+
+    // 别名写回：T0 结果按 alias_write 合并进 regs[T[idxreg]]。
+    //（子寄存器写本机即别名语义：S8/S16 保高位；S32 写 32 位寄存器自动零扩展。）
+    std::string writeback(int size, int idxreg) const {
+        const std::string slot =
+            std::string("[") + r64(ctx_) + " + " + r64(t_[idxreg]) + "*8 + 0x10]";
+        std::string o;
+        if (size == 3) {
+            o += std::string("    mov qword ptr ") + slot + ", " + r64(t_[0]) + "\n";
+        } else {
+            o += std::string("    mov ") + r64(t_[5]) + ", qword ptr " + slot + "\n";
+            o += std::string("    mov ") + rs(t_[5], size) + ", " + rs(t_[0], size) + "\n";
+            o += std::string("    mov qword ptr ") + slot + ", " + r64(t_[5]) + "\n";
+        }
+        return o;
+    }
+
+    // 从指令字（T8 仍存活）重提 reg_a 到 T[reg]（写回前 T4 可能已被清零）。
+    std::string reextract_a(int reg) const {
+        std::string o;
+        o += std::string("    mov ") + r64(t_[reg]) + ", " + r64(t_[8]) + "\n";
+        o += std::string("    shr ") + r64(t_[reg]) + ", 22\n";
+        o += std::string("    and ") + r64(t_[reg]) + ", 31\n";
+        return o;
+    }
+
+    // flags 装配 + 同步 v17 + 前进 + 回 dispatch。
+    // 标准：T6=ZF T3=CF(0/1) T4=OF T7=SF T9=PF。
+    // cf_preset：Inc/Dec 变体——T3 已是旧 CF 的 bit1 值（保留语义），不再移位。
+    std::string flags_tail(u64 dispatch, bool cf_preset) const {
+        std::string o;
+        o += std::string("    mov ") + r64(flags_) + ", " + r64(t_[6]) + "\n";
+        if (!cf_preset) o += std::string("    shl ") + r64(t_[3]) + ", 1\n";
+        o += std::string("    or ") + r64(flags_) + ", " + r64(t_[3]) + "\n";
+        o += std::string("    shl ") + r64(t_[4]) + ", 2\n";
+        o += std::string("    or ") + r64(flags_) + ", " + r64(t_[4]) + "\n";
+        o += std::string("    shl ") + r64(t_[7]) + ", 3\n";
+        o += std::string("    or ") + r64(flags_) + ", " + r64(t_[7]) + "\n";
+        o += std::string("    shl ") + r64(t_[9]) + ", 4\n";
+        o += std::string("    or ") + r64(flags_) + ", " + r64(t_[9]) + "\n";
+        o += std::string("    mov qword ptr [") + r64(ctx_) + " + 0x98], " + r64(flags_) + "\n";
+        o += advance(dispatch);
+        return o;
+    }
+
+    std::string advance(u64 dispatch) const {
+        return std::string("    add ") + r64(pc_) + ", 1\n    jmp " + hex(dispatch) + "\n";
+    }
+
+    // 尺寸链：cmp/je 检查 perm[0..2]；perm[3] 为链尾顺延跌入情形，故其块
+    // 最先排放。每个块自带终结跳转（jmp <tail>），块间绝不串行跌落。
+    std::string size_chain(const std::array<std::string, 4>& blocks, const std::string& tag) const {
+        std::string o;
+        for (int i = 0; i < 3; ++i) {
+            o += std::string("    cmp ") + r64(t_[2]) + ", " + imm(size_perm_[i]) + "\n";
+            o += "    je sz" + std::to_string(size_perm_[i]) + "_" + tag + "\n";
+        }
+        o += "sz" + std::to_string(size_perm_[3]) + "_" + tag + ":\n" + blocks[size_perm_[3]];
+        for (int i = 0; i < 3; ++i) {
+            const int s = size_perm_[i];
+            o += "sz" + std::to_string(s) + "_" + tag + ":\n" + blocks[s];
+        }
+        return o;
+    }
+
+    // setcc 抽取（本机 flags 刚由宽度匹配的运算产生；T3/T4/T6/T7/T9 上位已清零）。
+    std::string setcc5() const {
+        std::string o;
+        o += std::string("    setc ") + rs(t_[3], 0) + "\n";
+        o += std::string("    seto ") + rs(t_[4], 0) + "\n";
+        o += std::string("    setz ") + rs(t_[6], 0) + "\n";
+        o += std::string("    sets ") + rs(t_[7], 0) + "\n";
+        o += std::string("    setp ") + rs(t_[9], 0) + "\n";
+        return o;
+    }
+    std::string zero5() const {
+        std::string o;
+        for (int r : {3, 4, 6, 7, 9}) o += std::string("    xor ") + r64(t_[r]) + ", " + r64(t_[r]) + "\n";
+        return o;
+    }
+    std::string zero4() const {  // Inc/Dec：T3 保留旧 CF
+        std::string o;
+        for (int r : {4, 6, 7, 9}) o += std::string("    xor ") + r64(t_[r]) + ", " + r64(t_[r]) + "\n";
+        return o;
+    }
+
+    // ---- handler 构造 ----------------------------------------------------
+
+    // 二元计算（native=add/sub/and/or/xor/test；Cmp 用 sub 无写回）。
+    std::string build_binary(const char* native, u64 dispatch, bool do_wb) const {
+        const std::string tag = std::string(native) + std::to_string(seq());
+        const std::string tail_lbl = "ftail_" + tag;
+        std::array<std::string, 4> blocks;
+        for (int s = 0; s < 4; ++s) {
+            const std::string stag = tag + "_" + std::to_string(s);
+            std::string o;
+            o += load_operand(s, 3, 4, 0, "a" + stag);   // A（目的）
+            o += load_operand(s, 6, 7, 1, "b" + stag);   // B（源）
+            o += zero5();
+            o += std::string("    ") + native + " " + rs(t_[0], s) + ", " + rs(t_[1], s) + "\n";
+            o += setcc5();
+            if (do_wb) {
+                o += reextract_a(1);
+                o += writeback(s, 1);
+            }
+            o += "    jmp " + tail_lbl + "\n";
+            blocks[s] = o;
+        }
+        return decode_prelude() + size_chain(blocks, tag) + tail_lbl + ":\n" +
+               flags_tail(dispatch, false);
+    }
+
+    // Mov / Lea（v1 Lea=值传送：地址展开已在翻译器完成）。不更新 flags。
+    std::string build_mov(u64 dispatch) const {
+        const std::string tag = "mov" + std::to_string(seq());
+        const std::string tail_lbl = "atail_" + tag;
+        std::array<std::string, 4> blocks;
+        for (int s = 0; s < 4; ++s) {
+            std::string o;
+            // 源 = b 操作数；目的 = reg_a。
+            o += load_operand(s, 6, 7, 0, "b" + tag + "_" + std::to_string(s));
+            o += writeback(s, 4);
+            o += "    jmp " + tail_lbl + "\n";
+            blocks[s] = o;
+        }
+        return decode_prelude() + size_chain(blocks, tag) + tail_lbl + ":\n" + advance(dispatch);
+    }
+
+    // Not（无 flags）。
+    std::string build_not(u64 dispatch) const {
+        const std::string tag = "not" + std::to_string(seq());
+        const std::string tail_lbl = "atail_" + tag;
+        std::array<std::string, 4> blocks;
+        for (int s = 0; s < 4; ++s) {
+            std::string o;
+            o += load_operand(s, 3, 4, 0, "a" + tag + "_" + std::to_string(s));
+            o += std::string("    not ") + rs(t_[0], s) + "\n";
+            o += reextract_a(1);
+            o += writeback(s, 1);
+            o += "    jmp " + tail_lbl + "\n";
+            blocks[s] = o;
+        }
+        return decode_prelude() + size_chain(blocks, tag) + tail_lbl + ":\n" + advance(dispatch);
+    }
+
+    // Neg（flags 全量）。
+    std::string build_neg(u64 dispatch) const {
+        const std::string tag = "neg" + std::to_string(seq());
+        const std::string tail_lbl = "ftail_" + tag;
+        std::array<std::string, 4> blocks;
+        for (int s = 0; s < 4; ++s) {
+            std::string o;
+            o += load_operand(s, 3, 4, 0, "a" + tag + "_" + std::to_string(s));
+            o += zero5();
+            o += std::string("    neg ") + rs(t_[0], s) + "\n";
+            o += setcc5();
+            o += reextract_a(1);
+            o += writeback(s, 1);
+            o += "    jmp " + tail_lbl + "\n";
+            blocks[s] = o;
+        }
+        return decode_prelude() + size_chain(blocks, tag) + tail_lbl + ":\n" +
+               flags_tail(dispatch, false);
+    }
+
+    // Inc/Dec（x86 语义：CF 保留，ZF/SF/OF/PF 更新）。
+    std::string build_incdec(const char* native, u64 dispatch) const {
+        const std::string tag = std::string(native) + std::to_string(seq());
+        const std::string tail_lbl = "ftail_" + tag;
+        std::array<std::string, 4> blocks;
+        for (int s = 0; s < 4; ++s) {
+            std::string o;
+            o += load_operand(s, 3, 4, 0, "a" + tag + "_" + std::to_string(s));
+            o += zero4();
+            o += std::string("    mov ") + r64(t_[3]) + ", " + r64(flags_) + "\n";
+            o += std::string("    and ") + r64(t_[3]) + ", 2\n";   // 旧 CF 留在 bit1
+            o += std::string("    ") + native + " " + rs(t_[0], s) + "\n";
+            o += std::string("    setz ") + rs(t_[6], 0) + "\n";
+            o += std::string("    seto ") + rs(t_[4], 0) + "\n";
+            o += std::string("    sets ") + rs(t_[7], 0) + "\n";
+            o += std::string("    setp ") + rs(t_[9], 0) + "\n";
+            o += reextract_a(1);
+            o += writeback(s, 1);
+            o += "    jmp " + tail_lbl + "\n";
+            blocks[s] = o;
+        }
+        return decode_prelude() + size_chain(blocks, tag) + tail_lbl + ":\n" +
+               flags_tail(dispatch, true);
+    }
+
+    // Shl/Shr（计数=cl；掩码后计数 0 → 整条 no-op 不动 flags；本机掩码规则）。
+    std::string build_shift(const char* native, u64 dispatch) const {
+        const std::string tag = std::string(native) + std::to_string(seq());
+        const std::string adv_lbl = "adv_" + tag;
+        const std::string tail_lbl = "ftail_" + tag;
+        std::array<std::string, 4> blocks;
+        for (int s = 0; s < 4; ++s) {
+            const std::string stag = std::to_string(s) + "_" + tag;
+            std::string o;
+            o += load_operand(s, 3, 4, 0, "a" + stag);
+            // 计数 → T1（Imm=aux / Reg=寄存器全宽，本机再按宽度掩码）。
+            o += std::string("    cmp ") + r64(t_[6]) + ", 1\n";
+            o += "    jne cnti" + stag + "\n";
+            o += std::string("    mov ") + r64(t_[1]) + ", qword ptr [" + r64(ctx_) + " + " +
+                 r64(t_[7]) + "*8 + 0x10]\n";
+            o += "    jmp cntg" + stag + "\n";
+            o += "cnti" + stag + ":\n";
+            o += std::string("    mov ") + r64(t_[1]) + ", " + r64(t_[5]) + "\n";
+            o += "cntg" + stag + ":\n";
+            o += std::string("    mov cl, ") + rs(t_[1], 0) + "\n";
+            o += std::string("    and cl, ") + (s <= 1 ? "0x1F" : "0x3F") + "\n";
+            o += "    jz " + adv_lbl + "\n";   // 计数 0：值与 flags 均不变
+            o += zero5();
+            o += std::string("    ") + native + " " + rs(t_[0], s) + ", cl\n";
+            o += setcc5();
+            o += reextract_a(1);
+            o += writeback(s, 1);
+            o += "    jmp " + tail_lbl + "\n";
+            blocks[s] = o;
+        }
+        std::string out = decode_prelude() + size_chain(blocks, tag);
+        out += adv_lbl + ":\n" + advance(dispatch);   // 计数 0 出口
+        out += tail_lbl + ":\n" + flags_tail(dispatch, false);
+        return out;
+    }
+
+    // Load：a=数据目的，b=地址；mem = scratch_mem + [b]。
+    std::string build_load(u64 dispatch) const {
+        const std::string tag = "ld" + std::to_string(seq());
+        const std::string tail_lbl = "atail_" + tag;
+        std::array<std::string, 4> blocks;
+        for (int s = 0; s < 4; ++s) {
+            std::string o;
+            o += std::string("    mov ") + r64(t_[1]) + ", qword ptr [" + r64(ctx_) + " + " +
+                 r64(t_[7]) + "*8 + 0x10]\n";
+            o += std::string("    add ") + r64(t_[1]) + ", qword ptr [" + r64(ctx_) + " + 0x110]\n";
+            if (s == 3)
+                o += std::string("    mov ") + r64(t_[0]) + ", qword ptr [" + r64(t_[1]) + "]\n";
+            else if (s == 2)
+                o += std::string("    mov ") + rs(t_[0], 2) + ", dword ptr [" + r64(t_[1]) +
+                     "]\n";
+            else
+                o += std::string("    movzx ") + r64(t_[0]) + ", " + mptr(s) + " [" + r64(t_[1]) +
+                     "]\n";
+            o += writeback(s, 4);
+            o += "    jmp " + tail_lbl + "\n";
+            blocks[s] = o;
+        }
+        return decode_prelude() + size_chain(blocks, tag) + tail_lbl + ":\n" + advance(dispatch);
+    }
+
+    // Store：a=地址，b=数据（按宽度掩码写）。
+    std::string build_store(u64 dispatch) const {
+        const std::string tag = "st" + std::to_string(seq());
+        const std::string tail_lbl = "atail_" + tag;
+        std::array<std::string, 4> blocks;
+        for (int s = 0; s < 4; ++s) {
+            std::string o;
+            o += std::string("    mov ") + r64(t_[1]) + ", qword ptr [" + r64(ctx_) + " + " +
+                 r64(t_[4]) + "*8 + 0x10]\n";
+            o += std::string("    add ") + r64(t_[1]) + ", qword ptr [" + r64(ctx_) + " + 0x110]\n";
+            if (s == 3)
+                o += std::string("    mov ") + r64(t_[0]) + ", qword ptr [" + r64(ctx_) + " + " +
+                     r64(t_[7]) + "*8 + 0x10]\n";
+            else if (s == 2)
+                o += std::string("    mov ") + rs(t_[0], 2) + ", dword ptr [" + r64(ctx_) + " + " +
+                     r64(t_[7]) + "*8 + 0x10]\n";
+            else
+                o += std::string("    movzx ") + r64(t_[0]) + ", " + mptr(s) + " [" + r64(ctx_) +
+                     " + " + r64(t_[7]) + "*8 + 0x10]\n";
+            o += std::string("    mov ") + mptr(s) + " [" + r64(t_[1]) + "], " + rs(t_[0], s) + "\n";
+            o += "    jmp " + tail_lbl + "\n";
+            blocks[s] = o;
+        }
+        return decode_prelude() + size_chain(blocks, tag) + tail_lbl + ":\n" + advance(dispatch);
+    }
+
+    // Push：v4(rsp) -= 8；[scratch+rsp] = 源（S64）。
+    std::string build_push(u64 dispatch) const {
+        const std::string tag = "push" + std::to_string(seq());
+        std::string o = decode_prelude();
+        o += std::string("    mov ") + r64(t_[0]) + ", qword ptr [" + r64(ctx_) + " + 0x30]\n";
+        o += std::string("    sub ") + r64(t_[0]) + ", 8\n";
+        o += std::string("    mov qword ptr [") + r64(ctx_) + " + 0x30], " + r64(t_[0]) + "\n";
+        o += std::string("    cmp ") + r64(t_[3]) + ", 1\n";
+        o += "    jne pimm" + tag + "\n";
+        o += std::string("    mov ") + r64(t_[1]) + ", qword ptr [" + r64(ctx_) + " + " +
+             r64(t_[4]) + "*8 + 0x10]\n";
+        o += "    jmp pgo" + tag + "\n";
+        o += "pimm" + tag + ":\n";
+        o += std::string("    mov ") + r64(t_[1]) + ", " + r64(t_[5]) + "\n";
+        o += "pgo" + tag + ":\n";
+        o += std::string("    add ") + r64(t_[0]) + ", qword ptr [" + r64(ctx_) + " + 0x110]\n";
+        o += std::string("    mov qword ptr [") + r64(t_[0]) + "], " + r64(t_[1]) + "\n";
+        o += advance(dispatch);
+        return o;
+    }
+
+    // Pop：目的=reg_a（S64）；v4(rsp) += 8。
+    std::string build_pop(u64 dispatch) const {
+        std::string o = decode_prelude();
+        o += std::string("    mov ") + r64(t_[0]) + ", qword ptr [" + r64(ctx_) + " + 0x30]\n";
+        o += std::string("    add ") + r64(t_[0]) + ", qword ptr [" + r64(ctx_) + " + 0x110]\n";
+        o += std::string("    mov ") + r64(t_[1]) + ", qword ptr [" + r64(t_[0]) + "]\n";
+        o += std::string("    mov ") + r64(t_[9]) + ", qword ptr [" + r64(ctx_) + " + 0x30]\n";
+        o += std::string("    add ") + r64(t_[9]) + ", 8\n";
+        o += std::string("    mov qword ptr [") + r64(ctx_) + " + 0x30], " + r64(t_[9]) + "\n";
+        o += std::string("    mov qword ptr [") + r64(ctx_) + " + " + r64(t_[4]) + "*8 + 0x10], " +
+             r64(t_[1]) + "\n";
+        o += advance(dispatch);
+        return o;
+    }
+
+    // 相对跳转共通：pc += sext32(aux)（aux 为**条数**差，负数以补码存 u32）。
+    // movsxd 等价实现：左移 32 再算术右移 32（不依赖汇编器对 movsxd 的支持面）。
+    std::string emit_jump_taken() const {
+        std::string o;
+        o += std::string("    mov ") + r64(t_[0]) + ", " + r64(t_[8]) + "\n";
+        o += std::string("    shr ") + r64(t_[0]) + ", 32\n";
+        o += std::string("    shl ") + r64(t_[0]) + ", 32\n";
+        o += std::string("    sar ") + r64(t_[0]) + ", 32\n";
+        o += std::string("    add ") + r64(pc_) + ", " + r64(t_[0]) + "\n";
+        o += "    jmp {DISPATCH}\n";
+        return o;
+    }
+
+    // Jmp。
+    std::string build_jmp(u64 dispatch) const {
+        std::string o = emit_jump_taken();
+        const std::string target = hex(dispatch);
+        size_t p = o.find("{DISPATCH}");
+        o.replace(p, 10, target);
+        return o;
+    }
+
+    // 条件求值：按 ir::Cond 序号生成把 0/1 放入 T0 的指令串。
+    //（FLAGS 位布局同 isa::kFlag*：ZF=bit0 CF=bit1 OF=bit2 SF=bit3 PF=bit4。）
+    std::string cond_eval(int cond) const {
+        const std::string F = r64(flags_);
+        const std::string D = r64(t_[0]);
+        const std::string S = r64(t_[1]);
+        auto bit = [&](int b) {
+            std::string o = "    mov " + D + ", " + F + "\n";
+            if (b) o += "    shr " + D + ", " + imm(b) + "\n";
+            o += "    and " + D + ", 1\n";
+            return o;
+        };
+        auto invert = [&]() { return std::string("    xor ") + D + ", 1\n"; };
+        switch (static_cast<ir::Cond>(cond)) {
+            case ir::Cond::O:  return bit(2);
+            case ir::Cond::No: return bit(2) + invert();
+            case ir::Cond::B:  return bit(1);
+            case ir::Cond::Ae: return bit(1) + invert();
+            case ir::Cond::E:  return bit(0);
+            case ir::Cond::Ne: return bit(0) + invert();
+            case ir::Cond::S:  return bit(3);
+            case ir::Cond::Ns: return bit(3) + invert();
+            case ir::Cond::P:  return bit(4);
+            case ir::Cond::Np: return bit(4) + invert();
+            case ir::Cond::Be:  // CF | ZF
+            case ir::Cond::A: { // !(CF|ZF)
+                std::string o;
+                o += "    mov " + D + ", " + F + "\n    shr " + D + ", 1\n";
+                o += "    or " + D + ", " + F + "\n    and " + D + ", 1\n";
+                if (cond == int(ir::Cond::A)) o += invert();
+                return o;
+            }
+            case ir::Cond::L:  // SF != OF
+            case ir::Cond::Ge: { // !(SF != OF)
+                std::string o;
+                o += "    mov " + D + ", " + F + "\n    shr " + D + ", 3\n";
+                o += "    mov " + S + ", " + F + "\n    shr " + S + ", 2\n";
+                o += "    xor " + D + ", " + S + "\n    and " + D + ", 1\n";
+                if (cond == int(ir::Cond::Ge)) o += invert();
+                return o;
+            }
+            case ir::Cond::Le:  // ZF | (SF != OF)
+            case ir::Cond::G: { // !(ZF | (SF != OF))
+                std::string o;
+                o += "    mov " + D + ", " + F + "\n    shr " + D + ", 3\n";
+                o += "    mov " + S + ", " + F + "\n    shr " + S + ", 2\n";
+                o += "    xor " + D + ", " + S + "\n    and " + D + ", 1\n";
+                o += "    mov " + S + ", " + F + "\n    and " + S + ", 1\n";
+                o += "    or " + D + ", " + S + "\n";
+                if (cond == int(ir::Cond::G)) o += invert();
+                return o;
+            }
+        }
+        throw std::runtime_error("regvm runtime: bad cond");
+    }
+
+    // Jcc：cond=cond_or_size（ir::Cond 0..15）；成立 pc += sext32(aux)，否则 +1。
+    std::string build_jcc(u64 dispatch) const {
+        const std::string tag = "jcc" + std::to_string(seq());
+        const std::string test_lbl = "jtest" + tag;
+        const std::string fall_lbl = "jfall" + tag;
+        std::string out = decode_prelude();
+        // 链式分派（顺序随机；末条件 perm[15] 为链尾顺延跌入，其块最先排放）。
+        for (int i = 0; i < 15; ++i) {
+            const int c = cond_perm_[i];
+            out += std::string("    cmp ") + r64(t_[2]) + ", " + std::to_string(c) + "\n";
+            out += "    je cc" + std::to_string(c) + "_" + tag + "\n";
+        }
+        out += "cc" + std::to_string(cond_perm_[15]) + "_" + tag + ":\n" +
+               cond_eval(cond_perm_[15]) + "    jmp " + test_lbl + "\n";
+        for (int i = 0; i < 15; ++i) {
+            const int c = cond_perm_[i];
+            out += "cc" + std::to_string(c) + "_" + tag + ":\n";
+            out += cond_eval(c);
+            out += "    jmp " + test_lbl + "\n";
+        }
+        out += test_lbl + ":\n";
+        out += std::string("    test ") + r64(t_[0]) + ", " + r64(t_[0]) + "\n";
+        out += "    jz " + fall_lbl + "\n";
+        out += build_jmp(dispatch);   // taken：pc += sext(aux)
+        out += fall_lbl + ":\n";
+        out += advance(dispatch);
+        return out;
+    }
+
+    // Halt：写回 pc 与 ret_value(=regs[v0])，恢复现场，ret。
+    std::string build_halt(u64 /*dispatch*/) const {
+        std::string o;
+        o += std::string("    mov qword ptr [") + r64(ctx_) + " + 0x8], " + r64(pc_) + "\n";
+        o += std::string("    mov ") + r64(t_[0]) + ", qword ptr [" + r64(ctx_) + " + 0x10]\n";
+        o += std::string("    mov qword ptr [") + r64(ctx_) + " + 0x118], " + r64(t_[0]) + "\n";
+        o += "    pop r15\n    pop r14\n    pop r13\n    pop r12\n";
+        o += "    pop rsi\n    pop rdi\n    pop rbp\n    pop rbx\n";
+        o += "    ret\n";
+        return o;
+    }
+
+    std::string build_nop(u64 dispatch) const { return advance(dispatch); }
+
+    // GetFlags：reg_a = v17（S64 全宽）。
+    std::string build_getflags(u64 dispatch) const {
+        std::string o = decode_prelude();
+        o += std::string("    mov ") + r64(t_[0]) + ", " + r64(flags_) + "\n";
+        o += std::string("    mov qword ptr [") + r64(ctx_) + " + " + r64(t_[4]) +
+             "*8 + 0x10], " + r64(t_[0]) + "\n";
+        o += advance(dispatch);
+        return o;
+    }
+
+    // SetFlags：v17/缓存 = reg_a 低 5 位。
+    std::string build_setflags(u64 dispatch) const {
+        std::string o = decode_prelude();
+        o += std::string("    mov ") + r64(t_[0]) + ", qword ptr [" + r64(ctx_) + " + " +
+             r64(t_[4]) + "*8 + 0x10]\n";
+        o += std::string("    and ") + r64(t_[0]) + ", 0x1F\n";
+        o += std::string("    mov ") + r64(flags_) + ", " + r64(t_[0]) + "\n";
+        o += std::string("    mov qword ptr [") + r64(ctx_) + " + 0x98], " + r64(flags_) + "\n";
+        o += advance(dispatch);
+        return o;
+    }
+
+    // ---- 一元包装（HandlerDef 需要无参差成员函数指针） ----
+    std::string build_add(u64 d) const { return build_binary("add", d, true); }
+    std::string build_sub(u64 d) const { return build_binary("sub", d, true); }
+    std::string build_and(u64 d) const { return build_binary("and", d, true); }
+    std::string build_or(u64 d) const { return build_binary("or", d, true); }
+    std::string build_xor(u64 d) const { return build_binary("xor", d, true); }
+    std::string build_cmp(u64 d) const { return build_binary("sub", d, false); }
+    std::string build_test(u64 d) const { return build_binary("test", d, false); }
+    std::string build_inc(u64 d) const { return build_incdec("inc", d); }
+    std::string build_dec(u64 d) const { return build_incdec("dec", d); }
+    std::string build_shl(u64 d) const { return build_shift("shl", d); }
+    std::string build_shr(u64 d) const { return build_shift("shr", d); }
+
+private:
+    Rng& rng_;
+    int ctx_ = 0, pc_ = 0, flags_ = 0, base_ = 0;
+    int t_[10] = {};
+    std::array<int, 4> size_perm_{};
+    std::array<int, 16> cond_perm_{};
+    mutable int seq_ = 0;
+};
+
+struct HandlerDef {
+    int opcode;
+    const char* name;
+    std::string (AsmGen::*build)(u64) const;
+};
+
+} // namespace
+
+RuntimeGenResult generate_runtime(wvmp::Rng& rng) {
+    using isa::VmOp;
+    AsmGen g(rng);
+    g.roll();
+    KsSession ks;
+
+    // —— 入口块（地址 0；跌入 dispatch，无跨块引用）——
+    const std::string entry_text = g.build_entry();
+    const std::vector<u8> entry_code = ks.assemble(entry_text, 0, "entry");
+    const u64 dispatch_addr = entry_code.size();
+
+    // —— dispatch 第 1 遍（哑表偏移，强制 disp32 编码）——
+    constexpr u64 kDummyTableOff = 0x4000'0000ull;
+    const std::vector<u8> dispatch1 =
+        ks.assemble(g.build_dispatch(kDummyTableOff), dispatch_addr, "dispatch pass1");
+    const u64 dispatch_size = dispatch1.size();
+
+    // —— handler 清单（v1 覆盖集；Adc/Sbb/Sar/Rol/Ror/Call/Ret 的表项指向
+    //    Halt——遇到即停机，语义保守且不越界）——
+    std::vector<HandlerDef> handlers = {
+        {int(VmOp::Mov), "mov", &AsmGen::build_mov},
+        {int(VmOp::Lea), "lea", &AsmGen::build_mov},
+        {int(VmOp::Add), "add", &AsmGen::build_add},
+        {int(VmOp::Sub), "sub", &AsmGen::build_sub},
+        {int(VmOp::And), "and", &AsmGen::build_and},
+        {int(VmOp::Or), "or", &AsmGen::build_or},
+        {int(VmOp::Xor), "xor", &AsmGen::build_xor},
+        {int(VmOp::Not), "not", &AsmGen::build_not},
+        {int(VmOp::Neg), "neg", &AsmGen::build_neg},
+        {int(VmOp::Inc), "inc", &AsmGen::build_inc},
+        {int(VmOp::Dec), "dec", &AsmGen::build_dec},
+        {int(VmOp::Shl), "shl", &AsmGen::build_shl},
+        {int(VmOp::Shr), "shr", &AsmGen::build_shr},
+        {int(VmOp::Cmp), "cmp", &AsmGen::build_cmp},
+        {int(VmOp::Test), "test", &AsmGen::build_test},
+        {int(VmOp::Load), "load", &AsmGen::build_load},
+        {int(VmOp::Store), "store", &AsmGen::build_store},
+        {int(VmOp::Push), "push", &AsmGen::build_push},
+        {int(VmOp::Pop), "pop", &AsmGen::build_pop},
+        {int(VmOp::Jmp), "jmp", &AsmGen::build_jmp},
+        {int(VmOp::Jcc), "jcc", &AsmGen::build_jcc},
+        {int(VmOp::Nop), "nop", &AsmGen::build_nop},
+        {int(VmOp::Halt), "halt", &AsmGen::build_halt},
+        {int(VmOp::GetFlags), "getflags", &AsmGen::build_getflags},
+        {int(VmOp::SetFlags), "setflags", &AsmGen::build_setflags},
+    };
+    rng.shuffle(handlers.begin(), handlers.end());   // 码序随机
+
+    // —— 逐 handler 以真实运行地址独立汇编（内部标签互不冲突）——
+    std::vector<u8> handler_code;
+    std::map<int, u64> handler_off;
+    std::map<int, std::string> handler_text;   // dump 复用（标签序号勿再递增）
+    u64 cursor = dispatch_addr + dispatch_size;
+    for (const auto& h : handlers) {
+        std::string text = (g.*h.build)(dispatch_addr);
+        const std::vector<u8> code = ks.assemble(text, cursor, h.name);
+        handler_off[h.opcode] = cursor;
+        handler_text[h.opcode] = std::move(text);
+        handler_code.insert(handler_code.end(), code.begin(), code.end());
+        cursor += code.size();
+    }
+
+    // —— 跳转表（码尾，8 对齐垫片 0x90）——
+    const u64 table_off = (cursor + 7) & ~u64(7);
+    handler_code.insert(handler_code.end(), size_t(table_off - cursor), 0x90);
+
+    // —— dispatch 第 2 遍：真实表偏移；disp32 定宽 → 尺寸必须与第 1 遍一致 ——
+    const std::string dispatch_text = g.build_dispatch(table_off);
+    const std::vector<u8> dispatch2 =
+        ks.assemble(dispatch_text, dispatch_addr, "dispatch pass2");
+    if (dispatch2.size() != dispatch_size)
+        throw std::runtime_error("regvm runtime: dispatch pass2 size drifted (two-pass broken)");
+
+    // —— 装配：[entry][dispatch][handlers][pad][table] ——
+    vm::RuntimeImage image;
+    image.vm_entry_offset = 0;
+    image.code.reserve(size_t(table_off) + size_t(kTableEntries * 8));
+    image.code.insert(image.code.end(), entry_code.begin(), entry_code.end());
+    image.code.insert(image.code.end(), dispatch2.begin(), dispatch2.end());
+    image.code.insert(image.code.end(), handler_code.begin(), handler_code.end());
+    const u64 halt_off = handler_off.at(int(VmOp::Halt));
+    auto push_u64 = [&image](u64 v) {
+        for (int b = 0; b < 8; ++b) image.code.push_back(u8((v >> (8 * b)) & 0xFF));
+    };
+    for (u64 op = 0; op < kTableEntries; ++op)
+        push_u64(handler_off.count(int(op)) ? handler_off.at(int(op)) : halt_off);
+
+    // —— asm_dump（带布局注释的最终汇编文本）——
+    std::string dump;
+    dump += "; regvm runtime image: entry=+0x0, dispatch=+" + hex(dispatch_addr) +
+            ", table=+" + hex(table_off) + ", total=" + hex(image.code.size()) + "\n";
+    dump += "; codec: none (v1 直通；M3 织入点 = dispatch fetch 之后、跳表之前，对 T8 解密)\n";
+    dump += entry_text + "\n";
+    dump += "dispatch:\n" + dispatch_text + "\n";
+    for (const auto& h : handlers)
+        dump += "; ---- handler " + std::string(h.name) + " @ +" + hex(handler_off.at(h.opcode)) +
+                " ----\n" + handler_text.at(h.opcode) + "\n";
+    dump += "; ---- jump table @ +" + hex(table_off) +
+            " (64 x u64 LE, 项 = handler 相对码基址偏移；0/未实现 → halt) ----\n";
+    for (u64 op = 0; op < kTableEntries; ++op)
+        if (handler_off.count(int(op)))
+            dump += ";   [" + std::to_string(op) + "] = " + hex(handler_off.at(int(op))) + "\n";
+    dump += ";   [0] (illegal/未实现折叠) = " + hex(halt_off) + "\n";
+
+    return {std::move(image), std::move(dump)};
+}
+
+} // namespace wvmp::regvm::runtime
