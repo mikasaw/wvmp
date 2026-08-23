@@ -75,3 +75,16 @@ target_compile_options(wvmp_sar_sample PRIVATE
 target_link_options(wvmp_sar_sample PRIVATE
     $<$<CXX_COMPILER_ID:MSVC>:/INCREMENTAL:NO>
 )
+
+# MIT-245：端到端正路径样本——区域内含 adc（白名单内），验证 C2-Adc 修复后
+# CF_in 链路正确传播（add 留下的 carry 必须被 adc 看到）。用 _addcarry_u64
+# 强制编译器 emit `add` + `adc` 两条指令, 均落在 marker 区域内。
+add_executable(wvmp_adc_sample adc_sample_main.cpp)
+target_link_libraries(wvmp_adc_sample PRIVATE wvmp::sdk)
+target_compile_options(wvmp_adc_sample PRIVATE
+    $<$<CXX_COMPILER_ID:MSVC>:/Od;/Ob0;/utf-8>
+    $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-O0>
+)
+target_link_options(wvmp_adc_sample PRIVATE
+    $<$<CXX_COMPILER_ID:MSVC>:/INCREMENTAL:NO>
+)

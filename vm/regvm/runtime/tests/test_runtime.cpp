@@ -482,6 +482,118 @@ void run_semantic_battery(const vm::RuntimeImage& image, const std::string& dump
         EXPECT_EQ(run_stream(entry, s, scratch.data()).regs[0],
                   0xFFFF'FFFF'FFFF'FFFFull);
     }
+
+    // ---- (j) Adc：带 CF_in 的全加（含 carry 链、signed overflow、size 变体） ----
+    // Adc 语义要点（Intel SDM Vol. 2 ADC）：
+    //   - dst = dst + src + CF_in（CF_in 必须真实参与计算）
+    //   - CF = 全加最高位 carry-out
+    //   - OF = 仅当两操作数符号同且结果符号异（signed overflow 顶端）
+    //   - SF/ZF/PF = 结果 MSB / 全 0 / 低 8 偶校验
+    //   - flags 全量由 setcc5 捕 host CPU 真值
+    // 关键 catch 路径：build_binary 的 zero5() 用 xor 清 CF；build_adc 必须在
+    // zero5 前把 CF_in 读到 T3，zero5 后用 `bt T3, 0` 还原宿主 CF。
+    {
+        // (j.1) S64, CF_in=0：基本 0x10 + 0x20 = 0x30, CF=0, SF=ZF=0
+        std::vector<u8> s;
+        isa::append_insn(s, mov_imm(0, 0x10));
+        isa::append_insn(s, mov_imm(1, 0x20));
+        isa::append_insn(s, mov_imm(2, 0));    // CF=0
+        isa::append_insn(s, isa::make_insn(isa::VmOp::SetFlags,
+                                           isa::OpKind::Reg, 2, isa::OpKind::None, 0));
+        isa::append_insn(s, bin(isa::VmOp::Adc, 0, 1, ir::Size::S64));
+        isa::append_insn(s, isa::make_insn(isa::VmOp::GetFlags,
+                                           isa::OpKind::Reg, 3, isa::OpKind::None, 0));
+        isa::append_insn(s, halt());
+        const auto ctx = run_stream(entry, s, scratch.data());
+        EXPECT_EQ(ctx.regs[0], 0x30ull);
+        EXPECT_EQ(ctx.regs[3] & isa::kFlagCF, 0u);
+        EXPECT_EQ(ctx.regs[3] & isa::kFlagZF, 0u);
+        EXPECT_EQ(ctx.regs[3] & isa::kFlagSF, 0u);
+
+        // (j.2) S64, CF_in=1：基本 0x10 + 0x20 + 1 = 0x31, CF=0（无进位）
+        s.clear();
+        isa::append_insn(s, mov_imm(0, 0x10));
+        isa::append_insn(s, mov_imm(1, 0x20));
+        isa::append_insn(s, mov_imm(2, u32(isa::kFlagCF)));    // CF=1
+        isa::append_insn(s, isa::make_insn(isa::VmOp::SetFlags,
+                                           isa::OpKind::Reg, 2, isa::OpKind::None, 0));
+        isa::append_insn(s, bin(isa::VmOp::Adc, 0, 1, ir::Size::S64));
+        isa::append_insn(s, isa::make_insn(isa::VmOp::GetFlags,
+                                           isa::OpKind::Reg, 3, isa::OpKind::None, 0));
+        isa::append_insn(s, halt());
+        const auto ctx2 = run_stream(entry, s, scratch.data());
+        EXPECT_EQ(ctx2.regs[0], 0x31ull);
+        EXPECT_EQ(ctx2.regs[3] & isa::kFlagCF, 0u);
+
+        // (j.3) S64 carry, CF_in=0：-1 + 1 = 0, CF=1（典型 64-bit 进位）
+        // 用 sub 构造 -1（sub CF 路径不影响本测试，因显式 SetFlags 覆盖）
+        s.clear();
+        isa::append_insn(s, mov_imm(0, 0));                     // v0 = 0
+        isa::append_insn(s, mov_imm(1, 1));                     // v1 = 1
+        isa::append_insn(s, bin(isa::VmOp::Sub, 0, 1, ir::Size::S64));  // v0 = -1
+        isa::append_insn(s, mov_imm(2, 0));                     // CF_in=0
+        isa::append_insn(s, isa::make_insn(isa::VmOp::SetFlags,
+                                           isa::OpKind::Reg, 2, isa::OpKind::None, 0));
+        isa::append_insn(s, mov_imm(1, 1));                     // v1 = 1
+        isa::append_insn(s, bin(isa::VmOp::Adc, 0, 1, ir::Size::S64));  // v0 = -1+1+0 = 0, CF=1
+        isa::append_insn(s, isa::make_insn(isa::VmOp::GetFlags,
+                                           isa::OpKind::Reg, 3, isa::OpKind::None, 0));
+        isa::append_insn(s, halt());
+        const auto ctx3 = run_stream(entry, s, scratch.data());
+        EXPECT_EQ(ctx3.regs[0], 0ull);
+        EXPECT_EQ(ctx3.regs[3] & isa::kFlagCF, isa::kFlagCF);
+
+        // (j.4) **CF 链路关键 catch**：-1 + 1 + CF_in(from prev sub borrow)=1 = 1
+        // 不显式 SetFlags；让 sub 留下的 CF=1（borrow）作为下一条 adc 的 CF_in。
+        // 若 build_adc 把 CF_in 在 zero5 中清零，则退化为 -1 + 1 + 0 = 0。
+        s.clear();
+        isa::append_insn(s, mov_imm(0, 0));                     // v0 = 0
+        isa::append_insn(s, mov_imm(1, 1));                     // v1 = 1
+        isa::append_insn(s, bin(isa::VmOp::Sub, 0, 1, ir::Size::S64));  // v0 = -1, CF=1
+        isa::append_insn(s, mov_imm(1, 1));                     // v1 = 1
+        isa::append_insn(s, bin(isa::VmOp::Adc, 0, 1, ir::Size::S64));  // v0 = -1+1+1 = 1
+        isa::append_insn(s, isa::make_insn(isa::VmOp::GetFlags,
+                                           isa::OpKind::Reg, 3, isa::OpKind::None, 0));
+        isa::append_insn(s, halt());
+        const auto ctx4 = run_stream(entry, s, scratch.data());
+        // 关键断言：CF_in=1 路径区分。若 CF_in 被 zero5 清零（=0），v0 = 0；正确 v0 = 1
+        EXPECT_EQ(ctx4.regs[0], 1ull);
+
+        // (j.5) S32 signed overflow：0x80000000 + 0x80000000 + CF_in=0 = 0 (S32),
+        // CF=1 (carry), OF=1 (同负 + 结果正 = signed overflow 顶端)
+        s.clear();
+        isa::append_insn(s, mov_imm(0, 0x80000000u, ir::Size::S32));
+        isa::append_insn(s, mov_imm(1, 0x80000000u, ir::Size::S32));
+        isa::append_insn(s, mov_imm(2, 0));
+        isa::append_insn(s, isa::make_insn(isa::VmOp::SetFlags,
+                                           isa::OpKind::Reg, 2, isa::OpKind::None, 0));
+        isa::append_insn(s, bin(isa::VmOp::Adc, 0, 1, ir::Size::S32));
+        isa::append_insn(s, isa::make_insn(isa::VmOp::GetFlags,
+                                           isa::OpKind::Reg, 3, isa::OpKind::None, 0));
+        isa::append_insn(s, halt());
+        const auto ctx5 = run_stream(entry, s, scratch.data());
+        EXPECT_EQ(ctx5.regs[0], 0ull);                              // S32 truncate
+        EXPECT_EQ(ctx5.regs[3] & isa::kFlagCF, isa::kFlagCF);      // CF=1
+        EXPECT_EQ(ctx5.regs[3] & isa::kFlagOF, isa::kFlagOF);      // OF=1
+        EXPECT_EQ(ctx5.regs[3] & isa::kFlagZF, isa::kFlagZF);      // ZF=1
+
+        // (j.6) S32 unsigned 边界：0xFFFFFFFF + 0x00000001 + CF_in=0 = 0, CF=1, OF=0
+        // （异号相加，无 signed overflow；CF=1 表 32-bit carry）
+        s.clear();
+        isa::append_insn(s, mov_imm(0, 0xFFFFFFFFu, ir::Size::S32));
+        isa::append_insn(s, mov_imm(1, 0x00000001u, ir::Size::S32));
+        isa::append_insn(s, mov_imm(2, 0));
+        isa::append_insn(s, isa::make_insn(isa::VmOp::SetFlags,
+                                           isa::OpKind::Reg, 2, isa::OpKind::None, 0));
+        isa::append_insn(s, bin(isa::VmOp::Adc, 0, 1, ir::Size::S32));
+        isa::append_insn(s, isa::make_insn(isa::VmOp::GetFlags,
+                                           isa::OpKind::Reg, 3, isa::OpKind::None, 0));
+        isa::append_insn(s, halt());
+        const auto ctx6 = run_stream(entry, s, scratch.data());
+        EXPECT_EQ(ctx6.regs[0], 0ull);
+        EXPECT_EQ(ctx6.regs[3] & isa::kFlagCF, isa::kFlagCF);
+        EXPECT_EQ(ctx6.regs[3] & isa::kFlagOF, 0u);               // 异号相加，OF=0
+    }
 }
 
 } // namespace
@@ -552,6 +664,69 @@ TEST(Interpreter, SarFuzzTenThousand) {
                 << "seed=" << std::hex << seed << " iter=" << std::dec << i
                 << " val=" << std::hex << value32 << " cnt=" << std::dec << count;
             ASSERT_EQ(ctx.pc, 3u) << "Sar should halt at instruction 3";
+        }
+    }
+}
+
+// Adc 真执行 fuzz：1 万条随机 (a, b, cf_in) → 与 C++ 参考全加 bit-exact 比对，
+// 同时验证 CF_out（64-bit 最高位 carry）。覆盖 5 个不同 Rng 种子, 每颗 10000 次
+// = 5 万条。a/b 在 u32 范围内零扩展到 u64（与 mov_imm aux u32 限制一致），
+// cf_in ∈ {0, 1}。参考实现严格按 Intel SDM ADC：sum = a + b + cf_in, CF=1 iff
+// sum > 0xFFFFFFFF（32-bit 进位到高位）。
+namespace {
+// 静态函数定义在 namespace scope 避 MSVC C2267（局部静态函数禁止）。
+struct AdcRef { u64 sum; u64 cf; };
+// 参考实现严格按 Intel SDM ADC（u64 全宽）：
+//   sum = a + b + cf_in (wrap on u64 overflow)
+//   CF = carry out of bit 63 = (sum < a) [wraparound 标记]
+// 注意：本 fuzz 用 u32 输入零扩展到 u64（与 mov_imm aux u32 限制一致），
+// 32 位值加和最大 0x1FFFFFFFF < 2^64 → CF=0 总是。这是 fuzz 的"安全路径"，
+// 测试实现**不该**意外把 CF 置位。CF=1 的 carry 链路场景在语义电池 (j.3-j.6)
+// 单独覆盖。
+static AdcRef ref_adc(u64 a, u64 b, u64 cf) {
+    const u64 sum = a + b + cf;
+    const u64 cf_out = (sum < a) ? 1 : 0;
+    return {sum, cf_out};
+}
+} // namespace
+
+TEST(Interpreter, AdcFuzzTenThousand) {
+    for (u64 seed : {0xC0FFEEull, 0xBABEF00Dull, 0xDEADBEEFull, 0xCAFEBABEull, 0xFEEDFACEull}) {
+        wvmp::Rng rng(seed);
+        const auto result = rt::generate_runtime(rng);
+        RwxImage rwx(result.image.code);
+        const auto entry = rwx.entry();
+        alignas(16) std::array<u8, 0x10000> scratch{};
+        for (int i = 0; i < 10000; ++i) {
+            const u32 a32 = static_cast<u32>(rng.next());
+            const u32 b32 = static_cast<u32>(rng.next());
+            const u32 cf_in = static_cast<u32>(rng.uniform(0, 1));
+            const u64 a64 = a32;          // zero-extend (matches vm state)
+            const u64 b64 = b32;
+            const u64 cf64 = cf_in;
+            std::vector<u8> s;
+            isa::append_insn(s, mov_imm(0, a32));
+            isa::append_insn(s, mov_imm(1, b32));
+            isa::append_insn(s, mov_imm(2, cf_in ? u32(isa::kFlagCF) : 0u));
+            isa::append_insn(s, isa::make_insn(isa::VmOp::SetFlags,
+                                               isa::OpKind::Reg, 2, isa::OpKind::None, 0));
+            isa::append_insn(s, bin(isa::VmOp::Adc, 0, 1, ir::Size::S64));
+            isa::append_insn(s, isa::make_insn(isa::VmOp::GetFlags,
+                                               isa::OpKind::Reg, 3, isa::OpKind::None, 0));
+            isa::append_insn(s, halt());
+            const auto ctx = run_stream(entry, s, scratch.data());
+            const auto ref = ref_adc(a64, b64, cf64);
+            ASSERT_EQ(ctx.regs[0], ref.sum)
+                << "seed=" << std::hex << seed << " iter=" << std::dec << i
+                << " a=" << std::hex << a32 << " b=" << std::hex << b32
+                << " cf_in=" << std::dec << cf_in;
+            // CF 标志位（bit 1 = kFlagCF）。v3 & kFlagCF = 0 (CF=0) 或 2 (CF=1)。
+            const u64 got_cf = (ctx.regs[3] & isa::kFlagCF) ? 1 : 0;
+            ASSERT_EQ(got_cf, ref.cf)
+                << "CF mismatch seed=" << std::hex << seed << " iter=" << std::dec << i
+                << " a=" << std::hex << a32 << " b=" << std::hex << b32
+                << " cf_in=" << std::dec << cf_in;
+            ASSERT_EQ(ctx.pc, 7u) << "Adc test stream halts at instruction 7";
         }
     }
 }

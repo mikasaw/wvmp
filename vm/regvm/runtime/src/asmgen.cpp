@@ -833,6 +833,44 @@ public:
     // count=0 走 adv_lbl 不动值/flags（与 shr/shl 一致）。
     std::string build_sar(u64 d) const { return build_shift("sar", d); }
 
+    // Adc: dst = dst + src + CF_in（Intel SDM Vol. 2 ADC）。
+    // 与 Add/Sub 不可共用 build_binary：zero5() 用 xor 清 scratch 寄存器，
+    // 副作用把宿主 CPU 的 CF 也清零（XOR 写 CF=0），后续 native adc 看到的
+    // CF_in=0 退化成 add。
+    // 故这里不复用 build_binary, 按下列顺序显式保 CF_in：
+    //   load A → T0      (mov/movzx 不改 flags)
+    //   load B → T1      (mov/movzx 不改 flags)
+    //   zero5            (清 flag scratch, 副作用宿主 CF←0)
+    //   bt  flags_, 1    (宿主 CF = flags_ bit 1 = CF_in; flags_ 不在 zero5 范围)
+    //   adc  T0, T1      (CPU 完成 A+B+CF_in, flags 由 setcc5 捕真值)
+    //   setcc5
+    //   writeback
+    // flags 语义：CF=全加最高位 carryout; OF=两操作数同号且结果异号; SF/ZF/PF 按结果。
+    // size 0/1/2/3 由 rs(t_[0], s) 选 al/ax/eax/rax, adc native 按宽度处理。
+    // 注意：早期版本把 CF_in 先存到 T3, 再 zero5 把它清零, 退化成 add。
+    // bt flags_, 1 路径绕开 zero5 的清零范围（zero5 仅清 {T3,T4,T6,T7,T9}）。
+    std::string build_adc(u64 dispatch) const {
+        const std::string tag = "adc" + std::to_string(seq());
+        const std::string tail_lbl = "ftail_" + tag;
+        std::array<std::string, 4> blocks;
+        for (int s = 0; s < 4; ++s) {
+            const std::string stag = tag + "_" + std::to_string(s);
+            std::string o;
+            o += load_operand(s, 3, 4, 0, "a" + stag);   // A（目的）→ T0
+            o += load_operand(s, 6, 7, 1, "b" + stag);   // B（源）→ T1
+            o += zero5();     // 清 flag scratch；副作用宿主 CF←0
+            o += std::string("    bt ") + r64(flags_) + ", 1\n";  // 宿主 CF = flags_ bit 1 = CF_in
+            o += std::string("    adc ") + rs(t_[0], s) + ", " + rs(t_[1], s) + "\n";
+            o += setcc5();
+            o += reextract_a(1);
+            o += writeback(s, 1);
+            o += "    jmp " + tail_lbl + "\n";
+            blocks[s] = o;
+        }
+        return decode_prelude() + size_chain(blocks, tag) + tail_lbl + ":\n" +
+               flags_tail(dispatch, false);
+    }
+
 private:
     Rng& rng_;
     int ctx_ = 0, pc_ = 0, flags_ = 0, base_ = 0;
@@ -868,7 +906,8 @@ RuntimeGenResult generate_runtime(wvmp::Rng& rng) {
     const u64 dispatch_size = dispatch1.size();
 
     // —— handler 清单（v1 覆盖集；Adc/Sbb/Rol/Ror/Call/Ret 的表项指向
-    //    Halt——遇到即停机，语义保守且不越界。Sar 在 MIT-244 已接管。）——
+    //    Halt——遇到即停机，语义保守且不越界。Sar 在 MIT-244 已接管。
+    //    Adc 在 MIT-245 已接管。）——
     std::vector<HandlerDef> handlers = {
         {int(VmOp::Mov), "mov", &AsmGen::build_mov},
         {int(VmOp::Lea), "lea", &AsmGen::build_mov},
@@ -884,6 +923,7 @@ RuntimeGenResult generate_runtime(wvmp::Rng& rng) {
         {int(VmOp::Shl), "shl", &AsmGen::build_shl},
         {int(VmOp::Shr), "shr", &AsmGen::build_shr},
         {int(VmOp::Sar), "sar", &AsmGen::build_sar},
+        {int(VmOp::Adc), "adc", &AsmGen::build_adc},
         {int(VmOp::Cmp), "cmp", &AsmGen::build_cmp},
         {int(VmOp::Test), "test", &AsmGen::build_test},
         {int(VmOp::Load), "load", &AsmGen::build_load},
