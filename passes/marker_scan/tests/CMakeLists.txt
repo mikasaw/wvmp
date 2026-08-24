@@ -191,3 +191,18 @@ target_compile_options(wvmp_snake_sample PRIVATE
 target_link_options(wvmp_snake_sample PRIVATE
     $<$<CXX_COMPILER_ID:MSVC>:/INCREMENTAL:NO>
 )
+
+# MIT-301: 端到端正路径样本——区域内含 cl 变体 shift (D3 /5: shl/shr/sar/
+# rol/ror), 验证 cl 变体 shift 修复后翻译成功、运行时走真 ShlCl/ShrCl/
+# SarCl/RolCl/RorCl handler、行为与原生逐字节一致。用 volatile uint8_t
+# 计数强制 MSVC /Od 下 _rotl64 / _rotr64 codegen 为 cl 变体（D3 /5）而非
+# imm 形式 (C1 /r ib)。
+add_executable(wvmp_cl_shift_sample cl_shift_sample_main.cpp)
+target_link_libraries(wvmp_cl_shift_sample PRIVATE wvmp::sdk)
+target_compile_options(wvmp_cl_shift_sample PRIVATE
+    $<$<CXX_COMPILER_ID:MSVC>:/Od;/Ob0;/utf-8>
+    $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-O0>
+)
+target_link_options(wvmp_cl_shift_sample PRIVATE
+    $<$<CXX_COMPILER_ID:MSVC>:/INCREMENTAL:NO>
+)

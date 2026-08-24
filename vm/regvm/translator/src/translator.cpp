@@ -86,6 +86,21 @@ void add_note(std::vector<std::string>& notes, u64 addr, std::string_view what) 
     }
 }
 
+// ir::Op (Shl/Shr/Sar/Rol/Ror) -> VmOp (ShlCl/ShrCl/SarCl/RolCl/RorCl)。
+// MIT-301: lifter 用 Operand::Kind::Reg + Reg::Rcx 表示 cl 计数（D3 /5）,
+// 翻译器据此发射新 VmOp 让字节码语义显式。运行时 handler 复用 build_shift,
+// 读 regs[reg_b], 按宽度掩码, count=0 走 no-op 出口不更新 flags。
+[[nodiscard]] bool shift_cl_op_of(ir::Op op, VmOp& out) {
+    switch (op) {
+    case ir::Op::Shl: out = VmOp::ShlCl; return true;
+    case ir::Op::Shr: out = VmOp::ShrCl; return true;
+    case ir::Op::Sar: out = VmOp::SarCl; return true;
+    case ir::Op::Rol: out = VmOp::RolCl; return true;
+    case ir::Op::Ror: out = VmOp::RorCl; return true;
+    default: return false;
+    }
+}
+
 // 把 64 位立即数 v 拼进寄存器 d（4 条，全 S64）：
 //   Mov s,hi32 / Shl s,32 / Mov d,lo32 / Or d,s
 void emit_imm64_split(Emitter& em, Scratch& sc, u8 d, u64 v) {
@@ -477,6 +492,15 @@ struct Translator {
         if (src_mem) {
             const u8 s = emit_load(em, sc, in.src.mem, in.size, current_rva, next_ip);
             em.emit_rr(vop, d, s, isa::size_field(in.size));
+            return true;
+        }
+        // MIT-301: shift ops with cl variant (src.kind=Reg) emit dedicated VmOp.
+        // b_kind=OpKind::Reg, reg_b=Rcx（lifter 已限定 X86_REG_CL → Rcx）。
+        // 不走 emit_binop_tail（其用 vop 即 Shl 等, b_kind 同样 Reg, 行为亦正确,
+        // 但字节码语义上 ShlCl 等更显式, 与 imm 计数 Shl 等严格区分）。
+        VmOp cl_op{};
+        if (shift_cl_op_of(in.op, cl_op) && in.src.kind == ir::Operand::Kind::Reg) {
+            em.emit_rr(cl_op, d, isa::vm_reg_of(in.src.reg), isa::size_field(in.size));
             return true;
         }
         if (!emit_binop_tail(em, sc, in, vop, d))

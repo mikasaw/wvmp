@@ -1047,6 +1047,19 @@ public:
     std::string build_rol(u64 d) const { return build_shift("rol", d); }
     std::string build_ror(u64 d) const { return build_shift("ror", d); }
 
+    // MIT-301 cl 变体 shift: D3 /5 形式，计数源自 RCX 低 8 位（cl）而非 aux。
+    // 翻译器对 src.kind=Reg 的 shift 发射新 VmOp (ShlCl/ShrCl/SarCl/RolCl/
+    // RorCl), b_kind=OpKind::Reg, reg_b=RCX 槽。handler 复用 build_shift:
+    //   - b_kind=Reg 路径永远走 T6=1 分支，count 从 regs[T7] 取（即 RCX）
+    //   - 与 imm 变体共享同一段汇编，唯一差异是 VmOp 编号让 dispatch 跳此处
+    //   - 五个 cl 变体仅 native op 字符串不同 ("shl"/"shr"/"sar"/"rol"/"ror")
+    // 独立 VmOp 编码让字节码语义显式、asm_dump 可读、与 imm 变体严格区分。
+    std::string build_shl_cl(u64 d) const { return build_shift("shl", d); }
+    std::string build_shr_cl(u64 d) const { return build_shift("shr", d); }
+    std::string build_sar_cl(u64 d) const { return build_shift("sar", d); }
+    std::string build_rol_cl(u64 d) const { return build_shift("rol", d); }
+    std::string build_ror_cl(u64 d) const { return build_shift("ror", d); }
+
     // Adc: dst = dst + src + CF_in（Intel SDM Vol. 2 ADC）。
     // 与 Add/Sub 不可共用 build_binary：zero5() 用 xor 清 scratch 寄存器，
     // 副作用把宿主 CPU 的 CF 也清零（XOR 写 CF=0），后续 native adc 看到的
@@ -1184,6 +1197,12 @@ RuntimeGenResult generate_runtime(wvmp::Rng& rng) {
         {int(VmOp::Sar), "sar", &AsmGen::build_sar},
         {int(VmOp::Rol), "rol", &AsmGen::build_rol},
         {int(VmOp::Ror), "ror", &AsmGen::build_ror},
+        // MIT-301 cl 变体 shift（D3 /5, 计数源自 RCX 低 8 位）。
+        {int(VmOp::ShlCl), "shlcl", &AsmGen::build_shl_cl},
+        {int(VmOp::ShrCl), "shrcl", &AsmGen::build_shr_cl},
+        {int(VmOp::SarCl), "sarcl", &AsmGen::build_sar_cl},
+        {int(VmOp::RolCl), "rolcl", &AsmGen::build_rol_cl},
+        {int(VmOp::RorCl), "rorcl", &AsmGen::build_ror_cl},
         {int(VmOp::Adc), "adc", &AsmGen::build_adc},
         {int(VmOp::Sbb), "sbb", &AsmGen::build_sbb},
         {int(VmOp::Cmp), "cmp", &AsmGen::build_cmp},

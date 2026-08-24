@@ -31,9 +31,19 @@ enum class VmOp : u16 {
     // cond_or_size = arg_count（v1 仅支持 0；非零暂按 0 兜底并 diag warn）。
     // a_kind / b_kind / reg_a / reg_b 一律 None（gate 与 VM 操作数无关）。
     CallGate,
+
+    // —— MIT-301 cl 变体 shift ——
+    // 计数源自 RCX 低 8 位（cl），而非 aux 立即数。lifter 接住 D3 /5（D3 /r）
+    // 后用 Operand::Kind::Reg + Reg::Rcx 表示 src, 翻译器据此发射以下 5 个
+    // VmOp（b_kind=OpKind::Reg, reg_b=RCX 槽）。运行时 handler 复用 build_shift
+    // 逻辑——读 regs[RCX], 按宽度掩码（8/16 &31, 32/64 &63）, count=0 走 no-op
+    // 出口不更新 flags, 其余走 native shift + setcc5 + writeback。ShlCl/ShrCl/
+    // SarCl/RolCl/RorCl 与 Shl/Shr/Sar/Rol/Ror 编码一一对应, 调用 build_shift
+    // 时仅 native op 不同（"shl"/"shr"/"sar"/"rol"/"ror"）。
+    ShlCl, ShrCl, SarCl, RolCl, RorCl,
 };
 
-inline constexpr u16 kVmOpMax = static_cast<u16>(VmOp::CallGate);
+inline constexpr u16 kVmOpMax = static_cast<u16>(VmOp::RorCl);
 inline constexpr u16 kVmOpLimit = 1u << 14;  // 14 位编码空间上限
 
 constexpr const char* to_string(VmOp op) {
@@ -58,6 +68,11 @@ constexpr const char* to_string(VmOp op) {
         case VmOp::LoadRva: return "loadrva";
         case VmOp::StoreRva: return "storeriva";
         case VmOp::CallGate: return "callgate";
+        case VmOp::ShlCl: return "shlcl";
+        case VmOp::ShrCl: return "shrcl";
+        case VmOp::SarCl: return "sarcl";
+        case VmOp::RolCl: return "rolcl";
+        case VmOp::RorCl: return "rorcl";
     }
     return "?";
 }

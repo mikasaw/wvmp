@@ -3,7 +3,8 @@
 #   - MIT-249 follow-up (issue-08): wvmp_call_gate_sample / wvmp_call_gate_simple_sample /
 #     wvmp_rol_sample against 5 different seeds, asserts all PASS (callee-saved 池).
 #   - MIT-300: extend to wvmp_snake_sample (贪吃蛇核心逻辑真实业务 PE).
-#     Total: 4 samples × 5 seeds = 20 runs.
+#   - MIT-301: extend to wvmp_cl_shift_sample (cl 变体 shift 真虚拟化).
+#     Total: 5 samples × 5 seeds = 25 runs.
 
 set -u
 
@@ -15,6 +16,7 @@ samples=(
     "build/passes/marker_scan/tests/wvmp_call_gate_simple_sample.exe"
     "build/passes/marker_scan/tests/wvmp_rol_sample.exe"
     "build/passes/marker_scan/tests/wvmp_snake_sample.exe"
+    "build/passes/marker_scan/tests/wvmp_cl_shift_sample.exe"
 )
 
 # Seeds: 1 (small), 12345 (default), 99999 (large), 0xDEADBEEF (magic), 0xCAFEBABE (magic).

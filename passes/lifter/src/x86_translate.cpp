@@ -164,25 +164,36 @@ TranslateResult translate_unary(const cs_insn& ci, const cs_x86& x, ir::Arch arc
     return ok(out);
 }
 
-// shl/shr/sar：imm 计数直接映射；cl 计数 v1 跳过（TODO）。
+// shl/shr/sar/rol/ror：
+//   - imm 计数 (C1 /4 ib / C1 /r ib) → src = Operand::imm_(count)
+//   - cl  计数 (D3 /5)                → src = Operand::reg_(Rcx)（cl 是 RCX 低 8 位）
+//   - 隐式计数 1 (D1 /4)              → src = Operand::imm_(1)（capstone 不报第二操作数）
+// 区分依赖 Operand::Kind 现有字段（Reg vs Imm），不改 ir/ 冻结契约头。
+// 其他形式（ch/cx 等非 cl 寄存器计数）保守 unsupported，由 C1 gate 兜底。
 TranslateResult translate_shift(const cs_insn& ci, const cs_x86& x, ir::Arch arch, Op op) {
     if (x.op_count == 0 || x.op_count > 2) return unsupported(ci.address, ci.size);
     auto d = to_operand(x.operands[0]);
     if (!d || (d->kind != Operand::Kind::Reg && d->kind != Operand::Kind::Mem)) {
         return unsupported(ci.address, ci.size);
     }
-    if (x.op_count == 2) {
-        if (x.operands[1].type != X86_OP_IMM) return todo(ci.address, ci.size); // shl eax, cl —— TODO(lane)
-    }
     ir::Insn out;
     out.op = op;
     out.addr = ci.address;
     out.size = data_size(x.operands, x.op_count, arch);
     out.dst = *d;
-    // capstone 对隐式计数 1（D1 /r）只报 1 个操作数。
-    out.src = (x.op_count == 2) ? Operand::imm_(static_cast<i64>(x.operands[1].imm))
-                                : Operand::imm_(1);
     out.updates_flags = true;
+    if (x.op_count == 1) {
+        // capstone 对隐式计数 1（D1 /r）只报 1 个操作数
+        out.src = Operand::imm_(1);
+    } else if (x.operands[1].type == X86_OP_IMM) {
+        out.src = Operand::imm_(static_cast<i64>(x.operands[1].imm));
+    } else if (x.operands[1].type == X86_OP_REG && x.operands[1].reg == X86_REG_CL) {
+        // MIT-301: cl 变体（D3 /5）— cl 是 RCX 低 8 位，用 Reg 区分
+        out.src = Operand::reg_(ir::Reg::Rcx);
+    } else {
+        // ch / cx / 内存等非 cl 寄存器计数：v1 不接, 触发 C1 gate 兜底
+        return unsupported(ci.address, ci.size);
+    }
     return ok(out);
 }
 

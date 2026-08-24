@@ -407,10 +407,6 @@ TEST_F(LifterTranslate, ShiftsAndUnary) {
 }
 
 TEST_F(LifterTranslate, SkippedInstructions) {
-    // D3 E0: shl eax, cl —— cl 变体 v1 记 TODO 跳过
-    const wvmp::u8 cl[] = {0xD3, 0xE0};
-    EXPECT_EQ(translate_bytes(x64, cl, ir::Arch::X64).status, lifter::TranslateStatus::Todo);
-
     // 0F A2: cpuid —— 超出白名单
     const wvmp::u8 cpuid[] = {0x0F, 0xA2};
     EXPECT_EQ(translate_bytes(x64, cpuid, ir::Arch::X64).status,
@@ -425,6 +421,8 @@ TEST_F(LifterTranslate, SkippedInstructions) {
 
 // MIT-249 follow-up (issue-09): TranslateResult.skipped_ranges 在 status != Ok
 // 时被填 (rva, size), Ok 时留空。这是下游 C1 gate 识别 "IR 缺字节" 的核心数据。
+// MIT-301 后: lifter 不再走 Todo 分支（cl 变体已接住, 余下不可识别一律
+// Unsupported）——两条 cpuid + 一条 mov 都验证 skipped_ranges 的累积/留空。
 TEST_F(LifterTranslate, SkippedRangesAccumulated) {
     // cpuid (0F A2, 2 字节, @ RVA 0x1000): Unsupported → skipped_ranges 1 项
     const wvmp::u8 cpuid[] = {0x0F, 0xA2};
@@ -434,10 +432,10 @@ TEST_F(LifterTranslate, SkippedRangesAccumulated) {
     EXPECT_EQ(r1.skipped_ranges[0].first, 0x1000u);
     EXPECT_EQ(r1.skipped_ranges[0].second, 2u);
 
-    // shl eax, cl (D3 E0, 2 字节, @ RVA 0x2000): Todo → skipped_ranges 1 项
-    const wvmp::u8 cl[] = {0xD3, 0xE0};
-    auto r2 = translate_bytes(x64, cl, ir::Arch::X64, 0x2000);
-    ASSERT_EQ(r2.status, lifter::TranslateStatus::Todo);
+    // rol ch（0F A5 等不在白名单的指令占位用 cpuid 替代）：同上，验证 rva 2000
+    const wvmp::u8 cpuid2[] = {0x0F, 0xA2};
+    auto r2 = translate_bytes(x64, cpuid2, ir::Arch::X64, 0x2000);
+    ASSERT_EQ(r2.status, lifter::TranslateStatus::Unsupported);
     ASSERT_EQ(r2.skipped_ranges.size(), 1u);
     EXPECT_EQ(r2.skipped_ranges[0].first, 0x2000u);
     EXPECT_EQ(r2.skipped_ranges[0].second, 2u);
@@ -501,15 +499,86 @@ TEST_F(LifterTranslate, RolRorLifted) {
     ASSERT_EQ(r64.insn.src.kind, ir::Operand::Kind::Imm);
     EXPECT_EQ(r64.insn.src.imm, 32);
 
-    // D3 C0: rol eax, cl —— cl 变体 v1 仍记 TODO 跳过（与 shl/shr/sar 一致）
+    // MIT-301: cl 变体 (D3 /5) 由 lifter 接住, src=Operand::reg_(Rcx)。
+    // D3 C0: rol eax, cl —— Op::Rol + src.kind=Reg + src.reg=Rcx
     const wvmp::u8 rol_cl[] = {0xD3, 0xC0};
-    EXPECT_EQ(translate_bytes(x64, rol_cl, ir::Arch::X64).status,
-              lifter::TranslateStatus::Todo);
+    auto rolr = translate_bytes(x64, rol_cl, ir::Arch::X64);
+    ASSERT_EQ(rolr.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(rolr.insn.op, ir::Op::Rol);
+    EXPECT_EQ(rolr.insn.size, ir::Size::S32);
+    EXPECT_EQ(rolr.insn.dst.reg, ir::Reg::Rax);
+    ASSERT_EQ(rolr.insn.src.kind, ir::Operand::Kind::Reg);
+    EXPECT_EQ(rolr.insn.src.reg, ir::Reg::Rcx);
+    EXPECT_TRUE(rolr.insn.updates_flags);
 
     // D3 C8: ror eax, cl —— 同上
     const wvmp::u8 ror_cl[] = {0xD3, 0xC8};
-    EXPECT_EQ(translate_bytes(x64, ror_cl, ir::Arch::X64).status,
-              lifter::TranslateStatus::Todo);
+    auto rorr = translate_bytes(x64, ror_cl, ir::Arch::X64);
+    ASSERT_EQ(rorr.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(rorr.insn.op, ir::Op::Ror);
+    ASSERT_EQ(rorr.insn.src.kind, ir::Operand::Kind::Reg);
+    EXPECT_EQ(rorr.insn.src.reg, ir::Reg::Rcx);
+    EXPECT_TRUE(rorr.insn.updates_flags);
+}
+
+// MIT-301: D3 /5 (cl 变体) 全量覆盖 - shl/shr/sar/rol/ror + 64 位 size。
+//   - cl 在 x86 编码是 RCX 低 8 位；lifter 把 src 转 Operand::reg_(Rcx) 不改
+//     ir/ 冻结契约头（区分依赖 Operand::Kind::Reg, 与 imm 计数 Imm 严格区分）。
+//   - D3 E0/E8/F8/C0/C8: shl/shr/sar/rol/ror eax, cl —— 全部 Ok。
+TEST_F(LifterTranslate, ClVariantShiftLifted) {
+    // D3 E0: shl eax, cl
+    const wvmp::u8 shl_cl[] = {0xD3, 0xE0};
+    auto r = translate_bytes(x64, shl_cl, ir::Arch::X64);
+    ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r.insn.op, ir::Op::Shl);
+    EXPECT_EQ(r.insn.size, ir::Size::S32);
+    EXPECT_EQ(r.insn.dst.reg, ir::Reg::Rax);
+    ASSERT_EQ(r.insn.src.kind, ir::Operand::Kind::Reg);
+    EXPECT_EQ(r.insn.src.reg, ir::Reg::Rcx);
+    EXPECT_TRUE(r.insn.updates_flags);
+
+    // D3 E8: shr eax, cl
+    const wvmp::u8 shr_cl[] = {0xD3, 0xE8};
+    auto r2 = translate_bytes(x64, shr_cl, ir::Arch::X64);
+    ASSERT_EQ(r2.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r2.insn.op, ir::Op::Shr);
+    EXPECT_EQ(r2.insn.dst.reg, ir::Reg::Rax);
+    ASSERT_EQ(r2.insn.src.kind, ir::Operand::Kind::Reg);
+    EXPECT_EQ(r2.insn.src.reg, ir::Reg::Rcx);
+
+    // D3 F8: sar eax, cl
+    const wvmp::u8 sar_cl[] = {0xD3, 0xF8};
+    auto r3 = translate_bytes(x64, sar_cl, ir::Arch::X64);
+    ASSERT_EQ(r3.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r3.insn.op, ir::Op::Sar);
+    ASSERT_EQ(r3.insn.src.kind, ir::Operand::Kind::Reg);
+    EXPECT_EQ(r3.insn.src.reg, ir::Reg::Rcx);
+
+    // D3 C0: rol eax, cl
+    const wvmp::u8 rol_cl[] = {0xD3, 0xC0};
+    auto r4 = translate_bytes(x64, rol_cl, ir::Arch::X64);
+    ASSERT_EQ(r4.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r4.insn.op, ir::Op::Rol);
+    ASSERT_EQ(r4.insn.src.kind, ir::Operand::Kind::Reg);
+    EXPECT_EQ(r4.insn.src.reg, ir::Reg::Rcx);
+
+    // D3 C8: ror eax, cl
+    const wvmp::u8 ror_cl[] = {0xD3, 0xC8};
+    auto r5 = translate_bytes(x64, ror_cl, ir::Arch::X64);
+    ASSERT_EQ(r5.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r5.insn.op, ir::Op::Ror);
+    ASSERT_EQ(r5.insn.src.kind, ir::Operand::Kind::Reg);
+    EXPECT_EQ(r5.insn.src.reg, ir::Reg::Rcx);
+
+    // 48 D3 E0: shl rax, cl —— 64 位 size (REX.W)
+    const wvmp::u8 shl_cl_64[] = {0x48, 0xD3, 0xE0};
+    auto r6 = translate_bytes(x64, shl_cl_64, ir::Arch::X64);
+    ASSERT_EQ(r6.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r6.insn.op, ir::Op::Shl);
+    EXPECT_EQ(r6.insn.size, ir::Size::S64);
+    EXPECT_EQ(r6.insn.dst.reg, ir::Reg::Rax);
+    ASSERT_EQ(r6.insn.src.kind, ir::Operand::Kind::Reg);
+    EXPECT_EQ(r6.insn.src.reg, ir::Reg::Rcx);
 }
 
 TEST_F(LifterTranslate, X86Mode32) {

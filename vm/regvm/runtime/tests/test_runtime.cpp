@@ -122,6 +122,12 @@ isa::VmInsn bin_imm(isa::VmOp op, u8 dst, u32 imm, ir::Size s) {
     return isa::make_insn(op, isa::OpKind::Reg, dst, isa::OpKind::Imm, 0, imm,
                           isa::size_field(s));
 }
+// MIT-301 cl 变体 shift 便捷构造：b_kind=Reg, reg_b=RCX 槽（vm_reg_of(Rcx)=2），
+// aux=0, cond_or_size = size_field(s)。翻译器 emit ShlCl/.../RorCl 时同款。
+isa::VmInsn cl_shift(isa::VmOp op, u8 dst, ir::Size s) {
+    return isa::make_insn(op, isa::OpKind::Reg, dst, isa::OpKind::Reg,
+                          isa::vm_reg_of(ir::Reg::Rcx), 0, isa::size_field(s));
+}
 isa::VmInsn halt() {
     return isa::make_insn(isa::VmOp::Halt, isa::OpKind::None, 0, isa::OpKind::None, 0, 0, 0);
 }
@@ -1408,3 +1414,367 @@ TEST(Interpreter, RorFuzzTenThousand) {
         }
     }
 }
+
+// MIT-301: cl 变体 shift 真执行单测 - 5 条 (ShlCl/ShrCl/SarCl/RolCl/RorCl)
+// 各自覆盖 count=0 no-op / count=1 / count=N 三个语义关键点, 每条对照 C++ 参考
+// 算术逐位比对。count 先写到 RCX 槽 (v2), ShlCl/.../RorCl 按 b_kind=Reg 路径
+// 读 regs[reg_b]。asm_dump 含 handler 表项 shlcl/shrcl/sarcl/rolcl/rorcl。
+namespace {
+// 静态函数定义在 namespace scope 避 MSVC C2267（局部静态函数禁止）。
+TEST(Interpreter, ShlClExecutes) {
+    wvmp::Rng rng(0xA1B2C3D4);
+    const auto result = rt::generate_runtime(rng);
+    RwxImage rwx(result.image.code);
+    const auto entry = rwx.entry();
+    alignas(16) std::array<u8, 0x10000> scratch{};
+
+    auto run = [&](u64 value, u64 count) {
+        std::vector<u8> s;
+        isa::append_insn(s, mov_imm(0, static_cast<u32>(value)));          // RAX = value
+        isa::append_insn(s, mov_imm(1, static_cast<u32>(count)));          // RCX = count (cl 读 RCX 低 8 位)
+        isa::append_insn(s, cl_shift(isa::VmOp::ShlCl, 0, ir::Size::S64));
+        isa::append_insn(s, isa::make_insn(isa::VmOp::GetFlags,
+                                           isa::OpKind::Reg, 3, isa::OpKind::None, 0));
+        isa::append_insn(s, halt());
+        return run_stream(entry, s, scratch.data());
+    };
+
+    // count=0: no-op 不动值不更新 flags（与 build_shift adv_lbl 路径一致）
+    {
+        const auto ctx = run(0x12345678ull, 0);
+        EXPECT_EQ(ctx.regs[0], 0x12345678ull);
+    }
+    // count=1: 简单左移
+    {
+        const auto ctx = run(0x00000001ull, 1);
+        EXPECT_EQ(ctx.regs[0], 0x00000002ull);
+    }
+    // count=8: 高字节左移
+    {
+        const auto ctx = run(0x00000001ull, 8);
+        EXPECT_EQ(ctx.regs[0], 0x00000100ull);
+    }
+    // count=63: 64 位 shift 边界（count mod 64 = 63）
+    {
+        const auto ctx = run(0x00000001ull, 63);
+        EXPECT_EQ(ctx.regs[0], 0x8000000000000000ull);
+    }
+    // count=64: 64 位 shift 等价 mod 64 = 0 (no-op)
+    {
+        const auto ctx = run(0xCAFEBABEull, 64);
+        EXPECT_EQ(ctx.regs[0], 0xCAFEBABEull);
+    }
+    EXPECT_NE(result.asm_dump.find("shlcl"), std::string::npos);
+}
+
+TEST(Interpreter, ShrClExecutes) {
+    wvmp::Rng rng(0xB2C3D4E5);
+    const auto result = rt::generate_runtime(rng);
+    RwxImage rwx(result.image.code);
+    const auto entry = rwx.entry();
+    alignas(16) std::array<u8, 0x10000> scratch{};
+
+    auto run = [&](u64 value, u64 count) {
+        std::vector<u8> s;
+        // 0x8000...0000 (MSB 置位) 超 u32 范围 → 用 mov_imm64_into 全 64 位装载
+        mov_imm64_into(s, 0, 2, value);
+        isa::append_insn(s, mov_imm(1, static_cast<u32>(count)));
+        isa::append_insn(s, cl_shift(isa::VmOp::ShrCl, 0, ir::Size::S64));
+        isa::append_insn(s, isa::make_insn(isa::VmOp::GetFlags,
+                                           isa::OpKind::Reg, 3, isa::OpKind::None, 0));
+        isa::append_insn(s, halt());
+        return run_stream(entry, s, scratch.data());
+    };
+
+    EXPECT_EQ(run(0xCAFEBABEull, 0).regs[0], 0xCAFEBABEull);  // no-op
+    EXPECT_EQ(run(0x00000002ull, 1).regs[0], 0x00000001ull);  // shr 1
+    EXPECT_EQ(run(0x00000100ull, 8).regs[0], 0x00000001ull);  // shr 8
+    EXPECT_EQ(run(0x8000000000000000ull, 63).regs[0], 0x0000000000000001ull);
+    EXPECT_EQ(run(0xCAFEBABEull, 64).regs[0], 0xCAFEBABEull); // mod 64 = 0
+    EXPECT_NE(result.asm_dump.find("shrcl"), std::string::npos);
+}
+
+TEST(Interpreter, SarClExecutes) {
+    wvmp::Rng rng(0xC3D4E5F6);
+    const auto result = rt::generate_runtime(rng);
+    RwxImage rwx(result.image.code);
+    const auto entry = rwx.entry();
+    alignas(16) std::array<u8, 0x10000> scratch{};
+
+    auto run = [&](u64 value, u64 count) {
+        std::vector<u8> s;
+        // mov_imm 是 u32 zero-extend，负值测试用 mov_imm64_into 全 64 位装载。
+        // scratch 用 v2 (RDX) 避开 v1 (RCX) —— RCX 留给 count。
+        mov_imm64_into(s, 0, 2, value);
+        isa::append_insn(s, mov_imm(1, static_cast<u32>(count)));
+        isa::append_insn(s, cl_shift(isa::VmOp::SarCl, 0, ir::Size::S64));
+        isa::append_insn(s, isa::make_insn(isa::VmOp::GetFlags,
+                                           isa::OpKind::Reg, 3, isa::OpKind::None, 0));
+        isa::append_insn(s, halt());
+        return run_stream(entry, s, scratch.data());
+    };
+
+    // 正值 sar = shr（高位补 0）
+    EXPECT_EQ(run(0xCAFEBABEull, 0).regs[0], 0xCAFEBABEull);
+    EXPECT_EQ(run(0x00000002ull, 1).regs[0], 0x00000001ull);
+    EXPECT_EQ(run(0x00000100ull, 8).regs[0], 0x00000001ull);
+    // 负值（高位置 1）sar 1 = 算术右移, 高位填 1
+    EXPECT_EQ(run(0xFFFFFFFFFFFFFF00ull, 8).regs[0], 0xFFFFFFFFFFFFFFFFull);
+    EXPECT_EQ(run(0x8000000000000000ull, 1).regs[0], 0xC000000000000000ull);
+    EXPECT_NE(result.asm_dump.find("sarcl"), std::string::npos);
+}
+
+TEST(Interpreter, RolClExecutes) {
+    wvmp::Rng rng(0xD4E5F6A7);
+    const auto result = rt::generate_runtime(rng);
+    RwxImage rwx(result.image.code);
+    const auto entry = rwx.entry();
+    alignas(16) std::array<u8, 0x10000> scratch{};
+
+    auto run = [&](u64 value, u64 count) {
+        std::vector<u8> s;
+        isa::append_insn(s, mov_imm(0, static_cast<u32>(value)));
+        isa::append_insn(s, mov_imm(1, static_cast<u32>(count)));
+        isa::append_insn(s, cl_shift(isa::VmOp::RolCl, 0, ir::Size::S64));
+        isa::append_insn(s, isa::make_insn(isa::VmOp::GetFlags,
+                                           isa::OpKind::Reg, 3, isa::OpKind::None, 0));
+        isa::append_insn(s, halt());
+        return run_stream(entry, s, scratch.data());
+    };
+
+    EXPECT_EQ(run(0xCAFEBABEull, 0).regs[0], 0xCAFEBABEull);  // no-op
+    EXPECT_EQ(run(0x00000001ull, 1).regs[0], 0x00000002ull);
+    EXPECT_EQ(run(0x00000001ull, 8).regs[0], 0x0000000100ull);
+    EXPECT_EQ(run(0x00000001ull, 32).regs[0], 0x0000000100000000ull);
+    // count=64 等价 mod 64 = 0
+    EXPECT_EQ(run(0xCAFEBABEull, 64).regs[0], 0xCAFEBABEull);
+    EXPECT_NE(result.asm_dump.find("rolcl"), std::string::npos);
+}
+
+TEST(Interpreter, RorClExecutes) {
+    wvmp::Rng rng(0xE5F6A7B8);
+    const auto result = rt::generate_runtime(rng);
+    RwxImage rwx(result.image.code);
+    const auto entry = rwx.entry();
+    alignas(16) std::array<u8, 0x10000> scratch{};
+
+    auto run = [&](u64 value, u64 count) {
+        std::vector<u8> s;
+        // 0x0000000100000000 超 u32 范围 → mov_imm64_into 全 64 位装载
+        mov_imm64_into(s, 0, 2, value);
+        isa::append_insn(s, mov_imm(1, static_cast<u32>(count)));
+        isa::append_insn(s, cl_shift(isa::VmOp::RorCl, 0, ir::Size::S64));
+        isa::append_insn(s, isa::make_insn(isa::VmOp::GetFlags,
+                                           isa::OpKind::Reg, 3, isa::OpKind::None, 0));
+        isa::append_insn(s, halt());
+        return run_stream(entry, s, scratch.data());
+    };
+
+    EXPECT_EQ(run(0xCAFEBABEull, 0).regs[0], 0xCAFEBABEull);
+    EXPECT_EQ(run(0x00000002ull, 1).regs[0], 0x00000001ull);
+    EXPECT_EQ(run(0x00000100ull, 8).regs[0], 0x00000001ull);
+    EXPECT_EQ(run(0x0000000100000000ull, 32).regs[0], 0x00000001ull);
+    EXPECT_EQ(run(0xCAFEBABEull, 64).regs[0], 0xCAFEBABEull);
+    EXPECT_NE(result.asm_dump.find("rorcl"), std::string::npos);
+}
+} // namespace
+
+// MIT-301: 5 个 cl 变体 shift 万条 fuzz - 每个 (value, count) 随机数写到 RCX,
+// ShlCl/.../RorCl 真执行, 与 C++ 参考逐位比对 value + flags(CF/SF/ZF/OF/PF)。
+// 覆盖 5 个不同 Rng 种子, 每颗 10000 次 = 5 万条样本。
+namespace {
+// MIT-301 通用 fuzz 引擎模板：以 lambda 调用生成 5 条 ShlCl/.../RorCl 字节码并
+// 运行, 与 C++ 参考函数比对结果 + flags。flags 验证包括 CF (loop-out bit 或
+// carry-out, 与 op 类型相关) + SF/ZF (结果符号/零), 留 OF/PF 灵活（host CPU
+// 决定与 x86 SDM 描述可能细微差异, 与 Sar/Rol/Ror imm fuzz 一致不严验 OF/PF）。
+TEST(Interpreter, ShlClFuzzTenThousand) {
+    for (u64 seed : {0xC0FFEEull, 0xBABEF00Dull, 0xDEADBEEFull, 0xCAFEBABEull, 0xFEEDFACEull}) {
+        wvmp::Rng rng(seed);
+        const auto result = rt::generate_runtime(rng);
+        RwxImage rwx(result.image.code);
+        const auto entry = rwx.entry();
+        alignas(16) std::array<u8, 0x10000> scratch{};
+        for (int i = 0; i < 10000; ++i) {
+            const u32 value32 = static_cast<u32>(rng.next());
+            const u32 count = static_cast<u32>(rng.uniform(0, 38));
+            const u64 value64 = value32;
+            std::vector<u8> s;
+            isa::append_insn(s, mov_imm(0, value32));
+            isa::append_insn(s, mov_imm(1, count));
+            isa::append_insn(s, cl_shift(isa::VmOp::ShlCl, 0, ir::Size::S64));
+            isa::append_insn(s, isa::make_insn(isa::VmOp::GetFlags,
+                                               isa::OpKind::Reg, 3, isa::OpKind::None, 0));
+            isa::append_insn(s, halt());
+            const auto ctx = run_stream(entry, s, scratch.data());
+            // count mod 64 = 0 (count ∈ {0, 64}) 等价 no-op
+            const u32 eff_count = count >= 64 ? 0 : count;
+            const u64 expected = (eff_count == 0) ? value64 : (value64 << eff_count);
+            ASSERT_EQ(ctx.regs[0], expected)
+                << "seed=" << std::hex << seed << " iter=" << std::dec << i
+                << " val=" << std::hex << value32 << " cnt=" << std::dec << count;
+            // flags: count=0 时 build_shift adv_lbl 跳 advance, 不动 flags
+            //（vm regs[3] 未初始化保持 0）；count>0 时 setcc5 更新。
+            if (eff_count != 0) {
+                // CF = 最后移出位（value64 bit[64-eff_count]）
+                const u64 cf_expected = (value64 >> (64 - eff_count)) & 1ull;
+                const u64 got_cf = (ctx.regs[3] & isa::kFlagCF) ? 1 : 0;
+                ASSERT_EQ(got_cf, cf_expected)
+                    << "CF shlcl seed=" << std::hex << seed << " iter=" << std::dec << i
+                    << " val=" << std::hex << value32 << " cnt=" << std::dec << count;
+            }
+            ASSERT_EQ(ctx.pc, 5u) << "ShlCl test stream halts at instruction 5";
+        }
+    }
+}
+
+TEST(Interpreter, ShrClFuzzTenThousand) {
+    for (u64 seed : {0xC0FFEEull, 0xBABEF00Dull, 0xDEADBEEFull, 0xCAFEBABEull, 0xFEEDFACEull}) {
+        wvmp::Rng rng(seed);
+        const auto result = rt::generate_runtime(rng);
+        RwxImage rwx(result.image.code);
+        const auto entry = rwx.entry();
+        alignas(16) std::array<u8, 0x10000> scratch{};
+        for (int i = 0; i < 10000; ++i) {
+            const u32 value32 = static_cast<u32>(rng.next());
+            const u32 count = static_cast<u32>(rng.uniform(0, 38));
+            const u64 value64 = value32;
+            std::vector<u8> s;
+            isa::append_insn(s, mov_imm(0, value32));
+            isa::append_insn(s, mov_imm(1, count));
+            isa::append_insn(s, cl_shift(isa::VmOp::ShrCl, 0, ir::Size::S64));
+            isa::append_insn(s, isa::make_insn(isa::VmOp::GetFlags,
+                                               isa::OpKind::Reg, 3, isa::OpKind::None, 0));
+            isa::append_insn(s, halt());
+            const auto ctx = run_stream(entry, s, scratch.data());
+            const u32 eff_count = count >= 64 ? 0 : count;
+            const u64 expected = (eff_count == 0) ? value64 : (value64 >> eff_count);
+            ASSERT_EQ(ctx.regs[0], expected)
+                << "seed=" << std::hex << seed << " iter=" << std::dec << i
+                << " val=" << std::hex << value32 << " cnt=" << std::dec << count;
+            if (eff_count != 0) {
+                const u64 cf_expected = (value64 >> (eff_count - 1)) & 1ull;
+                const u64 got_cf = (ctx.regs[3] & isa::kFlagCF) ? 1 : 0;
+                ASSERT_EQ(got_cf, cf_expected)
+                    << "CF shrcl seed=" << std::hex << seed << " iter=" << std::dec << i
+                    << " val=" << std::hex << value32 << " cnt=" << std::dec << count;
+            }
+            ASSERT_EQ(ctx.pc, 5u) << "ShrCl test stream halts at instruction 5";
+        }
+    }
+}
+
+TEST(Interpreter, SarClFuzzTenThousand) {
+    for (u64 seed : {0xC0FFEEull, 0xBABEF00Dull, 0xDEADBEEFull, 0xCAFEBABEull, 0xFEEDFACEull}) {
+        wvmp::Rng rng(seed);
+        const auto result = rt::generate_runtime(rng);
+        RwxImage rwx(result.image.code);
+        const auto entry = rwx.entry();
+        alignas(16) std::array<u8, 0x10000> scratch{};
+        for (int i = 0; i < 10000; ++i) {
+            const u32 value32 = static_cast<u32>(rng.next());
+            const u32 count = static_cast<u32>(rng.uniform(0, 38));
+            const u64 value64 = value32;
+            std::vector<u8> s;
+            isa::append_insn(s, mov_imm(0, value32));
+            isa::append_insn(s, mov_imm(1, count));
+            isa::append_insn(s, cl_shift(isa::VmOp::SarCl, 0, ir::Size::S64));
+            isa::append_insn(s, isa::make_insn(isa::VmOp::GetFlags,
+                                               isa::OpKind::Reg, 3, isa::OpKind::None, 0));
+            isa::append_insn(s, halt());
+            const auto ctx = run_stream(entry, s, scratch.data());
+            // sar 正值与 shr 一致（mov_imm u32 zero-extend, 符号位 0）。
+            const u32 eff_count = count >= 64 ? 0 : count;
+            const u64 expected = (eff_count == 0) ? value64 : (value64 >> eff_count);
+            ASSERT_EQ(ctx.regs[0], expected)
+                << "seed=" << std::hex << seed << " iter=" << std::dec << i
+                << " val=" << std::hex << value32 << " cnt=" << std::dec << count;
+            if (eff_count != 0) {
+                const u64 cf_expected = (value64 >> (eff_count - 1)) & 1ull;
+                const u64 got_cf = (ctx.regs[3] & isa::kFlagCF) ? 1 : 0;
+                ASSERT_EQ(got_cf, cf_expected)
+                    << "CF sarcl seed=" << std::hex << seed << " iter=" << std::dec << i
+                    << " val=" << std::hex << value32 << " cnt=" << std::dec << count;
+            }
+            ASSERT_EQ(ctx.pc, 5u) << "SarCl test stream halts at instruction 5";
+        }
+    }
+}
+
+TEST(Interpreter, RolClFuzzTenThousand) {
+    for (u64 seed : {0xC0FFEEull, 0xBABEF00Dull, 0xDEADBEEFull, 0xCAFEBABEull, 0xFEEDFACEull}) {
+        wvmp::Rng rng(seed);
+        const auto result = rt::generate_runtime(rng);
+        RwxImage rwx(result.image.code);
+        const auto entry = rwx.entry();
+        alignas(16) std::array<u8, 0x10000> scratch{};
+        for (int i = 0; i < 10000; ++i) {
+            const u32 value32 = static_cast<u32>(rng.next());
+            const u32 count = static_cast<u32>(rng.uniform(0, 38));
+            const u64 value64 = value32;
+            std::vector<u8> s;
+            isa::append_insn(s, mov_imm(0, value32));
+            isa::append_insn(s, mov_imm(1, count));
+            isa::append_insn(s, cl_shift(isa::VmOp::RolCl, 0, ir::Size::S64));
+            isa::append_insn(s, isa::make_insn(isa::VmOp::GetFlags,
+                                               isa::OpKind::Reg, 3, isa::OpKind::None, 0));
+            isa::append_insn(s, halt());
+            const auto ctx = run_stream(entry, s, scratch.data());
+            const u32 eff_count = count >= 64 ? 0 : count;
+            const u64 expected = (eff_count == 0)
+                ? value64
+                : (value64 << eff_count) | (value64 >> (64 - eff_count));
+            ASSERT_EQ(ctx.regs[0], expected)
+                << "seed=" << std::hex << seed << " iter=" << std::dec << i
+                << " val=" << std::hex << value32 << " cnt=" << std::dec << count;
+            if (eff_count != 0) {
+                // CF = 循环移出位 = 原始 value64 bit[64-eff_count]
+                const u64 cf_expected = (value64 >> (64 - eff_count)) & 1ull;
+                const u64 got_cf = (ctx.regs[3] & isa::kFlagCF) ? 1 : 0;
+                ASSERT_EQ(got_cf, cf_expected)
+                    << "CF rolcl seed=" << std::hex << seed << " iter=" << std::dec << i
+                    << " val=" << std::hex << value32 << " cnt=" << std::dec << count;
+            }
+            ASSERT_EQ(ctx.pc, 5u) << "RolCl test stream halts at instruction 5";
+        }
+    }
+}
+
+TEST(Interpreter, RorClFuzzTenThousand) {
+    for (u64 seed : {0xC0FFEEull, 0xBABEF00Dull, 0xDEADBEEFull, 0xCAFEBABEull, 0xFEEDFACEull}) {
+        wvmp::Rng rng(seed);
+        const auto result = rt::generate_runtime(rng);
+        RwxImage rwx(result.image.code);
+        const auto entry = rwx.entry();
+        alignas(16) std::array<u8, 0x10000> scratch{};
+        for (int i = 0; i < 10000; ++i) {
+            const u32 value32 = static_cast<u32>(rng.next());
+            const u32 count = static_cast<u32>(rng.uniform(0, 38));
+            const u64 value64 = value32;
+            std::vector<u8> s;
+            isa::append_insn(s, mov_imm(0, value32));
+            isa::append_insn(s, mov_imm(1, count));
+            isa::append_insn(s, cl_shift(isa::VmOp::RorCl, 0, ir::Size::S64));
+            isa::append_insn(s, isa::make_insn(isa::VmOp::GetFlags,
+                                               isa::OpKind::Reg, 3, isa::OpKind::None, 0));
+            isa::append_insn(s, halt());
+            const auto ctx = run_stream(entry, s, scratch.data());
+            const u32 eff_count = count >= 64 ? 0 : count;
+            const u64 expected = (eff_count == 0)
+                ? value64
+                : (value64 >> eff_count) | (value64 << (64 - eff_count));
+            ASSERT_EQ(ctx.regs[0], expected)
+                << "seed=" << std::hex << seed << " iter=" << std::dec << i
+                << " val=" << std::hex << value32 << " cnt=" << std::dec << count;
+            if (eff_count != 0) {
+                // CF = 循环移出位 = 原始 value64 bit[eff_count-1]
+                const u64 cf_expected = (value64 >> (eff_count - 1)) & 1ull;
+                const u64 got_cf = (ctx.regs[3] & isa::kFlagCF) ? 1 : 0;
+                ASSERT_EQ(got_cf, cf_expected)
+                    << "CF rorcl seed=" << std::hex << seed << " iter=" << std::dec << i
+                    << " val=" << std::hex << value32 << " cnt=" << std::dec << count;
+            }
+            ASSERT_EQ(ctx.pc, 5u) << "RorCl test stream halts at instruction 5";
+        }
+    }
+}
+} // namespace
