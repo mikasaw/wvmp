@@ -3,10 +3,23 @@
 #include "wvmp/common/types.hpp"
 #include "wvmp/vm/backend.hpp"
 
+#include <array>
 #include <cstddef>
 #include <string>
 
 namespace wvmp::regvm::runtime {
+
+// callgate handler 跨 native call 必须保留 ctx_，因此 AsmGen::roll()
+// 分配 ctx_ 时只能从 callee-saved 寄存器池里抽（Win64 ABI: callee 必须保留
+// rbx, rbp, rsi, rdi, r12, r13, r14, r15）。如果 ctx_ 落到 caller-saved，
+// callgate step 6 `call t_[0]` 调 native 时 callee 按 ABI clobber 掉 ctx_，
+// step 9-10 用 r64(ctx_) 寻址 VmContext 会读到垃圾 → segfault。
+// kPhys[] 索引: rax=0, rdx=1, rbx=2, rbp=3, rsi=4, rdi=5, r8=6, r9=7,
+//                r10=8, r11=9, r12=10, r13=11, r14=12, r15=13.
+// 注意：kPhys 顺序不含 rsp（始终不参与）和 rcx（移位计数保留）。
+// 但本池指代的是 vm/regvm/runtime/src/asmgen.cpp 内 kPhys[14] 的下标，含义一致。
+// 详见 .multica/issue-10-callgate-ctx-callee-saved.md.
+inline constexpr std::array<int, 8> kCalleeSavedIdx = {2, 3, 4, 5, 10, 11, 12, 13};
 
 // =============================================================================
 // VmContext —— 解释器机器码与宿主之间唯一的运行时 ABI。

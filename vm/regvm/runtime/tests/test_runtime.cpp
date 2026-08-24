@@ -951,10 +951,13 @@ TEST(Interpreter, FiveSeedStability) {
 // 的"巧合"。修复后用 r64(ctx_)。本测试：
 //   (a) 多 seed 生成 runtime 全部成功（防回退偶发崩溃）
 //   (b) callgate handler 输出**绝大多数 seed** 不含硬编码 "[r14 + 0xD0"——
-//       ctx_ ∈ 14 GPR 池，等概率 → 13/14 ≈ 93% seed 应不含。任意一 seed 含
+//       ctx_ ∈ 14 GPR 池（MIT-299 后缩为 8 个 callee-saved），等概率 →
+//       13/14 ≈ 93% (MIT-299 后 7/8 ≈ 88%) seed 应不含。任意一 seed 含
 //       "[r14 +" 即视为硬编码回归。
-//   (c) seed=12345（已知 ctx_=r14）仍含 [r14 + 0xD0]——保持兼容性（fix 是替换
-//       字面量, ctx_=r14 时仍然产生 [r14 + 0xD0]，但不再是硬编码假设）。
+//   (c) MIT-299 起删除 seed=12345 → r14 特定断言：roll() 重写后 seed=12345
+//       不再保证 ctx_=r14（callee-saved 池 uniform 取, RNG 状态前移）。
+//       改由新单测 CallgateCtxAlwaysCalleeSaved / AsmGenCtxAlwaysCalleeSaved
+//       覆盖 "ctx_ 必为 callee-saved" 的不变量。
 TEST(Interpreter, CallGateScratchRegisterIndependence) {
     auto extract_callgate = [](const std::string& dump) -> std::string {
         const std::string marker = "handler callgate @ +";
@@ -964,16 +967,6 @@ TEST(Interpreter, CallGateScratchRegisterIndependence) {
         const auto end = (end_marker != std::string::npos) ? end_marker : dump.size();
         return dump.substr(pos, end - pos);
     };
-
-    // (c) seed=12345 → pool[0]=r14（ctx_=r14）→ 必须含 [r14 + 0xD0]
-    {
-        wvmp::Rng rng(12345ull);
-        const auto result = rt::generate_runtime(rng);
-        const std::string cg = extract_callgate(result.asm_dump);
-        ASSERT_FALSE(cg.empty()) << "seed=12345 dump 缺 callgate handler 段";
-        EXPECT_NE(cg.find("[r14 + 0xD0"), std::string::npos)
-            << "seed=12345 期望 ctx_=r14 → r64(ctx_) 仍拼出 [r14 + 0xD0]";
-    }
 
     // (a)+(b) 扫一批 seed，统计 callgate dump 是否仍含 [r14 + 0xD0]
     int total = 0, with_r14 = 0;
@@ -990,10 +983,148 @@ TEST(Interpreter, CallGateScratchRegisterIndependence) {
         ++total;
     }
     // 修复后: 任意含 "[r14 + 0xD0" 的 seed 即硬编码回归（ctx_=r14 是 1/14
-    // 巧合，不应影响判断——若**所有** seed 都含, 说明仍是硬编码字面量）。
+    // 巧合, MIT-299 后 1/8, 不应影响判断——若**所有** seed 都含, 说明仍
+    // 是硬编码字面量）。
     // 期望: 大多数 seed 不含（≈ 13/20，约 65% 仍可能出现，但全含为回归）。
     EXPECT_LT(with_r14, total)
         << "callgate dump 全 seed 都含 [r14 + 0xD0]，疑似硬编码回归";
+}
+
+// MIT-299 follow-up (issue-10): 验证 AsmGen::roll() 分配 ctx_ 时
+// 永远落在 callee-saved 池里（Win64 ABI：rbx, rbp, rsi, rdi, r12-r15）。
+// 否则 callgate step 6 `call t_[0]` 跨 native call 时，callee 按 ABI
+// clobber 掉 caller-saved ctx_，step 9-10 用 r64(ctx_) 寻址 VmContext
+// 会读到垃圾 → segfault（rc=139 SIGSEGV）。
+//
+// 验证策略：callgate 步骤 5 把 reserved slots (regs[24..27]) 抬到物理
+// rcx/rdx/r8/r9，访问模式必是 `[<ctx_> + 0xD0/D8/E0/E8]`。扫 dump 中
+// 哪个 callee-saved 寄存器名 + 0xD0..0xE8 出现 — 该寄存器即为 ctx_。
+// （任何 callee-saved 出现即可；若 caller-saved 出现 = 硬编码回归 = 测试失败。）
+TEST(Interpreter, AsmGenCtxAlwaysCalleeSaved) {
+    auto extract_callgate = [](const std::string& dump) -> std::string {
+        const std::string marker = "handler callgate @ +";
+        const auto pos = dump.find(marker);
+        if (pos == std::string::npos) return {};
+        const auto end_marker = dump.find("; ---- handler", pos + marker.size());
+        const auto end = (end_marker != std::string::npos) ? end_marker : dump.size();
+        return dump.substr(pos, end - pos);
+    };
+    const std::array<const char*, 8> kCalleeSavedNames = {
+        "rbx", "rbp", "rsi", "rdi", "r12", "r13", "r14", "r15"
+    };
+    const std::array<const char*, 4> kOffsets = {"0xD0", "0xD8", "0xE0", "0xE8"};
+
+    // 跑 50 个不同 seed，每个 seed 验证 ctx_ 落在 callee-saved 池里。
+    int total = 0, ok = 0;
+    for (u64 seed = 1; seed <= 50; ++seed) {
+        wvmp::Rng rng(seed);
+        const auto result = rt::generate_runtime(rng);
+        const std::string cg = extract_callgate(result.asm_dump);
+        ASSERT_FALSE(cg.empty()) << "seed=" << seed << " 缺 callgate handler 段";
+
+        // 找出 dump 中真正作为 ctx_ 使用的寄存器名（任一 callee-saved + 0xD0..0xE8）。
+        std::string found_reg;
+        for (const auto* name : kCalleeSavedNames) {
+            for (const auto* off : kOffsets) {
+                if (cg.find(std::string("[") + name + " + " + off + "]")
+                    != std::string::npos) {
+                    found_reg = name;
+                    break;
+                }
+            }
+            if (!found_reg.empty()) break;
+        }
+        ASSERT_FALSE(found_reg.empty())
+            << "seed=" << seed << " callgate 段未找到任何 callee-saved + 0xD0..0xE8";
+
+        // 同时确保无 caller-saved 寄存器被用作 ctx_ (硬编码回归)。
+        const std::array<const char*, 7> kCallerSaved = {
+            "rax", "rcx", "rdx", "r8", "r9", "r10", "r11"
+        };
+        std::string caller_reg;
+        for (const auto* name : kCallerSaved) {
+            for (const auto* off : kOffsets) {
+                if (cg.find(std::string("[") + name + " + " + off + "]")
+                    != std::string::npos) {
+                    caller_reg = name;
+                    break;
+                }
+            }
+            if (!caller_reg.empty()) break;
+        }
+        ++total;
+        if (caller_reg.empty()) ++ok;
+        EXPECT_TRUE(caller_reg.empty())
+            << "seed=" << seed << " callgate 用 caller-saved [" << caller_reg
+            << " + 0xD0..0xE8] 寻址 VmContext，跨 native call 会 segfault";
+    }
+    EXPECT_EQ(ok, total) << "ctx_ 池约束违反 " << (total - ok) << "/" << total;
+}
+
+// 升级版 CallGateScratchRegisterIndependence：现在 callgate dump 里
+// [reg + 0xD0..0xE8] 必须**总是** callee-saved 寄存器名（任何 seed）。
+// 20 seed 覆盖：seed=12345 等。MIT-299 修复后，所有 seed 应一致。
+TEST(Interpreter, CallgateCtxAlwaysCalleeSaved) {
+    auto extract_callgate = [](const std::string& dump) -> std::string {
+        const std::string marker = "handler callgate @ +";
+        const auto pos = dump.find(marker);
+        if (pos == std::string::npos) return {};
+        const auto end_marker = dump.find("; ---- handler", pos + marker.size());
+        const auto end = (end_marker != std::string::npos) ? end_marker : dump.size();
+        return dump.substr(pos, end - pos);
+    };
+    // callgate 步骤 5 必须用同一个 ctx_ 寄存器寻址 0xD0..0xE8 四个 slot。
+    // 扫 callgate 段，检查所有形如 "[<reg> + 0xD0/D8/E0/E8]" 的引用都用 callee-saved 寄存器名。
+    const std::array<const char*, 8> kCalleeSavedNames = {
+        "rbx", "rbp", "rsi", "rdi", "r12", "r13", "r14", "r15"
+    };
+    const std::array<const char*, 4> kOffsets = {"0xD0", "0xD8", "0xE0", "0xE8"};
+
+    int total = 0, ok = 0;
+    for (u64 seed : {1ull, 2ull, 3ull, 5ull, 10ull, 12345ull, 99999ull, 0xDEADBEEFull,
+                     0xCAFEBABEull, 0xC0FFEEull, 0xABCDEFull, 0xBABEF00Dull,
+                     0xFEEDFACEull, 4ull, 6ull, 7ull, 8ull, 100ull,
+                     1000ull, 10000ull}) {
+        wvmp::Rng rng(seed);
+        const auto result = rt::generate_runtime(rng);
+        const std::string cg = extract_callgate(result.asm_dump);
+        ASSERT_FALSE(cg.empty()) << "seed=" << seed << " 缺 callgate handler 段";
+        ++total;
+        // 至少应找到一处含 callee-saved 寄存器 + 0xD0..0xE8 的引用。
+        bool found_callee = false;
+        for (const auto* name : kCalleeSavedNames) {
+            for (const auto* off : kOffsets) {
+                if (cg.find(std::string("[") + name + " + " + off + "]")
+                    != std::string::npos) {
+                    found_callee = true;
+                    break;
+                }
+            }
+            if (found_callee) break;
+        }
+        // 同时断言：不含 caller-saved 寄存器名 + 0xD0/D8/E0/E8 的引用。
+        const std::array<const char*, 7> kCallerSaved = {
+            "rax", "rcx", "rdx", "r8", "r9", "r10", "r11"
+        };
+        bool found_caller = false;
+        std::string found_caller_reg;
+        for (const auto* name : kCallerSaved) {
+            for (const auto* off : kOffsets) {
+                if (cg.find(std::string("[") + name + " + " + off + "]")
+                    != std::string::npos) {
+                    found_caller = true;
+                    found_caller_reg = name;
+                    break;
+                }
+            }
+            if (found_caller) break;
+        }
+        EXPECT_FALSE(found_caller)
+            << "seed=" << seed << " callgate 用 caller-saved [" << found_caller_reg
+            << " + 0xD0..0xE8] 寻址 VmContext，跨 native call 会 segfault";
+        if (found_callee && !found_caller) ++ok;
+    }
+    EXPECT_EQ(ok, total) << "callgate dump 校验失败 " << (total - ok) << "/" << total;
 }
 
 TEST(Interpreter, AsmDumpStructure) {

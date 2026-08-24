@@ -201,14 +201,56 @@ public:
     explicit AsmGen(Rng& rng) : rng_(rng) {}
 
     void roll() {
-        std::array<int, 14> pool{};
-        for (int i = 0; i < 14; ++i) pool[i] = i;
+        // ctx_ 必须 callee-saved：callgate handler 跨 native call 用 r64(ctx_)
+        // 寻址 VmContext（step 9-10 push/pop 完后从 VmContext 读 pc/flags/base），
+        // 若 ctx_ 落到 caller-saved（rax/rdx/r8-r11），callee 按 Win64 ABI clobber，
+        // 寻址读到垃圾 → segfault（rc=139 SIGSEGV）。见 issue-10 修复：
+        //   .multica/issue-10-callgate-ctx-callee-saved.md
+        // kPhys[14] 索引下，callee-saved = {rbx=2, rbp=3, rsi=4, rdi=5,
+        //                                  r12=10, r13=11, r14=12, r15=13}
+        ctx_ = kCalleeSavedIdx[rng_.uniform(0u, u64(kCalleeSavedIdx.size()) - 1u)];
+
+        // base_ 也必须 callee-saved：vm_entry push base_ + push 7 rest(跳过 base_)
+        // = 8 个 push, host_rsp = native_sp - 0x1C8. 若 base_ 是 caller-saved
+        // (如 rax), 它不在 rest 数组里, push 数变成 9, host_rsp = native_sp
+        // - 0x1D0. callgate step 7 `sub rsp, 0x1A8` 按 0x1C8 算, 实际需 0x1A0
+        // (少 8 字节), pop ctx_ 时读错地址, ctx_ 被破坏 → 跨 native call
+        // 后寻址 VmContext 读到垃圾 → segfault.
+        int base_idx = ctx_;
+        while (base_idx == ctx_) {
+            base_idx = kCalleeSavedIdx[rng_.uniform(0u, u64(kCalleeSavedIdx.size()) - 1u)];
+        }
+
+        // t_[0] (目标 VA) 和 t_[5] (aux 立即数) 都必须 callee-saved:
+        // callgate step 5 写物理 rcx/rdx/r8/r9 (Win64 ABI 参数寄存器)。若
+        // t_[0] = rdx/r8/r9, step 5 clobber 目标 VA, step 6 call 错误地址。
+        // 若 t_[5] = rdx/r8/r9, step 5 clobber aux 立即数, step 1 算出错的
+        // 目标 VA。两者都得避 {rdx=1, r8=6, r9=7}, 即限定 callee-saved 池。
+        int t0_idx = ctx_;
+        while (t0_idx == ctx_ || t0_idx == base_idx) {
+            t0_idx = kCalleeSavedIdx[rng_.uniform(0u, u64(kCalleeSavedIdx.size()) - 1u)];
+        }
+        int t5_idx = ctx_;
+        while (t5_idx == ctx_ || t5_idx == base_idx || t5_idx == t0_idx) {
+            t5_idx = kCalleeSavedIdx[rng_.uniform(0u, u64(kCalleeSavedIdx.size()) - 1u)];
+        }
+
+        // 其余 10 个寄存器（除 ctx_/base_/t_[0]/t_[5]）随机洗牌给 pc_/flags_/t_[1..9]
+        std::array<int, 10> pool{};
+        int j = 0;
+        for (int i = 0; i < 14; ++i) {
+            if (i == ctx_ || i == base_idx || i == t0_idx || i == t5_idx) continue;
+            pool[j++] = i;
+        }
         rng_.shuffle(pool.begin(), pool.end());
-        ctx_ = pool[0];
-        pc_ = pool[1];
-        flags_ = pool[2];
-        base_ = pool[3];
-        for (int i = 0; i < 10; ++i) t_[i] = pool[4 + i];
+        pc_    = pool[0];
+        flags_ = pool[1];
+        // t_[0] 和 t_[5] 已固定, 其余 t_[i] 从 pool 填 (i=1..4, 6..9 = 8 个)
+        for (int i = 0; i < 4; ++i) t_[i + 1] = pool[2 + i];     // t_[1..4]
+        for (int i = 0; i < 4; ++i) t_[i + 6] = pool[6 + i];     // t_[6..9] (跳过 t_[5])
+        t_[0] = t0_idx;
+        t_[5] = t5_idx;
+        base_ = base_idx;
         for (int i = 0; i < 4; ++i) size_perm_[i] = i;
         rng_.shuffle(size_perm_.begin(), size_perm_.end());
         for (int i = 0; i < 16; ++i) cond_perm_[i] = i;
