@@ -169,18 +169,21 @@ TEST(StubLinkPass, UnmappableRegionKeepsNative) {
 
 TEST(StubGen, StubBytesStartWithPushesAndSubRsp) {
     // image_base（M2-8 起 stub 协定新增；PE optional header 的 ImageBase 字段
-    // 写入 VmContext.scratch_mem，供 Load/Store 访存汇编 `add addr, [CTX+0x110]`）
+    // 写入 VmContext.scratch_mem，供 Load/Store 访存汇编 `add addr, [CTX+0x110]`）。
+    // M2-9: VmContext 加 native_sp (+0x120) + host_rsp (+0x128) + base_save
+    // (+0x130) 共 24 字节，结构从 0x120 长到 0x138；kCtxSize 同步从 0x130 调到
+    // 0x140（0x138 + 8 字节 16-对齐垫）。
     const auto stub =
         wvmp::passes::generate_entry_stub(0x9000, 0x9100, 0x9040, 0x1100, 0x140000000ull);
     ASSERT_GT(stub.size(), static_cast<size_t>(32));
     // 首字节必为 push（0x50-0x57 或 REX 0x41 前缀）。
     EXPECT_TRUE((stub[0] >= 0x50 && stub[0] <= 0x57) ||
                 (stub[0] == 0x41 && stub[1] >= 0x50 && stub[1] <= 0x57));
-    // 序言后应有 sub rsp, 0x130（48 81 EC 30 01 00 00）。
+    // 序言后应有 sub rsp, 0x140（48 81 EC 40 01 00 00）。
     bool found_sub = false;
     for (size_t i = 0; i + 7 <= stub.size(); ++i) {
         if (stub[i] == 0x48 && stub[i + 1] == 0x81 && stub[i + 2] == 0xEC &&
-            stub[i + 3] == 0x30 && stub[i + 4] == 0x01) {
+            stub[i + 3] == 0x40 && stub[i + 4] == 0x01) {
             found_sub = true;
             break;
         }

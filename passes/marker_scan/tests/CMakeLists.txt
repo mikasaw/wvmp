@@ -139,3 +139,28 @@ target_compile_options(wvmp_rip_relative_simple_sample PRIVATE
 target_link_options(wvmp_rip_relative_simple_sample PRIVATE
     $<$<CXX_COMPILER_ID:MSVC>:/INCREMENTAL:NO>
 )
+
+# MIT-249: 端到端正路径样本——标记函数 f1 通过 call gate 调到未标记的
+# native helper，验证 CallGate 路径通畅（直接 call → emit CallGate →
+# 运行时切 rsp 跑 native → ret → RAX 写回 → 继续 dispatch）。helper 是
+# 普通 native 函数（非标记），callee 非 stub → call gate 走 native 主路径。
+add_executable(wvmp_call_gate_sample call_gate_sample_main.cpp)
+target_link_libraries(wvmp_call_gate_sample PRIVATE wvmp::sdk)
+target_compile_options(wvmp_call_gate_sample PRIVATE
+    $<$<CXX_COMPILER_ID:MSVC>:/Od;/Ob0;/utf-8>
+    $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-O0>
+)
+target_link_options(wvmp_call_gate_sample PRIVATE
+    $<$<CXX_COMPILER_ID:MSVC>:/INCREMENTAL:NO>
+)
+
+# MIT-249: 极简调试样本——不含 rip-relative 全局访存，单独验证 CallGate 路径.
+add_executable(wvmp_call_gate_simple_sample call_gate_simple_main.cpp)
+target_link_libraries(wvmp_call_gate_simple_sample PRIVATE wvmp::sdk)
+target_compile_options(wvmp_call_gate_simple_sample PRIVATE
+    $<$<CXX_COMPILER_ID:MSVC>:/Od;/Ob0;/utf-8>
+    $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-O0>
+)
+target_link_options(wvmp_call_gate_simple_sample PRIVATE
+    $<$<CXX_COMPILER_ID:MSVC>:/INCREMENTAL:NO>
+)

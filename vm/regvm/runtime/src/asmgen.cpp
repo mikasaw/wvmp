@@ -267,6 +267,13 @@ public:
             }
         }
         o += std::string("    mov ") + r64(ctx_) + ", rcx\n";
+        // M2-9 call gate: 把当前 host rsp 写入 VmContext.host_rsp (+0x128)，
+        // callgate handler 在 native call 返回后据此把 rsp 切回解释器栈。
+        // 必须用 t_[0]（pool[4] 一定是 scratch，不是持久寄存器）——rax
+        // 可能在随机分配里落到 ctx/pc/flags/base 之一，把它当 scratch 用会
+        // 把持久寄存器覆盖掉。
+        o += std::string("    mov ") + r64(t_[0]) + ", rsp\n";
+        o += std::string("    mov qword ptr [") + r64(ctx_) + " + 0x128], " + r64(t_[0]) + "\n";
         o += std::string("    mov ") + r64(pc_) + ", qword ptr [" + r64(ctx_) + " + 0x8]\n";
         o += std::string("    mov ") + r64(flags_) + ", qword ptr [" + r64(ctx_) + " + 0x98]\n";
         return o;
@@ -866,6 +873,66 @@ public:
         return o;
     }
 
+    // M2-9 CallGate：VM 字节码遇到 call 时由翻译器发出。
+    //
+    // 语义（v1：arg_count = 0）：
+    //   - aux = 目标 RVA（u32，零扩展至 u64）
+    //   - cond_or_size = arg_count（v1 必须 0）
+    //   - 运行时：目标 VA = RVA + image_base（scratch_mem），
+    //     调目标函数，callee ret 后 RAX 写回 regs[v0]，dispatch 继续。
+    //
+    // 寄存器/栈语义（核心约束）：
+    //   1) 持久寄存器 pc/flags/base 跨 native call 必须保留——随机分配可能让
+    //      它们落在 caller-saved GPR（rax/rcx/rdx/r8-r11），native callee 会
+    //      按 Win64 ABI 自由 clobber；故入 handler 先写到 VmContext 槽。
+    //   2) ctx 寄存器必须保留——call 后用来回写 VmContext。随机分配同样可能
+    //      让 ctx 落 caller-saved；故 push 到 host stack 暂存，ret 后 pop 恢复。
+    //   3) rsp 必须切到 caller 原始 frame（= native_sp），否则 [rsp+0..32] 是
+    //      解释器 VmContext，callee 写阴影区/栈参数会破坏 VmContext。
+    //      切 rsp 前预留 32 字节 Win64 阴影 + 8 字节对齐垫（40），使 call 前
+    //      rsp 16 对齐（callee 进入看到 8 mod 16，符合 Win64）。
+    //
+    // 栈回退算术（host_rsp = native_sp - 0x1C8 = 解释器执行期 rsp）：
+    //   stub 8 push + sub 0x140 + call 返回 8 + entry 8 push = 0x1C8
+    //   push ctx → rsp = host_rsp - 8 = native_sp - 0x1D0
+    //   mov rsp, native_sp - 0x28
+    //   call/ret → rsp = native_sp - 0x28
+    //   目标 rsp = native_sp - 0x1D0 = (native_sp - 0x28) - 0x1A8 → sub rsp, 0x1A8
+    //   pop ctx → rsp = host_rsp
+    std::string build_callgate(u64 dispatch) const {
+        std::string o = decode_prelude();
+        // 1) 目标 VA = 目标 RVA (T5, aux) + image_base ([ctx + 0x110])
+        o += std::string("    mov ") + r64(t_[0]) + ", " + r64(t_[5]) + "\n";
+        o += std::string("    add ") + r64(t_[0]) + ", qword ptr [" + r64(ctx_) +
+             " + 0x110]\n";
+        // 2) 保存 pc/flags/base 到 VmContext 槽（仍在 ctx_ 寄存器可访问）
+        o += std::string("    mov qword ptr [") + r64(ctx_) + " + 0x8], " + r64(pc_) + "\n";
+        o += std::string("    mov qword ptr [") + r64(ctx_) + " + 0x98], " + r64(flags_) + "\n";
+        o += std::string("    mov qword ptr [") + r64(ctx_) + " + 0x130], " + r64(base_) + "\n";
+        // 3) push ctx 到 host stack（ctx 可能在 caller-saved 里，native 会清）
+        o += std::string("    push ") + r64(ctx_) + "\n";
+        // 4) 切 rsp → native_sp - 40（32 shadow + 8 对齐）
+        o += std::string("    mov ") + r64(t_[1]) + ", qword ptr [" + r64(ctx_) +
+             " + 0x120]\n";
+        o += std::string("    sub ") + r64(t_[1]) + ", 0x28\n";
+        o += std::string("    mov rsp, ") + r64(t_[1]) + "\n";
+        // 5) 调 native（目标 VA 在 t_[0]）
+        o += std::string("    call ") + r64(t_[0]) + "\n";
+        // 6) rsp 回到 host stack 上 push ctx 处（native_sp - 0x1D0）
+        o += "    sub rsp, 0x1A8\n";
+        // 7) pop 回 ctx_
+        o += std::string("    pop ") + r64(ctx_) + "\n";
+        // 8) 从 VmContext 恢复 pc/flags/base
+        o += std::string("    mov ") + r64(pc_) + ", qword ptr [" + r64(ctx_) + " + 0x8]\n";
+        o += std::string("    mov ") + r64(flags_) + ", qword ptr [" + r64(ctx_) + " + 0x98]\n";
+        o += std::string("    mov ") + r64(base_) + ", qword ptr [" + r64(ctx_) + " + 0x130]\n";
+        // 9) RAX (callee 返回值) 写回 regs[v0]
+        o += std::string("    mov qword ptr [") + r64(ctx_) + " + 0x10], rax\n";
+        // 10) advance（PC += 1; jmp dispatch）
+        o += advance(dispatch);
+        return o;
+    }
+
     // ---- 一元包装（HandlerDef 需要无参差成员函数指针） ----
     std::string build_add(u64 d) const { return build_binary("add", d, true); }
     std::string build_sub(u64 d) const { return build_binary("sub", d, true); }
@@ -1020,7 +1087,8 @@ RuntimeGenResult generate_runtime(wvmp::Rng& rng) {
 
     // —— handler 清单（v1 覆盖集；Call/Ret 的表项指向
     //    Halt——遇到即停机，语义保守且不越界。Sar 在 MIT-244 已接管。
-    //    Adc 在 MIT-245 已接管；Sbb 在 MIT-246 已接管；Rol/Ror 在 MIT-247 已接管。）——
+    //    Adc 在 MIT-245 已接管；Sbb 在 MIT-246 已接管；Rol/Ror 在 MIT-247 已接管。
+    //    CallGate 在 MIT-249 已接管。）——
     std::vector<HandlerDef> handlers = {
         {int(VmOp::Mov), "mov", &AsmGen::build_mov},
         {int(VmOp::Lea), "lea", &AsmGen::build_mov},
@@ -1054,6 +1122,7 @@ RuntimeGenResult generate_runtime(wvmp::Rng& rng) {
         {int(VmOp::Halt), "halt", &AsmGen::build_halt},
         {int(VmOp::GetFlags), "getflags", &AsmGen::build_getflags},
         {int(VmOp::SetFlags), "setflags", &AsmGen::build_setflags},
+        {int(VmOp::CallGate), "callgate", &AsmGen::build_callgate},
     };
     rng.shuffle(handlers.begin(), handlers.end());   // 码序随机
 
@@ -1112,6 +1181,21 @@ RuntimeGenResult generate_runtime(wvmp::Rng& rng) {
         if (handler_off.count(int(op)))
             dump += ";   [" + std::to_string(op) + "] = " + hex(handler_off.at(int(op))) + "\n";
     dump += ";   [0] (illegal/未实现折叠) = " + hex(halt_off) + "\n";
+
+    // 调试钩子（排查用）：WVMP_RUNTIME_DUMP=<win 路径> 时把 asm_dump 落盘，
+    // 方便直接读 .wvmp 节汇编（含 callgate handler）。不影响产物字节。
+    {
+        char* dp = nullptr;
+        size_t dp_len = 0;
+        if (_dupenv_s(&dp, &dp_len, "WVMP_RUNTIME_DUMP") == 0 && dp && dp_len > 1) {
+            FILE* f = nullptr;
+            if (fopen_s(&f, dp, "wb") == 0 && f) {
+                std::fwrite(dump.data(), 1, dump.size(), f);
+                std::fclose(f);
+            }
+        }
+        std::free(dp);
+    }
 
     return {std::move(image), std::move(dump)};
 }

@@ -23,9 +23,17 @@ enum class VmOp : u16 {
     // Load/Store 不加 scratch_mem: 译码的地址已是绝对 VA（来自 host 寄存器
     // 拷贝 / 算术, 直接落地访存）。
     LoadRva, StoreRva,
+
+    // —— M2-9 call gate ——
+    // VM 字节码遇到 call 时由翻译器发出；运行时 handler 把 VM 上下文切到
+    // native caller frame（Win64 ABI），调目标 RVA 处的 native 函数，callee
+    // ret 后把 RAX 写回 regs[v0] 继续 dispatch。aux = 目标 RVA（u32）；
+    // cond_or_size = arg_count（v1 仅支持 0；非零暂按 0 兜底并 diag warn）。
+    // a_kind / b_kind / reg_a / reg_b 一律 None（gate 与 VM 操作数无关）。
+    CallGate,
 };
 
-inline constexpr u16 kVmOpMax = static_cast<u16>(VmOp::StoreRva);
+inline constexpr u16 kVmOpMax = static_cast<u16>(VmOp::CallGate);
 inline constexpr u16 kVmOpLimit = 1u << 14;  // 14 位编码空间上限
 
 constexpr const char* to_string(VmOp op) {
@@ -49,6 +57,7 @@ constexpr const char* to_string(VmOp op) {
         case VmOp::SetFlags: return "setflags";
         case VmOp::LoadRva: return "loadrva";
         case VmOp::StoreRva: return "storeriva";
+        case VmOp::CallGate: return "callgate";
     }
     return "?";
 }

@@ -21,6 +21,21 @@ namespace wvmp::regvm::runtime {
 //                             （v1 测试用；M2 换真实进程内存基址）
 //   +0x118  u64  ret_value    Halt 时写回 regs[v0]
 //
+//   +0x120  u64  native_sp    M2-9 call gate: caller 的原始 frame 基址
+//                             （即进入 stub 时的 rsp），由 stub_gen 在构造
+//                             VmContext 时一次性写入。CallGate handler 据此
+//                             把 rsp 切到 native caller 栈帧跑 native call；
+//                             native_sp 是 VM 跨指令稳定的值，VM 自身 push/
+//                             pop 修改 regs[4] 而不动此字段。
+//   +0x128  u64  host_rsp     M2-9 call gate: 解释器运行期间的 host rsp
+//                             （= stub entry 完成 push+sub 后的栈顶）。解释器
+//                             入口处一次性写入；CallGate handler 用来在 native
+//                             call 返回后把 rsp 切回解释器栈。
+//   +0x130  u64  base_save    M2-9 call gate: 解释器 BASE 寄存器（码基址）
+//                             的暂存槽。CallGate 入口把 BASE 写到此处（BASE
+//                             在随机分配中可能落在 caller-saved 寄存器，原生
+//                             callee 会清掉）；ret 后从此槽恢复。
+//
 // v4 = Rsp（Push/Pop 操作的栈指针，相对 scratch_mem 的偏移）。
 // v17 偏移 = 0x10 + 17*8 = 0x98；v4 偏移 = 0x30。
 // =============================================================================
@@ -30,13 +45,19 @@ struct VmContext {
     u64 regs[32] = {};        // +0x010
     u64 scratch_mem = 0;      // +0x110
     u64 ret_value = 0;        // +0x118
+    u64 native_sp = 0;        // +0x120
+    u64 host_rsp = 0;         // +0x128
+    u64 base_save = 0;        // +0x130
 };
-static_assert(sizeof(VmContext) == 0x120, "VmContext 布局即 ABI，禁止改动");
+static_assert(sizeof(VmContext) == 0x138, "VmContext 布局即 ABI，禁止改动");
 static_assert(offsetof(VmContext, bytecode) == 0x00);
 static_assert(offsetof(VmContext, pc) == 0x08);
 static_assert(offsetof(VmContext, regs) == 0x10);
 static_assert(offsetof(VmContext, scratch_mem) == 0x110);
 static_assert(offsetof(VmContext, ret_value) == 0x118);
+static_assert(offsetof(VmContext, native_sp) == 0x120);
+static_assert(offsetof(VmContext, host_rsp) == 0x128);
+static_assert(offsetof(VmContext, base_save) == 0x130);
 
 // 生成结果。
 struct RuntimeGenResult {

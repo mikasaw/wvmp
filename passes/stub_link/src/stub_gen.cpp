@@ -21,7 +21,9 @@ std::string hex(u64 v) {
 constexpr u64 kCtxRegs = 0x10;      // regs[0]
 constexpr u64 kCtxRsp = 0x30;       // regs[4]
 constexpr u64 kCtxScratch = 0x110;
-constexpr u64 kCtxSize = 0x130;     // 结构 0x120 + 栈对齐余量
+constexpr u64 kCtxNativeSp = 0x120; // M2-9 call gate: caller 原始 frame 基址
+// 结构 0x138 + 0x8 栈对齐余量 = 0x140。
+constexpr u64 kCtxSize = 0x140;
 
 // 占位 disp32（回填目标 = blob 指令流）：选罕见值便于汇编后定位。
 constexpr u32 kBlobDispDummy = 0xDEAD'0001;
@@ -53,9 +55,13 @@ std::string build_stub_asm(u64 rt_entry_rva, u64 resume_rva, u64 image_base) {
         }
     }
     // v4 = 原始 rsp（区域代码按原函数帧的 rsp 相对寻址）：当前 rsp 比原始值
-    // 低 8*push(0x40) + 0x130，用 lea 还原。rax 的原值已在 slot0 保存，可复用。
-    o += "lea rax, [rsp + 0x170]\n";
+    // 低 8*push(0x40) + kCtxSize(0x140) = 0x180，用 lea 还原。rax 的原值已在
+    // slot0 保存，可复用。同一份原始 rsp 同时写到 native_sp（M2-9 call gate
+    // 需要稳定的 caller frame 基址——v4 会被 VM 自身 push/pop 改写，native_sp
+    // 跨指令不变，供 callgate handler 把 rsp 切回 caller frame 跑 native）。
+    o += "lea rax, [rsp + 0x180]\n";
     o += "mov [rsp + " + hex(kCtxRsp) + "], rax\n";
+    o += "mov [rsp + " + hex(kCtxNativeSp) + "], rax\n";
     // image_base（PE optional header 的 ImageBase 字段）→ scratch_mem 槽：
     // Load/Store/Push/Pop 的访存汇编 `[addr + ctx+0x110]` 即 + image_base。
     // rip-relative 翻译期把 [rip+disp] 转 RVA 写进字节码；运行时按此槽加基址

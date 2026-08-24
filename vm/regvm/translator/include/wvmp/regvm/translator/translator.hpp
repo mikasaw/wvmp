@@ -18,7 +18,7 @@ struct TranslateResult {
 
 // 纯函数：把一个函数区域的 IR 逐指令翻译为 regvm 字节码。
 //   - 无跨指令分析、无状态残留；同输入同输出。
-//   - 遇到 v1 未支持的形态（call / rip-relative / 间接 jmp / 目标块缺失等）
+//   - 遇到 v1 未支持的形态（call [mem] / 间接 call / 目标块缺失等）
 //     不抛异常：跳过该指令并写入 notes，交由上层 gate 回退。
 //
 // ============================ 翻译约定（与 runtime/isa 对齐） ============================
@@ -81,7 +81,9 @@ struct TranslateResult {
 // Jmp/Jcc 的 aux = 目标块起始序号 - 本指令序号（**条数**，负值以二进制
 // 补码存入 u32，解释器按 8 字节步进）。块末尾 IR 指令若非 Jmp/Ret，补
 // Jmp +1（fallthrough 到布局中的下一块）。函数末尾恒补 Halt。
-// Call v1 跳过并在 notes 记 "call 未支持，建议 gate"（重定位归 M2）。
+// 直接 call (dst = Imm) emit VmOp::CallGate（aux = target RVA, cond_or_size
+// = arg_count, v1 固定 0）；间接 call / call [mem] 跳过并记 note 触发
+// C1 gate（保持原生）。完整 ABI 透传 / 递归 / 浮点参数留给后续 issue。
 // =====================================================================================
 [[nodiscard]] TranslateResult translate_function(const ir::FunctionRegion& fn);
 

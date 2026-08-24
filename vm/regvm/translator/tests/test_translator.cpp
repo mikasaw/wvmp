@@ -365,11 +365,16 @@ TEST(Translate, BlobRoundtripByteExact) {
 
 // ---------------- notes 路径（不失败） ----------------
 
+// MIT-249: 直接 call 现在 emit CallGate（不记 note），所以这条用例改为
+// 验证间接 call（dst=Reg）仍记 note 触发 C1 gate 兜底。直接 call 的发射
+// 见 CallDirectEmitsCallGate。
 TEST(Translate, CallSkippedWithNote) {
+    ir::Insn c = I(ir::Op::Call, ir::Size::S64);
+    c.dst = ir::Operand::reg_(ir::Reg::Rax); // 间接 call：目标 RVA 翻译期不可知
     const auto r = wvmp::regvm::translator::translate_function(
-        fn_of({blk(0x1000, {jump(ir::Op::Call, 0x5000)})}));
+        fn_of({blk(0x1000, {c})}));
     ASSERT_EQ(r.notes.size(), static_cast<size_t>(1));
-    EXPECT_NE(r.notes[0].find("call 未支持"), std::string::npos);
+    EXPECT_NE(r.notes[0].find("call"), std::string::npos);
     const Decoded d = decode_program(r.program); // 仍产出合法流（Jmp+1 + Halt）
     ASSERT_EQ(d.insns.size(), static_cast<size_t>(2));
     expect_is(d.insns[0], VmOp::Jmp, OpKind::None, 0, OpKind::None, 0, 1, kS64);
@@ -614,6 +619,56 @@ TEST(RefVmE2E, LoopSumWithBackwardJcc) {
     EXPECT_EQ(vm.regs[kRax], 15ull);
     EXPECT_EQ(vm.regs[kRcx], 0ull);
     EXPECT_GT(vm.steps, 5 * 4); // 确认回跳真实执行了多轮
+}
+
+// ---------------- Call (MIT-249 call gate) ----------------
+
+// 直接 call <imm>：aux = target RVA, cond_or_size = 0（arg_count v1 固定 0）。
+// 2 块布局: b0@0x1000 (call), b1@0x2000 (ret) → next_ip(call) = 0x2000。
+// dst.imm = 绝对目标 RVA（lifter 约定与 jcc/jmp 一致，Capstone 给的是绝对地址
+// 不是位移——这是 Capstone 默认行为，jcc/jmp 都按绝对目标处理）；
+// 这里 dst.imm = 0x2000 即直接 target = b1@0x2000；运行时 handler 加
+// image_base 还原 VA。
+TEST(Translate, CallDirectEmitsCallGate) {
+    ir::Insn c = I(ir::Op::Call, ir::Size::S64);
+    c.dst = ir::Operand::imm_(0x2000);
+    const auto r = wvmp::regvm::translator::translate_function(
+        fn_of({blk(0x1000, {c}),
+               blk(0x2000, {[] {
+                   ir::Insn r = I(ir::Op::Ret, ir::Size::S64);
+                   return r;
+               }()})}));
+    EXPECT_TRUE(r.notes.empty());
+    const Decoded d = decode_program(r.program);
+    ASSERT_GE(d.insns.size(), static_cast<size_t>(1));
+    expect_is(d.insns[0], VmOp::CallGate, OpKind::None, 0, OpKind::None, 0,
+              0x2000u, 0u);
+}
+
+TEST(Translate, CallIndirectRegIsSkipped) {
+    // call rax：dst.kind = Reg，翻译期不可知 → skip + note 触发 C1 gate。
+    ir::Insn c = I(ir::Op::Call, ir::Size::S64);
+    c.dst = ir::Operand::reg_(ir::Reg::Rax);
+    const auto r = wvmp::regvm::translator::translate_function(
+        fn_of({blk(0x1000, {c})}));
+    ASSERT_FALSE(r.notes.empty());
+    EXPECT_NE(r.notes.front().find("call"), std::string::npos);
+    // notes 触发 C1 gate：virtualize 会放弃该函数虚拟化。
+    const Decoded d = decode_program(r.program);
+    // skip → 仅保留 fallthrough Jmp +1 + Halt
+    ASSERT_EQ(d.insns.size(), static_cast<size_t>(2));
+    expect_is(d.insns[0], VmOp::Jmp, OpKind::None, 0, OpKind::None, 0, 1, kS64);
+    expect_is(d.insns[1], VmOp::Halt, OpKind::None, 0, OpKind::None, 0, 0, 0);
+}
+
+TEST(Translate, CallMemIsSkipped) {
+    // call [rbx]：dst.kind = Mem，target 来自内存 → skip + note 触发 C1 gate。
+    ir::Insn c = I(ir::Op::Call, ir::Size::S64);
+    c.dst = ir::Operand::mem_(m(ir::Reg::Rbx));
+    const auto r = wvmp::regvm::translator::translate_function(
+        fn_of({blk(0x1000, {c})}));
+    ASSERT_FALSE(r.notes.empty());
+    EXPECT_NE(r.notes.front().find("call"), std::string::npos);
 }
 
 } // namespace

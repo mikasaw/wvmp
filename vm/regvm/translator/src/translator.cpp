@@ -268,7 +268,7 @@ struct Translator {
         case ir::Op::Jmp:
         case ir::Op::Jcc: ok = translate_jump(em, in); break;
         case ir::Op::Call:
-            ok = skip(in, "call 未支持，建议 gate", nullptr);
+            ok = translate_call(em, in, next_ip);
             break;
         case ir::Op::Nop:
             em.emit(VmOp::Nop, OpKind::None, 0, OpKind::None, 0, 0,
@@ -410,6 +410,34 @@ struct Translator {
                     isa::size_field(in.size));
         // 跳转恒为本 IR 指令展开的最后一条：最终序号 = 已有 code 长度 + 偏移。
         pending.push_back({code.size() + em.out.size() - 1, it->second});
+        return true;
+    }
+
+    // Call（MIT-249 call gate）。
+    //   - 间接 call（dst = Reg，如 call rax）：target RVA 翻译期不可知，
+    //     走 C1 gate 兜底（保持原生），不作为 halt VM 硬错误。
+    //   - 内存间接 call（dst = Mem，如 call [rip+disp]）：target 来自内存
+    //     加载，翻译期同样不可知——保守 skip，C1 gate。
+    //   - 直接 call（dst = Imm，Capstone 解出 E8 + disp32 或 FF /2 imm32）：
+    //     in.dst.imm = 绝对目标 RVA（lifter 约定，与 Jcc/Jmp 的 dst.imm
+    //     语义一致——Capstone 给的是绝对地址，jcc/jmp 直接当块起点查）。
+    //     emit VmOp::CallGate（aux = target RVA, cond_or_size = arg_count）。
+    //   - 目标 RVA 越界（同 rip-relative 越界判定）→ skip 触发 C1 gate。
+    bool translate_call(Emitter& em, const ir::Insn& in, u64 /*next_ip*/) {
+        if (in.dst.kind == ir::Operand::Kind::Reg)
+            return skip(in, "间接 call 未支持，建议 gate", nullptr);
+        if (in.dst.kind == ir::Operand::Kind::Mem)
+            return skip(in, "call [mem] 未支持，建议 gate",
+                        in.dst.mem.base == ir::Reg::Rip ? &in.dst.mem : nullptr);
+        if (in.dst.kind != ir::Operand::Kind::Imm)
+            return skip(in, "call 目标非立即数，未支持", nullptr);
+        const i64 rva_i = static_cast<i64>(in.dst.imm);
+        if (rva_i < 0 || rva_i > static_cast<i64>(std::numeric_limits<u32>::max()))
+            return skip(in, "call 目标 RVA 越界", nullptr);
+        // aux = target RVA（u32 零扩展）；cond_or_size = 0（arg_count v1 固定 0）。
+        // a_kind/b_kind/reg_a/reg_b 一律 None——CallGate 与 VM 操作数无关。
+        em.emit(VmOp::CallGate, OpKind::None, 0, OpKind::None, 0,
+                static_cast<u32>(rva_i), 0);
         return true;
     }
 
