@@ -356,6 +356,7 @@ TranslateResult translate_insn(const cs_insn& ci, ir::Arch arch) {
 
     switch (ci.id) {
     case X86_INS_MOV: return translate_mov(ci, x, arch);
+    case X86_INS_MOVABS: return translate_mov(ci, x, arch);  // MIT-247 fix: movabs imm64 与 mov 共用 translate_mov, 翻译器对 S64 不可直放 imm 走 emit_imm64_split
     case X86_INS_LEA: return translate_lea(ci, x, arch);
     case X86_INS_ADD: return translate_alu(ci, x, arch, Op::Add);
     case X86_INS_SUB: return translate_alu(ci, x, arch, Op::Sub);

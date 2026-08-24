@@ -106,6 +106,23 @@ TEST_F(LifterTranslate, MovImmToReg) {
     EXPECT_EQ(r.insn.addr, 0u);
 }
 
+// MIT-249 关联修复: movabs（mov reg, imm64）必须被 lifter 接住——否则区域内
+// 含 imm64 load 会被静默跳过、且 C1 gate 只看翻译器 notes 不看 lifter notes，
+// 函数仍被虚拟化，原区域 movabs 字节被 stub_link 覆写后字节码缺一块、行为错。
+// 字节: 48 B8 BE BA FE CA EF BE AD DE = movabs rax, 0xDEADBEEFCAFEBABE
+TEST_F(LifterTranslate, MovAbsImm64ToReg) {
+    const wvmp::u8 b[] = {0x48, 0xB8, 0xBE, 0xBA, 0xFE, 0xCA, 0xEF, 0xBE, 0xAD, 0xDE};
+    auto r = translate_bytes(x64, b, ir::Arch::X64);
+    ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r.insn.op, ir::Op::Mov);
+    EXPECT_EQ(r.insn.size, ir::Size::S64);
+    EXPECT_FALSE(r.insn.updates_flags);
+    ASSERT_EQ(r.insn.dst.kind, ir::Operand::Kind::Reg);
+    EXPECT_EQ(r.insn.dst.reg, ir::Reg::Rax);
+    ASSERT_EQ(r.insn.src.kind, ir::Operand::Kind::Imm);
+    EXPECT_EQ(static_cast<wvmp::u64>(r.insn.src.imm), 0xDEADBEEFCAFEBABEull);
+}
+
 TEST_F(LifterTranslate, MovRegToReg64) {
     // 48 89 C1: mov rcx, rax
     const wvmp::u8 b[] = {0x48, 0x89, 0xC1};

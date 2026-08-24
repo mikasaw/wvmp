@@ -897,38 +897,70 @@ public:
     //   push ctx → rsp = host_rsp - 8 = native_sp - 0x1D0
     //   mov rsp, native_sp - 0x28
     //   call/ret → rsp = native_sp - 0x28
-    //   目标 rsp = native_sp - 0x1D0 = (native_sp - 0x28) - 0x1A8 → sub rsp, 0x1A8
+    //   sub rsp, 0x1A8 → rsp = host_rsp - 8
     //   pop ctx → rsp = host_rsp
+    //
+    // Win64 ABI：callee 允许 clobber rcx/rdx/r8/r9。callgate 必须**保证
+    // call 之前**它们持有调用参数——但 VM 翻译器把 mov/load 结果写到
+    // VmContext.regs[]（内存槽），物理 rcx/rdx/r8/r9 不一定更新（被随机
+    // 寄存器池当 scratch 用）。callgate 必须显式把 regs[1/2/8/9]
+    // （VM 的 rcx/rdx/r8/r9 语义槽，对应 Win64 ABI 整数参数 1~4）搬到
+    // 物理寄存器再 call。MIT-249 v1 不暴露 arg_count 字段——一律按 4 个
+    // 准备，callee 用不到也无所谓（额外赋值是 no-op）。
+    //
+    // reserved 槽位（v24..v27 = regs[24..27]）用于透传快照，与翻译器
+    // scratch 池 v18..v23 不重叠：
+    //   +0xD0 = regs[24] = callgate 入口的 regs[1]（VM 的 Rcx）
+    //   +0xD8 = regs[25] = callgate 入口的 regs[2]（VM 的 Rdx）
+    //   +0xE0 = regs[26] = callgate 入口的 regs[8]（VM 的 R8）
+    //   +0xE8 = regs[27] = callgate 入口的 regs[9]（VM 的 R9）
     std::string build_callgate(u64 dispatch) const {
         std::string o = decode_prelude();
+        // 0) 把 VM 整数参数槽（regs[1]=Rcx, /[2]=Rdx, /[8]=R8, /[9]=R9）
+        // 先搬到 reserved 槽位，防 callgate 自己的 prelude/pre-call 路径
+        // 在 push ctx 之后又读 VmContext 时被外部指令序串改坏——保留独立
+        // 通道供后续 load 物理寄存器用。
+        o += std::string("    mov rax, qword ptr [") + r64(ctx_) + " + 0x18]\n";   // regs[1] (Rcx)
+        o += std::string("    mov qword ptr [") + r64(ctx_) + " + 0xD0], rax\n";
+        o += std::string("    mov rax, qword ptr [") + r64(ctx_) + " + 0x20]\n";   // regs[2] (Rdx)
+        o += std::string("    mov qword ptr [") + r64(ctx_) + " + 0xD8], rax\n";
+        o += std::string("    mov rax, qword ptr [") + r64(ctx_) + " + 0x48]\n";   // regs[8] (R8)
+        o += std::string("    mov qword ptr [") + r64(ctx_) + " + 0xE0], rax\n";
+        o += std::string("    mov rax, qword ptr [") + r64(ctx_) + " + 0x50]\n";   // regs[9] (R9)
+        o += std::string("    mov qword ptr [") + r64(ctx_) + " + 0xE8], rax\n";
         // 1) 目标 VA = 目标 RVA (T5, aux) + image_base ([ctx + 0x110])
         o += std::string("    mov ") + r64(t_[0]) + ", " + r64(t_[5]) + "\n";
         o += std::string("    add ") + r64(t_[0]) + ", qword ptr [" + r64(ctx_) +
              " + 0x110]\n";
-        // 2) 保存 pc/flags/base 到 VmContext 槽（仍在 ctx_ 寄存器可访问）
+        // 2) 保存 pc/flags/base 到 VmContext 槽
         o += std::string("    mov qword ptr [") + r64(ctx_) + " + 0x8], " + r64(pc_) + "\n";
         o += std::string("    mov qword ptr [") + r64(ctx_) + " + 0x98], " + r64(flags_) + "\n";
         o += std::string("    mov qword ptr [") + r64(ctx_) + " + 0x130], " + r64(base_) + "\n";
-        // 3) push ctx 到 host stack（ctx 可能在 caller-saved 里，native 会清）
+        // 3) push ctx 到 host stack
         o += std::string("    push ") + r64(ctx_) + "\n";
         // 4) 切 rsp → native_sp - 40（32 shadow + 8 对齐）
         o += std::string("    mov ") + r64(t_[1]) + ", qword ptr [" + r64(ctx_) +
              " + 0x120]\n";
         o += std::string("    sub ") + r64(t_[1]) + ", 0x28\n";
         o += std::string("    mov rsp, ") + r64(t_[1]) + "\n";
-        // 5) 调 native（目标 VA 在 t_[0]）
+        // 5) 把 reserved 槽位的 args 抬到物理 rcx/rdx/r8/r9
+        o += "    mov rcx, qword ptr [r14 + 0xD0]\n";
+        o += "    mov rdx, qword ptr [r14 + 0xD8]\n";
+        o += "    mov r8, qword ptr [r14 + 0xE0]\n";
+        o += "    mov r9, qword ptr [r14 + 0xE8]\n";
+        // 6) 调 native（目标 VA 在 t_[0]，参数已就位）
         o += std::string("    call ") + r64(t_[0]) + "\n";
-        // 6) rsp 回到 host stack 上 push ctx 处（native_sp - 0x1D0）
+        // 7) rsp 回到 host stack 上 push ctx 处（native_sp - 0x1D0）
         o += "    sub rsp, 0x1A8\n";
-        // 7) pop 回 ctx_
+        // 8) pop 回 ctx_
         o += std::string("    pop ") + r64(ctx_) + "\n";
-        // 8) 从 VmContext 恢复 pc/flags/base
+        // 9) 从 VmContext 恢复 pc/flags/base
         o += std::string("    mov ") + r64(pc_) + ", qword ptr [" + r64(ctx_) + " + 0x8]\n";
         o += std::string("    mov ") + r64(flags_) + ", qword ptr [" + r64(ctx_) + " + 0x98]\n";
         o += std::string("    mov ") + r64(base_) + ", qword ptr [" + r64(ctx_) + " + 0x130]\n";
-        // 9) RAX (callee 返回值) 写回 regs[v0]
+        // 10) RAX (callee 返回值) 写回 regs[v0]
         o += std::string("    mov qword ptr [") + r64(ctx_) + " + 0x10], rax\n";
-        // 10) advance（PC += 1; jmp dispatch）
+        // 11) advance（PC += 1; jmp dispatch）
         o += advance(dispatch);
         return o;
     }
