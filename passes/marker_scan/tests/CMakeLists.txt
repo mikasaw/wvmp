@@ -178,3 +178,16 @@ target_compile_options(wvmp_lifter_skip_sample PRIVATE
 target_link_options(wvmp_lifter_skip_sample PRIVATE
     $<$<CXX_COMPILER_ID:MSVC>:/INCREMENTAL:NO>
 )
+
+# MIT-300: 端到端真实用例样本——贪吃蛇游戏核心逻辑被 WVMP 保护,
+# 验证 WVmp 当前实现能保护真实业务 PE (含 call gate / 多 seed 健壮性).
+# 区域内只用白名单 + call gate 整数 ABI, 不调 printf / rand / Sleep.
+add_executable(wvmp_snake_sample snake_sample_main.cpp)
+target_link_libraries(wvmp_snake_sample PRIVATE wvmp::sdk)
+target_compile_options(wvmp_snake_sample PRIVATE
+    $<$<CXX_COMPILER_ID:MSVC>:/Od;/Ob0;/utf-8>
+    $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-O0>
+)
+target_link_options(wvmp_snake_sample PRIVATE
+    $<$<CXX_COMPILER_ID:MSVC>:/INCREMENTAL:NO>
+)
