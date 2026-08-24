@@ -943,11 +943,15 @@ public:
              " + 0x120]\n";
         o += std::string("    sub ") + r64(t_[1]) + ", 0x28\n";
         o += std::string("    mov rsp, ") + r64(t_[1]) + "\n";
-        // 5) 把 reserved 槽位的 args 抬到物理 rcx/rdx/r8/r9
-        o += "    mov rcx, qword ptr [r14 + 0xD0]\n";
-        o += "    mov rdx, qword ptr [r14 + 0xD8]\n";
-        o += "    mov r8, qword ptr [r14 + 0xE0]\n";
-        o += "    mov r9, qword ptr [r14 + 0xE8]\n";
+        // 5) 把 reserved slots 抬到物理 rcx/rdx/r8/r9。
+        // 关键：必须用 r64(ctx_) 而非硬编码 "r14" —— ctx_ 由 AsmGen::roll()
+        // 从 14 GPR 池随机洗牌 (pool[0]) 选出，当前 seed=12345 下恰好是
+        // r14 是"巧合可行"而非设计。任何 seed 改动都会让此 4 行访问野地址。
+        // 其余 callgate 步骤（1-4, 9-11）一致用 r64(ctx_)，本步骤同步。
+        o += std::string("    mov rcx, qword ptr [") + r64(ctx_) + " + 0xD0]\n";
+        o += std::string("    mov rdx, qword ptr [") + r64(ctx_) + " + 0xD8]\n";
+        o += std::string("    mov r8,  qword ptr [") + r64(ctx_) + " + 0xE0]\n";
+        o += std::string("    mov r9,  qword ptr [") + r64(ctx_) + " + 0xE8]\n";
         // 6) 调 native（目标 VA 在 t_[0]，参数已就位）
         o += std::string("    call ") + r64(t_[0]) + "\n";
         // 7) rsp 回到 host stack 上 push ctx 处（native_sp - 0x1D0）

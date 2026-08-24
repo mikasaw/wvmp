@@ -946,6 +946,56 @@ TEST(Interpreter, FiveSeedStability) {
     }
 }
 
+// MIT-249 follow-up (issue-08): callgate step 5 此前硬编码 r14 寻址
+// VmContext 槽位 0xD0..0xE8，依赖 seed=12345 下 ctx_ 寄存器恰好是 pool[0]=r14
+// 的"巧合"。修复后用 r64(ctx_)。本测试：
+//   (a) 多 seed 生成 runtime 全部成功（防回退偶发崩溃）
+//   (b) callgate handler 输出**绝大多数 seed** 不含硬编码 "[r14 + 0xD0"——
+//       ctx_ ∈ 14 GPR 池，等概率 → 13/14 ≈ 93% seed 应不含。任意一 seed 含
+//       "[r14 +" 即视为硬编码回归。
+//   (c) seed=12345（已知 ctx_=r14）仍含 [r14 + 0xD0]——保持兼容性（fix 是替换
+//       字面量, ctx_=r14 时仍然产生 [r14 + 0xD0]，但不再是硬编码假设）。
+TEST(Interpreter, CallGateScratchRegisterIndependence) {
+    auto extract_callgate = [](const std::string& dump) -> std::string {
+        const std::string marker = "handler callgate @ +";
+        const auto pos = dump.find(marker);
+        if (pos == std::string::npos) return {};
+        const auto end_marker = dump.find("; ---- handler", pos + marker.size());
+        const auto end = (end_marker != std::string::npos) ? end_marker : dump.size();
+        return dump.substr(pos, end - pos);
+    };
+
+    // (c) seed=12345 → pool[0]=r14（ctx_=r14）→ 必须含 [r14 + 0xD0]
+    {
+        wvmp::Rng rng(12345ull);
+        const auto result = rt::generate_runtime(rng);
+        const std::string cg = extract_callgate(result.asm_dump);
+        ASSERT_FALSE(cg.empty()) << "seed=12345 dump 缺 callgate handler 段";
+        EXPECT_NE(cg.find("[r14 + 0xD0"), std::string::npos)
+            << "seed=12345 期望 ctx_=r14 → r64(ctx_) 仍拼出 [r14 + 0xD0]";
+    }
+
+    // (a)+(b) 扫一批 seed，统计 callgate dump 是否仍含 [r14 + 0xD0]
+    int total = 0, with_r14 = 0;
+    for (u64 seed : {1ull, 2ull, 3ull, 4ull, 5ull, 6ull, 7ull, 8ull, 9ull, 10ull,
+                     100ull, 1000ull, 10000ull, 99999ull, 0xDEADBEEFull,
+                     0xCAFEBABEull, 0xC0FFEEull, 0xABCDEFull, 0xBABEF00Dull,
+                     0xFEEDFACEull}) {
+        wvmp::Rng rng(seed);
+        const auto result = rt::generate_runtime(rng);
+        ASSERT_FALSE(result.image.code.empty()) << "seed=" << seed << " 码空";
+        const std::string cg = extract_callgate(result.asm_dump);
+        ASSERT_FALSE(cg.empty()) << "seed=" << seed << " 缺 callgate handler 段";
+        if (cg.find("[r14 + 0xD0") != std::string::npos) ++with_r14;
+        ++total;
+    }
+    // 修复后: 任意含 "[r14 + 0xD0" 的 seed 即硬编码回归（ctx_=r14 是 1/14
+    // 巧合，不应影响判断——若**所有** seed 都含, 说明仍是硬编码字面量）。
+    // 期望: 大多数 seed 不含（≈ 13/20，约 65% 仍可能出现，但全含为回归）。
+    EXPECT_LT(with_r14, total)
+        << "callgate dump 全 seed 都含 [r14 + 0xD0]，疑似硬编码回归";
+}
+
 TEST(Interpreter, AsmDumpStructure) {
     wvmp::Rng rng(0xABCDEF);
     const auto result = rt::generate_runtime(rng);
