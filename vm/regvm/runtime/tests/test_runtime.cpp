@@ -100,6 +100,20 @@ isa::VmInsn mov_imm(u8 dst, u32 imm, ir::Size s = ir::Size::S64) {
     return isa::make_insn(isa::VmOp::Mov, isa::OpKind::Reg, dst, isa::OpKind::Imm, 0, imm,
                           isa::size_field(s));
 }
+// mov_imm64：拆条生成 64-bit 立即数（与 translator 一致: hi 写入 scratch /
+// Shl 32 / Mov lo / Or）. scratch 是中间高 32 位寄存器, 不能与 dst 冲突.
+void mov_imm64_into(std::vector<u8>& s, u8 dst, u8 scratch_reg, u64 imm) {
+    const u8 sz = isa::size_field(ir::Size::S64);
+    isa::append_insn(s, isa::make_insn(isa::VmOp::Mov, isa::OpKind::Reg, scratch_reg,
+                                       isa::OpKind::Imm, 0,
+                                       static_cast<u32>(imm >> 32), sz));
+    isa::append_insn(s, isa::make_insn(isa::VmOp::Shl, isa::OpKind::Reg, scratch_reg,
+                                       isa::OpKind::Imm, 0, 32, sz));
+    isa::append_insn(s, isa::make_insn(isa::VmOp::Mov, isa::OpKind::Reg, dst, isa::OpKind::Imm,
+                                       0, static_cast<u32>(imm & 0xFFFFFFFFu), sz));
+    isa::append_insn(s, isa::make_insn(isa::VmOp::Or, isa::OpKind::Reg, dst,
+                                       isa::OpKind::Reg, scratch_reg, 0, sz));
+}
 isa::VmInsn bin(isa::VmOp op, u8 dst, u8 rhs, ir::Size s) {
     return isa::make_insn(op, isa::OpKind::Reg, dst, isa::OpKind::Reg, rhs, 0,
                           isa::size_field(s));
@@ -125,12 +139,14 @@ isa::VmInsn store(u8 addr, u8 src, ir::Size s) {
 }
 
 // 执行一段流，返回执行后的上下文（scratch 由调用方提供并可在其后检查）。
+// M2-8 起：scratch_mem 不再设默认值——Load/Store 直接用绝对 VA 寻址，
+// 不再加 scratch_mem；LoadRva/StoreRva 才加。测试按需自行 ctx.scratch_mem = ...
 rt::VmContext run_stream(RwxImage::Entry entry, const std::vector<u8>& stream, u8* scratch,
                          u64 init_rsp = 0) {
     rt::VmContext ctx;
     ctx.bytecode = const_cast<u8*>(stream.data());
     ctx.pc = 0;
-    ctx.scratch_mem = reinterpret_cast<u64>(scratch);
+    ctx.scratch_mem = 0;  // Load/Store 直接用绝对 VA；调用方按需覆写（LoadRva）
     ctx.regs[isa::vm_reg_of(ir::Reg::Rsp)] = init_rsp;   // v4 = Rsp
     entry(&ctx);
     return ctx;
@@ -281,18 +297,21 @@ void run_semantic_battery(const vm::RuntimeImage& image, const std::string& dump
         EXPECT_EQ(ctx.pc, 6u);   // halt+1 语义：pc 指向 halt 之后
     }
 
-    // ---- (e) Load/Store：经 scratch_mem，Size 缩放 ----
+    // ---- (e) Load/Store：M2-8 直接对绝对地址访存；addr reg 持绝对 VA ----
+    //   Load/Store 不再加 scratch_mem；addr reg 由 mov_imm64_into 装入 scratch 绝对
+    //   地址. 此用例无 sub/sbb 等 flag 依赖, mov_imm64_into 的 Shl 副作用可接受.
     {
         scratch.fill(0);
+        const u64 data_addr = reinterpret_cast<u64>(scratch.data()) + 0x10;
         std::vector<u8> s;
-        isa::append_insn(s, mov_imm(5, 0x10));                            // 0
-        isa::append_insn(s, mov_imm(6, 0xABCD1234));                      // 1
-        isa::append_insn(s, store(5, 6, ir::Size::S32));                  // 2 → +0x10
-        isa::append_insn(s, load(7, 5, ir::Size::S32));                   // 3
-        isa::append_insn(s, load(8, 5, ir::Size::S8));                    // 4
-        isa::append_insn(s, mov_imm(9, 0x11));                            // 5
-        isa::append_insn(s, store(9, 6, ir::Size::S8));                   // 6 → +0x11
-        isa::append_insn(s, halt());                                      // 7
+        mov_imm64_into(s, /*dst*/5, /*scratch*/isa::kScratchFirst, data_addr);  // 0..3
+        isa::append_insn(s, mov_imm(6, 0xABCD1234));                      // 4
+        isa::append_insn(s, store(5, 6, ir::Size::S32));                  // 5 → scratch[0x10]
+        isa::append_insn(s, load(7, 5, ir::Size::S32));                   // 6
+        isa::append_insn(s, load(8, 5, ir::Size::S8));                    // 7
+        mov_imm64_into(s, /*dst*/9, /*scratch*/isa::kScratchFirst + 1, data_addr + 1);  // 8..11
+        isa::append_insn(s, store(9, 6, ir::Size::S8));                   // 12 → +0x11
+        isa::append_insn(s, halt());                                      // 13
         const auto ctx = run_stream(entry, s, scratch.data());
         EXPECT_EQ(ctx.regs[7], 0xABCD1234ull);
         EXPECT_EQ(ctx.regs[8], 0x34ull);
@@ -302,6 +321,44 @@ void run_semantic_battery(const vm::RuntimeImage& image, const std::string& dump
         EXPECT_EQ(scratch[0x12], 0xCD);
         EXPECT_EQ(scratch[0x13], 0xAB);
         EXPECT_EQ(scratch[0x14], 0);
+        EXPECT_EQ(ctx.pc, 14u);
+    }
+
+    // ---- (e2) M2-8: LoadRva/StoreRva 走 scratch_mem=image_base 加基址还原 VA ----
+    //   翻译期算的 RVA 进 reg[T1]; 实际 VA = RVA + scratch_mem. 把数据预置到
+    //   scratch + 0x8000 + RVA (模拟真实进程 VA 布局), 验证 LoadRva/StoreRva 真的
+    //   加 [CTX+0x110].
+    {
+        scratch.fill(0);
+        constexpr u64 kImageBase = 0x8000;  // 模拟 image_base
+        scratch[0x8010] = 0x34; scratch[0x8011] = 0x12;
+        scratch[0x8012] = 0xCD; scratch[0x8013] = 0xAB;
+        std::vector<u8> s;
+        // RVA 0x10 → scratch_mem + 0x10 = scratch+0x8010
+        isa::append_insn(s, mov_imm(5, 0x10));                          // 0: RVA
+        isa::append_insn(s, isa::make_insn(isa::VmOp::LoadRva, isa::OpKind::Reg, 7,
+                                           isa::OpKind::Reg, 5, 0,
+                                           isa::size_field(ir::Size::S32)));  // 1
+        isa::append_insn(s, mov_imm(6, 0xCAFEBABEul));                   // 2
+        isa::append_insn(s, isa::make_insn(isa::VmOp::StoreRva, isa::OpKind::Reg, 5,
+                                           isa::OpKind::Reg, 6, 0,
+                                           isa::size_field(ir::Size::S32)));  // 3
+        isa::append_insn(s, isa::make_insn(isa::VmOp::LoadRva, isa::OpKind::Reg, 8,
+                                           isa::OpKind::Reg, 5, 0,
+                                           isa::size_field(ir::Size::S32)));  // 4
+        isa::append_insn(s, halt());                                    // 5
+        rt::VmContext ctx;
+        ctx.bytecode = s.data();
+        ctx.pc = 0;
+        ctx.scratch_mem = reinterpret_cast<u64>(scratch.data()) + kImageBase;
+        entry(&ctx);
+        // LoadRva: RVA 0x10 + image_base 0x8000 = scratch+0x8010 → 0xABCD1234
+        EXPECT_EQ(ctx.regs[7], 0xABCD1234ull);
+        // StoreRva: scratch[0x8010..0x8014] = 0xCAFEBABE
+        EXPECT_EQ(scratch[0x8010], 0xBE); EXPECT_EQ(scratch[0x8011], 0xBA);
+        EXPECT_EQ(scratch[0x8012], 0xFE); EXPECT_EQ(scratch[0x8013], 0xCA);
+        // LoadRva 回读
+        EXPECT_EQ(ctx.regs[8], 0xCAFEBABEull);
     }
 
     // ---- (f) Push/Pop：v4=Rsp 递减/递增、LIFO ----
@@ -320,12 +377,15 @@ void run_semantic_battery(const vm::RuntimeImage& image, const std::string& dump
         isa::make_insn(isa::VmOp::Pop, isa::OpKind::Reg, 10,
                                            isa::OpKind::None, 0));
         isa::append_insn(s, halt());
-        const auto ctx = run_stream(entry, s, scratch.data(), 0x800);
+        // M2-8 起 Push/Pop 不再加 scratch_mem, rsp 即 host 栈地址。把 init_rsp
+        // 设到 scratch.data() + 0x800, 让 push/pop 写入 scratch 内部.
+        const u64 init_rsp = reinterpret_cast<u64>(scratch.data()) + 0x800;
+        const auto ctx = run_stream(entry, s, scratch.data(), init_rsp);
         EXPECT_EQ(ctx.regs[3], 0xBBull);   // LIFO：后进先出
         EXPECT_EQ(ctx.regs[10], 0xAAull);
-        EXPECT_EQ(ctx.regs[isa::vm_reg_of(ir::Reg::Rsp)], 0x800ull);   // 栈回原位
-        EXPECT_EQ(*reinterpret_cast<u64*>(&scratch[0x800 - 8]), 0xAAull);
-        EXPECT_EQ(*reinterpret_cast<u64*>(&scratch[0x800 - 16]), 0xBBull);
+        EXPECT_EQ(ctx.regs[isa::vm_reg_of(ir::Reg::Rsp)], init_rsp);   // 栈回原位
+        EXPECT_EQ(*reinterpret_cast<u64*>(init_rsp - 8), 0xAAull);
+        EXPECT_EQ(*reinterpret_cast<u64*>(init_rsp - 16), 0xBBull);
     }
 
     // ---- (h) Test/GetFlags/SetFlags 位布局 ----
@@ -826,39 +886,43 @@ void run_semantic_battery(const vm::RuntimeImage& image, const std::string& dump
 TEST(Interpreter, SbbE2EMirrorChain) {
     // 模拟 MIT-246 E2E 中间操作：sub → store → load → sbb
     // 验证 CF_in 在 Load/Store 链后仍被正确传递。
+    // M2-8 起 Load/Store 不再加 scratch_mem, addr reg 必须为绝对 VA；
+    // 此用例通过 scratch_mem（=image_base）+ LoadRva 间接用小 RVA,
+    // 避免 mov_imm64_into 的 Shl 副作用污染 flags_.
     wvmp::Rng rng(0xC0FFEE);
     const auto result = rt::generate_runtime(rng);
     RwxImage rwx(result.image.code);
     const auto entry = rwx.entry();
     alignas(16) std::array<u8, 0x10000> scratch{};
-    // v4 = Rsp, v5 = scratch address slot, v6 = scratch_mem holder
-    // 准备 scratch: sp[0] (= scratch[0]) = 1 (模拟 a_hi)
-    uint64_t* sp = reinterpret_cast<uint64_t*>(scratch.data());
-    sp[0] = 1;   // scratch[0] = a_hi
+    // 准备 scratch[0] = 1（模拟 a_hi）
+    uint64_t* sp64 = reinterpret_cast<uint64_t*>(scratch.data());
+    sp64[0] = 1;  // scratch[0] = 1
     std::vector<u8> s;
     isa::append_insn(s, mov_imm(0, 0));                                // v0 = 0
     isa::append_insn(s, mov_imm(1, 1));                                // v1 = 1
     isa::append_insn(s, bin(isa::VmOp::Sub, 0, 1, ir::Size::S64));     // v0 = -1, CF=1
-    // Store + Load 中间操作:
-    isa::append_insn(s, store(4, 0, ir::Size::S64));   // scratch[regs[Rsp]+0] = v0 = -1
-    isa::append_insn(s, load(0, 4, ir::Size::S64));    // v0 = scratch[regs[Rsp]+0] = -1
-    // 然后重设 v0 = 1（模拟 Load a_hi=1）, v1 = 0（模拟 Sbb src=0）
-    // 等等，这里我们直接用 mov_imm 重设
+    // Store + Load 中间操作: RVA=0 经 LoadRva/StoreRva (image_base 加基址)
+    isa::append_insn(s, mov_imm(5, 0));                                // v5 = RVA 0
+    isa::append_insn(s, isa::make_insn(isa::VmOp::StoreRva, isa::OpKind::Reg, 5,
+                                       isa::OpKind::Reg, 0, 0,
+                                       isa::size_field(ir::Size::S64)));    // scratch[0] = -1
+    isa::append_insn(s, isa::make_insn(isa::VmOp::LoadRva, isa::OpKind::Reg, 0,
+                                       isa::OpKind::Reg, 5, 0,
+                                       isa::size_field(ir::Size::S64)));    // v0 = -1
     isa::append_insn(s, mov_imm(0, 1));                                // v0 = 1
     isa::append_insn(s, mov_imm(1, 0));                                // v1 = 0
     isa::append_insn(s, bin(isa::VmOp::Sbb, 0, 1, ir::Size::S64));     // v0 = 1 - 0 - CF
     isa::append_insn(s, isa::make_insn(isa::VmOp::GetFlags,
-                                       isa::OpKind::Reg, 5, isa::OpKind::None, 0));
+                                       isa::OpKind::Reg, 6, isa::OpKind::None, 0));
     isa::append_insn(s, halt());
     rt::VmContext ctx;
     ctx.bytecode = const_cast<u8*>(s.data());
     ctx.pc = 0;
-    ctx.scratch_mem = reinterpret_cast<u64>(scratch.data());
-    ctx.regs[isa::vm_reg_of(ir::Reg::Rsp)] = 0;
+    ctx.scratch_mem = reinterpret_cast<u64>(scratch.data());  // image_base = scratch
     entry(&ctx);
     // CF_in=1 链路正确: v0 = 1 - 0 - 1 = 0
-    EXPECT_EQ(ctx.regs[0], 0ull) << "Sbb lost CF_in across Load/Store (got " << ctx.regs[0] << ")";
-    EXPECT_EQ(ctx.regs[5] & isa::kFlagCF, 0u);
+    EXPECT_EQ(ctx.regs[0], 0ull) << "Sbb lost CF_in across LoadRva/StoreRva (got " << ctx.regs[0] << ")";
+    EXPECT_EQ(ctx.regs[6] & isa::kFlagCF, 0u);
 }
 
 } // namespace

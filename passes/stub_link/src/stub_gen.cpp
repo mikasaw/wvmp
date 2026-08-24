@@ -26,7 +26,7 @@ constexpr u64 kCtxSize = 0x130;     // 结构 0x120 + 栈对齐余量
 // 占位 disp32（回填目标 = blob 指令流）：选罕见值便于汇编后定位。
 constexpr u32 kBlobDispDummy = 0xDEAD'0001;
 
-std::string build_stub_asm(u64 rt_entry_rva, u64 resume_rva) {
+std::string build_stub_asm(u64 rt_entry_rva, u64 resume_rva, u64 image_base) {
     std::string o;
     o += "push rbx\n push rbp\n push rdi\n push rsi\n";
     o += "push r12\n push r13\n push r14\n push r15\n";
@@ -56,7 +56,14 @@ std::string build_stub_asm(u64 rt_entry_rva, u64 resume_rva) {
     // 低 8*push(0x40) + 0x130，用 lea 还原。rax 的原值已在 slot0 保存，可复用。
     o += "lea rax, [rsp + 0x170]\n";
     o += "mov [rsp + " + hex(kCtxRsp) + "], rax\n";
-    o += "mov qword ptr [rsp + " + hex(kCtxScratch) + "], 0\n"; // scratch=0：绝对地址空间
+    // image_base（PE optional header 的 ImageBase 字段）→ scratch_mem 槽：
+    // Load/Store/Push/Pop 的访存汇编 `[addr + ctx+0x110]` 即 + image_base。
+    // rip-relative 翻译期把 [rip+disp] 转 RVA 写进字节码；运行时按此槽加基址
+    // 还原 VA。ASLR 下 Windows 加载器把整 image 重定位, RVA 不变, 槽值不变.
+    // PE32+ ImageBase 8B 可 >0x7FFFFFFF（典型 0x140000000）, 不能直接走
+    // `mov [mem], imm32` (符号扩展至 64 位) 编码——必须经 rax 中转。
+    o += "mov rax, " + hex(image_base) + "\n";
+    o += "mov qword ptr [rsp + " + hex(kCtxScratch) + "], rax\n";
     o += "mov qword ptr [rsp + 0x8], 0\n";                   // pc = 0
     o += "lea rax, [rip + " + hex(kBlobDispDummy) + "]\n";   // blob 指令流（回填）
     o += "mov [rsp], rax\n";                                 // ctx.bytecode
@@ -84,13 +91,13 @@ std::string build_stub_asm(u64 rt_entry_rva, u64 resume_rva) {
 } // namespace
 
 std::vector<u8> generate_entry_stub(u64 stub_rva, u64 blob_stream_rva, u64 rt_entry_rva,
-                                    u64 resume_rva) {
+                                    u64 resume_rva, u64 image_base) {
     ks_engine* ks = nullptr;
     if (ks_open(KS_ARCH_X86, KS_MODE_64, &ks) != KS_ERR_OK)
         throw std::runtime_error("stub_link: ks_open failed");
     ks_option(ks, KS_OPT_SYNTAX, KS_OPT_SYNTAX_INTEL);
 
-    const std::string src = build_stub_asm(rt_entry_rva, resume_rva);
+    const std::string src = build_stub_asm(rt_entry_rva, resume_rva, image_base);
     // 调试钩子（排查用）：WVMP_STUB_DUMP=<win 路径> 时落盘汇编文本。
     {
         char* dp = nullptr;

@@ -95,7 +95,12 @@ void StubLinkPass::run(ProtectionContext& ctx) {
         const u64 stub_rva = section_rva + stub_off;
         std::vector<u8> stub;
         try {
-            stub = generate_entry_stub(stub_rva, blob_stream_rva, rt_entry, vf.end_rva);
+            // image_base（PE optional header 的 ImageBase）写入 VmContext 的
+            // scratch_mem 槽：运行时 Load/Store/Push/Pop 的访存汇编即
+            // `[addr + image_base]`. 翻译期算的 RVA（rip-relative 转绝对）
+            // + 此基址 = 实际 VA. ASLR 下基址变化不影响 RVA, 槽值不变.
+            stub = generate_entry_stub(stub_rva, blob_stream_rva, rt_entry, vf.end_rva,
+                                       pe->image_base);
         } catch (const std::exception& e) {
             ctx.diag.report(Severity::Error, name(),
                             "函数 " + vf.name + " stub 生成失败（保持原生）: " + e.what());

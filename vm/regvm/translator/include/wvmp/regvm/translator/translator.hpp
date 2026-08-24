@@ -63,7 +63,12 @@ struct TranslateResult {
 //   Add acc, ix -> (disp!=0 时) Add/Sub acc, |disp|。
 //   注：disp<0 时发 Sub acc, (u32)(-disp)（负 disp 若零扩展填 aux 会得到
 //   错误地址，故用减法；这是任务书 "Add scratch, imm" 在负 disp 下的等价改写）。
-//   base=Rip 的 RIP 相对寻址：跳过整条指令并在 notes 记 "rip-relative 未支持"。
+//   base=Rip 的 RIP 相对寻址：RVA = next_ip + disp（next_ip 由 caller 从块布局推
+//   算: 同块下一条 insn.addr / 下一块首地址 / fn.end_rva）。翻译期发
+//   `Mov acc, imm(RVA)` (S64)；运行时 Load/Store 汇编 `add acc, [CTX+0x110]`
+//   即 + image_base（VmContext.scratch_mem，由 stub_gen 从 PE optional header
+//   取出写入）。rip 越界（disp 极端负跌出 image 起点）或 RVA > 0xFFFFFFFF
+//   拒绝并记 note（触发 C1 gate，保持原生；不作为 halt VM 的硬错误）。
 //   ALU 带 mem：Add rax,[m] -> 地址计算 + Load s,[m] + Add rax,s；
 //   Add [m],rax -> 地址计算 + Load s,[m] + Add s,rax + Store [m],s
 //   （Cmp/Test 无写回，不发 Store）。

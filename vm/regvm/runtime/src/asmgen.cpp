@@ -583,9 +583,36 @@ public:
             std::string o;
             o += std::string("    mov ") + r64(t_[1]) + ", qword ptr [" + r64(ctx_) + " + " +
                  r64(t_[7]) + "*8 + 0x10]\n";
+            if (s == 3)
+                o += std::string("    mov ") + r64(t_[0]) + ", qword ptr [" + r64(t_[1]) +
+                     "]\n";
+            else if (s == 2)
+                o += std::string("    mov ") + rs(t_[0], 2) + ", dword ptr [" + r64(t_[1]) +
+                     "]\n";
+            else
+                o += std::string("    movzx ") + r64(t_[0]) + ", " + mptr(s) + " [" + r64(t_[1]) +
+                     "]\n";
+            o += writeback(s, 4);
+            o += "    jmp " + tail_lbl + "\n";
+            blocks[s] = o;
+        }
+        return decode_prelude() + size_chain(blocks, tag) + tail_lbl + ":\n" + advance(dispatch);
+    }
+
+    // LoadRva：M2-8 rip-relative 配套——a=数据目的, b=地址(RVA);
+    // 实际访存 = RVA + scratch_mem (= image_base) = VA.
+    std::string build_loadrva(u64 dispatch) const {
+        const std::string tag = "ldrva" + std::to_string(seq());
+        const std::string tail_lbl = "atail_" + tag;
+        std::array<std::string, 4> blocks;
+        for (int s = 0; s < 4; ++s) {
+            std::string o;
+            o += std::string("    mov ") + r64(t_[1]) + ", qword ptr [" + r64(ctx_) + " + " +
+                 r64(t_[7]) + "*8 + 0x10]\n";
             o += std::string("    add ") + r64(t_[1]) + ", qword ptr [" + r64(ctx_) + " + 0x110]\n";
             if (s == 3)
-                o += std::string("    mov ") + r64(t_[0]) + ", qword ptr [" + r64(t_[1]) + "]\n";
+                o += std::string("    mov ") + r64(t_[0]) + ", qword ptr [" + r64(t_[1]) +
+                     "]\n";
             else if (s == 2)
                 o += std::string("    mov ") + rs(t_[0], 2) + ", dword ptr [" + r64(t_[1]) +
                      "]\n";
@@ -602,6 +629,31 @@ public:
     // Store：a=地址，b=数据（按宽度掩码写）。
     std::string build_store(u64 dispatch) const {
         const std::string tag = "st" + std::to_string(seq());
+        const std::string tail_lbl = "atail_" + tag;
+        std::array<std::string, 4> blocks;
+        for (int s = 0; s < 4; ++s) {
+            std::string o;
+            o += std::string("    mov ") + r64(t_[1]) + ", qword ptr [" + r64(ctx_) + " + " +
+                 r64(t_[4]) + "*8 + 0x10]\n";
+            if (s == 3)
+                o += std::string("    mov ") + r64(t_[0]) + ", qword ptr [" + r64(ctx_) + " + " +
+                     r64(t_[7]) + "*8 + 0x10]\n";
+            else if (s == 2)
+                o += std::string("    mov ") + rs(t_[0], 2) + ", dword ptr [" + r64(ctx_) + " + " +
+                     r64(t_[7]) + "*8 + 0x10]\n";
+            else
+                o += std::string("    movzx ") + r64(t_[0]) + ", " + mptr(s) + " [" + r64(ctx_) +
+                     " + " + r64(t_[7]) + "*8 + 0x10]\n";
+            o += std::string("    mov ") + mptr(s) + " [" + r64(t_[1]) + "], " + rs(t_[0], s) + "\n";
+            o += "    jmp " + tail_lbl + "\n";
+            blocks[s] = o;
+        }
+        return decode_prelude() + size_chain(blocks, tag) + tail_lbl + ":\n" + advance(dispatch);
+    }
+
+    // StoreRva：M2-8 rip-relative 配套——a=地址(RVA), b=数据; 写 RVA+image_base.
+    std::string build_storerva(u64 dispatch) const {
+        const std::string tag = "strva" + std::to_string(seq());
         const std::string tail_lbl = "atail_" + tag;
         std::array<std::string, 4> blocks;
         for (int s = 0; s < 4; ++s) {
@@ -640,17 +692,15 @@ public:
         o += "pimm" + tag + ":\n";
         o += std::string("    mov ") + r64(t_[1]) + ", " + r64(t_[5]) + "\n";
         o += "pgo" + tag + ":\n";
-        o += std::string("    add ") + r64(t_[0]) + ", qword ptr [" + r64(ctx_) + " + 0x110]\n";
         o += std::string("    mov qword ptr [") + r64(t_[0]) + "], " + r64(t_[1]) + "\n";
         o += advance(dispatch);
         return o;
     }
 
-    // Pop：目的=reg_a（S64）；v4(rsp) += 8。
+    // Pop：目的=reg_a（S64）；v4(rsp) += 8。同 Push，**不加** scratch_mem。
     std::string build_pop(u64 dispatch) const {
         std::string o = decode_prelude();
         o += std::string("    mov ") + r64(t_[0]) + ", qword ptr [" + r64(ctx_) + " + 0x30]\n";
-        o += std::string("    add ") + r64(t_[0]) + ", qword ptr [" + r64(ctx_) + " + 0x110]\n";
         o += std::string("    mov ") + r64(t_[1]) + ", qword ptr [" + r64(t_[0]) + "]\n";
         o += std::string("    mov ") + r64(t_[9]) + ", qword ptr [" + r64(ctx_) + " + 0x30]\n";
         o += std::string("    add ") + r64(t_[9]) + ", 8\n";
@@ -994,6 +1044,8 @@ RuntimeGenResult generate_runtime(wvmp::Rng& rng) {
         {int(VmOp::Test), "test", &AsmGen::build_test},
         {int(VmOp::Load), "load", &AsmGen::build_load},
         {int(VmOp::Store), "store", &AsmGen::build_store},
+        {int(VmOp::LoadRva), "loadrva", &AsmGen::build_loadrva},
+        {int(VmOp::StoreRva), "storeriva", &AsmGen::build_storerva},
         {int(VmOp::Push), "push", &AsmGen::build_push},
         {int(VmOp::Pop), "pop", &AsmGen::build_pop},
         {int(VmOp::Jmp), "jmp", &AsmGen::build_jmp},

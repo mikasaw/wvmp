@@ -24,6 +24,18 @@ namespace {
 constexpr size_t kChecksumOffsetInOpt = 64;
 constexpr size_t kNtPrefix = 4 + 20;
 
+// DllCharacteristics 位于 OptionalHeader +0x46 (PE32+/PE32 相同, 在 Subsystem
+// +0x02 处). 绝对偏移 = nt_off (PE 签名 4 + FILE_HEADER 20) + 0x46 = nt_off + 0x5e.
+// IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE = 0x40 (ASLR 标志). M2-8 起 rip-relative
+// 翻译期把 [rip+disp] 转 RVA, 运行时经 LoadRva/StoreRva + VmContext.scratch_mem
+// (=image_base) 还原 VA. Windows ASLR 把 image 重新定位到随机基址, 但 stub
+// 只知道 PE.ImageBase（写入 scratch_mem）— 二者不等 → 访存错位 → 段错误。
+// 简化方案（M2-8 局限）：保护后清除 DYNAMIC_BASE 标志，强制 Windows 加载到
+// ImageBase 声明位置. 完整 ASLR 兼容需要 stub 在运行时通过 PE 重定位 / GetModuleHandle
+// 取真实基址——M2-9+ 排期。
+constexpr size_t kDllCharsOffsetFromNt = 0x5e;  // 4 (签名) + 20 (FILE_HEADER) + 0x46 (opt)
+constexpr u16 kImageDllCharacteristicsDynamicBase = 0x0040;
+
 } // namespace
 
 std::span<const std::string_view> PeWriterPass::requires_keys() const {
@@ -84,6 +96,31 @@ void PeWriterPass::run(ProtectionContext& ctx) {
     ByteWriter w(ctx.image);
     w.patch_u32(chk_off, 0);
     w.patch_u32(chk_off, pe_checksum(ctx.image, chk_off));
+
+    // 2.5) M2-8: 清除 DllCharacteristics.DYNAMIC_BASE (ASLR) — 仅在确实虚拟化
+    //   时（有 stub 产出）才需要. 没虚拟化的镜像保持原状（PE-writer 单元测试
+    //   往返断言要求 byte-identical）。
+    //   见 kDllCharsOffsetFromNt 注释——stub_link 写入 scratch_mem 用
+    //   PE.ImageBase, ASLR 重定位后不等于实际基址, 全局读写越界段错.
+    const auto* new_sections_check = ctx.find_slot<std::vector<NewSection>>(kNewSections);
+    const bool has_stub = new_sections_check != nullptr && !new_sections_check->empty();
+    if (has_stub &&
+        nt_off + kDllCharsOffsetFromNt + 2 <= ctx.image.size()) {
+        const u16 old_dll =
+            static_cast<u16>(static_cast<u16>(ctx.image[nt_off + kDllCharsOffsetFromNt]) |
+                            (static_cast<u16>(ctx.image[nt_off + kDllCharsOffsetFromNt + 1]) << 8));
+        const u16 new_dll = static_cast<u16>(old_dll & ~kImageDllCharacteristicsDynamicBase);
+        if (new_dll != old_dll) {
+            ctx.image[nt_off + kDllCharsOffsetFromNt] = static_cast<u8>(new_dll & 0xFF);
+            ctx.image[nt_off + kDllCharsOffsetFromNt + 1] = static_cast<u8>((new_dll >> 8) & 0xFF);
+            ctx.diag.report(Severity::Note, name(),
+                            "M2-8: 已清除 DllCharacteristics.DYNAMIC_BASE (ASLR)，强制镜像加载到 ImageBase 声明位置（stub scratch_mem 兼容性）");
+            // checksum 含 DllCharacters, 重新计算.
+            ByteWriter w2(ctx.image);
+            w2.patch_u32(chk_off, 0);
+            w2.patch_u32(chk_off, pe_checksum(ctx.image, chk_off));
+        }
+    }
 
     // 3) 临时文件 + rename 原子替换，防止半写文件暴露给用户。
     std::filesystem::path tmp = ctx.output_path;

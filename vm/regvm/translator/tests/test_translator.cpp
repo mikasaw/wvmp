@@ -376,16 +376,42 @@ TEST(Translate, CallSkippedWithNote) {
     expect_is(d.insns[1], VmOp::Halt, OpKind::None, 0, OpKind::None, 0, 0, 0);
 }
 
-TEST(Translate, RipRelativeSkippedWithNote) {
+// ---------------- rip-relative (M2-8 支持：RVA = next_ip + disp) ----------------
+// 块内单条 [rip+disp]：翻译期算出绝对 RVA，立即数进字节码（运行时
+// Load/Store 汇编加 VmContext.scratch_mem=image_base 还原 VA）。
+TEST(Translate, RipRelativeEncodesAbsoluteRVA) {
     // mov rax, [rip+8] -> IR Load（base=Rip）。
+    //   insn.addr = 0x1000; 单块单条; next_ip = fn.end_rva = 0x3000
+    //   disp = +8; RVA = 0x3000 + 8 = 0x3008
     ir::Insn ld = I(ir::Op::Load, ir::Size::S64);
     ld.dst = ir::Operand::reg_(ir::Reg::Rax);
     ld.src = ir::Operand::mem_(m(ir::Reg::Rip, ir::Reg::Flags, 0, 8));
-    const auto r = wvmp::regvm::translator::translate_function(fn_of({blk(0x1000, {ld})}));
-    ASSERT_EQ(r.notes.size(), static_cast<size_t>(1));
-    EXPECT_NE(r.notes[0].find("rip-relative 未支持"), std::string::npos);
+    const auto r = wvmp::regvm::translator::translate_function(
+        fn_of({blk(0x1000, {ld})}));
+    EXPECT_TRUE(r.notes.empty()) << "rip-relative M2-8 起翻译期不记 skip note";
     const Decoded d = decode_program(r.program);
-    ASSERT_EQ(d.insns.size(), static_cast<size_t>(2));
+    // 第一条应是 `Mov acc, imm(0x3008)`: 发射绝对 RVA, 运行时 [acc + image_base].
+    ASSERT_GE(d.insns.size(), static_cast<size_t>(2));
+    expect_is(d.insns[0], VmOp::Mov, OpKind::Reg, isa::kScratchFirst, OpKind::Imm, 0,
+              0x3008, kS64);
+}
+
+TEST(Translate, RipRelativeNegativeDisp) {
+    // 块内两条: insn0 @0x1000 ([rip-4] 读) + insn1 @0x1004 (ret).
+    // insn0 next_ip = 0x1004; disp=-4; RVA = 0x1000; 直接进 aux.
+    ir::Insn ld = I(ir::Op::Load, ir::Size::S64);
+    ld.addr = 0x1000;
+    ld.dst = ir::Operand::reg_(ir::Reg::Rax);
+    ld.src = ir::Operand::mem_(m(ir::Reg::Rip, ir::Reg::Flags, 0, -4));
+    ir::Insn ret = I(ir::Op::Ret, ir::Size::S64);
+    ret.addr = 0x1004;
+    const auto r = wvmp::regvm::translator::translate_function(
+        fn_of({blk(0x1000, {ld, ret})}));
+    EXPECT_TRUE(r.notes.empty());
+    const Decoded d = decode_program(r.program);
+    ASSERT_GE(d.insns.size(), static_cast<size_t>(3));
+    expect_is(d.insns[0], VmOp::Mov, OpKind::Reg, isa::kScratchFirst, OpKind::Imm, 0,
+              0x1000, kS64);  // base=0x1000 = next_ip(0x1004) + disp(-4)
 }
 
 // ---------------- 参考解释器（~150 行） ----------------

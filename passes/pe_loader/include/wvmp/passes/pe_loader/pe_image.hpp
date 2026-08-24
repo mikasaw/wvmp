@@ -36,6 +36,9 @@ struct PeImage {
     bool is_pe32_plus = false;  // OptionalHeader Magic == 0x20B（PE32+）
     u16 machine = 0;            // IMAGE_FILE_MACHINE_*（0x14c x86 / 0x8664 x64）
     u32 entry_point_rva = 0;    // AddressOfEntryPoint
+    u64 image_base = 0;         // PE optional header 的 ImageBase（PE32=4B / PE32+=8B；
+                                // M2-8 起供 rip-relative 翻译期把 [rip+disp] 转 RVA 时
+                                // 与 stub 协定的 image_base 字段互校）
     u32 section_alignment = 0;
     u32 file_alignment = 0;
     u16 num_sections = 0;

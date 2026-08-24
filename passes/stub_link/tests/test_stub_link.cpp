@@ -168,8 +168,10 @@ TEST(StubLinkPass, UnmappableRegionKeepsNative) {
 }
 
 TEST(StubGen, StubBytesStartWithPushesAndSubRsp) {
+    // image_base（M2-8 起 stub 协定新增；PE optional header 的 ImageBase 字段
+    // 写入 VmContext.scratch_mem，供 Load/Store 访存汇编 `add addr, [CTX+0x110]`）
     const auto stub =
-        wvmp::passes::generate_entry_stub(0x9000, 0x9100, 0x9040, 0x1100);
+        wvmp::passes::generate_entry_stub(0x9000, 0x9100, 0x9040, 0x1100, 0x140000000ull);
     ASSERT_GT(stub.size(), static_cast<size_t>(32));
     // 首字节必为 push（0x50-0x57 或 REX 0x41 前缀）。
     EXPECT_TRUE((stub[0] >= 0x50 && stub[0] <= 0x57) ||

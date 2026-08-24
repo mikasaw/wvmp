@@ -40,7 +40,8 @@ void put32(std::vector<u8>& v, size_t o, u32 x) {
 
 // 手工拼最小合法 PE：DOS 头(0x00) + NT 头(0x40) + 节表 + ".text" 原始数据。
 // 布局：[0x000,0x200) 头部 | [0x200,0x400) .text（VA 0x1000，VS=SR=0x200）。
-std::vector<u8> build_minimal_pe(bool pe32_plus, u16 machine) {
+// image_base 默认 0x400000；PE32+ 8B 字段写入, PE32 4B 字段写入。
+std::vector<u8> build_minimal_pe(bool pe32_plus, u16 machine, u64 image_base = 0x400000ull) {
     const u16 opt_size = pe32_plus ? 240 : 224; // PE32+ 240 / PE32 224
     const size_t nt = 0x40;
     const size_t opt = nt + 24;
@@ -55,10 +56,16 @@ std::vector<u8> build_minimal_pe(bool pe32_plus, u16 machine) {
     put16(img, nt + 4, machine);    // Machine
     put16(img, nt + 6, 1);          // NumberOfSections
     put16(img, nt + 20, opt_size);  // SizeOfOptionalHeader
-    // OptionalHeader（EntryPoint @16 / SectionAlignment @32 / FileAlignment @36，
-    // 两种格式偏移一致）
+    // OptionalHeader（EntryPoint @16 / ImageBase @24 (PE32+) / @24 (PE32) /
+    // SectionAlignment @32 / FileAlignment @36, 两种格式对齐到 @32）
     put16(img, opt + 0, pe32_plus ? 0x20B : 0x10B);
     put32(img, opt + 16, 0x1234);  // AddressOfEntryPoint
+    put32(img, opt + 20, 0x1000);  // BaseOfCode
+    if (pe32_plus) {
+        for (int i = 0; i < 8; ++i) img[opt + 24 + i] = u8(image_base >> (8 * i));
+    } else {
+        put32(img, opt + 24, u32(image_base));
+    }
     put32(img, opt + 32, 0x1000);  // SectionAlignment
     put32(img, opt + 36, 0x200);   // FileAlignment
     // 节表：".text"
@@ -101,12 +108,13 @@ fs::path write_temp(const std::string& name, std::span<const u8> bytes) {
 // —— 解析字段断言 ————————————————————————————————————————————————
 
 TEST(PeImageParse, MinimalX64) {
-    const auto bytes = build_minimal_pe(true, kMachineX64);
+    const auto bytes = build_minimal_pe(true, kMachineX64, 0x0000000140000000ull);
     const wvmp::passes::PeImage img = wvmp::passes::parse_pe_image(bytes);
 
     EXPECT_TRUE(img.is_pe32_plus);
     EXPECT_EQ(img.machine, kMachineX64);
     EXPECT_EQ(img.entry_point_rva, 0x1234u);
+    EXPECT_EQ(img.image_base, 0x0000000140000000ull);  // PE32+ 8B ImageBase
     EXPECT_EQ(img.section_alignment, 0x1000u);
     EXPECT_EQ(img.file_alignment, 0x200u);
     EXPECT_EQ(img.num_sections, u16(1));
@@ -123,11 +131,12 @@ TEST(PeImageParse, MinimalX64) {
 }
 
 TEST(PeImageParse, MinimalX86) {
-    const auto bytes = build_minimal_pe(false, kMachineX86);
+    const auto bytes = build_minimal_pe(false, kMachineX86, 0x400000u);
     const wvmp::passes::PeImage img = wvmp::passes::parse_pe_image(bytes);
 
     EXPECT_FALSE(img.is_pe32_plus);
     EXPECT_EQ(img.machine, kMachineX86);
+    EXPECT_EQ(img.image_base, 0x400000u);  // PE32 4B ImageBase
     EXPECT_EQ(img.num_sections, u16(1));
     EXPECT_EQ(img.sections[0].name, ".text");
 }

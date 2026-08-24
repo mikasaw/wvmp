@@ -61,7 +61,15 @@ PeImage parse_impl(std::span<const u8> image) {
     else if (magic != kMagicPe32) throw PeParseError("OptionalHeader 魔数不是 PE32/PE32+");
     r.skip(14);                     // 到 AddressOfEntryPoint @16
     img.entry_point_rva = r.read_u32();
-    r.skip(12);                     // BaseOfCode / ImageBase（两种格式对齐到 @32）
+    if (img.is_pe32_plus) {
+        // PE32+：BaseOfCode（4B）+ ImageBase（8B）= 12B；PE32：BaseOfCode（4B）+
+        // ImageBase（4B）= 8B. 共同起点 = 紧跟 entry_point_rva 之后.
+        r.skip(4);                  // BaseOfCode
+        img.image_base = r.read_u64();
+    } else {
+        r.skip(4);                  // BaseOfCode
+        img.image_base = r.read_u32();
+    }
     img.section_alignment = r.read_u32();
     img.file_alignment = r.read_u32();
 

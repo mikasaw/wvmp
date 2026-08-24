@@ -114,3 +114,28 @@ target_compile_options(wvmp_rol_sample PRIVATE
 target_link_options(wvmp_rol_sample PRIVATE
     $<$<CXX_COMPILER_ID:MSVC>:/INCREMENTAL:NO>
 )
+
+# MIT-248：端到端正路径样本——区域内含 rip-relative 真实全局读写 (mov/add/
+# mov [rip+g_counter])，验证 C4 修复后翻译期 [rip+disp] 转 RVA、运行时
+# + image_base 还原 VA、保护后行为与原生逐字节一致。区域**完整可虚拟化**
+# (除上述 ALU/Mov 仅 ret，不触发 C1 gate).
+add_executable(wvmp_rip_relative_sample rip_relative_sample_main.cpp)
+target_link_libraries(wvmp_rip_relative_sample PRIVATE wvmp::sdk)
+target_compile_options(wvmp_rip_relative_sample PRIVATE
+    $<$<CXX_COMPILER_ID:MSVC>:/Od;/Ob0;/utf-8>
+    $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-O0>
+)
+target_link_options(wvmp_rip_relative_sample PRIVATE
+    $<$<CXX_COMPILER_ID:MSVC>:/INCREMENTAL:NO>
+)
+
+# MIT-248: 简化调试样本——单条 [rip+disp] load, 无 spill 栈操作.
+add_executable(wvmp_rip_relative_simple_sample rip_relative_simple_main.cpp)
+target_link_libraries(wvmp_rip_relative_simple_sample PRIVATE wvmp::sdk)
+target_compile_options(wvmp_rip_relative_simple_sample PRIVATE
+    $<$<CXX_COMPILER_ID:MSVC>:/Od;/Ob0;/utf-8>
+    $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-O0>
+)
+target_link_options(wvmp_rip_relative_simple_sample PRIVATE
+    $<$<CXX_COMPILER_ID:MSVC>:/INCREMENTAL:NO>
+)

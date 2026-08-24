@@ -11,6 +11,7 @@
 
 #include <cinttypes>
 #include <cstdio>
+#include <limits>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -96,12 +97,49 @@ void emit_imm64_split(Emitter& em, Scratch& sc, u8 d, u64 v) {
     em.emit_rr(VmOp::Or, d, s, sz64);
 }
 
-// 地址计算：base(+index*scale)(+disp) -> acc。RIP 相对 / 非法 scale 返回
-// false（发射可能已写一半，但 Emitter 事务性保证整条指令被丢弃）。
+// 地址计算：base(+index*scale)(+disp) -> acc。RIP 相对：base=Rip 时用
+// next_ip + disp 算 RVA 直接发为 S64 立即数（带 index/disp 一律零相加；
+// x64 [rip+disp32] 实际 = next_ip + disp32, next_ip = current_rva + insn_len,
+// 由 caller 通过 next_ip_of_ 传入). 无效 scale/越界 RVA 返回 false.
 [[nodiscard]] bool emit_address(Emitter& em, Scratch& sc, const ir::MemOperand& m,
-                                u8& acc_out) {
-    if (m.base == ir::Reg::Rip)
-        return false;
+                                u64 current_rva, u64 next_ip, u8& acc_out) {
+    if (m.base == ir::Reg::Rip) {
+        // rip-relative: RVA = next_ip + disp (disp 是 i64, 可负).
+        // PE RVA 字段为 u32, 正常范围 [0, end_rva); 越界（极负 disp 跌出 image 起点）
+        // 拒绝, 触发 C1 gate 拦截（保持原生）, 不作为 halt VM 的硬错误.
+        const i64 rva_i = static_cast<i64>(next_ip) + m.disp;
+        if (rva_i < 0 || rva_i > static_cast<i64>(std::numeric_limits<u32>::max()))
+            return false;
+        const u64 rva = static_cast<u64>(rva_i);
+        const u8 acc = sc.take();
+        const u8 sz64 = isa::size_field(ir::Size::S64);
+        if (fits_aux(rva_i)) {
+            em.emit_ri(VmOp::Mov, acc, static_cast<u32>(rva_i), sz64);
+        } else {
+            emit_imm64_split(em, sc, acc, rva);
+        }
+        // index/scale 在 [rip+disp] 形式中不会出现（Capstone 不产 rip+index）；
+        // 即便 lifter 出, 也按 (index<<scale) + (RVA+disp) 一并入 acc, 行为
+        // 等价于 lea 后再访存. 守护：仅在 base=Rip 时 index 也飘零，否则接受.
+        if (m.index != ir::Reg::Flags) {
+            unsigned shift_bits = 0;
+            switch (m.scale == 0 ? 1u : m.scale) {
+            case 1: shift_bits = 0; break;
+            case 2: shift_bits = 1; break;
+            case 4: shift_bits = 2; break;
+            case 8: shift_bits = 3; break;
+            default: return false;
+            }
+            const u8 ix = sc.take();
+            em.emit_rr(VmOp::Mov, ix, isa::vm_reg_of(m.index), sz64);
+            if (shift_bits > 0)
+                em.emit_ri(VmOp::Shl, ix, shift_bits, sz64);
+            em.emit_rr(VmOp::Add, acc, ix, sz64);
+        }
+        (void)current_rva;
+        acc_out = acc;
+        return true;
+    }
     const u8 sz64 = isa::size_field(ir::Size::S64);
     const u8 acc = sc.take();
     if (m.base != ir::Reg::Flags) {
@@ -139,18 +177,22 @@ void emit_imm64_split(Emitter& em, Scratch& sc, u8 d, u64 v) {
             em.emit_rr(VmOp::Add, acc, t, sz64);
         }
     }
+    (void)current_rva;
     acc_out = acc;
     return true;
 }
 
 // 读 [mem] 到 fresh scratch（Load s, [acc]，方向：a=Reg(s)，b=Reg(acc)）。
-// 返回 false 的唯一原因（rip / 非法 scale）已由调用方先行检查。
-u8 emit_load(Emitter& em, Scratch& sc, const ir::MemOperand& m, ir::Size size) {
+// 返回 false 的唯一原因（非法 scale / 越界 RVA）已由调用方先行检查。
+u8 emit_load(Emitter& em, Scratch& sc, const ir::MemOperand& m, ir::Size size,
+             u64 current_rva, u64 next_ip) {
     u8 acc = 0;
-    const bool ok = emit_address(em, sc, m, acc);
+    const bool ok = emit_address(em, sc, m, current_rva, next_ip, acc);
     (void)ok;
     const u8 val = sc.take();
-    em.emit_rr(VmOp::Load, val, acc, isa::size_field(size));
+    const isa::VmOp load_op =
+        (m.base == ir::Reg::Rip) ? isa::VmOp::LoadRva : isa::VmOp::Load;
+    em.emit_rr(load_op, val, acc, isa::size_field(size));
     return val;
 }
 
@@ -183,11 +225,15 @@ struct PendingJump {
 
 // 单条 IR 指令翻译器。所有失败路径经 skip() 记 notes 并返回 false，
 // 临时发射内容随之丢弃；flags 语义见头文件（v1 不做额外指令）。
+//
+// rip-relative 计算用 next_ip_of_（每条 insn 的结束 RVA, 即 current_rva + insn_len;
+// 翻译期不持 capstone, 由 caller 从 fn.blocks 推断）。
 struct Translator {
     std::vector<VmInsn>& code;
     std::vector<PendingJump>& pending;
     const std::unordered_map<u64, size_t>& block_of_addr;
     std::vector<std::string>& notes;
+    const std::unordered_map<u64, u64>* next_ip_of_;   // insn.addr -> next_ip (=addr+len)
 
     bool skip(const ir::Insn& in, std::string_view what, const ir::MemOperand* rip) {
         if (rip && rip->base == ir::Reg::Rip)
@@ -200,11 +246,19 @@ struct Translator {
         Emitter em;
         Scratch sc;
         bool ok = true;
+        const u64 current_rva = in.addr;
+        // next_ip_of_ 在 translate_function 前已构造, 必有该 insn.addr; find 是
+        // const 安全路径（operator[] 会插入默认 0, 与语义不符, 故显式 find）。
+        u64 next_ip = current_rva;
+        if (next_ip_of_) {
+            const auto it = next_ip_of_->find(current_rva);
+            if (it != next_ip_of_->end()) next_ip = it->second;
+        }
         switch (in.op) {
         case ir::Op::Mov: ok = translate_mov(em, sc, in); break;
-        case ir::Op::Lea: ok = translate_lea(em, sc, in); break;
-        case ir::Op::Load: ok = translate_load(em, sc, in); break;
-        case ir::Op::Store: ok = translate_store(em, sc, in); break;
+        case ir::Op::Lea: ok = translate_lea(em, sc, in, current_rva, next_ip); break;
+        case ir::Op::Load: ok = translate_load(em, sc, in, current_rva, next_ip); break;
+        case ir::Op::Store: ok = translate_store(em, sc, in, current_rva, next_ip); break;
         case ir::Op::Push: ok = translate_push(em, in); break;
         case ir::Op::Pop: ok = translate_pop(em, in); break;
         case ir::Op::Ret:
@@ -222,9 +276,9 @@ struct Translator {
             break;
         default:
             if (is_alu_binop(in.op))
-                ok = translate_alu_binop(em, sc, in);
+                ok = translate_alu_binop(em, sc, in, current_rva, next_ip);
             else if (is_unary(in.op))
-                ok = translate_unary(em, sc, in);
+                ok = translate_unary(em, sc, in, current_rva, next_ip);
             else
                 ok = skip(in, "未支持的操作码", nullptr);
             break;
@@ -235,6 +289,8 @@ struct Translator {
 
     // ---- 数据移动 ----
 
+    // mov 不接 mem 操作数（lifter 已将 mem-src 拆为 Load, mem-dst 拆为 Store），
+    // 故不需要 next_ip 参数.
     bool translate_mov(Emitter& em, Scratch& sc, const ir::Insn& in) {
         if (in.dst.kind != ir::Operand::Kind::Reg)
             return skip(in, "mov 操作数形态未支持",
@@ -257,38 +313,44 @@ struct Translator {
         return true;
     }
 
-    bool translate_lea(Emitter& em, Scratch& sc, const ir::Insn& in) {
+    bool translate_lea(Emitter& em, Scratch& sc, const ir::Insn& in,
+                       u64 current_rva, u64 next_ip) {
         if (in.dst.kind != ir::Operand::Kind::Reg ||
             in.src.kind != ir::Operand::Kind::Mem)
             return skip(in, "lea 操作数形态未支持", nullptr);
         u8 acc = 0;
-        if (!emit_address(em, sc, in.src.mem, acc))
+        if (!emit_address(em, sc, in.src.mem, current_rva, next_ip, acc))
             return skip(in, "lea 地址形态未支持", &in.src.mem);
         // lea 不访存：地址值即结果；按原 size 写回（S32 lea 零扩展高位）。
         em.emit_rr(VmOp::Mov, isa::vm_reg_of(in.dst.reg), acc, isa::size_field(in.size));
         return true;
     }
 
-    bool translate_load(Emitter& em, Scratch& sc, const ir::Insn& in) {
+    bool translate_load(Emitter& em, Scratch& sc, const ir::Insn& in,
+                        u64 current_rva, u64 next_ip) {
         if (in.dst.kind != ir::Operand::Kind::Reg ||
             in.src.kind != ir::Operand::Kind::Mem)
             return skip(in, "load 操作数形态未支持", nullptr);
         u8 acc = 0;
-        if (!emit_address(em, sc, in.src.mem, acc))
+        if (!emit_address(em, sc, in.src.mem, current_rva, next_ip, acc))
             return skip(in, "load 地址形态未支持", &in.src.mem);
-        // 方向固定：a=Reg(dst)，b=Reg(addr)。
-        em.emit_rr(VmOp::Load, isa::vm_reg_of(in.dst.reg), acc, isa::size_field(in.size));
+        // rip-relative 翻译期算绝对 RVA, 运行时经 LoadRva 加 scratch_mem 还原 VA；
+        // 非 rip 已为绝对 VA（来自 host 寄存器拷贝 / 算术）, 走普通 Load.
+        const isa::VmOp load_op =
+            (in.src.mem.base == ir::Reg::Rip) ? isa::VmOp::LoadRva : isa::VmOp::Load;
+        em.emit_rr(load_op, isa::vm_reg_of(in.dst.reg), acc, isa::size_field(in.size));
         return true;
     }
 
-    bool translate_store(Emitter& em, Scratch& sc, const ir::Insn& in) {
+    bool translate_store(Emitter& em, Scratch& sc, const ir::Insn& in,
+                         u64 current_rva, u64 next_ip) {
         if (in.dst.kind != ir::Operand::Kind::Mem)
             return skip(in, "store 操作数形态未支持", nullptr);
         if (in.src.kind != ir::Operand::Kind::Reg &&
             in.src.kind != ir::Operand::Kind::Imm)
             return skip(in, "store 操作数形态未支持", nullptr); // 双 mem 不合法
         u8 acc = 0;
-        if (!emit_address(em, sc, in.dst.mem, acc))
+        if (!emit_address(em, sc, in.dst.mem, current_rva, next_ip, acc))
             return skip(in, "store 地址形态未支持", &in.dst.mem);
         u8 src_reg = 0;
         if (in.src.kind == ir::Operand::Kind::Reg) {
@@ -301,8 +363,10 @@ struct Translator {
             src_reg = sc.take();
             emit_imm64_split(em, sc, src_reg, static_cast<u64>(in.src.imm));
         }
-        // 方向固定：a=Reg(addr)，b=Reg(src)。
-        em.emit_rr(VmOp::Store, acc, src_reg, isa::size_field(in.size));
+        // rip-relative 用 StoreRva（运行时 + image_base）；非 rip 用普通 Store.
+        const isa::VmOp store_op =
+            (in.dst.mem.base == ir::Reg::Rip) ? isa::VmOp::StoreRva : isa::VmOp::Store;
+        em.emit_rr(store_op, acc, src_reg, isa::size_field(in.size));
         return true;
     }
 
@@ -351,7 +415,8 @@ struct Translator {
 
     // ---- 运算 ----
 
-    bool translate_alu_binop(Emitter& em, Scratch& sc, const ir::Insn& in) {
+    bool translate_alu_binop(Emitter& em, Scratch& sc, const ir::Insn& in,
+                             u64 current_rva, u64 next_ip) {
         VmOp vop{};
         if (!vm_op_of(in.op, vop))
             return skip(in, "未支持的操作码", nullptr);
@@ -363,21 +428,26 @@ struct Translator {
         if (dst_mem) {
             // [m] op src：地址一次计算、Load/Store 复用（scratch 预算内）。
             u8 acc = 0;
-            if (!emit_address(em, sc, in.dst.mem, acc))
+            if (!emit_address(em, sc, in.dst.mem, current_rva, next_ip, acc))
                 return skip(in, "alu 内存目的地址形态未支持", &in.dst.mem);
             const u8 s = sc.take();
-            em.emit_rr(VmOp::Load, s, acc, isa::size_field(in.size));
+            const isa::VmOp load_op =
+                (in.dst.mem.base == ir::Reg::Rip) ? isa::VmOp::LoadRva : isa::VmOp::Load;
+            em.emit_rr(load_op, s, acc, isa::size_field(in.size));
             if (!emit_binop_tail(em, sc, in, vop, s))
                 return skip(in, "alu 操作数形态未支持", nullptr);
-            if (in.op != ir::Op::Cmp && in.op != ir::Op::Test) // Cmp/Test 无写回
-                em.emit_rr(VmOp::Store, acc, s, isa::size_field(in.size));
+            if (in.op != ir::Op::Cmp && in.op != ir::Op::Test) { // Cmp/Test 无写回
+                const isa::VmOp store_op =
+                    (in.dst.mem.base == ir::Reg::Rip) ? isa::VmOp::StoreRva : isa::VmOp::Store;
+                em.emit_rr(store_op, acc, s, isa::size_field(in.size));
+            }
             return true;
         }
         if (in.dst.kind != ir::Operand::Kind::Reg)
             return skip(in, "alu 操作数形态未支持", nullptr);
         const u8 d = isa::vm_reg_of(in.dst.reg);
         if (src_mem) {
-            const u8 s = emit_load(em, sc, in.src.mem, in.size);
+            const u8 s = emit_load(em, sc, in.src.mem, in.size, current_rva, next_ip);
             em.emit_rr(vop, d, s, isa::size_field(in.size));
             return true;
         }
@@ -408,7 +478,8 @@ struct Translator {
         return true;
     }
 
-    bool translate_unary(Emitter& em, Scratch& sc, const ir::Insn& in) {
+    bool translate_unary(Emitter& em, Scratch& sc, const ir::Insn& in,
+                         u64 current_rva, u64 next_ip) {
         VmOp vop{};
         if (!vm_op_of(in.op, vop))
             return skip(in, "未支持的操作码", nullptr);
@@ -421,12 +492,16 @@ struct Translator {
             return skip(in, "单目操作数形态未支持", nullptr);
         // [m]：Load s; op s; Store s（地址一次计算、复用）。
         u8 acc = 0;
-        if (!emit_address(em, sc, in.dst.mem, acc))
+        if (!emit_address(em, sc, in.dst.mem, current_rva, next_ip, acc))
             return skip(in, "单目操作内存地址形态未支持", &in.dst.mem);
         const u8 s = sc.take();
-        em.emit_rr(VmOp::Load, s, acc, sz);
+        const isa::VmOp load_op =
+            (in.dst.mem.base == ir::Reg::Rip) ? isa::VmOp::LoadRva : isa::VmOp::Load;
+        em.emit_rr(load_op, s, acc, sz);
         em.emit(vop, OpKind::Reg, s, OpKind::None, 0, 0, sz);
-        em.emit_rr(VmOp::Store, acc, s, sz);
+        const isa::VmOp store_op =
+            (in.dst.mem.base == ir::Reg::Rip) ? isa::VmOp::StoreRva : isa::VmOp::Store;
+        em.emit_rr(store_op, acc, s, sz);
         return true;
     }
 };
@@ -441,10 +516,32 @@ TranslateResult translate_function(const ir::FunctionRegion& fn) {
     for (size_t i = 0; i < fn.blocks.size(); ++i)
         block_of_addr.emplace(fn.blocks[i].addr, i);
 
+    // 地址 -> next_ip（每条 insn 的结束 RVA; rip-relative 翻译用 next_ip+disp 算 RVA）。
+    // 推断规则：同一块内下一条 insn.addr; 块末尾下一条 = 下一块 .addr; 函数末尾
+    // 块的最后一条 = fn.end_rva. lifter 产出保证 insn.addr 块内严格递增, blocks
+    // 按地址升序, 故 next_ip > current_rva 恒成立.
+    std::unordered_map<u64, u64> next_ip_of;
+    next_ip_of.reserve(fn.blocks.size() * 4);
+    for (size_t bi = 0; bi < fn.blocks.size(); ++bi) {
+        const ir::BasicBlock& b = fn.blocks[bi];
+        for (size_t ii = 0; ii < b.insns.size(); ++ii) {
+            const u64 cur = b.insns[ii].addr;
+            u64 nxt;
+            if (ii + 1 < b.insns.size()) {
+                nxt = b.insns[ii + 1].addr;
+            } else if (bi + 1 < fn.blocks.size()) {
+                nxt = fn.blocks[bi + 1].addr;
+            } else {
+                nxt = fn.end_rva;
+            }
+            next_ip_of.emplace(cur, nxt);
+        }
+    }
+
     std::vector<VmInsn> code;
     std::vector<PendingJump> pending;
     std::vector<size_t> block_start(fn.blocks.size());
-    Translator tr{code, pending, block_of_addr, result.notes};
+    Translator tr{code, pending, block_of_addr, result.notes, &next_ip_of};
     const u8 sz64 = isa::size_field(ir::Size::S64);
 
     for (size_t bi = 0; bi < fn.blocks.size(); ++bi) {

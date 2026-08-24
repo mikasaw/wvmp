@@ -14,9 +14,18 @@ enum class VmOp : u16 {
     Halt,       // 停机：解释器退出执行循环
     GetFlags,   // 读 v16(flags) 到 reg_a（S64 语义）
     SetFlags,   // 将 reg_a 低 5 位写入 v16(flags)
+
+    // —— M2-8 rip-relative 变种 ——
+    // LoadRva/StoreRva 与 Load/Store 形态相同（a=Reg, b=Reg-地址），但
+    // 运行时会**额外**加上 VmContext.scratch_mem（=image_base）来还原
+    // RVA → VA. 用于翻译期把 [rip+disp] 转 RVA 的场景——RVA 与 image_base
+    // 都是 32 位内值, 相加不溢出（PE ImageBase < 0x1'0000'0000 典型 < 0x8000'0000）.
+    // Load/Store 不加 scratch_mem: 译码的地址已是绝对 VA（来自 host 寄存器
+    // 拷贝 / 算术, 直接落地访存）。
+    LoadRva, StoreRva,
 };
 
-inline constexpr u16 kVmOpMax = static_cast<u16>(VmOp::SetFlags);
+inline constexpr u16 kVmOpMax = static_cast<u16>(VmOp::StoreRva);
 inline constexpr u16 kVmOpLimit = 1u << 14;  // 14 位编码空间上限
 
 constexpr const char* to_string(VmOp op) {
@@ -38,6 +47,8 @@ constexpr const char* to_string(VmOp op) {
         case VmOp::Nop: return "nop";   case VmOp::Halt: return "halt";
         case VmOp::GetFlags: return "getflags";
         case VmOp::SetFlags: return "setflags";
+        case VmOp::LoadRva: return "loadrva";
+        case VmOp::StoreRva: return "storeriva";
     }
     return "?";
 }
