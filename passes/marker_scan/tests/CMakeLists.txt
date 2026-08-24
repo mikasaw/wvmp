@@ -164,3 +164,17 @@ target_compile_options(wvmp_call_gate_simple_sample PRIVATE
 target_link_options(wvmp_call_gate_simple_sample PRIVATE
     $<$<CXX_COMPILER_ID:MSVC>:/INCREMENTAL:NO>
 )
+
+# MIT-249 follow-up (issue-09): 验证 C1 gate 兜底——marker 区域含 cpuid
+# (Unsupported, 0F A2), lifter 跳过累积到 LiftMetadata.skipped_ranges,
+# backend 见 note → virtualize 放弃虚拟化 → 整函数保持原生执行。
+# stdout 为 vendor_class=0/1/2/3 之一, 与原生完全一致。
+add_executable(wvmp_lifter_skip_sample lifter_skip_sample_main.cpp)
+target_link_libraries(wvmp_lifter_skip_sample PRIVATE wvmp::sdk)
+target_compile_options(wvmp_lifter_skip_sample PRIVATE
+    $<$<CXX_COMPILER_ID:MSVC>:/Od;/Ob0;/utf-8>
+    $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-O0>
+)
+target_link_options(wvmp_lifter_skip_sample PRIVATE
+    $<$<CXX_COMPILER_ID:MSVC>:/INCREMENTAL:NO>
+)

@@ -4,6 +4,9 @@ add_library(wvmp_regvm_backend OBJECT
 )
 target_include_directories(wvmp_regvm_backend PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    # MIT-249 follow-up (issue-09): backend 检查 lifter 跳过的字节范围
+    # (LiftMetadata), 需可见 lifter header。
+    ${CMAKE_SOURCE_DIR}/passes/lifter/include
 )
 # OBJECT 直链各组件对象（OBJECT-as-SOURCES 不传播 usage requirements 的
 # 老问题对编译期 include 路径同样成立，故显式列出全部依赖）。

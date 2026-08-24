@@ -1,11 +1,14 @@
 #include "wvmp/regvm/backend/regvm_backend.hpp"
 
+#include "wvmp/passes/lifter/lift_metadata.hpp"
 #include "wvmp/regvm/runtime/runtime.hpp"
 #include "wvmp/regvm/translator/translator.hpp"
 #include "wvmp/vm/backend_registry.hpp"
 
+#include <cstdio>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace wvmp::regvm {
@@ -25,7 +28,38 @@ public:
         // 翻译是纯函数；诊断级 notes 经扩展槽传回调用方（virtualize pass）
         // 转 diag 并做 C1 保守拦截（key 见 regvm_backend.hpp）。契约签名
         // 冻结，无法改返回值——槽是框架预留的跨 pass 通道。
-        translator::TranslateResult result = translator::translate_function(fn);
+        //
+        // MIT-249 follow-up (issue-09): lifter 跳过的字节范围 (LiftMetadata)
+        // 不入 IR, 直接在此处检查 → 触发 C1 gate 兜底, 避免 stub_link 按
+        // IR 覆写原区域造成静默行为错 (movabs 事故根因)。
+        translator::TranslateResult result;
+        bool skipped = false;
+        if (const auto* meta_list =
+                ctx.find_slot<std::vector<wvmp::passes::lifter::LiftMetadata>>(
+                    wvmp::passes::lifter::kLiftedMetadata);
+            meta_list != nullptr) {
+            // LifterPass 写入的 meta_list 与 ctx.functions 按下标平行
+            // (lifter_pass.cpp 已保证此顺序). 函数间区分按 begin_rva
+            // 匹配 (FunctionRegion 是冻结契约不能加 id 字段; begin_rva
+            // 在区域内唯一)。
+            // v1 E2E 单函数 virtualize, 退化: 任一函数有 skipped 即兜底
+            // 当前函数——多函数并行虚拟化属于 M3+ 范畴。
+            if (!meta_list->empty()) {
+                const auto& m = meta_list->front();
+                if (!m.skipped_ranges.empty()) {
+                    char buf[160];
+                    std::snprintf(buf, sizeof(buf),
+                                  "函数 %s: lifter 跳过 %zu 条指令 (rva/size 列表), "
+                                  "IR 缺字节, 触发 C1 gate",
+                                  fn.name.c_str(), m.skipped_ranges.size());
+                    result.notes.emplace_back(buf);
+                    skipped = true;
+                }
+            }
+        }
+        if (!skipped) {
+            result = translator::translate_function(fn);
+        }
         ctx.slot<std::vector<std::string>>(kLastTranslateNotes) = std::move(result.notes);
         return std::move(result.program);
     }

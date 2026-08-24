@@ -6,6 +6,7 @@
 #include "wvmp/ir/insn.hpp"
 #include "wvmp/ir/operand.hpp"
 #include "wvmp/ir/region.hpp"
+#include "wvmp/passes/lifter/lift_metadata.hpp"
 #include "wvmp/passes/virtualize/virtualize_pass.hpp"
 #include "wvmp/regvm/backend/regvm_backend.hpp"
 #include "wvmp/regvm/translator/translator.hpp"
@@ -205,6 +206,45 @@ TEST(VirtualizePass, GateNotStickyAcrossFunctions) {
     ASSERT_NE(vfs, nullptr);
     ASSERT_EQ(vfs->size(), static_cast<size_t>(1));
     EXPECT_EQ(vfs->at(0).name, "second_clean");
+}
+
+// MIT-249 follow-up (issue-09): C1 gate 必须听 lifter 跳过的字节范围。
+// 含 skipped_ranges 的 LiftMetadata → backend 注 note → virtualize 拦截。
+TEST(VirtualizePass, GateSkipsFunctionWithLifterSkip) {
+    wvmp::ProtectionContext ctx;
+    ctx.functions.push_back(make_sample_function("lifter_skipped"));
+
+    // 模拟 LifterPass 写入的 kLiftedMetadata 槽：含 1 个跳过字节范围
+    // (cpuid @ 0x1000, 2 字节)。这把"lifter 跳过的指令不进入 IR"的
+    // 信号传递给 backend.
+    auto& meta_list =
+        ctx.slot<std::vector<wvmp::passes::lifter::LiftMetadata>>(
+            wvmp::passes::lifter::kLiftedMetadata);
+    meta_list.clear();
+    meta_list.push_back({});
+    meta_list.back().skipped_ranges.emplace_back(0x1000u, 2u);
+
+    wvmp::passes::VirtualizePass pass;
+    pass.run(ctx);
+
+    // 函数被 C1 gate 兜底, 不入 VirtualizedFunction 列表.
+    const auto* vfs = ctx.find_slot<std::vector<wvmp::passes::VirtualizedFunction>>(wvmp::kVmProgram);
+    ASSERT_NE(vfs, nullptr);
+    EXPECT_TRUE(vfs->empty());
+
+    // 至少一条 Note 含函数名 + 触发原因 (IR 缺字节).
+    bool found_note = false;
+    for (const auto& d : ctx.diag.items()) {
+        if (d.severity == wvmp::Severity::Note &&
+            d.message.find("lifter_skipped") != std::string::npos &&
+            d.message.find("保持原生") != std::string::npos &&
+            d.message.find("IR 缺字节") != std::string::npos) {
+            found_note = true;
+            break;
+        }
+    }
+    EXPECT_TRUE(found_note) << "expected C1 gate note for lifter-skipped function";
+    EXPECT_FALSE(ctx.diag.has_errors());
 }
 
 } // namespace
