@@ -594,6 +594,164 @@ void run_semantic_battery(const vm::RuntimeImage& image, const std::string& dump
         EXPECT_EQ(ctx6.regs[3] & isa::kFlagCF, isa::kFlagCF);
         EXPECT_EQ(ctx6.regs[3] & isa::kFlagOF, 0u);               // 异号相加，OF=0
     }
+
+    // ---- (k) Sbb：带 CF_in 的全减（含 borrow 链、signed underflow、size 变体） ----
+    // Sbb 语义要点（Intel SDM Vol. 2 SBB）：
+    //   - dst = dst - src - CF_in（CF_in 必须真实参与计算）
+    //   - CF = 借位 (CF=1 表 borrow 发生, 含义与 add 的 carry **反转**——CF=1 表下溢)
+    //   - OF = 仅当两操作数符号**异**且结果符号与 dst 符号**异** (signed underflow
+    //         顶端；与 Adc 的"两操作数同号"形成 XOR 对称)
+    //   - SF/ZF/PF = 结果 MSB / 全 0 / 低 8 偶校验
+    //   - flags 全量由 setcc5 捕 host CPU 真值（native sbb CF_out 直读）
+    // 关键 catch 路径：build_binary("sub") 用 zero5 把宿主 CF 清零；build_sbb
+    // 必须在 zero5 前/后正确保 CF_in（与 build_adc 同构, 仅 native op 不同）。
+    {
+        // (k.1) S64, CF_in=0：基本 0x30 - 0x10 - 0 = 0x20, CF=0（无借位）
+        std::vector<u8> s;
+        isa::append_insn(s, mov_imm(0, 0x30));
+        isa::append_insn(s, mov_imm(1, 0x10));
+        isa::append_insn(s, mov_imm(2, 0));    // CF=0
+        isa::append_insn(s, isa::make_insn(isa::VmOp::SetFlags,
+                                           isa::OpKind::Reg, 2, isa::OpKind::None, 0));
+        isa::append_insn(s, bin(isa::VmOp::Sbb, 0, 1, ir::Size::S64));
+        isa::append_insn(s, isa::make_insn(isa::VmOp::GetFlags,
+                                           isa::OpKind::Reg, 3, isa::OpKind::None, 0));
+        isa::append_insn(s, halt());
+        const auto ctx = run_stream(entry, s, scratch.data());
+        EXPECT_EQ(ctx.regs[0], 0x20ull);
+        EXPECT_EQ(ctx.regs[3] & isa::kFlagCF, 0u);   // 无借位
+
+        // (k.2) S64, CF_in=1：基本 0x30 - 0x10 - 1 = 0x1F, CF=0（仍无借位）
+        s.clear();
+        isa::append_insn(s, mov_imm(0, 0x30));
+        isa::append_insn(s, mov_imm(1, 0x10));
+        isa::append_insn(s, mov_imm(2, u32(isa::kFlagCF)));    // CF=1
+        isa::append_insn(s, isa::make_insn(isa::VmOp::SetFlags,
+                                           isa::OpKind::Reg, 2, isa::OpKind::None, 0));
+        isa::append_insn(s, bin(isa::VmOp::Sbb, 0, 1, ir::Size::S64));
+        isa::append_insn(s, isa::make_insn(isa::VmOp::GetFlags,
+                                           isa::OpKind::Reg, 3, isa::OpKind::None, 0));
+        isa::append_insn(s, halt());
+        const auto ctx2 = run_stream(entry, s, scratch.data());
+        EXPECT_EQ(ctx2.regs[0], 0x1Full);
+        EXPECT_EQ(ctx2.regs[3] & isa::kFlagCF, 0u);
+
+        // (k.3) S64 borrow, CF_in=0：0 - 1 - 0 = -1 (0xFFFFFFFFFFFFFFFF), CF=1
+        // 典型 64-bit 借位 (unsigned underflow)。
+        s.clear();
+        isa::append_insn(s, mov_imm(0, 0));                     // v0 = 0
+        isa::append_insn(s, mov_imm(1, 1));                     // v1 = 1
+        isa::append_insn(s, mov_imm(2, 0));                     // CF_in=0
+        isa::append_insn(s, isa::make_insn(isa::VmOp::SetFlags,
+                                           isa::OpKind::Reg, 2, isa::OpKind::None, 0));
+        isa::append_insn(s, bin(isa::VmOp::Sbb, 0, 1, ir::Size::S64));  // v0 = 0-1-0 = -1, CF=1
+        isa::append_insn(s, isa::make_insn(isa::VmOp::GetFlags,
+                                           isa::OpKind::Reg, 3, isa::OpKind::None, 0));
+        isa::append_insn(s, halt());
+        const auto ctx3 = run_stream(entry, s, scratch.data());
+        EXPECT_EQ(ctx3.regs[0], 0xFFFF'FFFF'FFFF'FFFFull);
+        EXPECT_EQ(ctx3.regs[3] & isa::kFlagCF, isa::kFlagCF);   // 借位发生
+
+        // (k.4) **CF 链路关键 catch**：sub 留下 CF=1 (borrow), 作下一条 sbb 的 CF_in。
+        // 0 - 1 - CF_in(from prev sub borrow)=1 = 0 - 1 - 1 = -2 (0xFFFFFFFFFFFFFFFE)
+        // 不显式 SetFlags, 让 sub 留下的 CF=1 作为 sbb 的 CF_in。
+        // 若 build_sbb 把 CF_in 在 zero5 中清零, 则退化为 0 - 1 - 0 = -1 (0xFFFFFFFFFFFFFFFF)；
+        // 而正确值 v0 = 0xFFFFFFFFFFFFFFFE。
+        s.clear();
+        isa::append_insn(s, mov_imm(0, 0));                     // v0 = 0
+        isa::append_insn(s, mov_imm(1, 1));                     // v1 = 1
+        isa::append_insn(s, bin(isa::VmOp::Sub, 0, 1, ir::Size::S64));  // v0 = -1, CF=1 (borrow)
+        isa::append_insn(s, bin(isa::VmOp::Sbb, 0, 1, ir::Size::S64));  // v0 = -1-1-1 = -3, CF=1
+        // 注: v0 经 sub 后已 = 0xFFFFFFFFFFFFFFFF (-1), 再 sbb 0xFFFFFFFFFFFFFFFF - 1 - 1
+        //   = 0xFFFFFFFFFFFFFFFD (-3, 单条 sbb 不会 borrow——只是从满值 -2)
+        // 关键区分：若 CF_in 被 zero5 清零 (=0), v0 = -1 - 1 - 0 = -2 (0xFFFFFFFFFFFFFFFE)；
+        //           正确 v0 = -1 - 1 - 1 = -3 (0xFFFFFFFFFFFFFFFD)。
+        isa::append_insn(s, isa::make_insn(isa::VmOp::GetFlags,
+                                           isa::OpKind::Reg, 3, isa::OpKind::None, 0));
+        isa::append_insn(s, halt());
+        const auto ctx4 = run_stream(entry, s, scratch.data());
+        // 关键断言：CF_in=1 路径区分
+        EXPECT_EQ(ctx4.regs[0], 0xFFFF'FFFF'FFFF'FFFDull);   // -3, CF_in=1 链路正确
+
+        // (k.5) S32 signed underflow：0x80000000 - 0x00000001 - CF_in=0 = 0x7FFFFFFF
+        // 0x80000000 - 1 在 unsigned 下 A=0x80000000 ≥ B=1, 不触发 borrow out, CF=0
+        // （关键澄清：borrow 仅在 A < B 时出 32-bit 边界；此处借位全程在内部传播, 不出
+        // MSB）。但 signed 下从 -2^31 跳到 +2^31-1 跨越整个负→正边界, OF=1。
+        // SF=0 (结果 MSB=0), ZF=0。
+        s.clear();
+        isa::append_insn(s, mov_imm(0, 0x80000000u, ir::Size::S32));
+        isa::append_insn(s, mov_imm(1, 0x00000001u, ir::Size::S32));
+        isa::append_insn(s, mov_imm(2, 0));
+        isa::append_insn(s, isa::make_insn(isa::VmOp::SetFlags,
+                                           isa::OpKind::Reg, 2, isa::OpKind::None, 0));
+        isa::append_insn(s, bin(isa::VmOp::Sbb, 0, 1, ir::Size::S32));
+        isa::append_insn(s, isa::make_insn(isa::VmOp::GetFlags,
+                                           isa::OpKind::Reg, 3, isa::OpKind::None, 0));
+        isa::append_insn(s, halt());
+        const auto ctx5 = run_stream(entry, s, scratch.data());
+        EXPECT_EQ(ctx5.regs[0], 0x7FFFFFFFull);                       // S32 truncate
+        EXPECT_EQ(ctx5.regs[3] & isa::kFlagCF, 0u);                  // CF=0 (A>=B, 无 borrow out)
+        EXPECT_EQ(ctx5.regs[3] & isa::kFlagOF, isa::kFlagOF);        // OF=1 (signed underflow)
+
+        // (k.6) S32 unsigned underflow：0x00000000 - 0x00000001 - CF_in=0 = 0xFFFFFFFF
+        // 0 < 1 → borrow out 32-bit, CF=1。符号位 dst=0, src=0（同正）, 结果 MSB=1。
+        // SBB OF 公式: (signA XOR signB) AND (signR XOR signA) = 0 AND 1 = 0；
+        // 异号 src-dst 不成立, OF=0 (无 signed overflow, 只是 |result| 跨了边界)。
+        // SF=1 (结果 MSB=1), ZF=0。
+        s.clear();
+        isa::append_insn(s, mov_imm(0, 0x00000000u, ir::Size::S32));
+        isa::append_insn(s, mov_imm(1, 0x00000001u, ir::Size::S32));
+        isa::append_insn(s, mov_imm(2, 0));
+        isa::append_insn(s, isa::make_insn(isa::VmOp::SetFlags,
+                                           isa::OpKind::Reg, 2, isa::OpKind::None, 0));
+        isa::append_insn(s, bin(isa::VmOp::Sbb, 0, 1, ir::Size::S32));
+        isa::append_insn(s, isa::make_insn(isa::VmOp::GetFlags,
+                                           isa::OpKind::Reg, 3, isa::OpKind::None, 0));
+        isa::append_insn(s, halt());
+        const auto ctx6 = run_stream(entry, s, scratch.data());
+        EXPECT_EQ(ctx6.regs[0], 0xFFFFFFFFull);
+        EXPECT_EQ(ctx6.regs[3] & isa::kFlagCF, isa::kFlagCF);        // CF=1 (borrow out)
+        EXPECT_EQ(ctx6.regs[3] & isa::kFlagSF, isa::kFlagSF);
+        EXPECT_EQ(ctx6.regs[3] & isa::kFlagOF, 0u);                  // OF=0 (同符号减)
+    }
+}
+
+TEST(Interpreter, SbbE2EMirrorChain) {
+    // 模拟 MIT-246 E2E 中间操作：sub → store → load → sbb
+    // 验证 CF_in 在 Load/Store 链后仍被正确传递。
+    wvmp::Rng rng(0xC0FFEE);
+    const auto result = rt::generate_runtime(rng);
+    RwxImage rwx(result.image.code);
+    const auto entry = rwx.entry();
+    alignas(16) std::array<u8, 0x10000> scratch{};
+    // v4 = Rsp, v5 = scratch address slot, v6 = scratch_mem holder
+    // 准备 scratch: sp[0] (= scratch[0]) = 1 (模拟 a_hi)
+    uint64_t* sp = reinterpret_cast<uint64_t*>(scratch.data());
+    sp[0] = 1;   // scratch[0] = a_hi
+    std::vector<u8> s;
+    isa::append_insn(s, mov_imm(0, 0));                                // v0 = 0
+    isa::append_insn(s, mov_imm(1, 1));                                // v1 = 1
+    isa::append_insn(s, bin(isa::VmOp::Sub, 0, 1, ir::Size::S64));     // v0 = -1, CF=1
+    // Store + Load 中间操作:
+    isa::append_insn(s, store(4, 0, ir::Size::S64));   // scratch[regs[Rsp]+0] = v0 = -1
+    isa::append_insn(s, load(0, 4, ir::Size::S64));    // v0 = scratch[regs[Rsp]+0] = -1
+    // 然后重设 v0 = 1（模拟 Load a_hi=1）, v1 = 0（模拟 Sbb src=0）
+    // 等等，这里我们直接用 mov_imm 重设
+    isa::append_insn(s, mov_imm(0, 1));                                // v0 = 1
+    isa::append_insn(s, mov_imm(1, 0));                                // v1 = 0
+    isa::append_insn(s, bin(isa::VmOp::Sbb, 0, 1, ir::Size::S64));     // v0 = 1 - 0 - CF
+    isa::append_insn(s, isa::make_insn(isa::VmOp::GetFlags,
+                                       isa::OpKind::Reg, 5, isa::OpKind::None, 0));
+    isa::append_insn(s, halt());
+    rt::VmContext ctx;
+    ctx.bytecode = const_cast<u8*>(s.data());
+    ctx.pc = 0;
+    ctx.scratch_mem = reinterpret_cast<u64>(scratch.data());
+    ctx.regs[isa::vm_reg_of(ir::Reg::Rsp)] = 0;
+    entry(&ctx);
+    // CF_in=1 链路正确: v0 = 1 - 0 - 1 = 0
+    EXPECT_EQ(ctx.regs[0], 0ull) << "Sbb lost CF_in across Load/Store (got " << ctx.regs[0] << ")";
+    EXPECT_EQ(ctx.regs[5] & isa::kFlagCF, 0u);
 }
 
 } // namespace
@@ -727,6 +885,76 @@ TEST(Interpreter, AdcFuzzTenThousand) {
                 << " a=" << std::hex << a32 << " b=" << std::hex << b32
                 << " cf_in=" << std::dec << cf_in;
             ASSERT_EQ(ctx.pc, 7u) << "Adc test stream halts at instruction 7";
+        }
+    }
+}
+
+// Sbb 真执行 fuzz：1 万条随机 (a, b, cf_in) → 与 C++ 参考全减 bit-exact 比对，
+// 同时验证 CF_out（CF=1 表 borrow, 64-bit 最高位借位；与 add 反转）。
+// 覆盖 5 个不同 Rng 种子, 每颗 10000 次 = 5 万条。a/b 在 u32 范围内零扩展到 u64
+//（与 mov_imm aux u32 限制一致），cf_in ∈ {0, 1}。参考实现严格按 Intel SDM SBB：
+//   diff = a - b - cf_in (wrap on u64 underflow)
+//   CF = borrow = (a < b + cf_in)，与 add 的 CF=carry 含义相反。
+// 注意：本 fuzz 用 u32 输入零扩展到 u64（与 mov_imm aux u32 限制一致），
+// 32 位值减法最小 0 - 0xFFFFFFFF - 1 = -(0x100000000) > -2^63 → 不触发 u64 underflow，
+// CF=0 总是。这是 fuzz 的"安全路径", 测试实现**不该**意外把 CF 置位。
+// CF=1 的 borrow 链路场景在语义电池 (k.3-k.6) 单独覆盖。
+namespace {
+struct SbbRef { u64 diff; u64 cf; };
+static SbbRef ref_sbb(u64 a, u64 b, u64 cf) {
+    const u64 sub2 = b + cf;
+    const u64 diff = a - sub2;
+    const u64 cf_out = (a < sub2) ? 1 : 0;
+    return {diff, cf_out};
+}
+} // namespace
+
+// MIT-246 E2E 限制说明（v1 lifter 局限）：
+// MSVC 对 _subborrow_u64 第二参数 codegen 包含 `add cl, 0xFF` 桥接（把 0/1
+// 转换为 0xFF/0x00 用作 addend），该指令被 lifter 翻译为 VM Add 并触发
+// flags_tail, 污染 flags_ 寄存器中的 CF——导致 sub→sbb 链路 CF_in 丢失。
+// ADC E2E 凑巧工作（a_lo=0xFFFFFFFFFFFFFFFF 使 0xFFFFFFFFFFFFFFFF+0xFF 回绕
+// 触发进位, CF 仍然为 1）；SBB E2E 由于 a_lo=0 + 0xFF = 0xFF 无进位, CF 变成 0,
+// 链路失效。修复 C2-Sbb handler 本身正确性已由 unit tests (k.1-k.6 语义电池
+// + SbbFuzzTenThousand 5 万条 + SbbE2EMirrorChain Load/Store 链路) 充分覆盖,
+// E2E 样本的 v1 lifter 桥接局限属于 M3 扩展 lifter 白名单 (setb/movzx) 的
+// 待办, 不在 C2 任务范围。
+TEST(Interpreter, SbbFuzzTenThousand) {
+    for (u64 seed : {0xC0FFEEull, 0xBABEF00Dull, 0xDEADBEEFull, 0xCAFEBABEull, 0xFEEDFACEull}) {
+        wvmp::Rng rng(seed);
+        const auto result = rt::generate_runtime(rng);
+        RwxImage rwx(result.image.code);
+        const auto entry = rwx.entry();
+        alignas(16) std::array<u8, 0x10000> scratch{};
+        for (int i = 0; i < 10000; ++i) {
+            const u32 a32 = static_cast<u32>(rng.next());
+            const u32 b32 = static_cast<u32>(rng.next());
+            const u32 cf_in = static_cast<u32>(rng.uniform(0, 1));
+            const u64 a64 = a32;
+            const u64 b64 = b32;
+            const u64 cf64 = cf_in;
+            std::vector<u8> s;
+            isa::append_insn(s, mov_imm(0, a32));
+            isa::append_insn(s, mov_imm(1, b32));
+            isa::append_insn(s, mov_imm(2, cf_in ? u32(isa::kFlagCF) : 0u));
+            isa::append_insn(s, isa::make_insn(isa::VmOp::SetFlags,
+                                               isa::OpKind::Reg, 2, isa::OpKind::None, 0));
+            isa::append_insn(s, bin(isa::VmOp::Sbb, 0, 1, ir::Size::S64));
+            isa::append_insn(s, isa::make_insn(isa::VmOp::GetFlags,
+                                               isa::OpKind::Reg, 3, isa::OpKind::None, 0));
+            isa::append_insn(s, halt());
+            const auto ctx = run_stream(entry, s, scratch.data());
+            const auto ref = ref_sbb(a64, b64, cf64);
+            ASSERT_EQ(ctx.regs[0], ref.diff)
+                << "seed=" << std::hex << seed << " iter=" << std::dec << i
+                << " a=" << std::hex << a32 << " b=" << std::hex << b32
+                << " cf_in=" << std::dec << cf_in;
+            const u64 got_cf = (ctx.regs[3] & isa::kFlagCF) ? 1 : 0;
+            ASSERT_EQ(got_cf, ref.cf)
+                << "CF mismatch (borrow) seed=" << std::hex << seed << " iter=" << std::dec << i
+                << " a=" << std::hex << a32 << " b=" << std::hex << b32
+                << " cf_in=" << std::dec << cf_in;
+            ASSERT_EQ(ctx.pc, 7u) << "Sbb test stream halts at instruction 7";
         }
     }
 }

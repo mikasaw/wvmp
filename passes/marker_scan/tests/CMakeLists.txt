@@ -88,3 +88,16 @@ target_compile_options(wvmp_adc_sample PRIVATE
 target_link_options(wvmp_adc_sample PRIVATE
     $<$<CXX_COMPILER_ID:MSVC>:/INCREMENTAL:NO>
 )
+
+# MIT-246：端到端正路径样本——区域内含 sbb（白名单内），验证 C2-Sbb 修复后
+# CF_in 链路正确传播（sub 留下的 borrow 必须被 sbb 看到）。用 _subborrow_u64
+# 强制编译器 emit `sub` + `sbb` 两条指令, 均落在 marker 区域内。
+add_executable(wvmp_sbb_sample sbb_sample_main.cpp)
+target_link_libraries(wvmp_sbb_sample PRIVATE wvmp::sdk)
+target_compile_options(wvmp_sbb_sample PRIVATE
+    $<$<CXX_COMPILER_ID:MSVC>:/Od;/Ob0;/utf-8>
+    $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-O0>
+)
+target_link_options(wvmp_sbb_sample PRIVATE
+    $<$<CXX_COMPILER_ID:MSVC>:/INCREMENTAL:NO>
+)

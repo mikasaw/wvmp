@@ -871,6 +871,50 @@ public:
                flags_tail(dispatch, false);
     }
 
+    // Sbb: dst = dst - src - CF_in（Intel SDM Vol. 2 SBB）。
+    // 与 Adc 结构对称：同样不能复用 build_binary（zero5 把宿主 CF 清零），
+    // 同样必须显式保 CF_in：
+    //   load A → T0      (mov/movzx 不改 flags)
+    //   load B → T1      (mov/movzx 不改 flags)
+    //   zero5            (清 flag scratch, 副作用宿主 CF←0)
+    //   bt  flags_, 1    (宿主 CF = flags_ bit 1 = CF_in; flags_ 不在 zero5 范围)
+    //   sbb  T0, T1      (CPU 完成 A-B-CF_in, flags 由 setcc5 捕真值)
+    //   setcc5
+    //   writeback
+    // flags 语义（与 Adc 的不对称点）：
+    //   CF  = 借位 (CF=1 表示 borrow 发生, 与 add 的 carry 含义相反——CF=1 表下溢)。
+    //         x86 sbb native CF_out 直接对应 Intel SDM: 1 iff (A < B + CF_in)。
+    //   OF  = 仅当两操作数符号**异**且结果符号与 dst 符号**异** (signed underflow
+    //         顶端；与 Adc 的"两操作数同号"形成 XOR 对称——加法/减法的 OF 判别
+    //         条件互补)。
+    //   SF/ZF/PF 按结果。setcc5 抽取的是 native CF/OF/SF/ZF/PF 直读, 不做语义
+    //   变换——x86 native 与 Intel SDM 描述直接对齐, 寄存器布局 (bit1=CF,
+    //   bit2=OF, bit3=SF, bit0=ZF, bit4=PF) 与 setcc5 完全一致。
+    // size 0/1/2/3 由 rs(t_[0], s) 选 al/ax/eax/rax, sbb native 按宽度处理。
+    // 关键 catch：build_binary("sub") 用 zero5 把宿主 CF 清零, 不会保留 CF_in；
+    // bt flags_, 1 路径绕开 zero5 的清零范围（同 Adc, zero5 仅清 {T3,T4,T6,T7,T9}）。
+    std::string build_sbb(u64 dispatch) const {
+        const std::string tag = "sbb" + std::to_string(seq());
+        const std::string tail_lbl = "ftail_" + tag;
+        std::array<std::string, 4> blocks;
+        for (int s = 0; s < 4; ++s) {
+            const std::string stag = tag + "_" + std::to_string(s);
+            std::string o;
+            o += load_operand(s, 3, 4, 0, "a" + stag);   // A（被减数）→ T0
+            o += load_operand(s, 6, 7, 1, "b" + stag);   // B（减数）→ T1
+            o += zero5();     // 清 flag scratch；副作用宿主 CF←0
+            o += std::string("    bt ") + r64(flags_) + ", 1\n";  // 宿主 CF = flags_ bit 1 = CF_in
+            o += std::string("    sbb ") + rs(t_[0], s) + ", " + rs(t_[1], s) + "\n";
+            o += setcc5();
+            o += reextract_a(1);
+            o += writeback(s, 1);
+            o += "    jmp " + tail_lbl + "\n";
+            blocks[s] = o;
+        }
+        return decode_prelude() + size_chain(blocks, tag) + tail_lbl + ":\n" +
+               flags_tail(dispatch, false);
+    }
+
 private:
     Rng& rng_;
     int ctx_ = 0, pc_ = 0, flags_ = 0, base_ = 0;
@@ -905,9 +949,9 @@ RuntimeGenResult generate_runtime(wvmp::Rng& rng) {
         ks.assemble(g.build_dispatch(kDummyTableOff), dispatch_addr, "dispatch pass1");
     const u64 dispatch_size = dispatch1.size();
 
-    // —— handler 清单（v1 覆盖集；Adc/Sbb/Rol/Ror/Call/Ret 的表项指向
+    // —— handler 清单（v1 覆盖集；Rol/Ror/Call/Ret 的表项指向
     //    Halt——遇到即停机，语义保守且不越界。Sar 在 MIT-244 已接管。
-    //    Adc 在 MIT-245 已接管。）——
+    //    Adc 在 MIT-245 已接管；Sbb 在 MIT-246 已接管。）——
     std::vector<HandlerDef> handlers = {
         {int(VmOp::Mov), "mov", &AsmGen::build_mov},
         {int(VmOp::Lea), "lea", &AsmGen::build_mov},
@@ -924,6 +968,7 @@ RuntimeGenResult generate_runtime(wvmp::Rng& rng) {
         {int(VmOp::Shr), "shr", &AsmGen::build_shr},
         {int(VmOp::Sar), "sar", &AsmGen::build_sar},
         {int(VmOp::Adc), "adc", &AsmGen::build_adc},
+        {int(VmOp::Sbb), "sbb", &AsmGen::build_sbb},
         {int(VmOp::Cmp), "cmp", &AsmGen::build_cmp},
         {int(VmOp::Test), "test", &AsmGen::build_test},
         {int(VmOp::Load), "load", &AsmGen::build_load},
