@@ -23,6 +23,8 @@
 #include <capstone/x86.h>
 
 #include <optional>
+#include <utility>
+#include <vector>
 
 namespace wvmp::passes::lifter {
 
@@ -42,6 +44,12 @@ enum class TranslateStatus : u8 {
 struct TranslateResult {
     TranslateStatus status = TranslateStatus::Unsupported;
     ir::Insn insn; // 仅 status == Ok 时有效
+
+    // MIT-249 follow-up (issue-09): 跳过指令 (status != Ok) 时, 记录
+    // 跳过的字节范围 [rva, size). lifter 在函数级聚合到 LiftMetadata,
+    // 下游 (translator / virtualize) 据此识别 IR 缺字节并触发 C1 gate。
+    // status == Ok 时为空。
+    std::vector<std::pair<u64, u64>> skipped_ranges;
 };
 
 // 把一条 capstone 已反汇编的指令映射为 ir::Insn。

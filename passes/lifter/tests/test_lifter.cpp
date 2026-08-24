@@ -423,6 +423,32 @@ TEST_F(LifterTranslate, SkippedInstructions) {
               lifter::TranslateStatus::Unsupported);
 }
 
+// MIT-249 follow-up (issue-09): TranslateResult.skipped_ranges 在 status != Ok
+// 时被填 (rva, size), Ok 时留空。这是下游 C1 gate 识别 "IR 缺字节" 的核心数据。
+TEST_F(LifterTranslate, SkippedRangesAccumulated) {
+    // cpuid (0F A2, 2 字节, @ RVA 0x1000): Unsupported → skipped_ranges 1 项
+    const wvmp::u8 cpuid[] = {0x0F, 0xA2};
+    auto r1 = translate_bytes(x64, cpuid, ir::Arch::X64, 0x1000);
+    ASSERT_EQ(r1.status, lifter::TranslateStatus::Unsupported);
+    ASSERT_EQ(r1.skipped_ranges.size(), 1u);
+    EXPECT_EQ(r1.skipped_ranges[0].first, 0x1000u);
+    EXPECT_EQ(r1.skipped_ranges[0].second, 2u);
+
+    // shl eax, cl (D3 E0, 2 字节, @ RVA 0x2000): Todo → skipped_ranges 1 项
+    const wvmp::u8 cl[] = {0xD3, 0xE0};
+    auto r2 = translate_bytes(x64, cl, ir::Arch::X64, 0x2000);
+    ASSERT_EQ(r2.status, lifter::TranslateStatus::Todo);
+    ASSERT_EQ(r2.skipped_ranges.size(), 1u);
+    EXPECT_EQ(r2.skipped_ranges[0].first, 0x2000u);
+    EXPECT_EQ(r2.skipped_ranges[0].second, 2u);
+
+    // Ok 情况: skipped_ranges 留空, 不污染下游
+    const wvmp::u8 mov[] = {0xB8, 0x01, 0x00, 0x00, 0x00}; // mov eax, 1
+    auto r3 = translate_bytes(x64, mov, ir::Arch::X64, 0x3000);
+    ASSERT_EQ(r3.status, lifter::TranslateStatus::Ok);
+    EXPECT_TRUE(r3.skipped_ranges.empty());
+}
+
 TEST_F(LifterTranslate, RolRorLifted) {
     // MIT-247: rol/ror 已解除 TODO, 由 translate_shift 走 Op::Rol/Op::Ror。
     // 覆盖 imm 计数 / 隐式计数 1 / size 变体。
@@ -545,8 +571,9 @@ TEST(LifterBlocks, JeJmpSplitsIntoFourBlocks) {
     fr.end_rva = sizeof(kBlockBytes);
 
     wvmp::Diagnostics diag;
+    lifter::LiftMetadata meta;
     const wvmp::u64 decoded = lifter::disassemble_and_lift(
-        session, kBlockBytes, sizeof(kBlockBytes), 0, fr.end_rva, fr.name, "lifter", diag, fr);
+        session, kBlockBytes, sizeof(kBlockBytes), 0, fr.end_rva, fr.name, "lifter", diag, fr, meta);
     EXPECT_EQ(decoded, 9u);
     EXPECT_TRUE(diag.items().empty());
 
@@ -596,9 +623,10 @@ TEST(LifterBlocks, UnsupportedInsnRecordedButNotFatal) {
     fr.end_rva = 0x1000 + sizeof(b);
 
     wvmp::Diagnostics diag;
+    lifter::LiftMetadata meta;
     const wvmp::u64 decoded =
         lifter::disassemble_and_lift(session, b, sizeof(b), fr.begin_rva, fr.end_rva, fr.name,
-                                     "lifter", diag, fr);
+                                     "lifter", diag, fr, meta);
     EXPECT_EQ(decoded, 4u); // cpuid 也被解码（计入），但不进入 insns
     ASSERT_EQ(fr.blocks.size(), 1u);
     ASSERT_EQ(fr.blocks[0].insns.size(), 3u); // push/pop/ret
@@ -615,6 +643,13 @@ TEST(LifterBlocks, UnsupportedInsnRecordedButNotFatal) {
     EXPECT_NE(diag.items()[0].message.find("cpuid"), std::string::npos);
     EXPECT_NE(diag.items()[0].message.find("4097"), std::string::npos); // 0x1001 的十进制
     EXPECT_FALSE(diag.has_errors());
+
+    // MIT-249 follow-up (issue-09): cpuid (0F A2, 2 字节) 被跳过, 应在
+    // meta.skipped_ranges 累积 (RVA, size) = (0x1001, 2). 这是下游
+    // C1 gate 识别 "IR 缺字节" 的关键数据。
+    ASSERT_EQ(meta.skipped_ranges.size(), 1u);
+    EXPECT_EQ(meta.skipped_ranges[0].first, 0x1001u);  // cpuid 的 RVA
+    EXPECT_EQ(meta.skipped_ranges[0].second, 2u);     // 0F A2 = 2 字节
 }
 
 TEST(LifterBlocks, CallTargetAndReturnPointAreLeaders) {
@@ -638,7 +673,8 @@ TEST(LifterBlocks, CallTargetAndReturnPointAreLeaders) {
     fr.end_rva = sizeof(b);
 
     wvmp::Diagnostics diag;
-    lifter::disassemble_and_lift(session, b, sizeof(b), 0, fr.end_rva, fr.name, "lifter", diag, fr);
+    lifter::LiftMetadata meta;
+    lifter::disassemble_and_lift(session, b, sizeof(b), 0, fr.end_rva, fr.name, "lifter", diag, fr, meta);
     ASSERT_TRUE(diag.items().empty());
 
     // leader：0（起点）、9（call 目标）、5（返回点）。9 之后单独成块。

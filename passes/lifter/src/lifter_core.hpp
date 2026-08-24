@@ -6,6 +6,7 @@
 #include "wvmp/common/types.hpp"
 #include "wvmp/framework/diagnostics.hpp"
 #include "wvmp/ir/region.hpp"
+#include "wvmp/passes/lifter/lift_metadata.hpp"
 
 #include <optional>
 #include <span>
@@ -40,9 +41,12 @@ void build_blocks(u64 begin_rva, u64 end_rva, std::span<const LiftedItem> items,
 // 线性反汇编、逐条映射并填充 fr.blocks。capstone 会话由调用方按 arch
 // 打开并复用。
 //   - 未支持指令 / 无效字节：记 Note（函数名 + RVA + 助记符），不失败；
+//     同时把字节范围 [rva, size) 追加到 meta_out.skipped_ranges（MIT-249
+//     follow-up issue-09: 让下游 translator / virtualize 识别 IR 缺字节
+//     并触发 C1 gate）。
 //   - 返回解码出的指令条数（含被跳过的指令）。
 u64 disassemble_and_lift(CapstoneSession& session, const u8* code, size_t size, u64 begin_rva,
                          u64 end_rva, std::string_view func_name, std::string_view pass_name,
-                         Diagnostics& diag, ir::FunctionRegion& fr);
+                         Diagnostics& diag, ir::FunctionRegion& fr, LiftMetadata& meta_out);
 
 } // namespace wvmp::passes::lifter

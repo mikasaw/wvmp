@@ -112,7 +112,7 @@ void build_blocks(u64 begin_rva, u64 end_rva, std::span<const LiftedItem> items,
 
 u64 disassemble_and_lift(CapstoneSession& session, const u8* code, size_t size, u64 begin_rva,
                          u64 end_rva, std::string_view func_name, std::string_view pass_name,
-                         Diagnostics& diag, ir::FunctionRegion& fr) {
+                         Diagnostics& diag, ir::FunctionRegion& fr, LiftMetadata& meta_out) {
     std::vector<LiftedItem> items;
     items.reserve(size / 4 + 4);
 
@@ -128,6 +128,9 @@ u64 disassemble_and_lift(CapstoneSession& session, const u8* code, size_t size, 
             diag.report(Severity::Note, pass_name,
                         std::string(func_name) + " @rva 0x" + std::to_string(address) +
                             ": 无法反汇编的字节，跳过 1 字节");
+            // MIT-249 follow-up (issue-09): 无效字节同样不入 IR, 视为跳过
+            // 范围一并记录到 meta_out.skipped_ranges, 让 C1 gate 可见。
+            meta_out.skipped_ranges.emplace_back(address, u64(1));
             ++p;
             --left;
             ++address;
@@ -155,6 +158,12 @@ u64 disassemble_and_lift(CapstoneSession& session, const u8* code, size_t size, 
             diag.report(Severity::Note, pass_name,
                         std::string(func_name) + " @rva 0x" + std::to_string(item.addr) +
                             ": 未支持指令 '" + ci->mnemonic + "' " + why + "，已跳过");
+            // MIT-249 follow-up (issue-09): 累积跳过的字节范围, 供下游
+            // C1 gate 识别 IR 缺字节。translator 看到该函数有 skipped_range
+            // 即放弃虚拟化, 保持原生执行, 避免 stub_link 覆写造成静默错。
+            meta_out.skipped_ranges.insert(meta_out.skipped_ranges.end(),
+                                           tr.skipped_ranges.begin(),
+                                           tr.skipped_ranges.end());
         }
         items.push_back(std::move(item));
     }

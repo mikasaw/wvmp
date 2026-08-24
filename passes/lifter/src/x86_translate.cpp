@@ -67,15 +67,24 @@ bool is_data_operand(const Operand& o) {
            o.kind == Operand::Kind::Mem;
 }
 
-TranslateResult ok(ir::Insn insn) { return {TranslateStatus::Ok, insn}; }
-TranslateResult unsupported() { return {TranslateStatus::Unsupported, {}}; }
-TranslateResult todo() { return {TranslateStatus::Todo, {}}; }
+TranslateResult ok(ir::Insn insn) { return {TranslateStatus::Ok, insn, {}}; }
+// MIT-249 follow-up (issue-09): unsupported()/todo() 接收 (rva, size) 并填
+// skipped_ranges, 让 lifter_core 能聚合到 LiftMetadata, 供下游 C1 gate 识别
+// IR 缺字节。Ok 时 skipped_ranges 留空。
+TranslateResult unsupported(u64 rva, u64 size) {
+    TranslateResult r{TranslateStatus::Unsupported, {}, {{rva, size}}};
+    return r;
+}
+TranslateResult todo(u64 rva, u64 size) {
+    TranslateResult r{TranslateStatus::Todo, {}, {{rva, size}}};
+    return r;
+}
 
 TranslateResult translate_mov(const cs_insn& ci, const cs_x86& x, ir::Arch arch) {
-    if (x.op_count != 2) return unsupported();
+    if (x.op_count != 2) return unsupported(ci.address, ci.size);
     auto d = to_operand(x.operands[0]);
     auto s = to_operand(x.operands[1]);
-    if (!d || !s) return unsupported();
+    if (!d || !s) return unsupported(ci.address, ci.size);
 
     ir::Insn out;
     out.addr = ci.address;
@@ -100,15 +109,15 @@ TranslateResult translate_mov(const cs_insn& ci, const cs_x86& x, ir::Arch arch)
         out.src = *s;
         return ok(out);
     }
-    return unsupported(); // 双内存等非法组合
+    return unsupported(ci.address, ci.size); // 双内存等非法组合
 }
 
 TranslateResult translate_lea(const cs_insn& ci, const cs_x86& x, ir::Arch arch) {
-    if (x.op_count != 2) return unsupported();
+    if (x.op_count != 2) return unsupported(ci.address, ci.size);
     auto d = to_operand(x.operands[0]);
     auto s = to_operand(x.operands[1]);
     if (!d || !s || d->kind != Operand::Kind::Reg || s->kind != Operand::Kind::Mem) {
-        return unsupported();
+        return unsupported(ci.address, ci.size);
     }
     ir::Insn out;
     out.op = Op::Lea;
@@ -122,11 +131,11 @@ TranslateResult translate_lea(const cs_insn& ci, const cs_x86& x, ir::Arch arch)
 
 // add/sub/adc/sbb/and/or/xor：允许 src 为内存（v1 约定：不拆 Load，后端展开）。
 TranslateResult translate_alu(const cs_insn& ci, const cs_x86& x, ir::Arch arch, Op op) {
-    if (x.op_count != 2) return unsupported();
+    if (x.op_count != 2) return unsupported(ci.address, ci.size);
     auto d = to_operand(x.operands[0]);
     auto s = to_operand(x.operands[1]);
-    if (!d || !s || !is_data_operand(*d) || !is_data_operand(*s)) return unsupported();
-    if (d->kind == Operand::Kind::Mem && s->kind == Operand::Kind::Mem) return unsupported();
+    if (!d || !s || !is_data_operand(*d) || !is_data_operand(*s)) return unsupported(ci.address, ci.size);
+    if (d->kind == Operand::Kind::Mem && s->kind == Operand::Kind::Mem) return unsupported(ci.address, ci.size);
 
     ir::Insn out;
     out.op = op;
@@ -141,10 +150,10 @@ TranslateResult translate_alu(const cs_insn& ci, const cs_x86& x, ir::Arch arch,
 // not/neg/inc/dec：一元，dst 可为寄存器或内存。
 TranslateResult translate_unary(const cs_insn& ci, const cs_x86& x, ir::Arch arch, Op op,
                                 bool sets_flags) {
-    if (x.op_count != 1) return unsupported();
+    if (x.op_count != 1) return unsupported(ci.address, ci.size);
     auto d = to_operand(x.operands[0]);
     if (!d || (d->kind != Operand::Kind::Reg && d->kind != Operand::Kind::Mem)) {
-        return unsupported();
+        return unsupported(ci.address, ci.size);
     }
     ir::Insn out;
     out.op = op;
@@ -157,13 +166,13 @@ TranslateResult translate_unary(const cs_insn& ci, const cs_x86& x, ir::Arch arc
 
 // shl/shr/sar：imm 计数直接映射；cl 计数 v1 跳过（TODO）。
 TranslateResult translate_shift(const cs_insn& ci, const cs_x86& x, ir::Arch arch, Op op) {
-    if (x.op_count == 0 || x.op_count > 2) return unsupported();
+    if (x.op_count == 0 || x.op_count > 2) return unsupported(ci.address, ci.size);
     auto d = to_operand(x.operands[0]);
     if (!d || (d->kind != Operand::Kind::Reg && d->kind != Operand::Kind::Mem)) {
-        return unsupported();
+        return unsupported(ci.address, ci.size);
     }
     if (x.op_count == 2) {
-        if (x.operands[1].type != X86_OP_IMM) return todo(); // shl eax, cl —— TODO(lane)
+        if (x.operands[1].type != X86_OP_IMM) return todo(ci.address, ci.size); // shl eax, cl —— TODO(lane)
     }
     ir::Insn out;
     out.op = op;
@@ -178,11 +187,11 @@ TranslateResult translate_shift(const cs_insn& ci, const cs_x86& x, ir::Arch arc
 }
 
 TranslateResult translate_cmp_test(const cs_insn& ci, const cs_x86& x, ir::Arch arch, Op op) {
-    if (x.op_count != 2) return unsupported();
+    if (x.op_count != 2) return unsupported(ci.address, ci.size);
     auto d = to_operand(x.operands[0]);
     auto s = to_operand(x.operands[1]);
-    if (!d || !s || !is_data_operand(*d) || !is_data_operand(*s)) return unsupported();
-    if (d->kind == Operand::Kind::Mem && s->kind == Operand::Kind::Mem) return unsupported();
+    if (!d || !s || !is_data_operand(*d) || !is_data_operand(*s)) return unsupported(ci.address, ci.size);
+    if (d->kind == Operand::Kind::Mem && s->kind == Operand::Kind::Mem) return unsupported(ci.address, ci.size);
     ir::Insn out;
     out.op = op;
     out.addr = ci.address;
@@ -194,9 +203,9 @@ TranslateResult translate_cmp_test(const cs_insn& ci, const cs_x86& x, ir::Arch 
 }
 
 TranslateResult translate_push(const cs_insn& ci, const cs_x86& x, ir::Arch arch) {
-    if (x.op_count != 1) return unsupported();
+    if (x.op_count != 1) return unsupported(ci.address, ci.size);
     auto d = to_operand(x.operands[0]);
-    if (!d || !is_data_operand(*d)) return unsupported();
+    if (!d || !is_data_operand(*d)) return unsupported(ci.address, ci.size);
     ir::Insn out;
     out.op = Op::Push;
     out.addr = ci.address;
@@ -207,9 +216,9 @@ TranslateResult translate_push(const cs_insn& ci, const cs_x86& x, ir::Arch arch
 }
 
 TranslateResult translate_pop(const cs_insn& ci, const cs_x86& x, ir::Arch arch) {
-    if (x.op_count != 1) return unsupported();
+    if (x.op_count != 1) return unsupported(ci.address, ci.size);
     auto d = to_operand(x.operands[0]);
-    if (!d || d->kind != Operand::Kind::Reg) return unsupported();
+    if (!d || d->kind != Operand::Kind::Reg) return unsupported(ci.address, ci.size);
     ir::Insn out;
     out.op = Op::Pop;
     out.addr = ci.address;
@@ -221,12 +230,12 @@ TranslateResult translate_pop(const cs_insn& ci, const cs_x86& x, ir::Arch arch)
 
 // jmp（rel/abs/reg 均为 Jmp，目标在 dst）；间接内存跳转 jmp [..] v1 跳过。
 TranslateResult translate_jmp(const cs_insn& ci, const cs_x86& x, ir::Arch arch) {
-    if (x.op_count != 1) return unsupported();
+    if (x.op_count != 1) return unsupported(ci.address, ci.size);
     if (x.operands[0].type != X86_OP_IMM && x.operands[0].type != X86_OP_REG) {
-        return unsupported();
+        return unsupported(ci.address, ci.size);
     }
     auto d = to_operand(x.operands[0]);
-    if (!d) return unsupported();
+    if (!d) return unsupported(ci.address, ci.size);
     ir::Insn out;
     out.op = Op::Jmp;
     out.addr = ci.address;
@@ -238,8 +247,8 @@ TranslateResult translate_jmp(const cs_insn& ci, const cs_x86& x, ir::Arch arch)
 
 TranslateResult translate_jcc(const cs_insn& ci, const cs_x86& x, ir::Arch arch) {
     auto cond = map_cond(static_cast<x86_insn>(ci.id));
-    if (!cond) return unsupported();
-    if (x.op_count != 1 || x.operands[0].type != X86_OP_IMM) return unsupported();
+    if (!cond) return unsupported(ci.address, ci.size);
+    if (x.op_count != 1 || x.operands[0].type != X86_OP_IMM) return unsupported(ci.address, ci.size);
     ir::Insn out;
     out.op = Op::Jcc;
     out.addr = ci.address;
@@ -251,12 +260,12 @@ TranslateResult translate_jcc(const cs_insn& ci, const cs_x86& x, ir::Arch arch)
 }
 
 TranslateResult translate_call(const cs_insn& ci, const cs_x86& x, ir::Arch arch) {
-    if (x.op_count != 1) return unsupported();
+    if (x.op_count != 1) return unsupported(ci.address, ci.size);
     if (x.operands[0].type != X86_OP_IMM && x.operands[0].type != X86_OP_REG) {
-        return unsupported(); // call [..] v1 跳过
+        return unsupported(ci.address, ci.size); // call [..] v1 跳过
     }
     auto d = to_operand(x.operands[0]);
-    if (!d) return unsupported();
+    if (!d) return unsupported(ci.address, ci.size);
     ir::Insn out;
     out.op = Op::Call;
     out.addr = ci.address;
@@ -267,14 +276,14 @@ TranslateResult translate_call(const cs_insn& ci, const cs_x86& x, ir::Arch arch
 }
 
 TranslateResult translate_ret(const cs_insn& ci, const cs_x86& x, ir::Arch arch) {
-    if (x.op_count > 1) return unsupported();
+    if (x.op_count > 1) return unsupported(ci.address, ci.size);
     ir::Insn out;
     out.op = Op::Ret;
     out.addr = ci.address;
     out.size = pointer_size(arch);
     out.updates_flags = false;
     if (x.op_count == 1) {
-        if (x.operands[0].type != X86_OP_IMM) return unsupported();
+        if (x.operands[0].type != X86_OP_IMM) return unsupported(ci.address, ci.size);
         out.src = Operand::imm_(static_cast<i64>(x.operands[0].imm)); // ret imm16
     }
     return ok(out);
@@ -346,13 +355,13 @@ std::optional<ir::Cond> map_cond(x86_insn id) {
 }
 
 TranslateResult translate_insn(const cs_insn& ci, ir::Arch arch) {
-    if (ci.detail == nullptr) return unsupported();
+    if (ci.detail == nullptr) return unsupported(ci.address, ci.size);
     const cs_x86& x = ci.detail->x86;
 
     // 带 lock/rep/repne 前缀（prefix[0]）的指令语义与普通形式不同，
     // 段覆盖前缀（prefix[1]，如 gs:[..] TLS 访问）无法在平坦内存模型下
     // 虚拟化——v1 一律跳过。
-    if (x.prefix[0] != 0 || x.prefix[1] != 0) return unsupported();
+    if (x.prefix[0] != 0 || x.prefix[1] != 0) return unsupported(ci.address, ci.size);
 
     switch (ci.id) {
     case X86_INS_MOV: return translate_mov(ci, x, arch);
@@ -395,7 +404,7 @@ TranslateResult translate_insn(const cs_insn& ci, ir::Arch arch) {
         return ok(out);
     }
     default:
-        return unsupported();
+        return unsupported(ci.address, ci.size);
     }
 }
 
