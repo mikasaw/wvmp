@@ -833,6 +833,25 @@ public:
     // count=0 走 adv_lbl 不动值/flags（与 shr/shl 一致）。
     std::string build_sar(u64 d) const { return build_shift("sar", d); }
 
+    // Rol/Ror 复用 build_shift：与 build_sar 同理, 仅 native op 不同。x86
+    // rol/ror 与 shl/shr 的语义差异仅在循环性, 无 CF_in 概念（单条指令内
+    // 闭环, 不接受跨指令 carry——与 adc/sbb 的 CF_in 完全不同）。flags 全量
+    // 由 setcc5 捕 host CPU 真值, 与 Intel SDM Vol. 2 ROL/ROR 一一对应:
+    //   CF  = 循环移出位 (looped-out bit; 即从循环另一端被踢出的那一位,
+    //         不同于 shr 的"末位 carry", 是闭环的对端位)
+    //   OF  = 仅 count==1 时按结果最高两位异或 (bit[N-1] XOR bit[N-2]);
+    //         count>1 时 undefined (Intel SDM 标 undefined), host CPU 仍写
+    //         一个值, setcc5 照样捕获——与 SDM "undefined" 一致
+    //   SF  = 结果 MSB
+    //   ZF  = 结果 == 0
+    //   PF  = 结果低 8 位偶校验
+    // 关键 catch：build_shift 不能直接复用于 build_adc/build_sbb（zero5 清
+    // 宿主 CF 导致 CF_in 丢失）；反之 build_adc/build_sbb 不能复用 build_shift
+    //（CF_in 路径不对）。Rol/Ror 走 build_shift 是对称的——它们无 CF_in 概念。
+    // count=0 走 adv_lbl 不动值/flags（与 shr/shl/sar 一致；x86 原生语义）。
+    std::string build_rol(u64 d) const { return build_shift("rol", d); }
+    std::string build_ror(u64 d) const { return build_shift("ror", d); }
+
     // Adc: dst = dst + src + CF_in（Intel SDM Vol. 2 ADC）。
     // 与 Add/Sub 不可共用 build_binary：zero5() 用 xor 清 scratch 寄存器，
     // 副作用把宿主 CPU 的 CF 也清零（XOR 写 CF=0），后续 native adc 看到的
@@ -949,9 +968,9 @@ RuntimeGenResult generate_runtime(wvmp::Rng& rng) {
         ks.assemble(g.build_dispatch(kDummyTableOff), dispatch_addr, "dispatch pass1");
     const u64 dispatch_size = dispatch1.size();
 
-    // —— handler 清单（v1 覆盖集；Rol/Ror/Call/Ret 的表项指向
+    // —— handler 清单（v1 覆盖集；Call/Ret 的表项指向
     //    Halt——遇到即停机，语义保守且不越界。Sar 在 MIT-244 已接管。
-    //    Adc 在 MIT-245 已接管；Sbb 在 MIT-246 已接管。）——
+    //    Adc 在 MIT-245 已接管；Sbb 在 MIT-246 已接管；Rol/Ror 在 MIT-247 已接管。）——
     std::vector<HandlerDef> handlers = {
         {int(VmOp::Mov), "mov", &AsmGen::build_mov},
         {int(VmOp::Lea), "lea", &AsmGen::build_mov},
@@ -967,6 +986,8 @@ RuntimeGenResult generate_runtime(wvmp::Rng& rng) {
         {int(VmOp::Shl), "shl", &AsmGen::build_shl},
         {int(VmOp::Shr), "shr", &AsmGen::build_shr},
         {int(VmOp::Sar), "sar", &AsmGen::build_sar},
+        {int(VmOp::Rol), "rol", &AsmGen::build_rol},
+        {int(VmOp::Ror), "ror", &AsmGen::build_ror},
         {int(VmOp::Adc), "adc", &AsmGen::build_adc},
         {int(VmOp::Sbb), "sbb", &AsmGen::build_sbb},
         {int(VmOp::Cmp), "cmp", &AsmGen::build_cmp},

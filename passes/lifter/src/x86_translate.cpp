@@ -371,8 +371,8 @@ TranslateResult translate_insn(const cs_insn& ci, ir::Arch arch) {
     case X86_INS_SHL: return translate_shift(ci, x, arch, Op::Shl);
     case X86_INS_SHR: return translate_shift(ci, x, arch, Op::Shr);
     case X86_INS_SAR: return translate_shift(ci, x, arch, Op::Sar);
-    case X86_INS_ROL: return todo(); // TODO(lane): rol/ror v1 跳过
-    case X86_INS_ROR: return todo();
+    case X86_INS_ROL: return translate_shift(ci, x, arch, Op::Rol);
+    case X86_INS_ROR: return translate_shift(ci, x, arch, Op::Ror);
     case X86_INS_CMP: return translate_cmp_test(ci, x, arch, Op::Cmp);
     case X86_INS_TEST: return translate_cmp_test(ci, x, arch, Op::Test);
     case X86_INS_PUSH: return translate_push(ci, x, arch);

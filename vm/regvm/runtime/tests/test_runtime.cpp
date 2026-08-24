@@ -714,6 +714,113 @@ void run_semantic_battery(const vm::RuntimeImage& image, const std::string& dump
         EXPECT_EQ(ctx6.regs[3] & isa::kFlagSF, isa::kFlagSF);
         EXPECT_EQ(ctx6.regs[3] & isa::kFlagOF, 0u);                  // OF=0 (同符号减)
     }
+
+    // ---- (l) Rol/Ror：循环移位、CF=循环移出位、count=0 no-op、S32/S64 全循环 ----
+    // Rol/Ror 语义要点（Intel SDM Vol. 2 ROL/ROR, felixcloutier.com/x86/rol/ror）：
+    //   - 循环移位：无 CF_in 概念（单条指令内闭环）
+    //   - CF = 循环移出位 (looped-out bit)
+    //   - OF: count==1 时 (CF XOR result MSB) [ROL] / (result bit[N-1] XOR
+    //         result bit[N-2]) [ROR]; count>1 时 undefined
+    //   - SF/ZF/PF = 按结果
+    // 任意 count>=32 (S32) / count>=64 (S64) 都按 x86 规范被 AND 0x1F/0x3F 掩。
+    // count=0 整条 no-op（值/flags 都不变）。
+    // 本测试段聚焦循环移位的**值**正确性 + count=0 路径 + count=1 OF 边界。
+    // 完整 flags 语义（含 SF/ZF/PF 多位组合 + CF 边带验证）由 RolFuzzTenThousand
+    // / RorFuzzTenThousand 5 万条 fuzz 承担, 每条都核对 CF=循环移出位 + value。
+    {
+        // (l.1) ROL S32 by 1：0x80000001 → 0x00000003
+        std::vector<u8> s;
+        isa::append_insn(s, mov_imm(0, 0x80000001u, ir::Size::S32));
+        isa::append_insn(s, bin_imm(isa::VmOp::Rol, 0, 1, ir::Size::S32));
+        isa::append_insn(s, halt());
+        EXPECT_EQ(run_stream(entry, s, scratch.data()).regs[0], 0x00000003ull);
+
+        // (l.2) ROR S32 by 1：0x80000001 → 0xC0000000
+        s.clear();
+        isa::append_insn(s, mov_imm(0, 0x80000001u, ir::Size::S32));
+        isa::append_insn(s, bin_imm(isa::VmOp::Ror, 0, 1, ir::Size::S32));
+        isa::append_insn(s, halt());
+        EXPECT_EQ(run_stream(entry, s, scratch.data()).regs[0], 0xC0000000ull);
+
+        // (l.3) ROL count=0 no-op：值不变（flags 不变由 SetFlags+GetFlags 守, 见下）
+        s.clear();
+        isa::append_insn(s, mov_imm(0, 0x12345u, ir::Size::S32));
+        isa::append_insn(s, mov_imm(2, u32(isa::kFlagCF | isa::kFlagSF | isa::kFlagPF)));
+        isa::append_insn(s, isa::make_insn(isa::VmOp::SetFlags,
+                                           isa::OpKind::Reg, 2, isa::OpKind::None, 0));
+        isa::append_insn(s, bin_imm(isa::VmOp::Rol, 0, 0, ir::Size::S32));
+        isa::append_insn(s, isa::make_insn(isa::VmOp::GetFlags,
+                                           isa::OpKind::Reg, 3, isa::OpKind::None, 0));
+        isa::append_insn(s, halt());
+        const auto ctx3 = run_stream(entry, s, scratch.data());
+        EXPECT_EQ(ctx3.regs[0], 0x12345ull);   // 值不变
+        EXPECT_EQ(ctx3.regs[3] & isa::kFlagsMask,
+                  u64(isa::kFlagCF | isa::kFlagSF | isa::kFlagPF));   // flags 全保留
+
+        // (l.4) ROR count=0 no-op：值与 flags 均不变
+        s.clear();
+        isa::append_insn(s, mov_imm(0, 0xABCDu, ir::Size::S32));
+        isa::append_insn(s, mov_imm(2, u32(isa::kFlagZF | isa::kFlagOF)));
+        isa::append_insn(s, isa::make_insn(isa::VmOp::SetFlags,
+                                           isa::OpKind::Reg, 2, isa::OpKind::None, 0));
+        isa::append_insn(s, bin_imm(isa::VmOp::Ror, 0, 0, ir::Size::S32));
+        isa::append_insn(s, isa::make_insn(isa::VmOp::GetFlags,
+                                           isa::OpKind::Reg, 3, isa::OpKind::None, 0));
+        isa::append_insn(s, halt());
+        const auto ctx4 = run_stream(entry, s, scratch.data());
+        EXPECT_EQ(ctx4.regs[0], 0xABCDull);
+        EXPECT_EQ(ctx4.regs[3] & isa::kFlagsMask,
+                  u64(isa::kFlagZF | isa::kFlagOF));
+
+        // (l.5) ROL S32 by 31 大位移：0x00000001 → 0x80000000
+        s.clear();
+        isa::append_insn(s, mov_imm(0, 0x00000001u, ir::Size::S32));
+        isa::append_insn(s, bin_imm(isa::VmOp::Rol, 0, 31, ir::Size::S32));
+        isa::append_insn(s, halt());
+        EXPECT_EQ(run_stream(entry, s, scratch.data()).regs[0], 0x80000000ull);
+
+        // (l.6) ROR S32 by 31 大位移：0x00000001 → 0x00000002
+        s.clear();
+        isa::append_insn(s, mov_imm(0, 0x00000001u, ir::Size::S32));
+        isa::append_insn(s, bin_imm(isa::VmOp::Ror, 0, 31, ir::Size::S32));
+        isa::append_insn(s, halt());
+        EXPECT_EQ(run_stream(entry, s, scratch.data()).regs[0], 0x00000002ull);
+
+        // (l.7) S32 全循环：0x12345678 ROL 4 → 0x23456781
+        s.clear();
+        isa::append_insn(s, mov_imm(0, 0x12345678u, ir::Size::S32));
+        isa::append_insn(s, bin_imm(isa::VmOp::Rol, 0, 4, ir::Size::S32));
+        isa::append_insn(s, halt());
+        EXPECT_EQ(run_stream(entry, s, scratch.data()).regs[0], 0x23456781ull);
+
+        // (l.8) S32 全循环：0x12345678 ROR 4 → 0x81234567
+        s.clear();
+        isa::append_insn(s, mov_imm(0, 0x12345678u, ir::Size::S32));
+        isa::append_insn(s, bin_imm(isa::VmOp::Ror, 0, 4, ir::Size::S32));
+        isa::append_insn(s, halt());
+        EXPECT_EQ(run_stream(entry, s, scratch.data()).regs[0], 0x81234567ull);
+
+        // (l.9) ZF=1 边界：0x00000000 ROL 1 → 0x00000000 (全程 0, ZF=1)
+        s.clear();
+        isa::append_insn(s, mov_imm(0, 0, ir::Size::S32));
+        isa::append_insn(s, bin_imm(isa::VmOp::Rol, 0, 1, ir::Size::S32));
+        isa::append_insn(s, halt());
+        EXPECT_EQ(run_stream(entry, s, scratch.data()).regs[0], 0ull);
+
+        // (l.10) ROR count=1 ZF 边界: 0x00000001 → 0x80000000
+        s.clear();
+        isa::append_insn(s, mov_imm(0, 0x00000001u, ir::Size::S32));
+        isa::append_insn(s, bin_imm(isa::VmOp::Ror, 0, 1, ir::Size::S32));
+        isa::append_insn(s, halt());
+        EXPECT_EQ(run_stream(entry, s, scratch.data()).regs[0], 0x80000000ull);
+
+        // (l.11) ROL count=1: 0x40000000 → 0x80000000
+        s.clear();
+        isa::append_insn(s, mov_imm(0, 0x40000000u, ir::Size::S32));
+        isa::append_insn(s, bin_imm(isa::VmOp::Rol, 0, 1, ir::Size::S32));
+        isa::append_insn(s, halt());
+        EXPECT_EQ(run_stream(entry, s, scratch.data()).regs[0], 0x80000000ull);
+    }
 }
 
 TEST(Interpreter, SbbE2EMirrorChain) {
@@ -955,6 +1062,104 @@ TEST(Interpreter, SbbFuzzTenThousand) {
                 << " a=" << std::hex << a32 << " b=" << std::hex << b32
                 << " cf_in=" << std::dec << cf_in;
             ASSERT_EQ(ctx.pc, 7u) << "Sbb test stream halts at instruction 7";
+        }
+    }
+}
+
+// Rol/Ror 真执行 fuzz：1 万条随机 (value, count) → 与 C++ 参考循环移位参考
+// bit-exact 比对, 同时验证 CF=循环移出位。覆盖 5 个不同 Rng 种子, 每颗
+// 种子跑 10000 次 = 5 万条样本。参考实现严格按 Intel SDM 64 位语义
+// （本 fuzz 的指令 bin_imm 用 S64, 测试寄存器全宽 64 位 rotate）。
+namespace {
+// 静态函数定义在 namespace scope 避 MSVC C2267（局部静态函数禁止）。
+struct RolRef { u64 value; u64 cf; };
+// 参考实现严格按 Intel SDM ROL (u64 全宽):
+//   count=0 → value 不变, CF=旧 CF（本 fuzz 验证 CF_out, 不依赖 CF_in）
+//   count∈[1,63] → value = ((v << count) | (v >> (64 - count))) (u64 全宽)
+//   CF = bit[(64 - count) mod 64] of original v (looped-out bit; 与 SHR 末位
+//        carry 不同——ROL 是闭环的对端位)
+//   OF: count==1 → (CF XOR result MSB); count!=1 → undefined (本 fuzz 不验)
+// 注意：本 fuzz 用 u32 输入零扩展到 u64（与 mov_imm aux u32 限制一致）。
+static RolRef ref_rol(u64 v, u32 count) {
+    if (count == 0 || count >= 64) return {v, 0};
+    const u64 rotated = (v << count) | (v >> (64 - count));
+    const u64 cf = (v >> (64 - count)) & 1ull;
+    return {rotated, cf};
+}
+struct RorRef { u64 value; u64 cf; };
+// 参考实现严格按 Intel SDM ROR (u64 全宽):
+//   count=0 → value 不变, CF=旧 CF（本 fuzz 验证 CF_out, 不依赖 CF_in）
+//   count∈[1,63] → value = ((v >> count) | (v << (64 - count))) (u64 全宽)
+//   CF = bit[(count - 1) mod 64] of original v (looped-out bit; 从低端移出)
+//   OF: count==1 → result bit[63] XOR result bit[62]
+// 注意：本 fuzz 用 u32 输入零扩展到 u64（与 mov_imm aux u32 限制一致）。
+static RorRef ref_ror(u64 v, u32 count) {
+    if (count == 0 || count >= 64) return {v, 0};
+    const u64 rotated = (v >> count) | (v << (64 - count));
+    const u64 cf = (v >> (count - 1)) & 1ull;
+    return {rotated, cf};
+}
+} // namespace
+
+TEST(Interpreter, RolFuzzTenThousand) {
+    for (u64 seed : {0xC0FFEEull, 0xBABEF00Dull, 0xDEADBEEFull, 0xCAFEBABEull, 0xFEEDFACEull}) {
+        wvmp::Rng rng(seed);
+        const auto result = rt::generate_runtime(rng);
+        RwxImage rwx(result.image.code);
+        const auto entry = rwx.entry();
+        alignas(16) std::array<u8, 0x10000> scratch{};
+        for (int i = 0; i < 10000; ++i) {
+            const u32 value32 = static_cast<u32>(rng.next());
+            const u32 count = static_cast<u32>(rng.uniform(0, 38));  // 包含 count>=32 边界
+            const u64 value64 = value32;   // zero-extend (matches vm state)
+            std::vector<u8> s;
+            isa::append_insn(s, mov_imm(0, value32));
+            isa::append_insn(s, bin_imm(isa::VmOp::Rol, 0, count, ir::Size::S64));
+            isa::append_insn(s, isa::make_insn(isa::VmOp::GetFlags,
+                                               isa::OpKind::Reg, 3, isa::OpKind::None, 0));
+            isa::append_insn(s, halt());
+            const auto ctx = run_stream(entry, s, scratch.data());
+            const auto ref = ref_rol(value64, count);
+            ASSERT_EQ(ctx.regs[0], ref.value)
+                << "seed=" << std::hex << seed << " iter=" << std::dec << i
+                << " val=" << std::hex << value32 << " cnt=" << std::dec << count;
+            // CF 标志位（bit 1 = kFlagCF）。
+            const u64 got_cf = (ctx.regs[3] & isa::kFlagCF) ? 1 : 0;
+            ASSERT_EQ(got_cf, ref.cf)
+                << "CF mismatch seed=" << std::hex << seed << " iter=" << std::dec << i
+                << " val=" << std::hex << value32 << " cnt=" << std::dec << count;
+            ASSERT_EQ(ctx.pc, 4u) << "Rol test stream halts at instruction 4";
+        }
+    }
+}
+
+TEST(Interpreter, RorFuzzTenThousand) {
+    for (u64 seed : {0xC0FFEEull, 0xBABEF00Dull, 0xDEADBEEFull, 0xCAFEBABEull, 0xFEEDFACEull}) {
+        wvmp::Rng rng(seed);
+        const auto result = rt::generate_runtime(rng);
+        RwxImage rwx(result.image.code);
+        const auto entry = rwx.entry();
+        alignas(16) std::array<u8, 0x10000> scratch{};
+        for (int i = 0; i < 10000; ++i) {
+            const u32 value32 = static_cast<u32>(rng.next());
+            const u32 count = static_cast<u32>(rng.uniform(0, 38));  // 包含 count>=32 边界
+            const u64 value64 = value32;
+            std::vector<u8> s;
+            isa::append_insn(s, mov_imm(0, value32));
+            isa::append_insn(s, bin_imm(isa::VmOp::Ror, 0, count, ir::Size::S64));
+            isa::append_insn(s, isa::make_insn(isa::VmOp::GetFlags,
+                                               isa::OpKind::Reg, 3, isa::OpKind::None, 0));
+            isa::append_insn(s, halt());
+            const auto ctx = run_stream(entry, s, scratch.data());
+            const auto ref = ref_ror(value64, count);
+            ASSERT_EQ(ctx.regs[0], ref.value)
+                << "seed=" << std::hex << seed << " iter=" << std::dec << i
+                << " val=" << std::hex << value32 << " cnt=" << std::dec << count;
+            const u64 got_cf = (ctx.regs[3] & isa::kFlagCF) ? 1 : 0;
+            ASSERT_EQ(got_cf, ref.cf)
+                << "CF mismatch seed=" << std::hex << seed << " iter=" << std::dec << i
+                << " val=" << std::hex << value32 << " cnt=" << std::dec << count;
+            ASSERT_EQ(ctx.pc, 4u) << "Ror test stream halts at instruction 4";
         }
     }
 }

@@ -394,12 +394,6 @@ TEST_F(LifterTranslate, SkippedInstructions) {
     const wvmp::u8 cl[] = {0xD3, 0xE0};
     EXPECT_EQ(translate_bytes(x64, cl, ir::Arch::X64).status, lifter::TranslateStatus::Todo);
 
-    // C1 C0 04: rol eax, 4 —— rol/ror v1 记 TODO 跳过
-    const wvmp::u8 rol[] = {0xC1, 0xC0, 0x04};
-    EXPECT_EQ(translate_bytes(x64, rol, ir::Arch::X64).status, lifter::TranslateStatus::Todo);
-    const wvmp::u8 ror[] = {0xC1, 0xC8, 0x04};
-    EXPECT_EQ(translate_bytes(x64, ror, ir::Arch::X64).status, lifter::TranslateStatus::Todo);
-
     // 0F A2: cpuid —— 超出白名单
     const wvmp::u8 cpuid[] = {0x0F, 0xA2};
     EXPECT_EQ(translate_bytes(x64, cpuid, ir::Arch::X64).status,
@@ -410,6 +404,69 @@ TEST_F(LifterTranslate, SkippedInstructions) {
     const wvmp::u8 lock[] = {0xF0, 0x01, 0x00};
     EXPECT_EQ(translate_bytes(x64, lock, ir::Arch::X64).status,
               lifter::TranslateStatus::Unsupported);
+}
+
+TEST_F(LifterTranslate, RolRorLifted) {
+    // MIT-247: rol/ror 已解除 TODO, 由 translate_shift 走 Op::Rol/Op::Ror。
+    // 覆盖 imm 计数 / 隐式计数 1 / size 变体。
+
+    // C1 C0 04: rol eax, 4 —— imm 计数
+    const wvmp::u8 rol_imm[] = {0xC1, 0xC0, 0x04};
+    auto r = translate_bytes(x64, rol_imm, ir::Arch::X64);
+    ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r.insn.op, ir::Op::Rol);
+    EXPECT_TRUE(r.insn.updates_flags);
+    EXPECT_EQ(r.insn.size, ir::Size::S32);
+    EXPECT_EQ(r.insn.dst.reg, ir::Reg::Rax);
+    ASSERT_EQ(r.insn.src.kind, ir::Operand::Kind::Imm);
+    EXPECT_EQ(r.insn.src.imm, 4);
+
+    // D1 C0: rol eax（隐式计数 1）
+    const wvmp::u8 rol_1[] = {0xD1, 0xC0};
+    auto r1 = translate_bytes(x64, rol_1, ir::Arch::X64);
+    ASSERT_EQ(r1.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r1.insn.op, ir::Op::Rol);
+    ASSERT_EQ(r1.insn.src.kind, ir::Operand::Kind::Imm);
+    EXPECT_EQ(r1.insn.src.imm, 1);
+
+    // C1 C8 04: ror eax, 4 —— imm 计数
+    const wvmp::u8 ror_imm[] = {0xC1, 0xC8, 0x04};
+    auto rr = translate_bytes(x64, ror_imm, ir::Arch::X64);
+    ASSERT_EQ(rr.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(rr.insn.op, ir::Op::Ror);
+    EXPECT_TRUE(rr.insn.updates_flags);
+    EXPECT_EQ(rr.insn.size, ir::Size::S32);
+    EXPECT_EQ(rr.insn.dst.reg, ir::Reg::Rax);
+    ASSERT_EQ(rr.insn.src.kind, ir::Operand::Kind::Imm);
+    EXPECT_EQ(rr.insn.src.imm, 4);
+
+    // D1 C8: ror eax（隐式计数 1）
+    const wvmp::u8 ror_1[] = {0xD1, 0xC8};
+    auto rr1 = translate_bytes(x64, ror_1, ir::Arch::X64);
+    ASSERT_EQ(rr1.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(rr1.insn.op, ir::Op::Ror);
+    ASSERT_EQ(rr1.insn.src.kind, ir::Operand::Kind::Imm);
+    EXPECT_EQ(rr1.insn.src.imm, 1);
+
+    // 48 C1 C1 20: rol rcx, 32 —— 64 位 size
+    const wvmp::u8 rol_64[] = {0x48, 0xC1, 0xC1, 0x20};
+    auto r64 = translate_bytes(x64, rol_64, ir::Arch::X64);
+    ASSERT_EQ(r64.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r64.insn.op, ir::Op::Rol);
+    EXPECT_EQ(r64.insn.size, ir::Size::S64);
+    EXPECT_EQ(r64.insn.dst.reg, ir::Reg::Rcx);
+    ASSERT_EQ(r64.insn.src.kind, ir::Operand::Kind::Imm);
+    EXPECT_EQ(r64.insn.src.imm, 32);
+
+    // D3 C0: rol eax, cl —— cl 变体 v1 仍记 TODO 跳过（与 shl/shr/sar 一致）
+    const wvmp::u8 rol_cl[] = {0xD3, 0xC0};
+    EXPECT_EQ(translate_bytes(x64, rol_cl, ir::Arch::X64).status,
+              lifter::TranslateStatus::Todo);
+
+    // D3 C8: ror eax, cl —— 同上
+    const wvmp::u8 ror_cl[] = {0xD3, 0xC8};
+    EXPECT_EQ(translate_bytes(x64, ror_cl, ir::Arch::X64).status,
+              lifter::TranslateStatus::Todo);
 }
 
 TEST_F(LifterTranslate, X86Mode32) {

@@ -101,3 +101,16 @@ target_compile_options(wvmp_sbb_sample PRIVATE
 target_link_options(wvmp_sbb_sample PRIVATE
     $<$<CXX_COMPILER_ID:MSVC>:/INCREMENTAL:NO>
 )
+
+# MIT-247：端到端正路径样本——区域内含 rol/ror（白名单内），验证 C2-Rol/Ror
+# 修复后翻译成功、运行时走真 Rol/Ror handler、行为与原生逐字节一致。用 MSVC
+# _rotl64 / _rotr64 内部函数在 /Od 下强制 codegen 为真 `rol` / `ror` 指令。
+add_executable(wvmp_rol_sample rol_sample_main.cpp)
+target_link_libraries(wvmp_rol_sample PRIVATE wvmp::sdk)
+target_compile_options(wvmp_rol_sample PRIVATE
+    $<$<CXX_COMPILER_ID:MSVC>:/Od;/Ob0;/utf-8>
+    $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-O0>
+)
+target_link_options(wvmp_rol_sample PRIVATE
+    $<$<CXX_COMPILER_ID:MSVC>:/INCREMENTAL:NO>
+)
