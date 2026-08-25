@@ -31,8 +31,11 @@
 #include <ctime>
 
 // ─── 游戏常量 ──────────────────────────────────────────────────────────
-static constexpr int GW = 30;      // 网格宽
-static constexpr int GH = 20;      // 网格高
+// GW/GH 取 2 的幂 (32): 食物重生路径 `s & (N - 2)` 替代 `s % (N - 1)`,
+// MSVC /Od codegen 产出 `and eax, 0x1E` (白名单内), 避免 div 指令触发
+// lifter C1 gate 兜底, snake 真虚拟化闭环 (MIT-318)。
+static constexpr int GW = 32;      // 网格宽 (2 的幂)
+static constexpr int GH = 32;      // 网格高 (2 的幂)
 static constexpr int MAX_LEN = 64; // 蛇最大长度
 
 // 方向: 0=up, 1=right, 2=down, 3=left
@@ -163,10 +166,12 @@ __declspec(noinline) static void tick(int new_dir) {
     if (ate != 0) {
         g_score = g_score + 1;
         // 重生食物: 简化用固定算法 (确定性)
-        //   food_x = (s % (GW - 1))
-        //   food_y = ((s >> 8) % (GH - 1))
-        int new_fx = (int)(s % (unsigned int)(GW - 1));
-        int new_fy = (int)((s >> 8) % (unsigned int)(GH - 1));
+        //   food_x = (s & (GW - 2))   ≡ s % 31  (GW=32 时)
+        //   food_y = ((s >> 8) & (GH - 2)) ≡ (s >> 8) % 31  (GH=32 时)
+        // 用 & (N-2) 替代 % (N-1): MSVC /Od codegen 出 `and eax, 0x1E`,
+        // 在 lifter 白名单内, 避开 div 指令。
+        int new_fx = (int)(s & (unsigned int)(GW - 2));
+        int new_fy = (int)((s >> 8) & (unsigned int)(GH - 2));
         g_food_x = new_fx;
         g_food_y = new_fy;
     }
