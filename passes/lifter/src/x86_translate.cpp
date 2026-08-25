@@ -394,6 +394,46 @@ TranslateResult translate_mul(const cs_insn& ci, const cs_x86& x, ir::Arch arch)
     return ok(out);
 }
 
+// movsxd (REX.W + 0x63 /r)：32→64 位有符号扩展，x64 专用。
+// MSVC /Od 默认 codegen REG-REG 与 REG-MEM（RSP 栈上局部变量 / RAX 字段访问）两种：
+//   - REG-REG：movsxd rax, edx   → ir::Op::Movsxd, src=Reg
+//   - REG-MEM：movsxd rax, [mem] → ir::Op::Movsxd, src=Mem
+//   - 字节结构：48/49 (REX.W/.B) | 63 (opcode) | ModR/M | 可选 SIB | 可选 disp8
+//   - 关键：movsxd 本身完成 32 位 load + 符号扩展（不分两条 Load + SignExt）。
+//     lifter 不拆分，emit Operand::mem_(...); 翻译器折 Load + Movsxd 或 MovsxdMem。
+// size 恒为 S64（movsxd 必 32→64）；updates_flags=false（movsxd 不影响 flags）。
+TranslateResult translate_movsxd(const cs_insn& ci, const cs_x86& x, ir::Arch arch) {
+    if (x.op_count != 2) return unsupported(ci.address, ci.size);
+    // dst 必是 64-bit 寄存器（x86 不支持 movsxd）
+    if (x.operands[0].type != X86_OP_REG) return unsupported(ci.address, ci.size);
+    auto d = map_reg(x.operands[0].reg);
+    if (!d) return unsupported(ci.address, ci.size);
+    if (arch != ir::Arch::X64) return unsupported(ci.address, ci.size);
+
+    ir::Insn out;
+    out.op = Op::Movsxd;
+    out.addr = ci.address;
+    out.size = Size::S64;
+    out.updates_flags = false;
+    out.dst = Operand::reg_(*d);
+
+    if (x.operands[1].type == X86_OP_REG) {
+        // movsxd r, r — REG-REG 形式
+        auto s = map_reg(x.operands[1].reg);
+        if (!s) return unsupported(ci.address, ci.size);
+        out.src = Operand::reg_(*s);
+        return ok(out);
+    }
+    if (x.operands[1].type == X86_OP_MEM) {
+        // movsxd r, [m] — REG-MEM 形式
+        auto m = mem_operand(x.operands[1].mem);
+        if (!m) return unsupported(ci.address, ci.size);
+        out.src = *m;
+        return ok(out);
+    }
+    return unsupported(ci.address, ci.size);
+}
+
 } // namespace
 
 std::optional<ir::Reg> map_reg(x86_reg r) {
@@ -502,6 +542,7 @@ TranslateResult translate_insn(const cs_insn& ci, ir::Arch arch) {
     case X86_INS_RET: return translate_ret(ci, x, arch);
     case X86_INS_IMUL: return translate_imul(ci, x, arch);
     case X86_INS_MUL: return translate_mul(ci, x, arch);
+    case X86_INS_MOVSXD: return translate_movsxd(ci, x, arch);
     case X86_INS_NOP: {
         ir::Insn out;
         out.op = Op::Nop;

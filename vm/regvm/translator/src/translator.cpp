@@ -294,6 +294,8 @@ struct Translator {
                 ok = translate_imul(em, sc, in, current_rva, next_ip);
             } else if (in.op == ir::Op::Mul) {
                 ok = translate_mul(em, in);
+            } else if (in.op == ir::Op::Movsxd) {
+                ok = translate_movsxd(em, sc, in, current_rva, next_ip);
             } else if (is_alu_binop(in.op)) {
                 ok = translate_alu_binop(em, sc, in, current_rva, next_ip);
             } else if (is_unary(in.op)) {
@@ -662,6 +664,48 @@ struct Translator {
         em.emit(VmOp::Mul, OpKind::Reg, isa::vm_reg_of(in.dst.reg),
                 OpKind::Reg, isa::vm_reg_of(in.src.reg), 0, sz);
         return true;
+    }
+
+    // ---- MIT-307: movsxd (32→64 位符号扩展，x64 专用) ----
+    //
+    // lifter 区分两种形式：
+    //   - REG-REG：movsxd r, r   → emit VmOp::Movsxd
+    //   - REG-MEM：movsxd r, [m] → emit_address 算地址到 scratch + VmOp::MovsxdMem
+    //
+    // Movsxd (Reg-Reg): native `movsxd <r64>, <r/m32>` 一次完成 32→64 符号扩展。
+    //   handler: movsxd t0, dword ptr [ctx + reg_b*8 + 0x10] (读 src 32 位)
+    //            mov [ctx + reg_a*8 + 0x10], t0 (写回 dst 64 位)
+    //
+    // MovsxdMem (Reg-Mem): 翻译期把地址算到 scratch 槽 (emit_address → acc),
+    //                     运行时 handler 把 acc 槽值当地址访存, 32 位 load + 符号扩展。
+    //   handler: mov t1, [ctx + reg_b*8 + 0x10]       (取地址)
+    //            movsxd t0, dword ptr [t1]              (32 位 load + 符号扩展)
+    //            mov [ctx + reg_a*8 + 0x10], t0        (写回 dst 64 位)
+    //
+    // 不更新 flags（movsxd 不影响 CF/OF/SF/ZF/PF）。
+    bool translate_movsxd(Emitter& em, Scratch& sc, const ir::Insn& in,
+                          u64 current_rva, u64 next_ip) {
+        if (in.dst.kind != ir::Operand::Kind::Reg)
+            return skip(in, "movsxd 操作数形态未支持", nullptr);
+        const u8 d = isa::vm_reg_of(in.dst.reg);
+        const u8 sz = isa::size_field(in.size);
+
+        if (in.src.kind == ir::Operand::Kind::Reg) {
+            // movsxd r, r：emit Movsxd（handler 内部 sign_ext_32）。
+            const u8 s = isa::vm_reg_of(in.src.reg);
+            em.emit_rr(VmOp::Movsxd, d, s, sz);
+            return true;
+        }
+        if (in.src.kind == ir::Operand::Kind::Mem) {
+            // movsxd r, [m]：emit_address 算 acc + emit MovsxdMem。
+            // scratch 预算: emit_address 用 1 scratch (acc)；本步不另取。
+            u8 acc = 0;
+            if (!emit_address(em, sc, in.src.mem, current_rva, next_ip, acc))
+                return skip(in, "movsxd 地址形态未支持", &in.src.mem);
+            em.emit_rr(VmOp::MovsxdMem, d, acc, sz);
+            return true;
+        }
+        return skip(in, "movsxd 操作数形态未支持", nullptr);
     }
 };
 

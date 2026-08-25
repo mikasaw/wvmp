@@ -33,6 +33,9 @@ std::string_view to_string(Op op) {
     case Op::Load: return "load";
     case Op::Store: return "store";
     case Op::Nop: return "nop";
+    case Op::Imul: return "imul";
+    case Op::Mul: return "mul";
+    case Op::Movsxd: return "movsxd";
     }
     return "?";
 }

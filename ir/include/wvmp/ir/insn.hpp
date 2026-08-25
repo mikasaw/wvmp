@@ -7,7 +7,14 @@ enum class Op : u16 { Mov, Lea, Add, Sub, Adc, Sbb, And, Or, Xor, Not, Neg, Inc,
                       // MIT-302: 有符号/无符号乘法。
                       // Imul 三形式（dst=Reg, src=Reg, src2=Imm 仅 3-op imm 形式）；
                       // Mul 单操作数（dst=Rdx 上半, src=Reg, Rax 下半硬编码）。
-                      Imul, Mul };
+                      Imul, Mul,
+                      // MIT-307: 32→64 位符号扩展（x64 专用）。
+                      //   - REG-REG: src=Reg（含 32-bit 子寄存器折叠）, dst=Reg
+                      //   - REG-MEM: src=Mem, dst=Reg（lifter 直接 emit Operand::mem_;
+                      //              翻译器折 Load + Movsxd 或 MovsxdMem 一条）
+                      // size 恒为 S64（movsxd 必 32→64），updates_flags=false
+                      //（movsxd 不影响 CF/OF/SF/ZF/PF）。
+                      Movsxd };
 enum class Size : u8 { S8, S16, S32, S64 };
 enum class Cond : u8 { O, No, B, Ae, E, Ne, Be, A, S, Ns, P, Np, L, Ge, Le, G };
 constexpr u64 bits(Size s) { return s==Size::S8?8: s==Size::S16?16: s==Size::S32?32:64; }

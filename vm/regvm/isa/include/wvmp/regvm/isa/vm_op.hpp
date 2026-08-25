@@ -57,9 +57,24 @@ enum class VmOp : u16 {
     // 运行时 handler 读 regs[Rax]，native mul 后将物理 rax/rdx 写回 regs[Rax]/regs[Rdx]。
     // flags 语义同 native mul（CF/OF 当低半 != 高半时 set）。
     Mul,
+
+    // —— MIT-307 movsxd（32→64 位符号扩展，x64 专用）——
+    // Movsxd (Reg-Reg): dst = sign_extend_32(src)，native "movsxd dst, src"。
+    // a_kind=Reg, reg_a=dst, b_kind=Reg, reg_b=src, aux=0, cond_or_size=3 (S64)。
+    // handler 用 movsxd t_[0], dword ptr [ctx + reg_b*8 + 0x10] 直接 32→64
+    // 符号扩展 + 写回 [ctx + reg_a*8 + 0x10]。不更新 flags。
+    Movsxd,
+    // MovsxdMem (Reg-Mem): dst = sign_extend_32([addr])，addr 在 reg_b VM 槽里。
+    // a_kind=Reg, reg_a=dst, b_kind=Reg, reg_b=address 槽（翻译器 emit_address 已
+    // 把地址算到 scratch 槽, 本 handler 读该槽作地址）。
+    // handler: mov t_[1], [ctx + reg_b*8 + 0x10]（取地址）
+    //         movsxd t_[0], dword ptr [t_[1]]（32 位 load + 符号扩展）
+    //         mov [ctx + reg_a*8 + 0x10], t_[0]（写回 64 位 dst）
+    // 不更新 flags。
+    MovsxdMem,
 };
 
-inline constexpr u16 kVmOpMax = static_cast<u16>(VmOp::Mul);
+inline constexpr u16 kVmOpMax = static_cast<u16>(VmOp::MovsxdMem);
 inline constexpr u16 kVmOpLimit = 1u << 14;  // 14 位编码空间上限
 
 constexpr const char* to_string(VmOp op) {
@@ -91,6 +106,8 @@ constexpr const char* to_string(VmOp op) {
         case VmOp::RorCl: return "rorcl";
         case VmOp::Imul: return "imul";
         case VmOp::Mul: return "mul";
+        case VmOp::Movsxd: return "movsxd";
+        case VmOp::MovsxdMem: return "movsxdmem";
     }
     return "?";
 }

@@ -1986,4 +1986,172 @@ TEST(Interpreter, ImulFuzzTenThousand) {
 TEST(Interpreter, MulFuzzTenThousand) {
     GTEST_SKIP() << "build_mul handler has subtle Rng-seed-dependent bug.";
 }
+
+// =============================================================================
+// MIT-307 Movsxd / MovsxdMem 真执行测试
+// =============================================================================
+// VmOp::Movsxd (Reg-Reg): dst = sign_extend_32(src)
+// VmOp::MovsxdMem (Reg-Mem): dst = sign_extend_32([addr])，addr 在 reg_b VM 槽
+// 不更新 flags。movsxd 是 32→64 符号扩展，结果的低 32 位与 native C++ 隐式
+// int64_t 转换的位模式完全一致；高 32 位全 0（正）或全 1（负）。
+
+namespace {
+// Movsxd 参考实现：取 32 位值低 32 位, 按 int32 符号扩展到 int64, 再零扩展到 u64。
+static u64 ref_movsxd(u32 src32) {
+    const int s32 = static_cast<int>(src32);
+    return static_cast<u64>(static_cast<i64>(s32));
+}
+// Movsxd (Reg-Reg) sink：emit mov_imm src, val32; Movsxd dst, src;
+//                     读 regs[dst] 与 ref_movsxd 比对。
+} // namespace
+
+TEST(Interpreter, MovsxdSemantics) {
+    // 5 个 Rng 种子 × 6 个边界值（覆盖 32 位全 0 / 0x7FFF.../ 0x8000.../ 0xFFFF.../ 中间值）
+    for (u64 seed : {0xC0FFEEull, 0xBABEF00Dull, 0xDEADBEEFull, 0xCAFEBABEull, 0xFEEDFACEull}) {
+        wvmp::Rng rng(seed);
+        const auto result = rt::generate_runtime(rng);
+        RwxImage rwx(result.image.code);
+        const auto entry = rwx.entry();
+        alignas(16) std::array<u8, 0x10000> scratch{};
+
+        struct C { u32 v; const char* tag; };
+        const C cases[] = {
+            {0x00000000u, "zero"},
+            {0x7FFFFFFFu, "+INT32_MAX"},
+            {0x80000000u, "-INT32_MIN"},
+            {0xFFFFFFFFu, "-1"},
+            {0x12345678u, "mid_pos"},
+            {0xEDCBA987u, "mid_neg"},
+        };
+        for (const auto& c : cases) {
+            std::vector<u8> s;
+            isa::append_insn(s, mov_imm(0, c.v));
+            isa::append_insn(s, isa::make_insn(isa::VmOp::Movsxd,
+                                               isa::OpKind::Reg, 1,
+                                               isa::OpKind::Reg, 0, 0,
+                                               isa::size_field(ir::Size::S64)));
+            isa::append_insn(s, halt());
+            const auto ctx = run_stream(entry, s, scratch.data());
+            const u64 expected = ref_movsxd(c.v);
+            ASSERT_EQ(ctx.regs[1], expected)
+                << "Movsxd " << c.tag << " seed=" << std::hex << seed
+                << " src=0x" << c.v << " -> got 0x" << ctx.regs[1]
+                << " expected 0x" << expected;
+        }
+    }
+}
+
+// MovsxdMem (Reg-Mem): 把 address (= scratch 绝对 VA) 写到 reg_b VM 槽；
+// scratch[address..address+4] 预填 32 位值；MovsxdMem dst, b 应等于
+// ref_movsxd(scratch_u32_le_at(address))。
+// 注: M2-8 起 Load/Store 直接用绝对 VA（不加 scratch_mem）。MovsxdMem 同样：
+// reg_b 槽里写的就是 64 位绝对 VA，handler 直接 `movsxd t, dword ptr [t]`。
+TEST(Interpreter, MovsxdMemSemantics) {
+    for (u64 seed : {0xC0FFEEull, 0xBABEF00Dull, 0xDEADBEEFull,
+                     0xCAFEBABEull, 0xFEEDFACEull}) {
+        wvmp::Rng rng(seed);
+        const auto result = rt::generate_runtime(rng);
+        RwxImage rwx(result.image.code);
+        const auto entry = rwx.entry();
+        alignas(16) std::array<u8, 0x10000> scratch{};
+
+        struct C { u64 off; u32 v; const char* tag; };
+        // 在 scratch 里用 8 字节对齐偏移 (movsxd 必须按 dword ptr 读)。
+        const C cases[] = {
+            {0x100, 0x00000000u, "zero"},
+            {0x108, 0x7FFFFFFFu, "+INT32_MAX"},
+            {0x110, 0x80000000u, "-INT32_MIN"},
+            {0x118, 0xFFFFFFFFu, "-1"},
+            {0x120, 0x12345678u, "mid_pos"},
+            {0x128, 0xEDCBA987u, "mid_neg"},
+        };
+        for (const auto& c : cases) {
+            const u64 data_addr = reinterpret_cast<u64>(scratch.data()) + c.off;
+            std::memcpy(scratch.data() + c.off, &c.v, sizeof(c.v));
+            std::vector<u8> s;
+            // regs[0] = 绝对 VA (mov_imm64 拆 4 条)
+            mov_imm64_into(s, /*dst*/0, /*scratch*/isa::kScratchFirst, data_addr);
+            isa::append_insn(s, isa::make_insn(isa::VmOp::MovsxdMem,
+                                               isa::OpKind::Reg, 1,
+                                               isa::OpKind::Reg, 0, 0,
+                                               isa::size_field(ir::Size::S64)));
+            isa::append_insn(s, halt());
+            const auto ctx = run_stream(entry, s, scratch.data());
+            const u64 expected = ref_movsxd(c.v);
+            ASSERT_EQ(ctx.regs[1], expected)
+                << "MovsxdMem " << c.tag << " seed=" << std::hex << seed
+                << " off=0x" << c.off << " v=0x" << c.v
+                << " data_addr=0x" << data_addr
+                << " -> got 0x" << ctx.regs[1] << " expected 0x" << expected;
+        }
+    }
+}
+
+// MIT-307 Movsxd 5 万条 fuzz：5 个 Rng 种子 × 10000 iter，每条与 ref_movsxd
+// bit-exact 比对，覆盖 32 位全随机值（含正/负边界）。与 Imul 同样的
+// seed 列表保证 runtime handler 在不同寄存器分配下都正确。
+// 流 (3 条)：mov_imm src, val32; Movsxd dst, src; halt. halt @ index 2,
+// 出口 pc = 3。
+TEST(Interpreter, MovsxdFuzzTenThousand) {
+    for (u64 seed : {0xC0FFEEull, 0xBABEF00Dull, 0xDEADBEEFull,
+                     0xCAFEBABEull, 0xFEEDFACEull}) {
+        wvmp::Rng rng(seed);
+        const auto result = rt::generate_runtime(rng);
+        RwxImage rwx(result.image.code);
+        const auto entry = rwx.entry();
+        alignas(16) std::array<u8, 0x10000> scratch{};
+        for (int i = 0; i < 10000; ++i) {
+            const u32 v32 = static_cast<u32>(rng.next());
+            const u64 expected = ref_movsxd(v32);
+            std::vector<u8> s;
+            isa::append_insn(s, mov_imm(0, v32));
+            isa::append_insn(s, isa::make_insn(isa::VmOp::Movsxd,
+                                               isa::OpKind::Reg, 1,
+                                               isa::OpKind::Reg, 0, 0,
+                                               isa::size_field(ir::Size::S64)));
+            isa::append_insn(s, halt());
+            const auto ctx = run_stream(entry, s, scratch.data());
+            ASSERT_EQ(ctx.regs[1], expected)
+                << "Movsxd fuzz seed=" << std::hex << seed << " iter=" << std::dec << i
+                << " v32=0x" << std::hex << v32
+                << " got 0x" << ctx.regs[1] << " expected 0x" << expected;
+            ASSERT_EQ(ctx.pc, 3u) << "Movsxd fuzz stream halts at instruction 3";
+        }
+    }
+}
+
+// MIT-307 MovsxdMem 5 万条 fuzz：5 个 Rng 种子 × 10000 iter，scratch 预填
+// 32 位随机值 (8 字节对齐), address = scratch 绝对 VA + offset, 比对结果。
+// 流 (4 条)：mov_imm64 addr (4 内部指令); MovsxdMem; halt. halt @ index 4,
+// 出口 pc = 5。
+TEST(Interpreter, MovsxdMemFuzzTenThousand) {
+    for (u64 seed : {0xC0FFEEull, 0xBABEF00Dull, 0xDEADBEEFull,
+                     0xCAFEBABEull, 0xFEEDFACEull}) {
+        wvmp::Rng rng(seed);
+        const auto result = rt::generate_runtime(rng);
+        RwxImage rwx(result.image.code);
+        const auto entry = rwx.entry();
+        alignas(16) std::array<u8, 0x10000> scratch{};
+        for (int i = 0; i < 10000; ++i) {
+            const u64 off = static_cast<u64>(rng.uniform(0u, 0xFF00u)) & ~u64(7);
+            const u32 v32 = static_cast<u32>(rng.next());
+            const u64 data_addr = reinterpret_cast<u64>(scratch.data()) + off;
+            std::memcpy(scratch.data() + off, &v32, sizeof(v32));
+            const u64 expected = ref_movsxd(v32);
+            std::vector<u8> s;
+            mov_imm64_into(s, /*dst*/0, /*scratch*/isa::kScratchFirst, data_addr);
+            isa::append_insn(s, isa::make_insn(isa::VmOp::MovsxdMem,
+                                               isa::OpKind::Reg, 1,
+                                               isa::OpKind::Reg, 0, 0,
+                                               isa::size_field(ir::Size::S64)));
+            isa::append_insn(s, halt());
+            const auto ctx = run_stream(entry, s, scratch.data());
+            ASSERT_EQ(ctx.regs[1], expected)
+                << "MovsxdMem fuzz seed=" << std::hex << seed << " iter=" << std::dec << i
+                << " off=0x" << std::hex << off << " v32=0x" << v32
+                << " got 0x" << ctx.regs[1] << " expected 0x" << expected;
+            ASSERT_EQ(ctx.pc, 6u) << "MovsxdMem fuzz stream halts at instruction 6";
+        }
+    }
+}
 } // namespace

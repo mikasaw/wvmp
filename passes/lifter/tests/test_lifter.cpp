@@ -597,6 +597,108 @@ TEST_F(LifterTranslate, ImulRegRegImmShortRegression) {
     EXPECT_EQ(r.insn.src2.imm, 7);
 }
 
+// MIT-307: movsxd (REX.W + 0x63 /r) 32→64 位符号扩展，x64 专用。
+// 字节编码来自项目主反汇编（派活单 §A，wvmp_snake_sample.exe capstone 输出）：
+//   - REG-REG (3 字节, 无 SIB/disp):  48 63 D2 = movsxd rdx, edx
+//                                    48 63 C1 = movsxd rax, ecx
+//   - REG-REG REX.B (R8-R15):         49 63 E8 = movsxd rbp, r8d
+//   - REG-MEM RSP+disp8 (SIB 必有):   48 63 44 24 24 = movsxd rax, [rsp+0x24]
+//   - REG-MEM base+disp8 (无 SIB):    48 63 40 3C = movsxd rax, [rax+0x3c]
+// lifter 对 REG-REG / REG-MEM 都直接 emit（不折 Load + SignExt）。
+// size 恒为 S64；updates_flags=false；movsxd 不影响 flags。
+TEST_F(LifterTranslate, MovsxdRegToReg) {
+    // 48 63 D2: movsxd rdx, edx — REG-REG 形式（同寄存器）
+    const wvmp::u8 b[] = {0x48, 0x63, 0xD2};
+    auto r = translate_bytes(x64, b, ir::Arch::X64);
+    ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r.insn.op, ir::Op::Movsxd);
+    EXPECT_EQ(r.insn.size, ir::Size::S64);        // 必 S64
+    EXPECT_FALSE(r.insn.updates_flags);           // 不改 flags
+    ASSERT_EQ(r.insn.dst.kind, ir::Operand::Kind::Reg);
+    EXPECT_EQ(r.insn.dst.reg, ir::Reg::Rdx);
+    ASSERT_EQ(r.insn.src.kind, ir::Operand::Kind::Reg);
+    EXPECT_EQ(r.insn.src.reg, ir::Reg::Rdx);
+    EXPECT_EQ(r.insn.addr, 0u);
+}
+
+TEST_F(LifterTranslate, MovsxdRegToRegDifferentReg) {
+    // 48 63 C1: movsxd rax, ecx — REG-REG 不同寄存器
+    const wvmp::u8 b[] = {0x48, 0x63, 0xC1};
+    auto r = translate_bytes(x64, b, ir::Arch::X64);
+    ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r.insn.op, ir::Op::Movsxd);
+    EXPECT_EQ(r.insn.size, ir::Size::S64);
+    EXPECT_FALSE(r.insn.updates_flags);
+    ASSERT_EQ(r.insn.dst.kind, ir::Operand::Kind::Reg);
+    EXPECT_EQ(r.insn.dst.reg, ir::Reg::Rax);
+    ASSERT_EQ(r.insn.src.kind, ir::Operand::Kind::Reg);
+    EXPECT_EQ(r.insn.src.reg, ir::Reg::Rcx);
+}
+
+TEST_F(LifterTranslate, MovsxdRexB) {
+    // 49 63 E8: movsxd rbp, r8d — REX.B 让 reg 映射到 R8-R15
+    // 49 (REX.W+REX.B) | 63 (movsxd opcode) | E8 (ModR/M: mod=11, reg=5=Rbp, r/m=0)
+    // REX.B 把 r/m 字段从 0 扩展到 8 (R8)。lifter 必须正确处理。
+    const wvmp::u8 b[] = {0x49, 0x63, 0xE8};
+    auto r = translate_bytes(x64, b, ir::Arch::X64);
+    ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r.insn.op, ir::Op::Movsxd);
+    EXPECT_EQ(r.insn.size, ir::Size::S64);
+    ASSERT_EQ(r.insn.dst.kind, ir::Operand::Kind::Reg);
+    EXPECT_EQ(r.insn.dst.reg, ir::Reg::Rbp);
+    ASSERT_EQ(r.insn.src.kind, ir::Operand::Kind::Reg);
+    EXPECT_EQ(r.insn.src.reg, ir::Reg::R8);
+    EXPECT_FALSE(r.insn.updates_flags);
+}
+
+TEST_F(LifterTranslate, MovsxdMemRspDisp8) {
+    // 48 63 44 24 24: movsxd rax, [rsp+0x24] — REG-MEM 含 SIB (5 字节)
+    // 48 (REX.W) | 63 | 44 (ModR/M: mod=01, reg=0=Rax, r/m=100=SIB)
+    //    | 24 (SIB: scale=00, index=100=none, base=100=Rsp) | 24 (disp8)
+    const wvmp::u8 b[] = {0x48, 0x63, 0x44, 0x24, 0x24};
+    auto r = translate_bytes(x64, b, ir::Arch::X64);
+    ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r.insn.op, ir::Op::Movsxd);
+    EXPECT_EQ(r.insn.size, ir::Size::S64);
+    EXPECT_FALSE(r.insn.updates_flags);
+    ASSERT_EQ(r.insn.dst.kind, ir::Operand::Kind::Reg);
+    EXPECT_EQ(r.insn.dst.reg, ir::Reg::Rax);
+    ASSERT_EQ(r.insn.src.kind, ir::Operand::Kind::Mem);
+    EXPECT_EQ(r.insn.src.mem.base, ir::Reg::Rsp);
+    EXPECT_EQ(r.insn.src.mem.index, ir::Reg::Flags); // SIB index=100=none
+    EXPECT_EQ(r.insn.src.mem.disp, 0x24);
+}
+
+TEST_F(LifterTranslate, MovsxdMemBaseDisp8) {
+    // 48 63 40 3C: movsxd rax, [rax+0x3c] — REG-MEM 无 SIB (4 字节)
+    // 48 (REX.W) | 63 | 40 (ModR/M: mod=01, reg=0=Rax, r/m=000=Rax)
+    //    | 3C (disp8)
+    const wvmp::u8 b[] = {0x48, 0x63, 0x40, 0x3C};
+    auto r = translate_bytes(x64, b, ir::Arch::X64);
+    ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r.insn.op, ir::Op::Movsxd);
+    EXPECT_EQ(r.insn.size, ir::Size::S64);
+    ASSERT_EQ(r.insn.dst.kind, ir::Operand::Kind::Reg);
+    EXPECT_EQ(r.insn.dst.reg, ir::Reg::Rax);
+    ASSERT_EQ(r.insn.src.kind, ir::Operand::Kind::Mem);
+    EXPECT_EQ(r.insn.src.mem.base, ir::Reg::Rax);
+    EXPECT_EQ(r.insn.src.mem.index, ir::Reg::Flags); // 无 index
+    EXPECT_EQ(r.insn.src.mem.disp, 0x3C);
+}
+
+TEST_F(LifterTranslate, MovsxdMemRspDispDifferent0x68) {
+    // 48 63 44 24 68: movsxd rax, [rsp+0x68] — 不同 disp 回归测试
+    // SIB 路径必正确（与 MovsxdMemRspDisp8 一起覆盖 RSP+disp8 形式全量）
+    const wvmp::u8 b[] = {0x48, 0x63, 0x44, 0x24, 0x68};
+    auto r = translate_bytes(x64, b, ir::Arch::X64);
+    ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r.insn.op, ir::Op::Movsxd);
+    ASSERT_EQ(r.insn.src.kind, ir::Operand::Kind::Mem);
+    EXPECT_EQ(r.insn.src.mem.base, ir::Reg::Rsp);
+    EXPECT_EQ(r.insn.src.mem.disp, 0x68);
+    EXPECT_FALSE(r.insn.updates_flags);
+}
+
 TEST_F(LifterTranslate, SkippedInstructions) {
     // 0F A2: cpuid —— 超出白名单
     const wvmp::u8 cpuid[] = {0x0F, 0xA2};

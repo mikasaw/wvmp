@@ -1060,6 +1060,50 @@ public:
     std::string build_rol_cl(u64 d) const { return build_shift("rol", d); }
     std::string build_ror_cl(u64 d) const { return build_shift("ror", d); }
 
+    // MIT-307 Movsxd (Reg-Reg): dst = sign_ext_32(src)。
+    // 用 native movsxd 一次完成 32→64 符号扩展：把 src VM 槽当 dword ptr
+    // (内存读取自动只取低 32 位), movsxd 把它符号扩展到 64 位目的物理寄存器,
+    // 最后写回 dst VM 槽 (qword)。不更新 flags（movsxd 不影响 CF/OF/SF/ZF/PF）。
+    // size 恒为 S64（movsxd 必 32→64），跳过 size_chain。
+    std::string build_movsxd(u64 dispatch) const {
+        const std::string tag = "movsxd" + std::to_string(seq());
+        std::string o = decode_prelude();
+        // 1. movsxd t_[0], dword ptr [ctx_ + reg_b*8 + 0x10]
+        //   把 src 32 位值（VM 槽当 dword 内存读）符号扩展到 t_[0] (64-bit)
+        o += std::string("    movsxd ") + r64(t_[0]) + ", dword ptr [" + r64(ctx_) +
+             " + " + r64(t_[7]) + "*8 + 0x10]\n";
+        // 2. mov qword ptr [ctx_ + reg_a*8 + 0x10], t_[0]
+        //   64 位写回 dst VM 槽
+        o += std::string("    mov qword ptr [") + r64(ctx_) + " + " + r64(t_[4]) +
+             "*8 + 0x10], " + r64(t_[0]) + "\n";
+        o += advance(dispatch);
+        (void)tag;
+        return o;
+    }
+
+    // MIT-307 MovsxdMem (Reg-Mem): dst = sign_ext_32([addr])，
+    // addr 是翻译器 emit_address 写到 reg_b VM 槽里的 64 位地址。
+    // handler: 取地址到 t_[1] → 32 位 load + 符号扩展到 t_[0] → 64 位写回 dst。
+    // 不更新 flags。
+    std::string build_movsxd_mem(u64 dispatch) const {
+        const std::string tag = "movsxdm" + std::to_string(seq());
+        std::string o = decode_prelude();
+        // 1. mov t_[1], qword ptr [ctx_ + reg_b*8 + 0x10]
+        //   把 reg_b 槽里 64 位地址取到 t_[1]
+        o += std::string("    mov ") + r64(t_[1]) + ", qword ptr [" + r64(ctx_) +
+             " + " + r64(t_[7]) + "*8 + 0x10]\n";
+        // 2. movsxd t_[0], dword ptr [t_[1]]
+        //   从 [t_[1]] 读 32 位, 符号扩展到 t_[0] (64-bit)
+        o += std::string("    movsxd ") + r64(t_[0]) + ", dword ptr [" + r64(t_[1]) + "]\n";
+        // 3. mov qword ptr [ctx_ + reg_a*8 + 0x10], t_[0]
+        //   64 位写回 dst VM 槽
+        o += std::string("    mov qword ptr [") + r64(ctx_) + " + " + r64(t_[4]) +
+             "*8 + 0x10], " + r64(t_[0]) + "\n";
+        o += advance(dispatch);
+        (void)tag;
+        return o;
+    }
+
     // Adc: dst = dst + src + CF_in（Intel SDM Vol. 2 ADC）。
     // 与 Add/Sub 不可共用 build_binary：zero5() 用 xor 清 scratch 寄存器，
     // 副作用把宿主 CPU 的 CF 也清零（XOR 写 CF=0），后续 native adc 看到的
@@ -1341,6 +1385,8 @@ RuntimeGenResult generate_runtime(wvmp::Rng& rng) {
         {int(VmOp::Sbb), "sbb", &AsmGen::build_sbb},
         {int(VmOp::Imul), "imul", &AsmGen::build_imul},
         {int(VmOp::Mul), "mul", &AsmGen::build_mul},
+        {int(VmOp::Movsxd), "movsxd", &AsmGen::build_movsxd},
+        {int(VmOp::MovsxdMem), "movsxdmem", &AsmGen::build_movsxd_mem},
         {int(VmOp::Cmp), "cmp", &AsmGen::build_cmp},
         {int(VmOp::Test), "test", &AsmGen::build_test},
         {int(VmOp::Load), "load", &AsmGen::build_load},
