@@ -113,7 +113,6 @@ __declspec(noinline) static void tick(int new_dir) {
     if (ny >= GH) wall = 1;
     if (wall != 0) {
         g_alive = 0;
-        WVMP_END(tick);
         return;
     }
 
@@ -133,7 +132,6 @@ __declspec(noinline) static void tick(int new_dir) {
     }
     if (self_hit != 0) {
         g_alive = 0;
-        WVMP_END(tick);
         return;
     }
 
