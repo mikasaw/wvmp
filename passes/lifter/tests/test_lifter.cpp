@@ -490,6 +490,113 @@ TEST_F(LifterTranslate, MulOneOperand64) {
     EXPECT_EQ(r.insn.src.reg, ir::Reg::Rcx);
 }
 
+// MIT-306: imul MEM 形式 (MSVC /Od 实际 codegen, MIT-302 仅接 REG-REG, 导致
+// wvmp_imul_sample 0% 真虚拟化)。字节编码来自项目主反汇编（派活单 §A）：
+//   - 2-op REG-MEM: 48 0F AF 44 24 28 = imul rax, [rsp+0x28]
+//   - 2-op REG-MEM: 48 0F AF 44 24 48 = imul rax, [rsp+0x48]
+//   - 3-op imm 短:  48 6B 44 24 30 07 = imul rax, [rsp+0x30], 7
+//   - 3-op imm 短:  48 6B 44 24 30 64 = imul rax, [rsp+0x30], 100
+//   - 3-op imm 短:  48 6B 44 24 28 64 = imul rax, [rsp+0x28], 100
+//   - 3-op imm 长:  48 69 44 24 28 E8 03 00 00 = imul rax, [rsp+0x28], 1000
+// lifter 在 MEM 形式上 emit Operand::mem_(...); 翻译器层折成 Load + Imul。
+TEST_F(LifterTranslate, ImulRegMem2Op) {
+    // 48 0F AF 44 24 28: imul rax, [rsp+0x28] — 2-op REG-MEM
+    const wvmp::u8 b[] = {0x48, 0x0F, 0xAF, 0x44, 0x24, 0x28};
+    auto r = translate_bytes(x64, b, ir::Arch::X64);
+    ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r.insn.op, ir::Op::Imul);
+    EXPECT_EQ(r.insn.size, ir::Size::S64); // REX.W -> 64 位
+    EXPECT_TRUE(r.insn.updates_flags);
+    ASSERT_EQ(r.insn.dst.kind, ir::Operand::Kind::Reg);
+    EXPECT_EQ(r.insn.dst.reg, ir::Reg::Rax);
+    // src 必须是 MEM 形式, base=Rsp, disp=0x28
+    ASSERT_EQ(r.insn.src.kind, ir::Operand::Kind::Mem);
+    EXPECT_EQ(r.insn.src.mem.base, ir::Reg::Rsp);
+    EXPECT_EQ(r.insn.src.mem.index, ir::Reg::Flags); // 无 index
+    EXPECT_EQ(r.insn.src.mem.disp, 0x28);
+    EXPECT_EQ(r.insn.addr, 0u);
+    // 2-op 形式 src2 不应被设置
+    EXPECT_NE(r.insn.src2.kind, ir::Operand::Kind::Imm);
+}
+
+TEST_F(LifterTranslate, ImulRegMemImmShort7) {
+    // 48 6B 44 24 30 07: imul rax, [rsp+0x30], 7 — 3-op imm 短 (sign-ext imm8)
+    const wvmp::u8 b[] = {0x48, 0x6B, 0x44, 0x24, 0x30, 0x07};
+    auto r = translate_bytes(x64, b, ir::Arch::X64);
+    ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r.insn.op, ir::Op::Imul);
+    EXPECT_EQ(r.insn.size, ir::Size::S64);
+    EXPECT_TRUE(r.insn.updates_flags);
+    ASSERT_EQ(r.insn.dst.kind, ir::Operand::Kind::Reg);
+    EXPECT_EQ(r.insn.dst.reg, ir::Reg::Rax);
+    ASSERT_EQ(r.insn.src.kind, ir::Operand::Kind::Mem);
+    EXPECT_EQ(r.insn.src.mem.base, ir::Reg::Rsp);
+    EXPECT_EQ(r.insn.src.mem.disp, 0x30);
+    ASSERT_EQ(r.insn.src2.kind, ir::Operand::Kind::Imm);
+    EXPECT_EQ(r.insn.src2.imm, 7);
+}
+
+TEST_F(LifterTranslate, ImulRegMemImmShort100) {
+    // 48 6B 44 24 30 64: imul rax, [rsp+0x30], 100 — 3-op imm 短
+    const wvmp::u8 b[] = {0x48, 0x6B, 0x44, 0x24, 0x30, 0x64};
+    auto r = translate_bytes(x64, b, ir::Arch::X64);
+    ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r.insn.op, ir::Op::Imul);
+    ASSERT_EQ(r.insn.src.kind, ir::Operand::Kind::Mem);
+    EXPECT_EQ(r.insn.src.mem.disp, 0x30);
+    ASSERT_EQ(r.insn.src2.kind, ir::Operand::Kind::Imm);
+    EXPECT_EQ(r.insn.src2.imm, 100);
+}
+
+TEST_F(LifterTranslate, ImulRegMemImmShortDifferentBase) {
+    // 48 6B 44 24 28 64: imul rax, [rsp+0x28], 100 — base disp 不同
+    const wvmp::u8 b[] = {0x48, 0x6B, 0x44, 0x24, 0x28, 0x64};
+    auto r = translate_bytes(x64, b, ir::Arch::X64);
+    ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r.insn.op, ir::Op::Imul);
+    ASSERT_EQ(r.insn.src.kind, ir::Operand::Kind::Mem);
+    EXPECT_EQ(r.insn.src.mem.disp, 0x28);
+    EXPECT_EQ(r.insn.src2.imm, 100);
+}
+
+TEST_F(LifterTranslate, ImulRegMemImmLong) {
+    // 48 69 44 24 28 E8 03 00 00: imul rax, [rsp+0x28], 1000 — 3-op imm 长 (imm32)
+    const wvmp::u8 b[] = {0x48, 0x69, 0x44, 0x24, 0x28, 0xE8, 0x03, 0x00, 0x00};
+    auto r = translate_bytes(x64, b, ir::Arch::X64);
+    ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r.insn.op, ir::Op::Imul);
+    EXPECT_EQ(r.insn.size, ir::Size::S64);
+    ASSERT_EQ(r.insn.src.kind, ir::Operand::Kind::Mem);
+    EXPECT_EQ(r.insn.src.mem.disp, 0x28);
+    ASSERT_EQ(r.insn.src2.kind, ir::Operand::Kind::Imm);
+    EXPECT_EQ(r.insn.src2.imm, 1000);
+}
+
+TEST_F(LifterTranslate, ImulRegMem2OpDifferentDisp) {
+    // 48 0F AF 44 24 48: imul rax, [rsp+0x48] — 2-op 不同 disp
+    const wvmp::u8 b[] = {0x48, 0x0F, 0xAF, 0x44, 0x24, 0x48};
+    auto r = translate_bytes(x64, b, ir::Arch::X64);
+    ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r.insn.op, ir::Op::Imul);
+    ASSERT_EQ(r.insn.src.kind, ir::Operand::Kind::Mem);
+    EXPECT_EQ(r.insn.src.mem.disp, 0x48);
+}
+
+TEST_F(LifterTranslate, ImulRegRegImmShortRegression) {
+    // 48 6B C0 07: imul rax, rax, 7 — MIT-302 老路径回归 (src=Reg)
+    const wvmp::u8 b[] = {0x48, 0x6B, 0xC0, 0x07};
+    auto r = translate_bytes(x64, b, ir::Arch::X64);
+    ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r.insn.op, ir::Op::Imul);
+    EXPECT_EQ(r.insn.size, ir::Size::S64); // REX.W -> S64 (验证 MIT-306 改 data_size)
+    ASSERT_EQ(r.insn.dst.kind, ir::Operand::Kind::Reg);
+    EXPECT_EQ(r.insn.dst.reg, ir::Reg::Rax);
+    ASSERT_EQ(r.insn.src.kind, ir::Operand::Kind::Reg);
+    EXPECT_EQ(r.insn.src.reg, ir::Reg::Rax);
+    ASSERT_EQ(r.insn.src2.kind, ir::Operand::Kind::Imm);
+    EXPECT_EQ(r.insn.src2.imm, 7);
+}
+
 TEST_F(LifterTranslate, SkippedInstructions) {
     // 0F A2: cpuid —— 超出白名单
     const wvmp::u8 cpuid[] = {0x0F, 0xA2};

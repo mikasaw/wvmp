@@ -565,41 +565,79 @@ struct Translator {
     // ---- MIT-302: imul / mul ----
     //
     // imul 三形式（lifter 区分）：
-    //   1) 3-op imm 形式：dst = src * imm32（src2 = Imm，size = S32）
-    //   2) 2-op reg 形式：dst = dst * src（src = Reg，size = arch 指针宽）
+    //   1) 3-op imm 形式：dst = src * imm32（src2 = Imm，size 由 data_size 决定）
+    //   2) 2-op 形式：dst = dst * src（src = Reg 或 Mem，size = 真实位宽）
     //   3) 1-op 形式（极少见，F7 /5）：lifter 直接转 Op::Mul
-    // 翻译器对 Op::Imul 按 src2.kind 区分 3-op imm 与 2-op reg：
-    //   - src2.kind == Imm → 拆 mov_scratch + Imul(dst, scratch)：先 mov scratch,
-    //     imm（VmOp::Mov w/ aux=imm32），再 Imul 2-op(dst, scratch)。避开 native
-    //     "imul r, r, imm" 要求第 3 操作数为汇编期常量的硬限制。
-    //   - src2.kind == None → emit VmOp::Imul（b_kind=Reg reg_b=src, aux=0）
-    // mul 单操作数：emit VmOp::Mul（a_kind=Reg reg_a=Rdx 槽, b_kind=Reg reg_b=src;
-    // Rax 是隐式被乘数，asmgen handler 硬编码读 regs[Rax] / 写 regs[Rax]+regs[Rdx]）。
+    // MIT-306 扩 MEM 形式 (lifter emit Operand::mem_):
+    //   - 2-op MEM (imul r, [mem]): 拆成 Load + Imul(dst, tmp), dst = dst * [mem].
+    //   - 3-op imm MEM (imul r, [mem], imm): 拆成 Load + Mov(dst, tmp)
+    //     + Mov(scratch, imm) + Imul(dst, scratch), dst = [mem] * imm
+    //     (注意 native 3-op imm 是 dst = src*imm, 不是 dst = dst*imm;
+    //     必须先把 [mem] 拷到 dst 再与 imm 相乘)。
+    // 翻译器对 Op::Imul 按 src.kind + src2.kind 区分:
+    //   - src=Mem, src2=Imm → Load+Mov+Mov+Imul (MEM 3-op imm)
+    //   - src=Mem, src2!=Imm → Load+Imul (MEM 2-op)
+    //   - src=Reg, src2=Imm → mov_scratch+Imul(dst, scratch) (REG 3-op imm)
+    //     ⚠ MIT-302 老路径: src=dst 时 dst=dst*imm 与 dst=src*imm 等价; MSVC
+    //     /Od 实际产 imul r,r,imm 全部 src==dst, 现有实现正确。src!=dst
+    //     (如 imul rax, rdx, 7) MSVC 不产, 未测试。
+    //   - src=Reg, src2!=Imm → emit VmOp::Imul (REG 2-op)
+    // mul 单操作数：emit VmOp::Mul (a_kind=Reg reg_a=Rdx 槽, b_kind=Reg
+    // reg_b=src; Rax 是隐式被乘数, asmgen handler 硬编码读 regs[Rax] /
+    // 写 regs[Rax]+regs[Rdx])。
     //
     // flags 语义（与 add/sub 完全不同）：
     //   - CF/OF 当低半 != 高半时 set（与 mul 末尾 carry/IMUL 截断同语义）
     //   - SF/ZF/PF 按结果
-    //   - handler 用 native imul/mul 直读 host CPU flags, setcc5 捕获——与 add/sub
-    //     的 zero5 + setcc5 路径一致, 复用 build_binary("imul"/"mul") 即可。
-    //
-    // v1 约束：不接 mem 操作数（lifter 已将 mem-src 拆为 Load, mem-dst 拆为 Store）；
-    // 遇到不支持形态由 C1 gate 兜底（保持原生）。
+    //   - handler 用 native imul/mul 直读 host CPU flags, setcc5 捕获——与
+    //     add/sub 的 zero5 + setcc5 路径一致, 复用 build_binary("imul"/"mul")
+    //     即可。
     bool translate_imul(Emitter& em, Scratch& sc, const ir::Insn& in,
                         u64 current_rva, u64 next_ip) {
-        (void)current_rva; (void)next_ip; // v1: 不接 mem 操作数，不需地址/翻译 scratch
-        if (in.dst.kind != ir::Operand::Kind::Reg ||
-            in.src.kind != ir::Operand::Kind::Reg) {
+        if (in.dst.kind != ir::Operand::Kind::Reg)
             return skip(in, "imul 操作数形态未支持", nullptr);
-        }
         const u8 d = isa::vm_reg_of(in.dst.reg);
-        const u8 s = isa::vm_reg_of(in.src.reg);
         const u8 sz = isa::size_field(in.size);
-        // 3-op imm 形式：mov scratch, imm32 → Imul(dst, scratch)
-        // native imul 第 3 操作数必须是汇编期常量, 不可用 reg, 故拆 mov+imul。
-        if (in.src2.kind == ir::Operand::Kind::Imm) {
-            if (!fits_aux(in.src2.imm)) {
-                return skip(in, "imul imm32 越界", nullptr);
+
+        // MIT-306: MEM 形式 (lifter emit Operand::mem_).
+        if (in.src.kind == ir::Operand::Kind::Mem) {
+            // emit_load: emit_address(1 scratch for acc) + sc.take() 1 scratch
+            // for val (tmp 持有 [mem] 值)。
+            const u8 tmp = emit_load(em, sc, in.src.mem, in.size, current_rva, next_ip);
+            if (in.src2.kind == ir::Operand::Kind::Imm) {
+                // 3-op imm MEM (dst = [mem] * imm):
+                //   1. Mov dst, tmp        (dst := [mem])
+                //   2. Mov scratch, imm    (scratch := imm)
+                //   3. Imul dst, scratch   (dst := dst * scratch = [mem]*imm)
+                // scratch 预算: emit_load 用 acc+tmp (2), 本步用 scratch (1) = 3,
+                // 在 6 scratch 预算内。
+                if (!fits_aux(in.src2.imm))
+                    return skip(in, "imul imm32 越界", nullptr);
+                const u8 scratch = sc.take();
+                em.emit_rr(VmOp::Mov, d, tmp, sz);
+                em.emit_ri(VmOp::Mov, scratch,
+                           static_cast<u32>(static_cast<u64>(in.src2.imm)), sz);
+                em.emit_rr(VmOp::Imul, d, scratch, sz);
+                return true;
             }
+            // 2-op MEM (dst = dst * [mem]):
+            //   1. Imul dst, tmp
+            // scratch 预算: emit_load 用 acc+tmp (2), 本步 0 = 2, 在预算内。
+            em.emit_rr(VmOp::Imul, d, tmp, sz);
+            return true;
+        }
+        if (in.src.kind != ir::Operand::Kind::Reg)
+            return skip(in, "imul 操作数形态未支持", nullptr);
+
+        const u8 s = isa::vm_reg_of(in.src.reg);
+        // 3-op imm 形式 (REG)：mov scratch, imm32 → Imul(dst, scratch)
+        // native imul 第 3 操作数必须是汇编期常量, 不可用 reg, 故拆 mov+imul。
+        // 注意: 语义是 dst = src*imm, 但本路径下 src 与 dst 同寄存器 (MSVC
+        // /Od 默认 codegen imul r,r,imm, 例 imul rax, rax, 100), 故
+        // dst=dst*imm 与 dst=src*imm 等价。
+        if (in.src2.kind == ir::Operand::Kind::Imm) {
+            if (!fits_aux(in.src2.imm))
+                return skip(in, "imul imm32 越界", nullptr);
             const u8 scratch = sc.take();
             em.emit_ri(VmOp::Mov, scratch,
                        static_cast<u32>(static_cast<u64>(in.src2.imm)), sz);

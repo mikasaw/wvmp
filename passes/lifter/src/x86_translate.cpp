@@ -300,47 +300,59 @@ TranslateResult translate_ret(const cs_insn& ci, const cs_x86& x, ir::Arch arch)
     return ok(out);
 }
 
-// imul 三形式：
-//   1) imul r, r/m, imm (3-op imm, 69 /r id): dst = src * imm32（默认 S32）
-//   2) imul r, r/m       (2-op reg, 0F AF /r): dst = dst * src
-//   3) imul r/m          (1-op, F7 /5): 同 mul 但有符号；rdx:rax = rax * src
-// imm 形式 src=Reg + src2=Imm（Insn.src2 字段是 MIT-302 新增的第三个操作数槽），
-// 其余 2 形式只用 dst/src。3 形式与 2 形式都标 updates_flags=true（OF/CF 当低半
-// != 高半时 set，与 add/sub 完全不同；语义由 asmgen 直读 native imul flags）。
+// imul 三形式（MIT-302）+ MIT-306 MEM 形式扩展：
+//   1) imul r, r/m, imm (3-op imm, 69 /r id 或 6B /r ib): dst = src * imm
+//   2) imul r, r/m       (2-op, 0F AF /r):              dst = dst * src
+//   3) imul r/m          (1-op, F7 /5): 同 mul, lifter 转 Op::Mul 兜底
+// MIT-306: 形式 1/2 的 src 操作数可同时为 REG 或 MEM（MSVC /Od 对栈局部变量
+// 的乘法默认 codegen 为 REG-MEM / REG-MEM-IMM 形式, 靠 [rsp+disp] 寻址）。
+// MEM 形式在 lifter 层直接 emit Operand::mem_(...); 翻译器层把 MEM 折成
+// Load + Imul (2-op) 或 Load + Mov + Mov + Imul (3-op imm 处理 dst = [mem]*imm
+// 语义)。
+// imm 形式 src2=Operand::imm_(imm32)（Insn.src2 字段是 MIT-302 新增的第三个
+// 操作数槽）。其余 2 形式只用 dst/src。3 形式与 2 形式都标 updates_flags=true
+// （OF/CF 当低半 != 高半时 set，与 add/sub 完全不同；语义由 asmgen 直读
+// native imul flags）。
 // v1 限制：8-bit 2-op imul 不存在（Intel SDM: IMUL r/m8 仅单操作数 AL 形式；
 // 2-op 仅 r16/r32/r64）。`char * char` 由 C/C++ 语义提升到 int，lifter 不会产
 // S8 imul——若 capstone 解出 (e.g. 编译器刻意生成), 拒为 unsupported 让 C1 gate
 // 兜底。同理 1-op 形式拒 S8 (mul 1-op r/m8 写 AX，与 Rdx:RAx 不一致)。
+// MIT-306 改：3-op imm 形式 size 从硬编码 S32 改用 data_size()——REX.W (48 前缀)
+// 下 MEM 反汇编全部是 64-bit, 硬编码 S32 会传错。
 TranslateResult translate_imul(const cs_insn& ci, const cs_x86& x, ir::Arch arch) {
     ir::Insn out;
     out.op = Op::Imul;
     out.addr = ci.address;
     out.updates_flags = true;
 
-    // 3-op imm 形式：imul dst, src, imm32
+    // 3-op imm 形式：imul dst, src, imm（src 可 REG 或 MEM；MIT-306 扩 MEM）
     if (x.op_count == 3 && x.operands[2].type == X86_OP_IMM &&
-        x.operands[0].type == X86_OP_REG && x.operands[1].type == X86_OP_REG) {
+        x.operands[0].type == X86_OP_REG &&
+        (x.operands[1].type == X86_OP_REG || x.operands[1].type == X86_OP_MEM)) {
         auto d = map_reg(x.operands[0].reg);
-        auto s = map_reg(x.operands[1].reg);
+        auto s = to_operand(x.operands[1]);
         if (!d || !s) return unsupported(ci.address, ci.size);
         out.dst = Operand::reg_(*d);
-        out.src = Operand::reg_(*s);
-        // imm 形式默认 S32（capstone 的 imm 形式即 69 /r id, 32 位）。
-        out.size = Size::S32;
+        out.src = *s;
+        // MIT-306: 改用 data_size() 取真实位宽（REX.W 下 S64, 否则 S32）。
+        // MIT-302 硬编码 S32 对 REX.W + 69 /r id (64-bit imul) 会出错，但当时
+        // 测试集 (69 C1, eax/ecx) 恰为 S32, 未触发。MEM 反汇编全是 REX.W,
+        // 必须 data_size() 才能正确传 S64。
+        out.size = data_size(x.operands, x.op_count, arch);
+        if (out.size == Size::S8) return unsupported(ci.address, ci.size);
         out.src2 = Operand::imm_(static_cast<i64>(x.operands[2].imm));
         return ok(out);
     }
-    // 2-op reg 形式：imul dst, src
+    // 2-op 形式：imul dst, src（src 可 REG 或 MEM；MIT-306 扩 MEM）
     if (x.op_count == 2 && x.operands[0].type == X86_OP_REG &&
-        x.operands[1].type == X86_OP_REG) {
+        (x.operands[1].type == X86_OP_REG || x.operands[1].type == X86_OP_MEM)) {
         auto d = map_reg(x.operands[0].reg);
-        auto s = map_reg(x.operands[1].reg);
+        auto s = to_operand(x.operands[1]);
         if (!d || !s) return unsupported(ci.address, ci.size);
         out.dst = Operand::reg_(*d);
-        out.src = Operand::reg_(*s);
-        auto sz = data_size(x.operands, x.op_count, arch);
-        if (sz == Size::S8) return unsupported(ci.address, ci.size); // S8 imul 2-op 不存在
-        out.size = sz;
+        out.src = *s;
+        out.size = data_size(x.operands, x.op_count, arch);
+        if (out.size == Size::S8) return unsupported(ci.address, ci.size); // S8 imul 2-op 不存在
         return ok(out);
     }
     // 1-op 形式（F7 /5, signed rdx:rax = rax * src）—— MSVC /Od 对 `int a * b`

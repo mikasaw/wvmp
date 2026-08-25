@@ -6,11 +6,19 @@
 #   - MIT-301: extend to wvmp_cl_shift_sample (cl 变体 shift 真虚拟化).
 #   - MIT-302: extend to wvmp_imul_sample (有符号乘法真虚拟化).
 #     Total: 6 samples × 5 seeds = 30 runs.
+#   - MIT-306: REQUIRE_REAL=1 校验日志含 "已生成 N 个入口 stub" 防止 C1 gate
+#     兜底被误判 PASS（仅 byte-exact 不够, C1 gate 函数被跳过仍能输出相同
+#     stdout+rc）。与 multiseed_e2e_real.sh 配套使用。
 
 set -u
 
 repo="$(cd "$(dirname "$0")/.." && pwd)"
 cli="$repo/build/cli/wvmp_cli.exe"
+
+# MIT-306: REQUIRE_REAL 强校验. 设 1 时除 byte-exact 外, 还需 CLI 日志含
+# "已生成 N 个入口 stub" 标记（stub_link 在 virtualize 至少产生 1 个
+# VirtualizedFunction 时输出; C1 gate 兜底或无已虚拟化函数则不会出此标记）。
+REQUIRE_REAL="${REQUIRE_REAL:-0}"
 
 samples=(
     "build/passes/marker_scan/tests/wvmp_call_gate_sample.exe"
@@ -64,6 +72,20 @@ EOF
             fail=$((fail + 1))
             rm -rf "$tmp"
             continue
+        fi
+        # MIT-306: REQUIRE_REAL 校验日志含 "已生成 N 个入口 stub" 标记。
+        # stub_link 在 virtualize pass 至少产生 1 个 VirtualizedFunction 时输出此
+        # Note; C1 gate (virtualize 放弃) 或无已虚拟化函数则不会出此标记。
+        # 仅 byte-exact 不够, C1 gate 函数被跳过仍能输出相同 stdout+rc, 这是假
+        # PASS——REQUIRE_REAL=1 时必须含 stub 生成标记才视为真虚拟化。
+        if [[ "$REQUIRE_REAL" == "1" ]]; then
+            if ! echo "$out" | grep -q "已生成 [1-9][0-9]* 个入口 stub"; then
+                echo "[multiseed] FAIL seed=$seed sample=$sample is C1 gate, not real virtualization" >&2
+                echo "$out" | tail -5 >&2
+                fail=$((fail + 1))
+                rm -rf "$tmp"
+                continue
+            fi
         fi
         # Run both, compare stdout + rc byte-exact.
         "$sample" > "$tmp/stdout.expected" 2>/dev/null
