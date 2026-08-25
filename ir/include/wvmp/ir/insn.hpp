@@ -14,7 +14,14 @@ enum class Op : u16 { Mov, Lea, Add, Sub, Adc, Sbb, And, Or, Xor, Not, Neg, Inc,
                       //              翻译器折 Load + Movsxd 或 MovsxdMem 一条）
                       // size 恒为 S64（movsxd 必 32→64），updates_flags=false
                       //（movsxd 不影响 CF/OF/SF/ZF/PF）。
-                      Movsxd };
+                      Movsxd,
+                      // MIT-315: 8→32/64 位零扩展（x64/x86 都支持）。
+                      //   - REG-REG: src=Reg（含 8-bit 子寄存器折叠）, dst=Reg
+                      //   - REG-MEM: src=Mem, dst=Reg（lifter 直接 emit Operand::mem_;
+                      //              翻译器折 movzxMem）
+                      // size 取目的位宽：8→32 为 S32, 8→64（REX.W）为 S64。
+                      // updates_flags=false（movzx 不影响 CF/OF/SF/ZF/PF）。
+                      Movzx };
 enum class Size : u8 { S8, S16, S32, S64 };
 enum class Cond : u8 { O, No, B, Ae, E, Ne, Be, A, S, Ns, P, Np, L, Ge, Le, G };
 constexpr u64 bits(Size s) { return s==Size::S8?8: s==Size::S16?16: s==Size::S32?32:64; }

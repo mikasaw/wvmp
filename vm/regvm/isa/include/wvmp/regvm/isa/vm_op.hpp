@@ -72,9 +72,23 @@ enum class VmOp : u16 {
     //         mov [ctx + reg_a*8 + 0x10], t_[0]（写回 64 位 dst）
     // 不更新 flags。
     MovsxdMem,
+    // —— MIT-315 movzx（8→32/64 位零扩展，x64/x86 都支持）——
+    // Movzx (Reg-Reg): dst = zero_extend_8(src)，native "movzx dst, byte ptr [..]"。
+    // a_kind=Reg, reg_a=dst, b_kind=Reg, reg_b=src, aux=0, cond_or_size=size。
+    // handler 用 byte ptr 读 src VM 槽低 8 位（按 alias_read 自动零扩展到完整
+    // 64 位），movzx 到 t_[0] 后写回 dst VM 槽（qword）。不更新 flags。
+    Movzx,
+    // MovzxMem (Reg-Mem): dst = zero_extend_8([addr])，addr 在 reg_b VM 槽里。
+    // a_kind=Reg, reg_a=dst, b_kind=Reg, reg_b=address 槽（翻译器 emit_address 已
+    // 把地址算到 scratch 槽, 本 handler 读该槽作地址）。
+    // handler: mov t_[1], [ctx + reg_b*8 + 0x10]    (取地址)
+    //         movzx t_[0], byte ptr [t_[1]]          (8 位 load + 零扩展)
+    //         mov [ctx + reg_a*8 + 0x10], t_[0]      (写回 64 位 dst)
+    // 不更新 flags。
+    MovzxMem,
 };
 
-inline constexpr u16 kVmOpMax = static_cast<u16>(VmOp::MovsxdMem);
+inline constexpr u16 kVmOpMax = static_cast<u16>(VmOp::MovzxMem);
 inline constexpr u16 kVmOpLimit = 1u << 14;  // 14 位编码空间上限
 
 constexpr const char* to_string(VmOp op) {
@@ -108,6 +122,8 @@ constexpr const char* to_string(VmOp op) {
         case VmOp::Mul: return "mul";
         case VmOp::Movsxd: return "movsxd";
         case VmOp::MovsxdMem: return "movsxdmem";
+        case VmOp::Movzx: return "movzx";
+        case VmOp::MovzxMem: return "movzxmem";
     }
     return "?";
 }

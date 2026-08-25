@@ -699,6 +699,114 @@ TEST_F(LifterTranslate, MovsxdMemRspDispDifferent0x68) {
     EXPECT_FALSE(r.insn.updates_flags);
 }
 
+// MIT-315: movzx (0F B6 /r, 可选 REX.W) 8→32/64 位零扩展，x64/x86 都支持。
+// 字节编码来自项目主反汇编（派活单 §A, wvmp_cl_shift_sample.exe capstone 输出）：
+//   - REG-REG 8→32:         0F B6 C8 = movzx ecx, al
+//   - REG-REG 8→32 同寄:     0F B6 C0 = movzx eax, al
+//   - REG-MEM RSP+disp8:    0F B6 4C 24 22 = movzx ecx, [rsp+0x22]
+//   - REG-MEM base+disp8:   0F B6 44 24 40 = movzx eax, [rsp+0x40]
+//   - REG-MEM 复杂寻址:     0F B6 84 01 88 3E 00 00 = movzx eax, [rcx+rax+0x3e88]
+//   - REG-REG 8→64 (REX.W): 48 0F B6 C8 = movzx rcx, al
+// lifter 对 REG-REG / REG-MEM 都直接 emit（不折 Load + ZeroExt）。
+// size 取目的位宽：8→32 → S32, 8→64 (REX.W) → S64；updates_flags=false。
+TEST_F(LifterTranslate, MovzxRegToReg8To32) {
+    // 0F B6 C8: movzx ecx, al — REG-REG 形式 8→32
+    const wvmp::u8 b[] = {0x0F, 0xB6, 0xC8};
+    auto r = translate_bytes(x64, b, ir::Arch::X64);
+    ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r.insn.op, ir::Op::Movzx);
+    EXPECT_EQ(r.insn.size, ir::Size::S32);       // 8→32
+    EXPECT_FALSE(r.insn.updates_flags);          // movzx 不改 flags
+    ASSERT_EQ(r.insn.dst.kind, ir::Operand::Kind::Reg);
+    EXPECT_EQ(r.insn.dst.reg, ir::Reg::Rcx);     // ECX 折叠到 Rcx
+    ASSERT_EQ(r.insn.src.kind, ir::Operand::Kind::Reg);
+    EXPECT_EQ(r.insn.src.reg, ir::Reg::Rax);     // AL 折叠到 Rax
+    EXPECT_EQ(r.insn.addr, 0u);
+}
+
+TEST_F(LifterTranslate, MovzxRegToRegSameReg) {
+    // 0F B6 C0: movzx eax, al — REG-REG 同寄存器
+    const wvmp::u8 b[] = {0x0F, 0xB6, 0xC0};
+    auto r = translate_bytes(x64, b, ir::Arch::X64);
+    ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r.insn.op, ir::Op::Movzx);
+    EXPECT_EQ(r.insn.size, ir::Size::S32);
+    ASSERT_EQ(r.insn.dst.kind, ir::Operand::Kind::Reg);
+    EXPECT_EQ(r.insn.dst.reg, ir::Reg::Rax);
+    ASSERT_EQ(r.insn.src.kind, ir::Operand::Kind::Reg);
+    EXPECT_EQ(r.insn.src.reg, ir::Reg::Rax);
+    EXPECT_FALSE(r.insn.updates_flags);
+}
+
+TEST_F(LifterTranslate, MovzxMemRspDisp8) {
+    // 0F B6 4C 24 22: movzx ecx, [rsp+0x22] — REG-MEM 含 SIB (5 字节)
+    // 0F (multi-byte prefix) | B6 (opcode) | 4C (ModR/M: mod=01, reg=1=Rcx,
+    //   r/m=100=SIB) | 24 (SIB: scale=00, index=100=none, base=100=Rsp)
+    //   | 22 (disp8)
+    const wvmp::u8 b[] = {0x0F, 0xB6, 0x4C, 0x24, 0x22};
+    auto r = translate_bytes(x64, b, ir::Arch::X64);
+    ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r.insn.op, ir::Op::Movzx);
+    EXPECT_EQ(r.insn.size, ir::Size::S32);
+    EXPECT_FALSE(r.insn.updates_flags);
+    ASSERT_EQ(r.insn.dst.kind, ir::Operand::Kind::Reg);
+    EXPECT_EQ(r.insn.dst.reg, ir::Reg::Rcx);
+    ASSERT_EQ(r.insn.src.kind, ir::Operand::Kind::Mem);
+    EXPECT_EQ(r.insn.src.mem.base, ir::Reg::Rsp);
+    EXPECT_EQ(r.insn.src.mem.index, ir::Reg::Flags); // SIB index=100=none
+    EXPECT_EQ(r.insn.src.mem.disp, 0x22);
+}
+
+TEST_F(LifterTranslate, MovzxMemBaseDisp8) {
+    // 0F B6 44 24 40: movzx eax, [rsp+0x40] — base+disp8
+    // 0F B6 44 (ModR/M: mod=01, reg=0=Rax, r/m=100=SIB) | 24 (SIB)
+    //   | 40 (disp8=0x40)
+    const wvmp::u8 b[] = {0x0F, 0xB6, 0x44, 0x24, 0x40};
+    auto r = translate_bytes(x64, b, ir::Arch::X64);
+    ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r.insn.op, ir::Op::Movzx);
+    EXPECT_EQ(r.insn.size, ir::Size::S32);
+    ASSERT_EQ(r.insn.dst.kind, ir::Operand::Kind::Reg);
+    EXPECT_EQ(r.insn.dst.reg, ir::Reg::Rax);
+    ASSERT_EQ(r.insn.src.kind, ir::Operand::Kind::Mem);
+    EXPECT_EQ(r.insn.src.mem.base, ir::Reg::Rsp);
+    EXPECT_EQ(r.insn.src.mem.index, ir::Reg::Flags);
+    EXPECT_EQ(r.insn.src.mem.disp, 0x40);
+}
+
+TEST_F(LifterTranslate, MovzxMemComplexSIB) {
+    // 0F B6 84 01 88 3E 00 00: movzx eax, [rcx+rax+0x3e88] — 复杂寻址 (7 字节)
+    // 0F B6 84 (ModR/M: mod=10, reg=0=Rax, r/m=100=SIB) | 01 (SIB: scale=00,
+    //   index=000=Rax, base=001=Rcx) | 88 3E 00 00 (disp32=0x3e88)
+    const wvmp::u8 b[] = {0x0F, 0xB6, 0x84, 0x01, 0x88, 0x3E, 0x00, 0x00};
+    auto r = translate_bytes(x64, b, ir::Arch::X64);
+    ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r.insn.op, ir::Op::Movzx);
+    EXPECT_EQ(r.insn.size, ir::Size::S32);
+    ASSERT_EQ(r.insn.dst.kind, ir::Operand::Kind::Reg);
+    EXPECT_EQ(r.insn.dst.reg, ir::Reg::Rax);
+    ASSERT_EQ(r.insn.src.kind, ir::Operand::Kind::Mem);
+    EXPECT_EQ(r.insn.src.mem.base, ir::Reg::Rcx);
+    EXPECT_EQ(r.insn.src.mem.index, ir::Reg::Rax);
+    EXPECT_EQ(r.insn.src.mem.scale, 1); // scale=00 in SIB → 1 (MemOperand 规整)
+    EXPECT_EQ(r.insn.src.mem.disp, 0x3e88);
+}
+
+TEST_F(LifterTranslate, MovzxRexW64) {
+    // 48 0F B6 C8: movzx rcx, al — REX.W 触发 8→64 (size=S64)
+    // 48 (REX.W) | 0F B6 | C8 (ModR/M: mod=11, reg=1=Rcx, r/m=0=Rax)
+    const wvmp::u8 b[] = {0x48, 0x0F, 0xB6, 0xC8};
+    auto r = translate_bytes(x64, b, ir::Arch::X64);
+    ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r.insn.op, ir::Op::Movzx);
+    EXPECT_EQ(r.insn.size, ir::Size::S64);       // REX.W → 8→64
+    EXPECT_FALSE(r.insn.updates_flags);
+    ASSERT_EQ(r.insn.dst.kind, ir::Operand::Kind::Reg);
+    EXPECT_EQ(r.insn.dst.reg, ir::Reg::Rcx);
+    ASSERT_EQ(r.insn.src.kind, ir::Operand::Kind::Reg);
+    EXPECT_EQ(r.insn.src.reg, ir::Reg::Rax);
+}
+
 TEST_F(LifterTranslate, SkippedInstructions) {
     // 0F A2: cpuid —— 超出白名单
     const wvmp::u8 cpuid[] = {0x0F, 0xA2};

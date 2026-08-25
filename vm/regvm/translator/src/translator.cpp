@@ -296,6 +296,8 @@ struct Translator {
                 ok = translate_mul(em, in);
             } else if (in.op == ir::Op::Movsxd) {
                 ok = translate_movsxd(em, sc, in, current_rva, next_ip);
+            } else if (in.op == ir::Op::Movzx) {
+                ok = translate_movzx(em, sc, in, current_rva, next_ip);
             } else if (is_alu_binop(in.op)) {
                 ok = translate_alu_binop(em, sc, in, current_rva, next_ip);
             } else if (is_unary(in.op)) {
@@ -706,6 +708,51 @@ struct Translator {
             return true;
         }
         return skip(in, "movsxd 操作数形态未支持", nullptr);
+    }
+
+    // ---- MIT-315: movzx (8→32/64 位零扩展) ----
+    //
+    // lifter 区分两种形式：
+    //   - REG-REG：movzx r, r8   → emit VmOp::Movzx
+    //   - REG-MEM：movzx r, [m]  → emit_address 算地址到 scratch 槽 + VmOp::MovzxMem
+    //
+    // Movzx (Reg-Reg): native `movzx <r32/r64>, byte ptr [...]` 一次完成 8→32/64 零扩展。
+    //   handler: movzx t_[0], byte ptr [ctx + reg_b*8 + 0x10] (读 src 8 位零扩展到 64 位)
+    //            mov qword ptr [ctx + reg_a*8 + 0x10], t_[0] (写回 dst VM 槽)
+    //   native movzx 自动根据目的寄存器宽度 emit REX.W (8→32 vs 8→64), VM 槽
+    //   总是 qword, 与 IR.size (S32 or S64) 一致——8→32 走 eax, 8→64 走 rax, 但
+    //   qword 写回语义相同 (零扩展自动).
+    //
+    // MovzxMem (Reg-Mem): 翻译期把地址算到 scratch 槽 (emit_address → acc),
+    //                     运行时 handler 把 acc 槽值当地址访存, 8 位 load + 零扩展。
+    //   handler: mov t_[1], qword ptr [ctx + reg_b*8 + 0x10] (取地址)
+    //            movzx t_[0], byte ptr [t_[1]]                (8 位 load + 零扩展)
+    //            mov qword ptr [ctx + reg_a*8 + 0x10], t_[0] (写回 dst 64 位)
+    //
+    // 不更新 flags（movzx 不影响 CF/OF/SF/ZF/PF）。
+    bool translate_movzx(Emitter& em, Scratch& sc, const ir::Insn& in,
+                         u64 current_rva, u64 next_ip) {
+        if (in.dst.kind != ir::Operand::Kind::Reg)
+            return skip(in, "movzx 操作数形态未支持", nullptr);
+        const u8 d = isa::vm_reg_of(in.dst.reg);
+        const u8 sz = isa::size_field(in.size);
+
+        if (in.src.kind == ir::Operand::Kind::Reg) {
+            // movzx r, r8：emit Movzx（handler 内部 zero_ext_8）。
+            const u8 s = isa::vm_reg_of(in.src.reg);
+            em.emit_rr(VmOp::Movzx, d, s, sz);
+            return true;
+        }
+        if (in.src.kind == ir::Operand::Kind::Mem) {
+            // movzx r, [m]：emit_address 算 acc + emit MovzxMem。
+            // scratch 预算: emit_address 用 1 scratch (acc)；本步不另取。
+            u8 acc = 0;
+            if (!emit_address(em, sc, in.src.mem, current_rva, next_ip, acc))
+                return skip(in, "movzx 地址形态未支持", &in.src.mem);
+            em.emit_rr(VmOp::MovzxMem, d, acc, sz);
+            return true;
+        }
+        return skip(in, "movzx 操作数形态未支持", nullptr);
     }
 };
 

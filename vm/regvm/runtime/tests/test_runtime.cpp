@@ -2154,4 +2154,204 @@ TEST(Interpreter, MovsxdMemFuzzTenThousand) {
         }
     }
 }
+
+// =============================================================================
+// MIT-315 Movzx / MovzxMem 真执行测试
+// =============================================================================
+// VmOp::Movzx (Reg-Reg): dst = zero_extend_8(src)
+// VmOp::MovzxMem (Reg-Mem): dst = zero_extend_8([addr])，addr 在 reg_b VM 槽
+// 不更新 flags。movzx 是 8→32/64 零扩展（与 movsxd 的符号扩展镜像），结果的低
+// 8 位与 native C++ 隐式 uint64_t 转换的位模式完全一致；高 56 位全 0。
+
+namespace {
+// Movzx 参考实现：取 8 位值低 8 位, 零扩展到 u64。
+static u64 ref_movzx(u8 src8) {
+    return static_cast<u64>(src8);
+}
+} // namespace
+
+TEST(Interpreter, MovzxSemantics) {
+    // 5 个 Rng 种子 × 6 个边界值（覆盖 8 位全 0 / 0x7F / 0x80 / 0xFF / 中间值）
+    for (u64 seed : {0xC0FFEEull, 0xBABEF00Dull, 0xDEADBEEFull,
+                     0xCAFEBABEull, 0xFEEDFACEull}) {
+        wvmp::Rng rng(seed);
+        const auto result = rt::generate_runtime(rng);
+        RwxImage rwx(result.image.code);
+        const auto entry = rwx.entry();
+        alignas(16) std::array<u8, 0x10000> scratch{};
+
+        struct C { u8 v; const char* tag; };
+        const C cases[] = {
+            {0x00u, "zero"},
+            {0x7Fu, "+BYTE_MAX"},
+            {0x80u, "high_bit"},
+            {0xFFu, "-1_unsigned"},
+            {0x42u, "mid_low"},
+            {0xEDu, "mid_high"},
+        };
+        for (const auto& c : cases) {
+            // src 写在 regs[0], dst 读 regs[1]。S32 size 与 IR.size 一致。
+            std::vector<u8> s;
+            isa::append_insn(s, mov_imm(0, c.v, ir::Size::S32));
+            isa::append_insn(s, isa::make_insn(isa::VmOp::Movzx,
+                                               isa::OpKind::Reg, 1,
+                                               isa::OpKind::Reg, 0, 0,
+                                               isa::size_field(ir::Size::S32)));
+            isa::append_insn(s, halt());
+            const auto ctx = run_stream(entry, s, scratch.data());
+            const u64 expected = ref_movzx(c.v);
+            ASSERT_EQ(ctx.regs[1], expected)
+                << "Movzx " << c.tag << " seed=" << std::hex << seed
+                << " src=0x" << static_cast<unsigned>(c.v)
+                << " -> got 0x" << ctx.regs[1]
+                << " expected 0x" << expected;
+        }
+    }
+}
+
+TEST(Interpreter, MovzxSemanticsS64) {
+    // 8→64 (REX.W, size=S64): movzx rcx, al 应该把 0xFF 零扩展为 0x00000000000000FF
+    // （不是符号扩展）。handler 用 r64 物理寄存器，自动 emit REX.W。
+    for (u64 seed : {0xC0FFEEull, 0xBABEF00Dull, 0xDEADBEEFull,
+                     0xCAFEBABEull, 0xFEEDFACEull}) {
+        wvmp::Rng rng(seed);
+        const auto result = rt::generate_runtime(rng);
+        RwxImage rwx(result.image.code);
+        const auto entry = rwx.entry();
+        alignas(16) std::array<u8, 0x10000> scratch{};
+
+        struct C { u8 v; const char* tag; };
+        const C cases[] = {
+            {0x00u, "zero"},
+            {0x7Fu, "positive"},
+            {0x80u, "high_bit"},
+            {0xFFu, "all_ones"},  // 关键: 0xFF 应零扩展为 0xFF (不是 0xFFFFFFFFFFFFFF)
+        };
+        for (const auto& c : cases) {
+            std::vector<u8> s;
+            isa::append_insn(s, mov_imm(0, c.v, ir::Size::S64));
+            isa::append_insn(s, isa::make_insn(isa::VmOp::Movzx,
+                                               isa::OpKind::Reg, 1,
+                                               isa::OpKind::Reg, 0, 0,
+                                               isa::size_field(ir::Size::S64)));
+            isa::append_insn(s, halt());
+            const auto ctx = run_stream(entry, s, scratch.data());
+            const u64 expected = ref_movzx(c.v);
+            ASSERT_EQ(ctx.regs[1], expected)
+                << "MovzxS64 " << c.tag << " seed=" << std::hex << seed
+                << " src=0x" << static_cast<unsigned>(c.v)
+                << " -> got 0x" << ctx.regs[1]
+                << " expected 0x" << expected;
+        }
+    }
+}
+
+TEST(Interpreter, MovzxMemSemantics) {
+    // MovzxMem (Reg-Mem): 把 address (= scratch 绝对 VA) 写到 reg_b VM 槽；
+    // scratch[address..address+1] 预填 8 位值；MovzxMem dst, b 应等于
+    // ref_movzx(scratch_u8_at(address))。
+    for (u64 seed : {0xC0FFEEull, 0xBABEF00Dull, 0xDEADBEEFull,
+                     0xCAFEBABEull, 0xFEEDFACEull}) {
+        wvmp::Rng rng(seed);
+        const auto result = rt::generate_runtime(rng);
+        RwxImage rwx(result.image.code);
+        const auto entry = rwx.entry();
+        alignas(16) std::array<u8, 0x10000> scratch{};
+
+        struct C { u64 off; u8 v; const char* tag; };
+        const C cases[] = {
+            {0x100, 0x00u, "zero"},
+            {0x108, 0x7Fu, "positive"},
+            {0x110, 0x80u, "high_bit"},
+            {0x118, 0xFFu, "all_ones"},
+            {0x120, 0x42u, "mid_low"},
+            {0x128, 0xEDu, "mid_high"},
+        };
+        for (const auto& c : cases) {
+            const u64 data_addr = reinterpret_cast<u64>(scratch.data()) + c.off;
+            std::memcpy(scratch.data() + c.off, &c.v, sizeof(c.v));
+            std::vector<u8> s;
+            // regs[0] = 绝对 VA (mov_imm64 拆 4 条)
+            mov_imm64_into(s, /*dst*/0, /*scratch*/isa::kScratchFirst, data_addr);
+            isa::append_insn(s, isa::make_insn(isa::VmOp::MovzxMem,
+                                               isa::OpKind::Reg, 1,
+                                               isa::OpKind::Reg, 0, 0,
+                                               isa::size_field(ir::Size::S32)));
+            isa::append_insn(s, halt());
+            const auto ctx = run_stream(entry, s, scratch.data());
+            const u64 expected = ref_movzx(c.v);
+            ASSERT_EQ(ctx.regs[1], expected)
+                << "MovzxMem " << c.tag << " seed=" << std::hex << seed
+                << " off=0x" << c.off << " v=0x" << static_cast<unsigned>(c.v)
+                << " data_addr=0x" << data_addr
+                << " -> got 0x" << ctx.regs[1] << " expected 0x" << expected;
+        }
+    }
+}
+
+TEST(Interpreter, MovzxFuzzTenThousand) {
+    // 5 万条 fuzz: 5 个 Rng 种子 × 10000 iter, 每条与 ref_movzx bit-exact 比对,
+    // 覆盖 8 位全随机值. 与 movsxd 同模式保证 runtime handler 在不同寄存器
+    // 分配下都正确. 流 (3 条): mov_imm src, val8; Movzx dst, src; halt.
+    for (u64 seed : {0xC0FFEEull, 0xBABEF00Dull, 0xDEADBEEFull,
+                     0xCAFEBABEull, 0xFEEDFACEull}) {
+        wvmp::Rng rng(seed);
+        const auto result = rt::generate_runtime(rng);
+        RwxImage rwx(result.image.code);
+        const auto entry = rwx.entry();
+        alignas(16) std::array<u8, 0x10000> scratch{};
+        for (int i = 0; i < 10000; ++i) {
+            const u8 v8 = static_cast<u8>(rng.next() & 0xFFu);
+            const u64 expected = ref_movzx(v8);
+            std::vector<u8> s;
+            isa::append_insn(s, mov_imm(0, v8, ir::Size::S32));
+            isa::append_insn(s, isa::make_insn(isa::VmOp::Movzx,
+                                               isa::OpKind::Reg, 1,
+                                               isa::OpKind::Reg, 0, 0,
+                                               isa::size_field(ir::Size::S32)));
+            isa::append_insn(s, halt());
+            const auto ctx = run_stream(entry, s, scratch.data());
+            ASSERT_EQ(ctx.regs[1], expected)
+                << "Movzx fuzz seed=" << std::hex << seed << " iter=" << std::dec << i
+                << " v8=0x" << std::hex << static_cast<unsigned>(v8)
+                << " got 0x" << ctx.regs[1] << " expected 0x" << expected;
+            ASSERT_EQ(ctx.pc, 3u) << "Movzx fuzz stream halts at instruction 3";
+        }
+    }
+}
+
+TEST(Interpreter, MovzxMemFuzzTenThousand) {
+    // 5 万条 fuzz: 5 个 Rng 种子 × 10000 iter, scratch 预填 8 位随机值
+    // (任意对齐偏移), address = scratch 绝对 VA + offset, 比对结果.
+    // 流 (4 条): mov_imm64 addr (4 内部指令); MovzxMem; halt. halt @ index 4,
+    // 出口 pc = 5.
+    for (u64 seed : {0xC0FFEEull, 0xBABEF00Dull, 0xDEADBEEFull,
+                     0xCAFEBABEull, 0xFEEDFACEull}) {
+        wvmp::Rng rng(seed);
+        const auto result = rt::generate_runtime(rng);
+        RwxImage rwx(result.image.code);
+        const auto entry = rwx.entry();
+        alignas(16) std::array<u8, 0x10000> scratch{};
+        for (int i = 0; i < 10000; ++i) {
+            const u64 off = static_cast<u64>(rng.uniform(0u, 0xFF00u));
+            const u8 v8 = static_cast<u8>(rng.next() & 0xFFu);
+            const u64 data_addr = reinterpret_cast<u64>(scratch.data()) + off;
+            std::memcpy(scratch.data() + off, &v8, sizeof(v8));
+            const u64 expected = ref_movzx(v8);
+            std::vector<u8> s;
+            mov_imm64_into(s, /*dst*/0, /*scratch*/isa::kScratchFirst, data_addr);
+            isa::append_insn(s, isa::make_insn(isa::VmOp::MovzxMem,
+                                               isa::OpKind::Reg, 1,
+                                               isa::OpKind::Reg, 0, 0,
+                                               isa::size_field(ir::Size::S32)));
+            isa::append_insn(s, halt());
+            const auto ctx = run_stream(entry, s, scratch.data());
+            ASSERT_EQ(ctx.regs[1], expected)
+                << "MovzxMem fuzz seed=" << std::hex << seed << " iter=" << std::dec << i
+                << " off=0x" << std::hex << off << " v8=0x" << static_cast<unsigned>(v8)
+                << " got 0x" << ctx.regs[1] << " expected 0x" << expected;
+            ASSERT_EQ(ctx.pc, 6u) << "MovzxMem fuzz stream halts at instruction 6";
+        }
+    }
+}
 } // namespace
