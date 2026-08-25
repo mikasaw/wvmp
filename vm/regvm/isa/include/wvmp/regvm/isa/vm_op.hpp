@@ -41,9 +41,25 @@ enum class VmOp : u16 {
     // SarCl/RolCl/RorCl 与 Shl/Shr/Sar/Rol/Ror 编码一一对应, 调用 build_shift
     // 时仅 native op 不同（"shl"/"shr"/"sar"/"rol"/"ror"）。
     ShlCl, ShrCl, SarCl, RolCl, RorCl,
+
+    // —— MIT-302 有符号/无符号乘法 ——
+    // Imul 2-op reg 形式（dst = dst * src, native "imul <sz> reg_a, reg_b"）。
+    // b_kind=OpKind::Reg, reg_b=src, aux=0, cond_or_size=size。
+    // flags 语义同 native imul（CF/OF 当低半 != 高半时 set, SF/ZF/PF 按结果），
+    // setcc5 直读 host CPU flags。
+    // 3-op imm 形式（dst = src * imm）由翻译器拆为 mov_scratch + Imul(dst, scratch)
+    // 两条：先 mov scratch, imm（VmOp::Mov w/ aux=imm32），再 Imul(dst, scratch)
+    // 复用本 handler 的 2-op 路径——避免 native imul 第 3 操作数必须为静态立即数的
+    // 硬限制（x86 imul r, r, imm 形式要求 imm 是汇编期常量，运行时不可)。
+    Imul,
+    // Mul 单操作数（unsigned rdx:rax = rax * src, native "mul <sz> reg_b"）。
+    // reg_a 不参与（native mul 无显式 dst）；reg_b=src，隐式 RAX 作被乘数。
+    // 运行时 handler 读 regs[Rax]，native mul 后将物理 rax/rdx 写回 regs[Rax]/regs[Rdx]。
+    // flags 语义同 native mul（CF/OF 当低半 != 高半时 set）。
+    Mul,
 };
 
-inline constexpr u16 kVmOpMax = static_cast<u16>(VmOp::RorCl);
+inline constexpr u16 kVmOpMax = static_cast<u16>(VmOp::Mul);
 inline constexpr u16 kVmOpLimit = 1u << 14;  // 14 位编码空间上限
 
 constexpr const char* to_string(VmOp op) {
@@ -73,6 +89,8 @@ constexpr const char* to_string(VmOp op) {
         case VmOp::SarCl: return "sarcl";
         case VmOp::RolCl: return "rolcl";
         case VmOp::RorCl: return "rorcl";
+        case VmOp::Imul: return "imul";
+        case VmOp::Mul: return "mul";
     }
     return "?";
 }

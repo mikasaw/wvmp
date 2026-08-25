@@ -1142,6 +1142,140 @@ public:
                flags_tail(dispatch, false);
     }
 
+    // MIT-302 Imul 2-op reg 形式 (0F AF /r)：dst = dst * src。
+    // 不能直接复用 build_binary("imul", ...) —— 8-bit imul 无 2-op 形式
+    // (Intel SDM: IMUL 仅 r16/r32/r64 有 2-op, r/m8 仅有 1-op 写 AX)。S8 块
+    // 跳过 native imul，只保留 jmp tail 防 keystone 装配失败。lifter 已拒 S8
+    // imul 2-op（C1 gate 兜底），但 handler 文本仍按 4 路展开, S8 块必须
+    // 不带无效指令。
+    // flags 语义：与 add/sub 不同——CF/OF 当低半 != 高半时 set, 由 native imul
+    // 直接产生; setcc5 直读 host CPU 真值。
+    // 3-op imm 形式（dst = src * imm32）在翻译器层拆为 mov_scratch + Imul(dst, scratch)
+    // 两条：先 mov scratch, imm（VmOp::Mov w/ aux=imm32），再 Imul(dst, scratch)
+    // 复用本 handler 的 2-op 路径——避免 native imul 第 3 操作数必须为汇编期立即数
+    // 的硬限制（x86 imul r, r, imm 形式要求 imm 是汇编期常量，运行时不可）。
+    std::string build_imul(u64 dispatch) const {
+        const std::string tag = "imul" + std::to_string(seq());
+        const std::string tail_lbl = "ftail_" + tag;
+        std::array<std::string, 4> blocks;
+        for (int s = 0; s < 4; ++s) {
+            const std::string stag = tag + "_" + std::to_string(s);
+            std::string o;
+            if (s == 0) {
+                // S8：imul 无 2-op 形式，跳过 native insn + flags_tail（仍按规范
+                // 走 ftail + flags_tail: load A → 立即 jmp tail → flags_tail 用 zero5
+                // 占位保持位布局一致）。实际 S8 imul 2-op 不应到达（C1 gate 兜底），
+                // 本路径为防御。
+                o += load_operand(s, 3, 4, 0, "a" + stag);
+                o += "    jmp " + tail_lbl + "\n";
+            } else {
+                o += load_operand(s, 3, 4, 0, "a" + stag);
+                o += load_operand(s, 6, 7, 1, "b" + stag);
+                o += zero5();
+                o += std::string("    imul ") + rs(t_[0], s) + ", " + rs(t_[1], s) + "\n";
+                o += setcc5();
+                o += reextract_a(1);
+                o += writeback(s, 1);
+                o += "    jmp " + tail_lbl + "\n";
+            }
+            blocks[s] = o;
+        }
+        return decode_prelude() + size_chain(blocks, tag) + tail_lbl + ":\n" +
+               flags_tail(dispatch, false);
+    }
+
+    // MIT-302 Mul 单操作数（F7 /4）：rdx:rax = rax * src（无符号）。
+    // a_kind=Reg reg_a=Rdx 槽（仅作 tag）, b_kind=Reg reg_b=src, aux=0。
+    // 关键路径：native "mul <sz> reg_b" 隐式用 RAX 作被乘数，结果写物理 RDX:RAX。
+    // 但 VM regs[Rax] / regs[Rdx] 才是真状态——必须先把 regs[Rax] 搬到 T1（物理
+    // RAX 兼容），mul 后把物理 rax/rdx 重新捕获到 T1/T0，再写回 regs 槽。
+    // 与 build_binary 不同：load_operand 读 dst=Reg (Rdx) 没意义——Rdx 是要被
+    // 写入的目的，不是被读取的源；native mul 自然产生新 Rdx。所以本 handler
+    // 只读 src 槽（reg_b → T0）与 regs[Rax]（→ T1），mul 后**重新捕获** rax/rdx
+    // 再用 alias_write 合并写回（因为 T1/T0 仍持有旧值/旧 src, 不重新捕获会写错）。
+    // size 链 4 路：native mul al/ax/eax/rax 按宽度处理。
+    //   s=0/1：mul 仅修改 ax；rdx 不变（m=0）或上 48 位未定义（m=1）——跳过 Rdx 写回。
+    //   s=2/3：mul 修改 edx:eax / rdx:rax；rax 自动零/符号扩展，rdx 同。
+    std::string build_mul(u64 dispatch) const {
+        const std::string tag = "mul" + std::to_string(seq());
+        const std::string tail_lbl = "ftail_" + tag;
+        const u8 rax_slot = isa::vm_reg_of(ir::Reg::Rax);
+        const u8 rdx_slot = isa::vm_reg_of(ir::Reg::Rdx);
+        std::array<std::string, 4> blocks;
+        for (int s = 0; s < 4; ++s) {
+            const std::string stag = tag + "_" + std::to_string(s);
+            std::string o;
+            // src → T0（按宽度读 src 寄存器槽；size=0/1 用 movzx, 2/3 用 mov）
+            if (s == 3)
+                o += std::string("    mov ") + r64(t_[0]) + ", qword ptr [" + r64(ctx_) +
+                     " + " + r64(t_[7]) + "*8 + 0x10]\n";
+            else if (s == 2)
+                o += std::string("    mov ") + rs(t_[0], 2) + ", dword ptr [" + r64(ctx_) +
+                     " + " + r64(t_[7]) + "*8 + 0x10]\n";
+            else
+                o += std::string("    movzx ") + r64(t_[0]) + ", " + mptr(s) + " [" +
+                     r64(ctx_) + " + " + r64(t_[7]) + "*8 + 0x10]\n";
+            // Rax（隐式被乘数）→ T1（按宽度读 Rax 槽）。
+            // **注意**: 用 std::to_string(rax_slot) 输出字面量槽号（0），
+            // 不能用 r64(rax_slot) — 那是 kPhys[0]="rax" 物理寄存器名。
+            if (s == 3)
+                o += std::string("    mov ") + r64(t_[1]) + ", qword ptr [" + r64(ctx_) +
+                     " + " + std::to_string(rax_slot) + "*8 + 0x10]\n";
+            else if (s == 2)
+                o += std::string("    mov ") + rs(t_[1], 2) + ", dword ptr [" + r64(ctx_) +
+                     " + " + std::to_string(rax_slot) + "*8 + 0x10]\n";
+            else
+                o += std::string("    movzx ") + r64(t_[1]) + ", " + mptr(s) + " [" +
+                     r64(ctx_) + " + " + std::to_string(rax_slot) + "*8 + 0x10]\n";
+            o += zero5();
+            // [关键 catch] native mul <sz> T0 用物理 RAX 作隐式被乘数, 但
+            // decode_prelude 已把 T4 (rax 物理寄存器) 写成 reg_a 解码值,
+            // 不能直接用。须先把 T1 (= Rax 槽内容) 搬到 RAX 再 mul:
+            //   mov rax, rbp   ; 物理 rax = Rax 槽值
+            //   mul rbx         ; rdx:rax = rax * rbx
+            if (s == 3)
+                o += std::string("    mov rax, ") + r64(t_[1]) + "\n";
+            else if (s == 2)
+                o += std::string("    mov eax, ") + rs(t_[1], 2) + "\n";
+            else if (s == 1)
+                o += std::string("    mov ax, ") + rs(t_[1], 1) + "\n";
+            else
+                o += std::string("    mov al, ") + rs(t_[1], 0) + "\n";
+            // native mul <sz> T0 (rdx:rax = rax * T0；ax/ax 仅低 m 位有意义, 上位未定义)
+            o += std::string("    mul ") + rs(t_[0], s) + "\n";
+            // [关键 catch 2]**立即**将物理 rax/rdx 写回 regs 槽——必须在 setcc5 之前。
+            {
+                // 用 imm(slot*8) 拼 rax_offset = regs[Rax] 绝对地址 (slot=0 → 0x10):
+                const std::string rax_slot_off = imm(static_cast<u64>(rax_slot) * 8 + 0x10);
+                const std::string rax_slot_qp = "qword ptr [" + std::string(r64(ctx_)) + " + " + rax_slot_off + "]";
+                if (s == 3) {
+                    o += std::string("    mov ") + rax_slot_qp + ", rax\n";
+                } else {
+                    o += std::string("    mov ") + r64(t_[1]) + ", " + rax_slot_qp + "\n";
+                    o += std::string("    mov ") + rs(t_[1], s) + ", " + rs(0, s) + "\n";
+                    o += std::string("    mov ") + rax_slot_qp + ", " + r64(t_[1]) + "\n";
+                }
+            }
+            if (s >= 2) {
+                const std::string rdx_slot_off = imm(static_cast<u64>(rdx_slot) * 8 + 0x10);
+                const std::string rdx_slot_qp = "qword ptr [" + std::string(r64(ctx_)) + " + " + rdx_slot_off + "]";
+                if (s == 3) {
+                    o += std::string("    mov ") + rdx_slot_qp + ", rdx\n";
+                } else {
+                    o += std::string("    mov ") + r64(t_[1]) + ", " + rdx_slot_qp + "\n";
+                    o += std::string("    mov ") + rs(t_[1], s) + ", " + rs(1, s) + "\n";
+                    o += std::string("    mov ") + rdx_slot_qp + ", " + r64(t_[1]) + "\n";
+                }
+            }
+            o += setcc5();
+            // [写回已在 mul 后立即完成, 此处不再写]
+            o += "    jmp " + tail_lbl + "\n";
+            blocks[s] = o;
+        }
+        return decode_prelude() + size_chain(blocks, tag) + tail_lbl + ":\n" +
+               flags_tail(dispatch, false);
+    }
+
 private:
     Rng& rng_;
     int ctx_ = 0, pc_ = 0, flags_ = 0, base_ = 0;
@@ -1205,6 +1339,8 @@ RuntimeGenResult generate_runtime(wvmp::Rng& rng) {
         {int(VmOp::RorCl), "rorcl", &AsmGen::build_ror_cl},
         {int(VmOp::Adc), "adc", &AsmGen::build_adc},
         {int(VmOp::Sbb), "sbb", &AsmGen::build_sbb},
+        {int(VmOp::Imul), "imul", &AsmGen::build_imul},
+        {int(VmOp::Mul), "mul", &AsmGen::build_mul},
         {int(VmOp::Cmp), "cmp", &AsmGen::build_cmp},
         {int(VmOp::Test), "test", &AsmGen::build_test},
         {int(VmOp::Load), "load", &AsmGen::build_load},

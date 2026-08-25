@@ -406,6 +406,90 @@ TEST_F(LifterTranslate, ShiftsAndUnary) {
     EXPECT_FALSE(p.insn.updates_flags);
 }
 
+// MIT-302: imul 三形式 (3-op imm / 2-op reg / 1-op F7/5) + mul 单操作数 (F7 /4)
+// 都被 x86_translate 接住——snake 根因之一（MSVC /Od 的 Magic Number 乘法）。
+// imm 形式 src=Reg + src2=Imm（src2 字段是 MIT-302 新增的第三操作数槽）；
+// 其余形式只用 dst/src；mul 单操作数 dst 硬编码为 Rdx（Rax 是隐式被乘数）。
+TEST_F(LifterTranslate, ImulThreeOperandImm) {
+    // 69 C1 64 00 00 00: imul eax, ecx, 100 — 3-op imm 形式
+    const wvmp::u8 b[] = {0x69, 0xC1, 0x64, 0x00, 0x00, 0x00};
+    auto r = translate_bytes(x64, b, ir::Arch::X64);
+    ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r.insn.op, ir::Op::Imul);
+    EXPECT_EQ(r.insn.size, ir::Size::S32);        // imm 形式默认 S32
+    EXPECT_TRUE(r.insn.updates_flags);             // OF/CF 当低半 != 高半
+    ASSERT_EQ(r.insn.dst.kind, ir::Operand::Kind::Reg);
+    EXPECT_EQ(r.insn.dst.reg, ir::Reg::Rax);
+    ASSERT_EQ(r.insn.src.kind, ir::Operand::Kind::Reg);
+    EXPECT_EQ(r.insn.src.reg, ir::Reg::Rcx);
+    ASSERT_EQ(r.insn.src2.kind, ir::Operand::Kind::Imm);
+    EXPECT_EQ(r.insn.src2.imm, 100);
+    EXPECT_EQ(r.insn.addr, 0u);
+}
+
+TEST_F(LifterTranslate, ImulTwoOperandReg) {
+    // 0F AF C1: imul eax, ecx — 2-op reg 形式
+    const wvmp::u8 b[] = {0x0F, 0xAF, 0xC1};
+    auto r = translate_bytes(x64, b, ir::Arch::X64);
+    ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r.insn.op, ir::Op::Imul);
+    EXPECT_EQ(r.insn.size, ir::Size::S32);        // 32 位默认（eax 操作）
+    EXPECT_TRUE(r.insn.updates_flags);
+    ASSERT_EQ(r.insn.dst.kind, ir::Operand::Kind::Reg);
+    EXPECT_EQ(r.insn.dst.reg, ir::Reg::Rax);
+    ASSERT_EQ(r.insn.src.kind, ir::Operand::Kind::Reg);
+    EXPECT_EQ(r.insn.src.reg, ir::Reg::Rcx);
+    // 2-op 形式 src2 不应被设置（按 Imm 区分）
+    EXPECT_NE(r.insn.src2.kind, ir::Operand::Kind::Imm);
+}
+
+TEST_F(LifterTranslate, ImulTwoOperandReg64) {
+    // 48 0F AF C9: imul rcx, rcx — REX.W 触发 64 位 size
+    const wvmp::u8 b[] = {0x48, 0x0F, 0xAF, 0xC9};
+    auto r = translate_bytes(x64, b, ir::Arch::X64);
+    ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r.insn.op, ir::Op::Imul);
+    EXPECT_EQ(r.insn.size, ir::Size::S64);
+    EXPECT_EQ(r.insn.dst.reg, ir::Reg::Rcx);
+    EXPECT_EQ(r.insn.src.reg, ir::Reg::Rcx);
+}
+
+TEST_F(LifterTranslate, ImulOneOperand) {
+    // F7 E9: imul ecx — 1-op F7 /5 形式（极少见, lifter 转 Op::Mul 兜底）
+    const wvmp::u8 b[] = {0xF7, 0xE9};
+    auto r = translate_bytes(x64, b, ir::Arch::X64);
+    ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+    // 1-op 形式被 lift 为 Op::Mul（与 mul 同形态：dst=Rdx 上半, src=乘数）
+    EXPECT_EQ(r.insn.op, ir::Op::Mul);
+    EXPECT_EQ(r.insn.size, ir::Size::S32);
+    EXPECT_TRUE(r.insn.updates_flags);
+    EXPECT_EQ(r.insn.dst.reg, ir::Reg::Rdx);
+    EXPECT_EQ(r.insn.src.reg, ir::Reg::Rcx);
+}
+
+TEST_F(LifterTranslate, MulOneOperand) {
+    // F7 E1: mul ecx — 1-op F7 /4 形式（unsigned rdx:rax = rax * ecx）
+    const wvmp::u8 b[] = {0xF7, 0xE1};
+    auto r = translate_bytes(x64, b, ir::Arch::X64);
+    ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r.insn.op, ir::Op::Mul);
+    EXPECT_EQ(r.insn.size, ir::Size::S32);
+    EXPECT_TRUE(r.insn.updates_flags);
+    EXPECT_EQ(r.insn.dst.reg, ir::Reg::Rdx);  // upper half
+    EXPECT_EQ(r.insn.src.reg, ir::Reg::Rcx);
+}
+
+TEST_F(LifterTranslate, MulOneOperand64) {
+    // 48 F7 E1: mul rcx — REX.W 触发 64 位 size
+    const wvmp::u8 b[] = {0x48, 0xF7, 0xE1};
+    auto r = translate_bytes(x64, b, ir::Arch::X64);
+    ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r.insn.op, ir::Op::Mul);
+    EXPECT_EQ(r.insn.size, ir::Size::S64);
+    EXPECT_EQ(r.insn.dst.reg, ir::Reg::Rdx);
+    EXPECT_EQ(r.insn.src.reg, ir::Reg::Rcx);
+}
+
 TEST_F(LifterTranslate, SkippedInstructions) {
     // 0F A2: cpuid —— 超出白名单
     const wvmp::u8 cpuid[] = {0x0F, 0xA2};

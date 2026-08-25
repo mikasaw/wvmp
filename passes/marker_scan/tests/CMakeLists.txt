@@ -206,3 +206,17 @@ target_compile_options(wvmp_cl_shift_sample PRIVATE
 target_link_options(wvmp_cl_shift_sample PRIVATE
     $<$<CXX_COMPILER_ID:MSVC>:/INCREMENTAL:NO>
 )
+
+# MIT-302: 端到端正路径样本——区域内含 imul 3 形式 (3-op imm / 2-op reg /
+# 1-op F7/5)，验证 imul/mul 修复后翻译成功、运行时走真 Imul/Mul handler、
+# 行为与原生逐字节一致。用 volatile int64_t 计乘数避免 MSVC 常量折叠把
+# 乘法挪出 marker 区域，区域不含 rip-relative / printf 调用。
+add_executable(wvmp_imul_sample imul_sample_main.cpp)
+target_link_libraries(wvmp_imul_sample PRIVATE wvmp::sdk)
+target_compile_options(wvmp_imul_sample PRIVATE
+    $<$<CXX_COMPILER_ID:MSVC>:/Od;/Ob0;/utf-8>
+    $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-O0>
+)
+target_link_options(wvmp_imul_sample PRIVATE
+    $<$<CXX_COMPILER_ID:MSVC>:/INCREMENTAL:NO>
+)

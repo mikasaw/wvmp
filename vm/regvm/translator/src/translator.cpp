@@ -290,12 +290,17 @@ struct Translator {
                     isa::size_field(in.size));
             break;
         default:
-            if (is_alu_binop(in.op))
+            if (in.op == ir::Op::Imul) {
+                ok = translate_imul(em, sc, in, current_rva, next_ip);
+            } else if (in.op == ir::Op::Mul) {
+                ok = translate_mul(em, in);
+            } else if (is_alu_binop(in.op)) {
                 ok = translate_alu_binop(em, sc, in, current_rva, next_ip);
-            else if (is_unary(in.op))
+            } else if (is_unary(in.op)) {
                 ok = translate_unary(em, sc, in, current_rva, next_ip);
-            else
+            } else {
                 ok = skip(in, "未支持的操作码", nullptr);
+            }
             break;
         }
         if (ok)
@@ -554,6 +559,70 @@ struct Translator {
         const isa::VmOp store_op =
             (in.dst.mem.base == ir::Reg::Rip) ? isa::VmOp::StoreRva : isa::VmOp::Store;
         em.emit_rr(store_op, acc, s, sz);
+        return true;
+    }
+
+    // ---- MIT-302: imul / mul ----
+    //
+    // imul 三形式（lifter 区分）：
+    //   1) 3-op imm 形式：dst = src * imm32（src2 = Imm，size = S32）
+    //   2) 2-op reg 形式：dst = dst * src（src = Reg，size = arch 指针宽）
+    //   3) 1-op 形式（极少见，F7 /5）：lifter 直接转 Op::Mul
+    // 翻译器对 Op::Imul 按 src2.kind 区分 3-op imm 与 2-op reg：
+    //   - src2.kind == Imm → 拆 mov_scratch + Imul(dst, scratch)：先 mov scratch,
+    //     imm（VmOp::Mov w/ aux=imm32），再 Imul 2-op(dst, scratch)。避开 native
+    //     "imul r, r, imm" 要求第 3 操作数为汇编期常量的硬限制。
+    //   - src2.kind == None → emit VmOp::Imul（b_kind=Reg reg_b=src, aux=0）
+    // mul 单操作数：emit VmOp::Mul（a_kind=Reg reg_a=Rdx 槽, b_kind=Reg reg_b=src;
+    // Rax 是隐式被乘数，asmgen handler 硬编码读 regs[Rax] / 写 regs[Rax]+regs[Rdx]）。
+    //
+    // flags 语义（与 add/sub 完全不同）：
+    //   - CF/OF 当低半 != 高半时 set（与 mul 末尾 carry/IMUL 截断同语义）
+    //   - SF/ZF/PF 按结果
+    //   - handler 用 native imul/mul 直读 host CPU flags, setcc5 捕获——与 add/sub
+    //     的 zero5 + setcc5 路径一致, 复用 build_binary("imul"/"mul") 即可。
+    //
+    // v1 约束：不接 mem 操作数（lifter 已将 mem-src 拆为 Load, mem-dst 拆为 Store）；
+    // 遇到不支持形态由 C1 gate 兜底（保持原生）。
+    bool translate_imul(Emitter& em, Scratch& sc, const ir::Insn& in,
+                        u64 current_rva, u64 next_ip) {
+        (void)current_rva; (void)next_ip; // v1: 不接 mem 操作数，不需地址/翻译 scratch
+        if (in.dst.kind != ir::Operand::Kind::Reg ||
+            in.src.kind != ir::Operand::Kind::Reg) {
+            return skip(in, "imul 操作数形态未支持", nullptr);
+        }
+        const u8 d = isa::vm_reg_of(in.dst.reg);
+        const u8 s = isa::vm_reg_of(in.src.reg);
+        const u8 sz = isa::size_field(in.size);
+        // 3-op imm 形式：mov scratch, imm32 → Imul(dst, scratch)
+        // native imul 第 3 操作数必须是汇编期常量, 不可用 reg, 故拆 mov+imul。
+        if (in.src2.kind == ir::Operand::Kind::Imm) {
+            if (!fits_aux(in.src2.imm)) {
+                return skip(in, "imul imm32 越界", nullptr);
+            }
+            const u8 scratch = sc.take();
+            em.emit_ri(VmOp::Mov, scratch,
+                       static_cast<u32>(static_cast<u64>(in.src2.imm)), sz);
+            em.emit_rr(VmOp::Imul, d, scratch, sz);
+            return true;
+        }
+        // 2-op reg 形式：emit VmOp::Imul（aux = 0）。
+        em.emit_rr(VmOp::Imul, d, s, sz);
+        return true;
+    }
+
+    bool translate_mul(Emitter& em, const ir::Insn& in) {
+        // dst = Rdx（高半，lifter 约定），src = Reg 乘数（Rax 是隐式被乘数）。
+        if (in.dst.kind != ir::Operand::Kind::Reg ||
+            in.src.kind != ir::Operand::Kind::Reg) {
+            return skip(in, "mul 操作数形态未支持", nullptr);
+        }
+        // a_kind=Reg, reg_a = Rdx 槽（asmgen 硬编码读 Rax/写 Rax+Rdx，reg_a 仅
+        // 作为 handler 入口 tag，实际计算不依赖 reg_a 的值；保留 Rdx 槽让 handler
+        // 在 self-check 时知道这是 Mul 而非别的操作）。
+        const u8 sz = isa::size_field(in.size);
+        em.emit(VmOp::Mul, OpKind::Reg, isa::vm_reg_of(in.dst.reg),
+                OpKind::Reg, isa::vm_reg_of(in.src.reg), 0, sz);
         return true;
     }
 };

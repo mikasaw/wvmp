@@ -300,6 +300,88 @@ TranslateResult translate_ret(const cs_insn& ci, const cs_x86& x, ir::Arch arch)
     return ok(out);
 }
 
+// imul 三形式：
+//   1) imul r, r/m, imm (3-op imm, 69 /r id): dst = src * imm32（默认 S32）
+//   2) imul r, r/m       (2-op reg, 0F AF /r): dst = dst * src
+//   3) imul r/m          (1-op, F7 /5): 同 mul 但有符号；rdx:rax = rax * src
+// imm 形式 src=Reg + src2=Imm（Insn.src2 字段是 MIT-302 新增的第三个操作数槽），
+// 其余 2 形式只用 dst/src。3 形式与 2 形式都标 updates_flags=true（OF/CF 当低半
+// != 高半时 set，与 add/sub 完全不同；语义由 asmgen 直读 native imul flags）。
+// v1 限制：8-bit 2-op imul 不存在（Intel SDM: IMUL r/m8 仅单操作数 AL 形式；
+// 2-op 仅 r16/r32/r64）。`char * char` 由 C/C++ 语义提升到 int，lifter 不会产
+// S8 imul——若 capstone 解出 (e.g. 编译器刻意生成), 拒为 unsupported 让 C1 gate
+// 兜底。同理 1-op 形式拒 S8 (mul 1-op r/m8 写 AX，与 Rdx:RAx 不一致)。
+TranslateResult translate_imul(const cs_insn& ci, const cs_x86& x, ir::Arch arch) {
+    ir::Insn out;
+    out.op = Op::Imul;
+    out.addr = ci.address;
+    out.updates_flags = true;
+
+    // 3-op imm 形式：imul dst, src, imm32
+    if (x.op_count == 3 && x.operands[2].type == X86_OP_IMM &&
+        x.operands[0].type == X86_OP_REG && x.operands[1].type == X86_OP_REG) {
+        auto d = map_reg(x.operands[0].reg);
+        auto s = map_reg(x.operands[1].reg);
+        if (!d || !s) return unsupported(ci.address, ci.size);
+        out.dst = Operand::reg_(*d);
+        out.src = Operand::reg_(*s);
+        // imm 形式默认 S32（capstone 的 imm 形式即 69 /r id, 32 位）。
+        out.size = Size::S32;
+        out.src2 = Operand::imm_(static_cast<i64>(x.operands[2].imm));
+        return ok(out);
+    }
+    // 2-op reg 形式：imul dst, src
+    if (x.op_count == 2 && x.operands[0].type == X86_OP_REG &&
+        x.operands[1].type == X86_OP_REG) {
+        auto d = map_reg(x.operands[0].reg);
+        auto s = map_reg(x.operands[1].reg);
+        if (!d || !s) return unsupported(ci.address, ci.size);
+        out.dst = Operand::reg_(*d);
+        out.src = Operand::reg_(*s);
+        auto sz = data_size(x.operands, x.op_count, arch);
+        if (sz == Size::S8) return unsupported(ci.address, ci.size); // S8 imul 2-op 不存在
+        out.size = sz;
+        return ok(out);
+    }
+    // 1-op 形式（F7 /5, signed rdx:rax = rax * src）—— MSVC /Od 对 `int a * b`
+    // 不产此形式（产 2-op 0F AF /r），但 v1 lifter 接住以兜底 F7 /5 字节。语义上
+    // 与 Mul（同 1 操作数）一致：低半 bit-exact 相同（imul/mul 对低 N 位结果
+    // 完全相同），仅高半 signed/unsigned 解读差异。保守按 Mul 路径发射。
+    if (x.op_count == 1 && x.operands[0].type == X86_OP_REG) {
+        auto s = map_reg(x.operands[0].reg);
+        if (!s) return unsupported(ci.address, ci.size);
+        auto sz = data_size(x.operands, x.op_count, arch);
+        if (sz == Size::S8) return unsupported(ci.address, ci.size); // S8 mul 写 AX 而非 Rdx:Rax
+        out.op = Op::Mul;
+        out.dst = Operand::reg_(ir::Reg::Rdx);  // upper half
+        out.src = Operand::reg_(*s);
+        out.size = sz;
+        return ok(out);
+    }
+    return unsupported(ci.address, ci.size);
+}
+
+// mul 单操作数（F7 /4）：unsigned rdx:rax = rax * src。
+// 只接寄存器源（内存源触发 C1 gate 兜底）。S8 拒（mul r/m8 写 AX 与 Rdx:Rax 语义
+// 不一致，C/C++ 自动提升到 int 由 32-bit mul 处理）。
+TranslateResult translate_mul(const cs_insn& ci, const cs_x86& x, ir::Arch arch) {
+    if (x.op_count != 1 || x.operands[0].type != X86_OP_REG) {
+        return unsupported(ci.address, ci.size);
+    }
+    auto s = map_reg(x.operands[0].reg);
+    if (!s) return unsupported(ci.address, ci.size);
+    auto sz = data_size(x.operands, x.op_count, arch);
+    if (sz == Size::S8) return unsupported(ci.address, ci.size);
+    ir::Insn out;
+    out.op = Op::Mul;
+    out.addr = ci.address;
+    out.updates_flags = true; // OF/CF 当低半 != 高半时 set
+    out.dst = Operand::reg_(ir::Reg::Rdx);  // upper half
+    out.src = Operand::reg_(*s);            // 乘数（Rax 是隐式被乘数，asmgen 硬编码）
+    out.size = sz;
+    return ok(out);
+}
+
 } // namespace
 
 std::optional<ir::Reg> map_reg(x86_reg r) {
@@ -406,6 +488,8 @@ TranslateResult translate_insn(const cs_insn& ci, ir::Arch arch) {
         return translate_jcc(ci, x, arch);
     case X86_INS_CALL: return translate_call(ci, x, arch);
     case X86_INS_RET: return translate_ret(ci, x, arch);
+    case X86_INS_IMUL: return translate_imul(ci, x, arch);
+    case X86_INS_MUL: return translate_mul(ci, x, arch);
     case X86_INS_NOP: {
         ir::Insn out;
         out.op = Op::Nop;
