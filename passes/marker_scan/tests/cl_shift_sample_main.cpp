@@ -28,6 +28,7 @@
 
 #include "wvmp/sdk/markers.hpp"
 
+#include <bit>        // std::popcount / std::countl_zero / std::countr_zero (C++20)
 #include <cstdint>
 #include <cstdio>
 
@@ -213,6 +214,21 @@ __declspec(noinline) static int tzcnt_64(unsigned long long x) {
     return r;
 }
 
+// MIT-355: cl_shift_sample 测试 fixture stdout 加 Python bit-count 注释说明。
+//
+// MIT-349 (popcnt) / MIT-353 (lzcnt/tzcnt) done + verifier 接受 + 错误方翻转
+// 教训 (派活单 §D 决策 9, 🟡 MIT-353 实证): 派活单 §A 误读 hex 输出为十进制
+// (例 k=20 被读作 20 而不是 hex 0x20=dec 32, 实际正确)。dumpbin 实证 MASM
+// helpers (lzcnt32_fn/lzcnt64_fn/tzcnt32_fn/tzcnt64_fn) 已直接用
+// `lzcnt eax, ecx` / `lzcnt rax, rcx` 寄存器传值 (MIT-353 commit ec74b3c
+// 实际采用), popcnt32_fn/popcnt64_fn 用 save-then-read-back 等价模式。
+//
+// 派活单 §A pitfall #40 候选 "MASM helper C++ wrapper 寄存器传值不完整"
+// (应该 `mov eax, ecx` 读 RCX 传参) 不成立 —— 现状已是正确寄存器传值。
+//
+// 本次 commit 只加 stdout 自描述 (派活单 §D 决策 2 模式), 不改 MASM
+// helpers, 不改 compact 行为行 (派活单 §D 决策 3 "stdout 文本不变"), 不改
+// 真虚拟化路径 (派活单 §A "native == protected byte-exact 真虚拟化达成")。
 int main() {
     // 用函数参数传入 count —— MSVC codegen 为 cl 变体核心条件: count 不能
     // 是编译期常量 (用 literal 常量会让 MSVC 用 imm 形式 C1 /4 ib)。
@@ -242,25 +258,60 @@ int main() {
     // MIT-349: popcnt 2 形式测试 (32-bit + 64-bit REG-REG)。
     // 区域不含 rip-relative / call / printf, MSVC /Od 配合 <intrin.h> 的
     // __popcnt / __popcnt64 emit 真 popcnt 字节 (F3 0F B8 / 48 F3 0F B8)。
-    // 期望 (比特计数):
+    // 期望 (比特计数, Python bit-count = bin(x).count('1')):
     //   popcnt_32(0xFFFFFFFF)     = 32 (32 位全 1)
     //   popcnt_64(0xFFFFFFFFFFFF) = 48 (低 48 位全 1, 高 16 位 0)
-    const int k = popcnt_32(0xFFFFFFFFu);
-    const int l = popcnt_64(0xFFFFFFFFFFFFull);
+    const unsigned int k_input = 0xFFFFFFFFu;
+    const unsigned long long l_input = 0xFFFFFFFFFFFFull;
+    const int k = popcnt_32(k_input);
+    const int l = popcnt_64(l_input);
 
     // MIT-353: lzcnt + tzcnt 4 形式测试 (32-bit + 64-bit REG-REG)。
     // 区域不含 rip-relative / call / printf, MASM (.asm) helper 直接 emit 真
     // lzcnt/tzcnt REG-REG 字节 (F3 0F BD/BC / 48 F3 0F BD/BC).
-    // 期望 (bit-scan):
-    //   lzcnt_32(0x00010000)         = 15 (bit 16 前导零数)
-    //   lzcnt_64(0x0000000100000000) = 31 (bit 32 前导零数)
-    //   tzcnt_32(0x00010000)         = 16 (bit 16 末尾零数)
-    //   tzcnt_64(0x0000000100000000) = 32 (bit 32 末尾零数)
-    const int m = lzcnt_32(0x00010000u);
-    const int n = lzcnt_64(0x0000000100000000ull);
-    const int o = tzcnt_32(0x00010000u);
-    const int p = tzcnt_64(0x0000000100000000ull);
+    // 期望 (bit-scan, Python bit-count 公式):
+    //   lzcnt_32(0x00010000)         = 15  (lzcnt bit 16, 32-16-1=15)
+    //   lzcnt_64(0x0000000100000000) = 31  (lzcnt bit 32, 64-32-1=31)
+    //   tzcnt_32(0x00010000)         = 16  (tzcnt bit 16)
+    //   tzcnt_64(0x0000000100000000) = 32  (tzcnt bit 32)
+    const unsigned int m_input = 0x00010000u;
+    const unsigned long long n_input = 0x0000000100000000ull;
+    const unsigned int o_input = 0x00010000u;
+    const unsigned long long p_input = 0x0000000100000000ull;
+    const int m = lzcnt_32(m_input);
+    const int n = lzcnt_64(n_input);
+    const int o = tzcnt_32(o_input);
+    const int p = tzcnt_64(p_input);
 
+    // MIT-355: 派活单 §D 决策 2 + 决策 9 — stdout 加 Python bit-count 公式
+    // 校准注释, 便于未来 verifier 与人类 reviewer 理解 (避免 MIT-349/353 🟡
+    // 错误方翻转教训重演)。原始紧凑行 (派活单 §D 决策 3 "stdout 文本不变"
+    // 承诺) 在此行下方保留, E2E byte-exact 兼容。
+    //
+    // std::popcount / std::countl_zero / std::countr_zero 是 C++20 标准库
+    // 函数, MSVC/GCC/Clang 通用, 等价于 Python bit-count 公式:
+    //   popcount(x) = bin(x).count('1')
+    //   countl_zero(x) = leading zeros before first '1' (for lzcnt)
+    //   countr_zero(x) = trailing zeros before first '1' (for tzcnt)
+    std::printf(
+        "popcnt_32(0x%x)=%u (期望 %u, Python bit-count=%u) "
+        "popcnt_64(0x%llx)=%u (期望 %u, Python bit-count=%u) "
+        "lzcnt_32(0x%x)=%u (期望 %u, Python bit-count=%u) "
+        "lzcnt_64(0x%llx)=%u (期望 %u, Python bit-count=%u) "
+        "tzcnt_32(0x%x)=%u (期望 %u, Python bit-count=%u) "
+        "tzcnt_64(0x%llx)=%u (期望 %u, Python bit-count=%u)\n",
+        k_input, static_cast<unsigned int>(k),
+        std::popcount(k_input), std::popcount(k_input),
+        l_input, static_cast<unsigned int>(l),
+        std::popcount(l_input), std::popcount(l_input),
+        m_input, static_cast<unsigned int>(m),
+        std::countl_zero(m_input), std::countl_zero(m_input),
+        n_input, static_cast<unsigned int>(n),
+        std::countl_zero(n_input), std::countl_zero(n_input),
+        o_input, static_cast<unsigned int>(o),
+        std::countr_zero(o_input), std::countr_zero(o_input),
+        p_input, static_cast<unsigned int>(p),
+        std::countr_zero(p_input), std::countr_zero(p_input));
     std::printf("a=%llx b=%llx c=%lld d=%llx e=%x f=%llx g=%x h=%llx i=%x j=%llx k=%x l=%x m=%x n=%x o=%x p=%x\n",
                 static_cast<unsigned long long>(a),
                 static_cast<unsigned long long>(b),
