@@ -196,9 +196,25 @@ enum class VmOp : u16 {
     //     (pitfall #34 additive enum append-only); 派活单限定不支持 lock prefix
     //     (lock cmpxchg 涉及 atomic 语义, 需独立 issue 调试 VM runtime)。
     Cmpxchg,
+    // —— MIT-347 movsx（8/16→32/64 位有符号扩展，x64/x86 都支持）——
+    // Movsx (Reg-Reg): dst = sign_extend_8/16(src)，native "movsx dst, src"。
+    // a_kind=Reg, reg_a=dst, b_kind=Reg, reg_b=src, aux=src_size (低 2 位:
+    // S8=0 / S16=1), cond_or_size=size (S32 / S64)。
+    // handler 用 byte ptr / word ptr 读 src VM 槽低 8/16 位（按 alias_read 自动
+    // 零扩展到完整 64 位），movsx 到 t_[0] 后写回 dst VM 槽（qword，符号扩展
+    // 结果落到高 56/48 位）。不更新 flags。
+    Movsx,
+    // MovsxMem (Reg-Mem): dst = sign_extend_8/16([addr])，addr 在 reg_b VM 槽里。
+    // a_kind=Reg, reg_a=dst, b_kind=Reg, reg_b=address 槽（翻译器 emit_address 已
+    // 把地址算到 scratch 槽, 本 handler 读该槽作地址）。
+    // handler: mov t_[1], [ctx + reg_b*8 + 0x10]    (取地址)
+    //         movsx t_[0], byte/word ptr [t_[1]]    (8/16 位 load + 符号扩展)
+    //         mov [ctx + reg_a*8 + 0x10], t_[0]      (写回 64 位 dst)
+    // 不更新 flags。
+    MovsxMem,
 };
 
-inline constexpr u16 kVmOpMax = static_cast<u16>(VmOp::Cmpxchg);
+inline constexpr u16 kVmOpMax = static_cast<u16>(VmOp::MovsxMem);
 inline constexpr u16 kVmOpLimit = 1u << 14;  // 14 位编码空间上限
 
 constexpr const char* to_string(VmOp op) {
@@ -240,6 +256,8 @@ constexpr const char* to_string(VmOp op) {
         case VmOp::Setcc: return "setcc";
         case VmOp::Cmovcc: return "cmovcc";
         case VmOp::Cmpxchg: return "cmpxchg";
+        case VmOp::Movsx: return "movsx";
+        case VmOp::MovsxMem: return "movsxmem";
     }
     return "?";
 }

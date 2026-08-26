@@ -10,6 +10,9 @@
 #   - MIT-336: extend to wvmp_setcc_sample (setcc REG-REG 真虚拟化).
 #   - MIT-339: extend to wvmp_cmovcc_sample (cmovcc REG-REG 真虚拟化).
 #   - MIT-341: extend to wvmp_cmpxchg_sample (cmpxchg REG-REG 真虚拟化).
+#   - MIT-345: extend to wvmp_cl_shift_sample (movzx 8→16/16→64 真虚拟化).
+#   - MIT-347: extend to wvmp_cl_shift_sample (movsx 4 形式 8→32/8→64/16→32/
+#     16→64 真虚拟化, sign-extend, 与 movzx 对偶 zero-extend).
 #     Total: 11 samples × 5 seeds = 55 runs.
 #   - MIT-306: REQUIRE_REAL=1 校验日志含 "已生成 N 个入口 stub" 防止 C1 gate
 #     兜底被误判 PASS（仅 byte-exact 不够, C1 gate 函数被跳过仍能输出相同

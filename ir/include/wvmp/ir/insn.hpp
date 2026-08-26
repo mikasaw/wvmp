@@ -97,7 +97,22 @@ enum class Op : u16 { Mov, Lea, Add, Sub, Adc, Sbb, And, Or, Xor, Not, Neg, Inc,
                       //     结构）。派活单限定不支持 lock prefix 与 mod=01/10。
                       //   - 派活单 §D 决策 4: Cmpxchg 必 append-only 在 Cmovcc 之后
                       //     (pitfall #34 additive enum append-only)。
-                      Cmpxchg };
+                      Cmpxchg,
+                      // MIT-347: 8/16→32/64 位有符号扩展 (movsx r, r/m8 / r, r/m16)。
+                      //   - REG-REG: src=Reg（含 8-bit 子寄存器折叠）, dst=Reg
+                      //   - REG-MEM: src=Mem, dst=Reg（lifter 直接 emit Operand::mem_;
+                      //              翻译器折 movsxMem）
+                      //   - 字节结构：[48] (REX.W 可选) | 0F BE (opcode, 8 位源)
+                      //              / 0F BF (16 位源) | ModR/M | 可选 SIB | 可选 disp
+                      //   - 关键：movsx 本身完成 8/16 位 load + 符号扩展（不分两条 Load + SignExt）。
+                      //     lifter 不拆分，emit Operand::mem_(...); 翻译器折 MovsxMem。
+                      //   - size 取目的位宽（无 REX.W → S32, 有 REX.W → S64）。
+                      //   - src_size 取源位宽：0F BE → S8, 0F BF → S16。
+                      //   - updates_flags=false（movsx 不影响 CF/OF/SF/ZF/PF）。
+                      //   - 派活单 §D 决策: Movsx 必 append-only 在 Cmpxchg 之后
+                      //     (pitfall #34 additive enum append-only)；派活单限定不支
+                      //     持 movsx r16, r/m16 (16→16 no-op, 编译器不 emit)。
+                      Movsx };
 enum class Size : u8 { S8, S16, S32, S64 };
 enum class Cond : u8 { O, No, B, Ae, E, Ne, Be, A, S, Ns, P, Np, L, Ge, Le, G };
 constexpr u64 bits(Size s) { return s==Size::S8?8: s==Size::S16?16: s==Size::S32?32:64; }

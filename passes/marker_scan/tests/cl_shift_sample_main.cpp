@@ -99,6 +99,46 @@ __declspec(noinline) static unsigned long long movzx_16_64(unsigned short x) {
     return r;
 }
 
+// MIT-347: movsx 8→32 (0F BE + ModR/M, MSVC /Od codegen for
+// `int r = (signed char)x`). 测试 movsx r32, r/m8 —
+// 8 位源符号扩展到 32 位目的. 区域里 r 用 volatile 接收防优化掉.
+__declspec(noinline) static int movsx_8_32(signed char x) {
+    WVMP_BEGIN(movsx_8_32);
+    volatile int r = static_cast<int>(x);   // movsx eax, al (0F BE C0 类)
+    WVMP_END(movsx_8_32);
+    return r;
+}
+
+// MIT-347: movsx 8→64 (REX.W + 0F BE + ModR/M, MSVC /Od codegen for
+// `long long r = (signed char)x`). 测试 movsx r64, r/m8 —
+// 8 位源符号扩展到 64 位目的. 负数 (bit 7 = 1) 应填满上 56 位 1.
+__declspec(noinline) static long long movsx_8_64(signed char x) {
+    WVMP_BEGIN(movsx_8_64);
+    volatile long long r = static_cast<long long>(x); // movsx rax, al (48 0F BE C0 类)
+    WVMP_END(movsx_8_64);
+    return r;
+}
+
+// MIT-347: movsx 16→32 (0F BF + ModR/M, MSVC /Od codegen for
+// `int r = (signed short)x`). 测试 movsx r32, r/m16 —
+// 16 位源符号扩展到 32 位目的.
+__declspec(noinline) static int movsx_16_32(short x) {
+    WVMP_BEGIN(movsx_16_32);
+    volatile int r = static_cast<int>(x);   // movsx eax, ax (0F BF C0 类)
+    WVMP_END(movsx_16_32);
+    return r;
+}
+
+// MIT-347: movsx 16→64 (REX.W + 0F BF + ModR/M, MSVC /Od codegen for
+// `long long r = (signed short)x`). 测试 movsx r64, r/m16 —
+// 16 位源符号扩展到 64 位目的. 负数 (bit 15 = 1) 应填满上 48 位 1.
+__declspec(noinline) static long long movsx_16_64(short x) {
+    WVMP_BEGIN(movsx_16_64);
+    volatile long long r = static_cast<long long>(x); // movsx rax, ax (48 0F BF C0 类)
+    WVMP_END(movsx_16_64);
+    return r;
+}
+
 int main() {
     // 用函数参数传入 count —— MSVC codegen 为 cl 变体核心条件: count 不能
     // 是编译期常量 (用 literal 常量会让 MSVC 用 imm 形式 C1 /4 ib)。
@@ -113,12 +153,28 @@ int main() {
     const unsigned short e = movzx_8_16(0xABu);
     const unsigned long long f = movzx_16_64(0xABCDu);
 
-    std::printf("a=%llx b=%llx c=%lld d=%llx e=%x f=%llx\n",
+    // MIT-347: movsx 4 形式测试 (与 movzx 对偶, sign-extend vs zero-extend).
+    // 区域不含 rip-relative / call / printf, MSVC /Od 自然 codegen movsx.
+    // 期望 (sign-extend, bit 7/15 = 1 时填满上 56/48 位):
+    //   movsx_8_32(-1)  = 0xFFFFFFFF (signed char -1 → int -1)
+    //   movsx_8_64(-1)  = 0xFFFFFFFFFFFFFFFF (signed char -1 → long long -1)
+    //   movsx_16_32(-1) = 0xFFFFFFFF (signed short -1 → int -1)
+    //   movsx_16_64(-1) = 0xFFFFFFFFFFFFFFFF (signed short -1 → long long -1)
+    const int g = movsx_8_32(-1);
+    const long long h = movsx_8_64(-1);
+    const int i = movsx_16_32(-1);
+    const long long j = movsx_16_64(-1);
+
+    std::printf("a=%llx b=%llx c=%lld d=%llx e=%x f=%llx g=%x h=%llx i=%x j=%llx\n",
                 static_cast<unsigned long long>(a),
                 static_cast<unsigned long long>(b),
                 static_cast<long long>(c),
                 static_cast<unsigned long long>(d),
                 static_cast<unsigned int>(e),
-                static_cast<unsigned long long>(f));
+                static_cast<unsigned long long>(f),
+                static_cast<unsigned int>(g),
+                static_cast<unsigned long long>(h),
+                static_cast<unsigned int>(i),
+                static_cast<unsigned long long>(j));
     return 0;
 }

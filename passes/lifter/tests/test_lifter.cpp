@@ -879,6 +879,72 @@ TEST_F(LifterTranslate, MovzxMemRspDisp8_16To64) {
     EXPECT_EQ(r.insn.src.mem.disp, 0x22);
 }
 
+// MIT-347: movsx 8→32 (0F BE + ModR/M) — 32 位目的, 8 位源。REG-REG 形式。
+// 字节: 0F BE | C8 (ModR/M: mod=11, reg=001=Rcx=dst, r/m=000=Rax=src).
+// MSVC /Od codegen for `int r = (signed char)x` 通常 emit 这条 (e.g. 0F BE C0)。
+TEST_F(LifterTranslate, MovsxRegToReg8To32) {
+    const wvmp::u8 b[] = {0x0F, 0xBE, 0xC8};
+    auto r = translate_bytes(x64, b, ir::Arch::X64);
+    ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r.insn.op, ir::Op::Movsx);
+    EXPECT_EQ(r.insn.size, ir::Size::S32);       // 8→32
+    EXPECT_EQ(r.insn.src_size, ir::Size::S8);    // 0F BE → S8 源
+    EXPECT_FALSE(r.insn.updates_flags);
+    ASSERT_EQ(r.insn.dst.kind, ir::Operand::Kind::Reg);
+    EXPECT_EQ(r.insn.dst.reg, ir::Reg::Rcx);
+    ASSERT_EQ(r.insn.src.kind, ir::Operand::Kind::Reg);
+    EXPECT_EQ(r.insn.src.reg, ir::Reg::Rax);
+    EXPECT_EQ(r.insn.addr, 0u);
+}
+
+// MIT-347: movsx 8→64 (REX.W + 0F BE + ModR/M) — 64 位目的, 8 位源。
+// 字节: 48 (REX.W) | 0F BE | C8 (ModR/M: mod=11, reg=001=Rcx, r/m=000=Rax)。
+TEST_F(LifterTranslate, MovsxRegToReg8To64) {
+    const wvmp::u8 b[] = {0x48, 0x0F, 0xBE, 0xC8};
+    auto r = translate_bytes(x64, b, ir::Arch::X64);
+    ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r.insn.op, ir::Op::Movsx);
+    EXPECT_EQ(r.insn.size, ir::Size::S64);       // REX.W → 64 位目的
+    EXPECT_EQ(r.insn.src_size, ir::Size::S8);    // 0F BE → S8 源
+    EXPECT_FALSE(r.insn.updates_flags);
+    ASSERT_EQ(r.insn.dst.kind, ir::Operand::Kind::Reg);
+    EXPECT_EQ(r.insn.dst.reg, ir::Reg::Rcx);
+    ASSERT_EQ(r.insn.src.kind, ir::Operand::Kind::Reg);
+    EXPECT_EQ(r.insn.src.reg, ir::Reg::Rax);
+}
+
+// MIT-347: movsx 16→64 (REX.W + 0F BF + ModR/M) — 64 位目的, 16 位源。
+// 字节: 48 (REX.W) | 0F BF | C3 (ModR/M: mod=11, reg=000=Rax, r/m=011=Rbx)。
+TEST_F(LifterTranslate, MovsxRegToReg16To64) {
+    const wvmp::u8 b[] = {0x48, 0x0F, 0xBF, 0xC3};
+    auto r = translate_bytes(x64, b, ir::Arch::X64);
+    ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r.insn.op, ir::Op::Movsx);
+    EXPECT_EQ(r.insn.size, ir::Size::S64);       // REX.W → 64 位目的
+    EXPECT_EQ(r.insn.src_size, ir::Size::S16);   // 0F BF → S16 源
+    EXPECT_FALSE(r.insn.updates_flags);
+    ASSERT_EQ(r.insn.dst.kind, ir::Operand::Kind::Reg);
+    EXPECT_EQ(r.insn.dst.reg, ir::Reg::Rax);
+    ASSERT_EQ(r.insn.src.kind, ir::Operand::Kind::Reg);
+    EXPECT_EQ(r.insn.src.reg, ir::Reg::Rbx);
+}
+
+// MIT-347: movsx 16→32 (0F BF + ModR/M, 无 REX.W) — 32 位目的, 16 位源。
+// 字节: 0F BF | C1 (ModR/M: mod=11, reg=000=Rax, r/m=001=Rcx)。
+TEST_F(LifterTranslate, MovsxRegToReg16To32) {
+    const wvmp::u8 b[] = {0x0F, 0xBF, 0xC1};
+    auto r = translate_bytes(x64, b, ir::Arch::X64);
+    ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r.insn.op, ir::Op::Movsx);
+    EXPECT_EQ(r.insn.size, ir::Size::S32);       // 32 位目的
+    EXPECT_EQ(r.insn.src_size, ir::Size::S16);   // 0F BF → S16 源
+    EXPECT_FALSE(r.insn.updates_flags);
+    ASSERT_EQ(r.insn.dst.kind, ir::Operand::Kind::Reg);
+    EXPECT_EQ(r.insn.dst.reg, ir::Reg::Rax);
+    ASSERT_EQ(r.insn.src.kind, ir::Operand::Kind::Reg);
+    EXPECT_EQ(r.insn.src.reg, ir::Reg::Rcx);
+}
+
 TEST_F(LifterTranslate, SkippedInstructions) {
     // 0F A2: cpuid —— 超出白名单
     const wvmp::u8 cpuid[] = {0x0F, 0xA2};

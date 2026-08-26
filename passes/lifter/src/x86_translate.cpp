@@ -496,6 +496,70 @@ TranslateResult translate_movzx(const cs_insn& ci, const cs_x86& x, ir::Arch arc
     return unsupported(ci.address, ci.size);
 }
 
+// MIT-347 movsx (0F BE / 0F BF, 可选 REX.W): 8/16→32/64 位符号扩展。
+// 与 movzx 是对偶指令（movsx 符号扩展 vs movzx 零扩展），两者共用 src_size
+// 字段 (S8 / S16) 与 size 字段 (S32 / S64) 的编码方式。
+// MSVC /Od 默认 codegen REG-REG 与 REG-MEM 两种：
+//   - REG-REG：movsx rax, cl   → ir::Op::Movsx, src=Reg
+//   - REG-MEM：movsx rax, [mem] → ir::Op::Movsx, src=Mem
+//   - 字节结构：[66] (0x66 prefix 可选, 16-bit dst) [48] (REX.W 可选)
+//              | 0F BE (opcode, 8 位源) / 0F BF (16 位源) | ModR/M
+//              | 可选 SIB | 可选 disp
+//   - 关键：movsx 本身完成 8/16 位 load + 符号扩展（不分两条 Load + SignExt）。
+//     lifter 不拆分，emit Operand::mem_(...); 翻译器折 MovsxMem。
+// size 取目的位宽（无 REX.W → S32，有 REX.W → S64）；
+// src_size 取源位宽：0F BE → S8, 0F BF → S16。
+// updates_flags=false（movsx 不影响 CF/OF/SF/ZF/PF）。
+TranslateResult translate_movsx(const cs_insn& ci, const cs_x86& x, ir::Arch arch) {
+    if (x.op_count != 2) return unsupported(ci.address, ci.size);
+    // dst 必是寄存器
+    if (x.operands[0].type != X86_OP_REG) return unsupported(ci.address, ci.size);
+    auto d = map_reg(x.operands[0].reg);
+    if (!d) return unsupported(ci.address, ci.size);
+
+    // MIT-347: src_size 由 ci.bytes[*] 决定 (0F BE = 8-bit 源, 0F BF = 16-bit 源).
+    // 字节布局: [66] (0x66 prefix, 16-bit dst) [REX] (0x40-0x4F) [0F] [BE/BF] [ModR/M]
+    //   - 无前缀: 0xBE/0xBF 在 ci.bytes[1]
+    //   - 有 0x66 或 REX: 0xBE/0xBF 在 ci.bytes[2]
+    //   - 两个前缀都有: 0xBE/0xBF 在 ci.bytes[3]
+    // 我们扫描 [1..3] 找 BE/BF (其他字节是 0x0F / REX / 0x66 已知, 不会冲突).
+    Size src_size = Size::S8;
+    bool found = false;
+    for (size_t i = 1; i < ci.size && i < 4; ++i) {
+        if (ci.bytes[i] == 0xBE) { src_size = Size::S8; found = true; break; }
+        if (ci.bytes[i] == 0xBF) { src_size = Size::S16; found = true; break; }
+    }
+    if (!found) {
+        // 0x0F BE/BF 之外: 不应进入 movsx 分支, 防御性拒绝 (caller 已 ci.id 检查).
+        return unsupported(ci.address, ci.size);
+    }
+
+    ir::Insn out;
+    out.op = Op::Movsx;
+    out.addr = ci.address;
+    // size 由 data_size() 取目的位宽：movsx ecx, al → S32, movsx rcx, al → S64
+    out.size = data_size(x.operands, x.op_count, arch);
+    out.src_size = src_size;  // MIT-347: 源位宽 (S8 / S16) 传给翻译器/asmgen
+    out.updates_flags = false;
+    out.dst = Operand::reg_(*d);
+
+    if (x.operands[1].type == X86_OP_REG) {
+        // movsx r, r8/r16 — REG-REG 形式
+        auto s = map_reg(x.operands[1].reg);
+        if (!s) return unsupported(ci.address, ci.size);
+        out.src = Operand::reg_(*s);
+        return ok(out);
+    }
+    if (x.operands[1].type == X86_OP_MEM) {
+        // movsx r, [m] — REG-MEM 形式
+        auto m = mem_operand(x.operands[1].mem);
+        if (!m) return unsupported(ci.address, ci.size);
+        out.src = *m;
+        return ok(out);
+    }
+    return unsupported(ci.address, ci.size);
+}
+
 // MIT-333 bswap reg32/reg64 (0F C8+rd, 可选 REX.W): 字节序反转。
 // MSVC /Od 默认 codegen:
 //   - bswap eax       (无 REX.W, S32): 32 位字节反转, 上 32 位 zero-extend
@@ -865,6 +929,7 @@ TranslateResult translate_insn(const cs_insn& ci, ir::Arch arch) {
     case X86_INS_MUL: return translate_mul(ci, x, arch);
     case X86_INS_MOVSXD: return translate_movsxd(ci, x, arch);
     case X86_INS_MOVZX: return translate_movzx(ci, x, arch);
+    case X86_INS_MOVSX: return translate_movsx(ci, x, arch);
     case X86_INS_BSWAP: return translate_bswap(ci, x, arch);
     case X86_INS_XCHG: return translate_xchg(ci, x, arch);
     // MIT-336: setcc 16 variants (0F 90+cc+rm, mod=11 REG / mod=00 MEM).

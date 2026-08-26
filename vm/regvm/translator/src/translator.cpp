@@ -298,6 +298,8 @@ struct Translator {
                 ok = translate_movsxd(em, sc, in, current_rva, next_ip);
             } else if (in.op == ir::Op::Movzx) {
                 ok = translate_movzx(em, sc, in, current_rva, next_ip);
+            } else if (in.op == ir::Op::Movsx) {
+                ok = translate_movsx(em, sc, in, current_rva, next_ip);
             } else if (in.op == ir::Op::Bswap) {
                 ok = translate_bswap(em, in);
             } else if (in.op == ir::Op::Xchg) {
@@ -787,6 +789,53 @@ struct Translator {
             return true;
         }
         return skip(in, "movzx 操作数形态未支持", nullptr);
+    }
+
+    // ---- MIT-347: movsx (8/16→32/64 位有符号扩展) ----
+    //
+    // movsx 与 movzx 是对偶指令（movsx 符号扩展 vs movzx 零扩展）。两者共用
+    // src_size 字段 (S8 / S16) 与 size 字段 (S32 / S64) 的编码方式；翻译器折
+    // 出的 VmOp 也一一对应 (Movsx / MovsxMem)。
+    //   - REG-REG：movsx r, r8/r16 → emit VmOp::Movsx
+    //   - REG-MEM：movsx r, [m]    → emit_address 算地址到 scratch 槽 + VmOp::MovsxMem
+    //
+    // Movsx (Reg-Reg): native `movsx <r32/r64>, byte/word ptr [...]` 一次完成符号扩展。
+    //   handler: movsx t_[0], byte/word ptr [ctx + reg_b*8 + 0x10]
+    //   aux 编码 src_size (低 2 位: 0=S8, 1=S16)；asmgen 运行时 cmp/jne 选 byte vs word。
+    //
+    // MovsxMem (Reg-Mem): 翻译期把地址算到 scratch 槽 (emit_address → acc),
+    //   然后 emit MovsxMem (handler 读 acc 槽作地址):
+    //            mov t_[1], qword ptr [ctx + reg_b*8 + 0x10]   (取地址)
+    //            movsx t_[0], byte/word ptr [t_[1]]             (8/16 位 load + 符号扩展)
+    //            mov qword ptr [ctx + reg_a*8 + 0x10], t_[0]    (写回 64 位 dst)
+    //
+    // 不更新 flags（movsx 不影响 CF/OF/SF/ZF/PF）。
+    bool translate_movsx(Emitter& em, Scratch& sc, const ir::Insn& in,
+                         u64 current_rva, u64 next_ip) {
+        if (in.dst.kind != ir::Operand::Kind::Reg)
+            return skip(in, "movsx 操作数形态未支持", nullptr);
+        const u8 d = isa::vm_reg_of(in.dst.reg);
+        const u8 sz = isa::size_field(in.size);
+        // MIT-347: src_size 编码进 aux[3..0], asmgen 据此选 byte ptr / word ptr.
+        //   S8=0, S16=1（与 movzx 共用 src_size_aux 编码方式, MIT-345 pitfall）。
+        const u32 src_size_aux = static_cast<u32>(in.src_size) & 0x3u;
+
+        if (in.src.kind == ir::Operand::Kind::Reg) {
+            // movsx r, r8/r16：emit Movsx（handler 内部 sign_ext_8/16）。
+            const u8 s = isa::vm_reg_of(in.src.reg);
+            em.emit(VmOp::Movsx, OpKind::Reg, d, OpKind::Reg, s, src_size_aux, sz);
+            return true;
+        }
+        if (in.src.kind == ir::Operand::Kind::Mem) {
+            // movsx r, [m]：emit_address 算 acc + emit MovsxMem。
+            // scratch 预算: emit_address 用 1 scratch (acc)；本步不另取。
+            u8 acc = 0;
+            if (!emit_address(em, sc, in.src.mem, current_rva, next_ip, acc))
+                return skip(in, "movsx 地址形态未支持", &in.src.mem);
+            em.emit(VmOp::MovsxMem, OpKind::Reg, d, OpKind::Reg, acc, src_size_aux, sz);
+            return true;
+        }
+        return skip(in, "movsx 操作数形态未支持", nullptr);
     }
 
     // ---- MIT-333: bswap (字节序反转) ----

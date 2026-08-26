@@ -1472,6 +1472,74 @@ public:
         return o;
     }
 
+    // MIT-347 Movsx (Reg-Reg): dst = sign_extend_8/16(src)。
+    // 与 build_movzx 1:1 对偶，唯一区别是 native `movsx` 而非 `movzx`（符号扩展 vs 零扩展）。
+    // src_size 编码在 aux[0] (T5&1): 0=S8, 1=S16。lifter 据 0x0F BE/BF 派活单决策
+    // 时填进 aux 传给 asmgen；handler 运行时 cmp/jne 选 byte ptr vs word ptr。
+    // native movsx 一次完成 8/16 位符号扩展到 64 位目的物理寄存器, VM 槽 qword
+    // 写回。size 字段 (T2=cond_or_size) 决定目的寄存器宽度但 handler 不分支
+    // （native movsx 自动按目的寄存器 emit 正确 REX.W / 0x66 前缀, VM 槽 qword
+    // 总是 64 位写回）。不更新 flags（movsx 不影响 CF/OF/SF/ZF/PF）。
+    std::string build_movsx(u64 dispatch) const {
+        const std::string tag = "movsx" + std::to_string(seq());
+        const std::string l_sz8 = "movsx_sz8_" + tag;
+        const std::string l_done = "movsx_done_" + tag;
+        std::string o = decode_prelude();
+        // MIT-347: src_size 提取到 T1 (decode_prelude 不写 T1)。与 build_movzx 同款。
+        o += std::string("    mov ") + r64(t_[1]) + ", " + r64(t_[5]) + "\n";   // T1 = aux
+        o += std::string("    and ") + r64(t_[1]) + ", " + imm(1) + "\n";       // T1 = src_size bit
+        o += std::string("    cmp ") + r64(t_[1]) + ", " + imm(1) + "\n";
+        o += std::string("    jne ") + l_sz8 + "\n";
+        // S16 路径: word ptr (src = 16-bit)
+        o += std::string("    movsx ") + r64(t_[0]) + ", word ptr [" + r64(ctx_) +
+             " + " + r64(t_[7]) + "*8 + 0x10]\n";
+        o += std::string("    jmp ") + l_done + "\n";
+        o += l_sz8 + ":\n";
+        // S8 路径: byte ptr (src = 8-bit)
+        o += std::string("    movsx ") + r64(t_[0]) + ", byte ptr [" + r64(ctx_) +
+             " + " + r64(t_[7]) + "*8 + 0x10]\n";
+        o += l_done + ":\n";
+        // qword 写回 dst VM 槽（movsx 把符号位扩展到上 56/48 位，负数填 1 正数填 0）
+        o += std::string("    mov qword ptr [") + r64(ctx_) + " + " + r64(t_[4]) +
+             "*8 + 0x10], " + r64(t_[0]) + "\n";
+        o += advance(dispatch);
+        (void)tag;
+        return o;
+    }
+
+    // MIT-347 MovsxMem (Reg-Mem): dst = sign_extend_8/16([addr])。
+    // 与 build_movzx_mem 1:1 对偶，唯一区别是 native `movsx` 而非 `movzx`。
+    // addr 是翻译器 emit_address 写到 reg_b VM 槽里的 64 位地址。
+    // handler: 取地址到 T1 → byte/word ptr 读 + 符号扩展到 T0 → qword 写回 dst。
+    // 不更新 flags。
+    std::string build_movsx_mem(u64 dispatch) const {
+        const std::string tag = "movsxm" + std::to_string(seq());
+        const std::string l_sz8 = "movsxm_sz8_" + tag;
+        const std::string l_done = "movsxm_done_" + tag;
+        std::string o = decode_prelude();
+        // MIT-347: src_size 提取到 T6 (decode_prelude 用 T6=b_kind, 本 handler 不复用)。
+        // 与 build_movzx_mem 同款。
+        o += std::string("    mov ") + r64(t_[6]) + ", " + r64(t_[5]) + "\n";
+        o += std::string("    and ") + r64(t_[6]) + ", " + imm(1) + "\n";
+        // 1. mov T1, qword ptr [ctx + reg_b*8 + 0x10]   (T1 = address)
+        o += std::string("    mov ") + r64(t_[1]) + ", qword ptr [" + r64(ctx_) +
+             " + " + r64(t_[7]) + "*8 + 0x10]\n";
+        // 2. movsx T0, byte/word ptr [T1]  (src_size 决定 ptr 大小, 符号扩展)
+        o += std::string("    cmp ") + r64(t_[6]) + ", " + imm(1) + "\n";
+        o += std::string("    jne ") + l_sz8 + "\n";
+        o += std::string("    movsx ") + r64(t_[0]) + ", word ptr [" + r64(t_[1]) + "]\n";
+        o += std::string("    jmp ") + l_done + "\n";
+        o += l_sz8 + ":\n";
+        o += std::string("    movsx ") + r64(t_[0]) + ", byte ptr [" + r64(t_[1]) + "]\n";
+        o += l_done + ":\n";
+        // 3. mov qword ptr [ctx + reg_a*8 + 0x10], T0   (写回 dst VM 槽)
+        o += std::string("    mov qword ptr [") + r64(ctx_) + " + " + r64(t_[4]) +
+             "*8 + 0x10], " + r64(t_[0]) + "\n";
+        o += advance(dispatch);
+        (void)tag;
+        return o;
+    }
+
     // MIT-333 Bswap: dst = byte_swap(dst), 单操作数 (dst only, no src).
     // a_kind=Reg reg_a=dst, b_kind=None, aux=0, cond_or_size=size (S32/S64).
     //
@@ -1909,6 +1977,8 @@ RuntimeGenResult generate_runtime(wvmp::Rng& rng) {
         {int(VmOp::Setcc), "setcc", &AsmGen::build_setcc},
         {int(VmOp::Cmovcc), "cmovcc", &AsmGen::build_cmovcc},
         {int(VmOp::Cmpxchg), "cmpxchg", &AsmGen::build_cmpxchg},
+        {int(VmOp::Movsx), "movsx", &AsmGen::build_movsx},
+        {int(VmOp::MovsxMem), "movsxmem", &AsmGen::build_movsx_mem},
         {int(VmOp::Cmp), "cmp", &AsmGen::build_cmp},
         {int(VmOp::Test), "test", &AsmGen::build_test},
         {int(VmOp::Load), "load", &AsmGen::build_load},

@@ -2494,6 +2494,149 @@ TEST(Interpreter, MovzxS16SrcFuzzTenThousand) {
 }
 
 // =============================================================================
+// MIT-347 Movsx / MovsxMem 真执行测试
+// =============================================================================
+// VmOp::Movsx (Reg-Reg): dst = sign_extend_8/16(src)
+// VmOp::MovsxMem (Reg-Mem): dst = sign_extend_8/16([addr])，addr 在 reg_b VM 槽
+// 不更新 flags。movsx 是 8/16→32/64 有符号扩展（与 movzx 的零扩展镜像），
+// 负值 (bit 7 / bit 15 = 1) 应填满上 56/48 位 1。
+
+namespace {
+// Movsx 参考实现：取 8 位值低 8 位, 按符号位扩展到 u64。
+static u64 ref_movsx_s8(wvmp::u8 src8) {
+    const wvmp::i8 v = static_cast<wvmp::i8>(src8);
+    return static_cast<u64>(static_cast<wvmp::i64>(v));
+}
+// Movsx 参考实现：取 16 位值低 16 位, 按符号位扩展到 u64。
+static u64 ref_movsx_s16(wvmp::u16 src16) {
+    const wvmp::i16 v = static_cast<wvmp::i16>(src16);
+    return static_cast<u64>(static_cast<wvmp::i64>(v));
+}
+}  // namespace
+
+TEST(Interpreter, MovsxSemanticsS8Src) {
+    // 8→32 与 8→64 形式, src_size 编码 S8 (aux bit 0 = 0).
+    // 5 个 Rng 种子 × 6 个边界值 (覆盖 8 位全 0 / 0x7F / 0x80 / 0xFF / 中间值).
+    // 关键: 0x80 应**符号扩展**为 0xFFFFFFFFFFFFFF80 (高 56 位填 1, 不是 movzx 的 0x80)。
+    for (u64 seed : {0xC0FFEEull, 0xBABEF00Dull, 0xDEADBEEFull,
+                     0xCAFEBABEull, 0xFEEDFACEull}) {
+        wvmp::Rng rng(seed);
+        const auto result = rt::generate_runtime(rng);
+        RwxImage rwx(result.image.code);
+        const auto entry = rwx.entry();
+        alignas(16) std::array<u8, 0x10000> scratch{};
+
+        struct C { u8 v; const char* tag; ir::Size sz; };
+        const C cases[] = {
+            {0x00u, "zero_8_32",        ir::Size::S32},
+            {0x7Fu, "positive_8_32",    ir::Size::S32},
+            {0x80u, "negative_8_32",    ir::Size::S32},
+            {0xFFu, "all_ones_8_32",    ir::Size::S32},
+            {0xABu, "mid_8_64",         ir::Size::S64},
+            {0xFEu, "neg_8_64",         ir::Size::S64},
+        };
+        for (const auto& c : cases) {
+            std::vector<u8> s;
+            isa::append_insn(s, mov_imm(0, c.v, ir::Size::S64));
+            isa::append_insn(s, isa::make_insn(isa::VmOp::Movsx,
+                                               isa::OpKind::Reg, 1,
+                                               isa::OpKind::Reg, 0, 0,
+                                               isa::size_field(c.sz)));
+            isa::append_insn(s, halt());
+            const auto ctx = run_stream(entry, s, scratch.data());
+            const u64 expected = ref_movsx_s8(c.v);
+            ASSERT_EQ(ctx.regs[1], expected)
+                << "MovsxS8 " << c.tag << " seed=" << std::hex << seed
+                << " src=0x" << static_cast<unsigned>(c.v)
+                << " -> got 0x" << ctx.regs[1]
+                << " expected 0x" << expected;
+        }
+    }
+}
+
+TEST(Interpreter, MovsxSemanticsS16Src) {
+    // 16→32 与 16→64 形式, src_size 编码 S16 (aux bit 0 = 1).
+    // 关键: 0x8000 应**符号扩展**为 0xFFFFFFFFFFFF8000。
+    for (u64 seed : {0xC0FFEEull, 0xBABEF00Dull, 0xDEADBEEFull,
+                     0xCAFEBABEull, 0xFEEDFACEull}) {
+        wvmp::Rng rng(seed);
+        const auto result = rt::generate_runtime(rng);
+        RwxImage rwx(result.image.code);
+        const auto entry = rwx.entry();
+        alignas(16) std::array<u8, 0x10000> scratch{};
+
+        struct C { wvmp::u16 v; const char* tag; ir::Size sz; };
+        const C cases[] = {
+            {0x0000u, "zero_16_32",     ir::Size::S32},
+            {0x7FFFu, "positive_16_32", ir::Size::S32},
+            {0x8000u, "negative_16_32", ir::Size::S32},
+            {0xFFFFu, "all_ones_16_32", ir::Size::S32},
+            {0xABCDu, "mid_16_64",      ir::Size::S64},
+            {0xFFFEu, "neg_16_64",      ir::Size::S64},
+        };
+        for (const auto& c : cases) {
+            std::vector<u8> s;
+            isa::append_insn(s, mov_imm(0, c.v, ir::Size::S64));
+            isa::append_insn(s, isa::make_insn(isa::VmOp::Movsx,
+                                               isa::OpKind::Reg, 1,
+                                               isa::OpKind::Reg, 0,
+                                               static_cast<u32>(ir::Size::S16),  // aux bit 0 = 1
+                                               isa::size_field(c.sz)));
+            isa::append_insn(s, halt());
+            const auto ctx = run_stream(entry, s, scratch.data());
+            const u64 expected = ref_movsx_s16(c.v);
+            ASSERT_EQ(ctx.regs[1], expected)
+                << "MovsxS16 " << c.tag << " seed=" << std::hex << seed
+                << " src=0x" << c.v
+                << " -> got 0x" << ctx.regs[1]
+                << " expected 0x" << expected;
+        }
+    }
+}
+
+TEST(Interpreter, MovsxMemSemanticsS8Src) {
+    // MovsxMem 8 位源: scratch[addr..addr+1] 预填 8 位值, MovsxMem 应正确
+    // 读 8 位**符号扩展**到 64 位 (bit 7 = 1 时填满上 56 位)。
+    for (u64 seed : {0xC0FFEEull, 0xBABEF00Dull, 0xDEADBEEFull,
+                     0xCAFEBABEull, 0xFEEDFACEull}) {
+        wvmp::Rng rng(seed);
+        const auto result = rt::generate_runtime(rng);
+        RwxImage rwx(result.image.code);
+        const auto entry = rwx.entry();
+        alignas(16) std::array<u8, 0x10000> scratch{};
+
+        struct C { u8 v; const char* tag; };
+        const C cases[] = {
+            {0x00u, "zero"},
+            {0x7Fu, "positive"},
+            {0x80u, "negative"},
+            {0xFFu, "all_ones"},
+        };
+        for (const auto& c : cases) {
+            // address = scratch + 0x100
+            const u64 data_addr = reinterpret_cast<u64>(scratch.data()) + 0x100;
+            scratch[0x100] = c.v;
+
+            std::vector<u8> s;
+            // regs[0] = 绝对 VA (mov_imm64 拆 4 条)
+            mov_imm64_into(s, /*dst*/0, /*scratch*/isa::kScratchFirst, data_addr);
+            isa::append_insn(s, isa::make_insn(isa::VmOp::MovsxMem,
+                                               isa::OpKind::Reg, 1,
+                                               isa::OpKind::Reg, 0, 0,
+                                               isa::size_field(ir::Size::S64)));
+            isa::append_insn(s, halt());
+            const auto ctx = run_stream(entry, s, scratch.data());
+            const u64 expected = ref_movsx_s8(c.v);
+            ASSERT_EQ(ctx.regs[1], expected)
+                << "MovsxMemS8 " << c.tag << " seed=" << std::hex << seed
+                << " src=0x" << static_cast<unsigned>(c.v)
+                << " -> got 0x" << ctx.regs[1]
+                << " expected 0x" << expected;
+        }
+    }
+}
+
+// =============================================================================
 // MIT-322 LeaRva 真执行测试
 // =============================================================================
 // VmOp::LeaRva: dst = reg_b 槽值 + image_base (与 LoadRva/StoreRva 配套,
