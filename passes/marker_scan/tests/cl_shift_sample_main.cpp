@@ -13,6 +13,13 @@
 //     工作, 行为与 sar_sample 等价 (count 自动 mod 32/64 按 host CPU 规则)。
 //   - 用 volatile 防 MSVC 把 r 提升为常量（每次写都重新读 g_x）。
 //
+// MIT-345: 区域内增加 movzx 8→16 / 16→64 验证 (0F B7 形式):
+//   - movzx_8_16(unsigned char) -> unsigned short: MSVC /Od emit `movzx ax, cl`
+//     (0x66 0F B6 C1 类字节, 3 字节含 0x66 prefix).
+//   - movzx_16_64(unsigned short) -> unsigned long long: MSVC /Od emit
+//     `movzx rax, bx` (REX.W + 0F B7, 4 字节).
+//   - 用 volatile 接收返回值防 MSVC 优化掉。
+//
 // 区域约束 (M2-4 沿用):
 //   - 不含 rip-relative (g_x 是 volatile 读取, 编译器可能 codegen 为
 //     [rip+disp] 全局访存——已 C1 gate 兜底; 但本样本移除了 volatile 全局
@@ -72,6 +79,26 @@ __declspec(noinline) static unsigned long long shl_shr_sar_chain(unsigned long l
     return r;
 }
 
+// MIT-345: movzx 8→16 (0x66 0F B6 + ModR/M, MSVC /Od codegen for
+// `(unsigned short)(unsigned char)x`). 测试 movzx r16, r/m8 —
+// 8 位源零扩展到 16 位目的. 区域里 r 用 volatile 接收防优化掉.
+__declspec(noinline) static unsigned short movzx_8_16(unsigned char x) {
+    WVMP_BEGIN(movzx_8_16);
+    volatile unsigned short r = static_cast<unsigned short>(x); // movzx ax, cl (66 0F B6 C1 类)
+    WVMP_END(movzx_8_16);
+    return r;
+}
+
+// MIT-345: movzx 16→64 (REX.W + 0F B7 + ModR/M, MSVC /Od codegen for
+// `(unsigned long long)(unsigned short)x`). 测试 movzx r64, r/m16 —
+// 16 位源零扩展到 64 位目的. 同上 volatile 接收.
+__declspec(noinline) static unsigned long long movzx_16_64(unsigned short x) {
+    WVMP_BEGIN(movzx_16_64);
+    volatile unsigned long long r = static_cast<unsigned long long>(x); // movzx rax, bx (48 0F B7 C3)
+    WVMP_END(movzx_16_64);
+    return r;
+}
+
 int main() {
     // 用函数参数传入 count —— MSVC codegen 为 cl 变体核心条件: count 不能
     // 是编译期常量 (用 literal 常量会让 MSVC 用 imm 形式 C1 /4 ib)。
@@ -79,10 +106,19 @@ int main() {
     const unsigned long long b = shr_cl(0xCAFEBABEull, 8);                 // 0x00CAFEBB
     const long long c = sar_cl(-1024LL, 1);                                 // sar -1024, 1 = -512
     const unsigned long long d = shl_shr_sar_chain(0x1000ull, 4, 2, 1);    // 链式
-    std::printf("a=%llx b=%llx c=%lld d=%llx\n",
+
+    // MIT-345: movzx 8→16 / 16→64 测试 (沿用 MIT-314 cl_shift 模式, MSVC /Od
+    // 自然 codegen movzx, 区域不含 rip-relative / call / printf)。
+    // 期望: movzx_8_16(0xAB) = 0x00AB; movzx_16_64(0xABCD) = 0x000000000000ABCD
+    const unsigned short e = movzx_8_16(0xABu);
+    const unsigned long long f = movzx_16_64(0xABCDu);
+
+    std::printf("a=%llx b=%llx c=%lld d=%llx e=%x f=%llx\n",
                 static_cast<unsigned long long>(a),
                 static_cast<unsigned long long>(b),
                 static_cast<long long>(c),
-                static_cast<unsigned long long>(d));
+                static_cast<unsigned long long>(d),
+                static_cast<unsigned int>(e),
+                static_cast<unsigned long long>(f));
     return 0;
 }

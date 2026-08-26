@@ -20,6 +20,8 @@ enum class Op : u16 { Mov, Lea, Add, Sub, Adc, Sbb, And, Or, Xor, Not, Neg, Inc,
                       //   - REG-MEM: src=Mem, dst=Reg（lifter 直接 emit Operand::mem_;
                       //              翻译器折 movzxMem）
                       // size 取目的位宽：8→32 为 S32, 8→64（REX.W）为 S64。
+                      // src_size 取源位宽：0F B6 为 S8, 0F B7 为 S16（区分
+                      // 8→32/16→32 等 asmgen 需 byte ptr vs word ptr 的场景）。
                       // updates_flags=false（movzx 不影响 CF/OF/SF/ZF/PF）。
                       Movzx,
                       // MIT-333: 字节序反转（bswap reg32/reg64）。
@@ -108,6 +110,9 @@ struct Insn {
     Operand src2;
     bool updates_flags = false;
     u64 addr = 0;
+    // MIT-345: 源操作数宽度（仅 Movzx 用）。0F B6 → S8, 0F B7 → S16。
+    // 默认 S8 兼容既有构造路径；movzx asmgen 据此选 byte ptr vs word ptr 读 src。
+    Size src_size = Size::S8;
 };
 std::string_view to_string(Op); std::string_view to_string(Size); std::string_view to_string(Cond);
 }

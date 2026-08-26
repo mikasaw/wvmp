@@ -435,13 +435,17 @@ TranslateResult translate_movsxd(const cs_insn& ci, const cs_x86& x, ir::Arch ar
 }
 
 // MIT-315 movzx (0F B6 /r, 可选 REX.W): 8→32/64 位零扩展。
+// MIT-345 扩展：0F B7 (16 位源) 形式——8→16/16→32/16→64 zero-extend。
 // MSVC /Od 默认 codegen REG-REG 与 REG-MEM（RSP 栈上局部变量 / 复杂寻址）两种：
 //   - REG-REG：movzx rax, cl   → ir::Op::Movzx, src=Reg
 //   - REG-MEM：movzx rax, [mem] → ir::Op::Movzx, src=Mem
-//   - 字节结构：[48] (REX.W 可选) | 0F B6 (opcode) | ModR/M | 可选 SIB | 可选 disp
-//   - 关键：movzx 本身完成 8 位 load + 零扩展（不分两条 Load + ZeroExt）。
+//   - 字节结构：[48] (REX.W 可选) | 0F B6 (opcode, 8 位源) / 0F B7 (16 位源)
+//              | ModR/M | 可选 SIB | 可选 disp
+//   - 关键：movzx 本身完成 8/16 位 load + 零扩展（不分两条 Load + ZeroExt）。
 //     lifter 不拆分，emit Operand::mem_(...); 翻译器折 MovzxMem。
-// size 取目的位宽（无 REX.W → S32；有 REX.W → S64）；updates_flags=false。
+// size 取目的位宽（无 REX.W → S16/S32；有 REX.W → S64）；
+// src_size 取源位宽：0F B6 → S8, 0F B7 → S16（MIT-345 新增）。
+// updates_flags=false。
 TranslateResult translate_movzx(const cs_insn& ci, const cs_x86& x, ir::Arch arch) {
     if (x.op_count != 2) return unsupported(ci.address, ci.size);
     // dst 必是寄存器
@@ -449,16 +453,34 @@ TranslateResult translate_movzx(const cs_insn& ci, const cs_x86& x, ir::Arch arc
     auto d = map_reg(x.operands[0].reg);
     if (!d) return unsupported(ci.address, ci.size);
 
+    // MIT-345: src_size 由 ci.bytes[*] 决定 (0F B6 = 8-bit 源, 0F B7 = 16-bit 源).
+    // 字节布局: [66] (0x66 prefix, 16-bit dst) [REX] (0x40-0x4F) [0F] [B6/B7] [ModR/M]
+    //   - 无前缀: 0xB6/0xB7 在 ci.bytes[1]
+    //   - 有 0x66 或 REX: 0xB6/0xB7 在 ci.bytes[2]
+    //   - 两个前缀都有: 0xB6/0xB7 在 ci.bytes[3]
+    // 我们扫描 [1..3] 找 B6/B7 (其他字节是 0x0F / REX / 0x66 已知, 不会冲突).
+    Size src_size = Size::S8;
+    bool found = false;
+    for (size_t i = 1; i < ci.size && i < 4; ++i) {
+        if (ci.bytes[i] == 0xB6) { src_size = Size::S8; found = true; break; }
+        if (ci.bytes[i] == 0xB7) { src_size = Size::S16; found = true; break; }
+    }
+    if (!found) {
+        // 0x0F B6/B7 之外: 不应进入 movzx 分支, 防御性拒绝 (caller 已 ci.id 检查).
+        return unsupported(ci.address, ci.size);
+    }
+
     ir::Insn out;
     out.op = Op::Movzx;
     out.addr = ci.address;
     // size 由 data_size() 取目的位宽：movzx ecx, al → S32, movzx rcx, al → S64
     out.size = data_size(x.operands, x.op_count, arch);
+    out.src_size = src_size;  // MIT-345: 源位宽 (S8 / S16) 传给翻译器/asmgen
     out.updates_flags = false;
     out.dst = Operand::reg_(*d);
 
     if (x.operands[1].type == X86_OP_REG) {
-        // movzx r, r8 — REG-REG 形式
+        // movzx r, r8/r16 — REG-REG 形式
         auto s = map_reg(x.operands[1].reg);
         if (!s) return unsupported(ci.address, ci.size);
         out.src = Operand::reg_(*s);

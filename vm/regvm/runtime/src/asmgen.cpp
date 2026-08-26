@@ -1406,21 +1406,33 @@ public:
     }
 
     // MIT-315 Movzx (Reg-Reg): dst = zero_extend_8(src)。
-    // 用 native movzx 一次完成 8→32/64 零扩展：把 src VM 槽当 byte ptr 读
-    // (内存读取只取低 8 位), movzx 自动根据目的物理寄存器宽度零扩展 (32 位
-    // 寄存器 → 8→32, 64 位寄存器 → 8→64; 上位均填 0), 写回 dst VM 槽
-    // (qword)。不更新 flags（movzx 不影响 CF/OF/SF/ZF/PF）。
-    // size 由 IR.size 决定但 handler 不分支（native movzx 自动 emit 正确 REX），
-    // 跳过 size_chain。Reg-Reg 路径无 scratch 占用。
+    // MIT-345 扩: src 可为 S8 (0F B6, byte ptr) 或 S16 (0F B7, word ptr)。
+    //   src_size 编码在 aux[0] (T5&1): 0=S8, 1=S16。lifter 据 0x0F B6/B7 派活单
+    //   决策时填进 aux 传给 asmgen；handler 运行时 cmp/jne 选 byte ptr vs word ptr。
+    // native movzx 一次完成 8/16 位零扩展到 64 位目的物理寄存器, VM 槽 qword
+    // 写回。size 字段 (T2=cond_or_size) 决定目的寄存器宽度但 handler 不分支
+    // （native movzx 自动按目的寄存器 emit 正确 REX.W / 0x66 前缀, VM 槽 qword
+    // 总是 64 位写回）。不更新 flags（movzx 不影响 CF/OF/SF/ZF/PF）。
     std::string build_movzx(u64 dispatch) const {
         const std::string tag = "movzx" + std::to_string(seq());
+        const std::string l_sz8 = "movzx_sz8_" + tag;
+        const std::string l_done = "movzx_done_" + tag;
         std::string o = decode_prelude();
-        // 1. movzx t_[0], byte ptr [ctx_ + reg_b*8 + 0x10]
-        //   把 src VM 槽当 byte 读（内存读取只取低 8 位），movzx 到 t_[0]
+        // MIT-345: src_size 提取到 T1 (decode_prelude 不写 T1)。
+        o += std::string("    mov ") + r64(t_[1]) + ", " + r64(t_[5]) + "\n";   // T1 = aux
+        o += std::string("    and ") + r64(t_[1]) + ", " + imm(1) + "\n";       // T1 = src_size bit
+        o += std::string("    cmp ") + r64(t_[1]) + ", " + imm(1) + "\n";
+        o += std::string("    jne ") + l_sz8 + "\n";
+        // S16 路径: word ptr (src = 16-bit)
+        o += std::string("    movzx ") + r64(t_[0]) + ", word ptr [" + r64(ctx_) +
+             " + " + r64(t_[7]) + "*8 + 0x10]\n";
+        o += std::string("    jmp ") + l_done + "\n";
+        o += l_sz8 + ":\n";
+        // S8 路径: byte ptr (src = 8-bit)
         o += std::string("    movzx ") + r64(t_[0]) + ", byte ptr [" + r64(ctx_) +
              " + " + r64(t_[7]) + "*8 + 0x10]\n";
-        // 2. mov qword ptr [ctx_ + reg_a*8 + 0x10], t_[0]
-        //   64 位写回 dst VM 槽（qword, 上 56 位由 movzx 自动填 0）
+        o += l_done + ":\n";
+        // qword 写回 dst VM 槽（movzx 自动填 0 到上 56/48 位）
         o += std::string("    mov qword ptr [") + r64(ctx_) + " + " + r64(t_[4]) +
              "*8 + 0x10], " + r64(t_[0]) + "\n";
         o += advance(dispatch);
@@ -1429,21 +1441,30 @@ public:
     }
 
     // MIT-315 MovzxMem (Reg-Mem): dst = zero_extend_8([addr])，
+    // MIT-345 扩: src 8/16 位同 build_movzx。
     // addr 是翻译器 emit_address 写到 reg_b VM 槽里的 64 位地址。
-    // handler: 取地址到 t_[1] → 8 位 load + 零扩展到 t_[0] → 64 位写回 dst。
+    // handler: 取地址到 T1 → byte/word ptr 读 + 零扩展到 T0 → qword 写回 dst。
     // 不更新 flags。
     std::string build_movzx_mem(u64 dispatch) const {
         const std::string tag = "movzxm" + std::to_string(seq());
+        const std::string l_sz8 = "movzxm_sz8_" + tag;
+        const std::string l_done = "movzxm_done_" + tag;
         std::string o = decode_prelude();
-        // 1. mov t_[1], qword ptr [ctx_ + reg_b*8 + 0x10]
-        //   把 reg_b 槽里 64 位地址取到 t_[1]
+        // MIT-345: src_size 提取到 T6 (decode_prelude 用 T6=b_kind, 本 handler 不复用)。
+        o += std::string("    mov ") + r64(t_[6]) + ", " + r64(t_[5]) + "\n";
+        o += std::string("    and ") + r64(t_[6]) + ", " + imm(1) + "\n";
+        // 1. mov T1, qword ptr [ctx + reg_b*8 + 0x10]   (T1 = address)
         o += std::string("    mov ") + r64(t_[1]) + ", qword ptr [" + r64(ctx_) +
              " + " + r64(t_[7]) + "*8 + 0x10]\n";
-        // 2. movzx t_[0], byte ptr [t_[1]]
-        //   从 [t_[1]] 读 8 位, 零扩展到 t_[0] (64-bit, 上位填 0)
+        // 2. movzx T0, byte/word ptr [T1]  (src_size 决定 ptr 大小)
+        o += std::string("    cmp ") + r64(t_[6]) + ", " + imm(1) + "\n";
+        o += std::string("    jne ") + l_sz8 + "\n";
+        o += std::string("    movzx ") + r64(t_[0]) + ", word ptr [" + r64(t_[1]) + "]\n";
+        o += std::string("    jmp ") + l_done + "\n";
+        o += l_sz8 + ":\n";
         o += std::string("    movzx ") + r64(t_[0]) + ", byte ptr [" + r64(t_[1]) + "]\n";
-        // 3. mov qword ptr [ctx_ + reg_a*8 + 0x10], t_[0]
-        //   64 位写回 dst VM 槽
+        o += l_done + ":\n";
+        // 3. mov qword ptr [ctx + reg_a*8 + 0x10], T0   (写回 dst VM 槽)
         o += std::string("    mov qword ptr [") + r64(ctx_) + " + " + r64(t_[4]) +
              "*8 + 0x10], " + r64(t_[0]) + "\n";
         o += advance(dispatch);

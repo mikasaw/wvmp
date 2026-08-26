@@ -2356,6 +2356,144 @@ TEST(Interpreter, MovzxMemFuzzTenThousand) {
 }
 
 // =============================================================================
+// MIT-345 movzx 16-bit source (0F B7) 形式真执行测试
+// =============================================================================
+// src_size 编码在 aux[0]: 0 = S8 (byte ptr), 1 = S16 (word ptr)。asmgen 运行时
+// cmp/jne 选 byte/word ptr, 这里验证两端路径都正确：
+//   - 16→32 (size=S32, src_size=S16): movzx eax, bx 应把 bx 零扩展到 rax 槽
+//   - 16→64 (size=S64, src_size=S16): movzx rax, bx 应零扩展到 rax 槽
+//   - MEM 形式同款: scratch[addr..addr+2] 预填 16 位值, MovzxMem 应正确读 16 位
+// 与 MIT-315 Movzx (8-bit src) 路径对称, 验证 asmgen 运行时分支选 word ptr 正确。
+
+namespace {
+// movzx 16-bit source 参考实现: 取 src16 低 16 位, 零扩展到 u64。
+static u64 ref_movzx16(wvmp::u16 src16) {
+    return static_cast<u64>(src16);
+}
+} // namespace
+
+TEST(Interpreter, MovzxSemanticsS16Src) {
+    // 16→32 与 16→64 形式, src_size 编码 S16 (aux bit 0 = 1).
+    // 5 个 Rng 种子 × 6 个边界值 (覆盖 16 位全 0 / 0x7FFF / 0x8000 / 0xFFFF / 中间值).
+    for (u64 seed : {0xC0FFEEull, 0xBABEF00Dull, 0xDEADBEEFull,
+                     0xCAFEBABEull, 0xFEEDFACEull}) {
+        wvmp::Rng rng(seed);
+        const auto result = rt::generate_runtime(rng);
+        RwxImage rwx(result.image.code);
+        const auto entry = rwx.entry();
+        alignas(16) std::array<u8, 0x10000> scratch{};
+
+        const wvmp::u16 case_vals[] = {0x0000u, 0x7FFFu, 0x8000u, 0xFFFFu, 0x1234u, 0xEDCBu};
+        for (wvmp::u16 cv : case_vals) {
+            // 16→32
+            {
+                std::vector<u8> s;
+                isa::append_insn(s, mov_imm(0, cv, ir::Size::S32));
+                isa::append_insn(s, isa::make_insn(isa::VmOp::Movzx,
+                                                   isa::OpKind::Reg, 1,
+                                                   isa::OpKind::Reg, 0,
+                                                   static_cast<u32>(ir::Size::S16),  // aux bit 0 = 1
+                                                   isa::size_field(ir::Size::S32)));
+                isa::append_insn(s, halt());
+                const auto ctx = run_stream(entry, s, scratch.data());
+                const u64 expected = ref_movzx16(cv);
+                ASSERT_EQ(ctx.regs[1], expected)
+                    << "MovzxS16 src=0x" << std::hex << cv
+                    << " -> got 0x" << ctx.regs[1]
+                    << " expected 0x" << expected << " (16->32)";
+            }
+            // 16→64
+            {
+                std::vector<u8> s;
+                isa::append_insn(s, mov_imm(0, cv, ir::Size::S64));
+                isa::append_insn(s, isa::make_insn(isa::VmOp::Movzx,
+                                                   isa::OpKind::Reg, 1,
+                                                   isa::OpKind::Reg, 0,
+                                                   static_cast<u32>(ir::Size::S16),  // aux bit 0 = 1
+                                                   isa::size_field(ir::Size::S64)));
+                isa::append_insn(s, halt());
+                const auto ctx = run_stream(entry, s, scratch.data());
+                const u64 expected = ref_movzx16(cv);
+                ASSERT_EQ(ctx.regs[1], expected)
+                    << "MovzxS64 src=0x" << std::hex << cv
+                    << " -> got 0x" << ctx.regs[1]
+                    << " expected 0x" << expected << " (16->64)";
+            }
+        }
+    }
+}
+
+TEST(Interpreter, MovzxMemSemanticsS16Src) {
+    // MovzxMem 16 位源: scratch[addr..addr+2] 预填 16 位值, MovzxMem
+    // 应正确读 16 位零扩展到 64 位。
+    for (u64 seed : {0xC0FFEEull, 0xBABEF00Dull, 0xDEADBEEFull,
+                     0xCAFEBABEull, 0xFEEDFACEull}) {
+        wvmp::Rng rng(seed);
+        const auto result = rt::generate_runtime(rng);
+        RwxImage rwx(result.image.code);
+        const auto entry = rwx.entry();
+        alignas(16) std::array<u8, 0x10000> scratch{};
+
+        const u64 case_offs[] = {0x100, 0x108, 0x110, 0x118, 0x120, 0x128};
+        const wvmp::u16 case_vals[] = {0x0000u, 0x7FFFu, 0x8000u, 0xFFFFu, 0x1234u, 0xEDCBu};
+        for (size_t k = 0; k < 6; ++k) {
+            const u64 off = case_offs[k];
+            const wvmp::u16 cv = case_vals[k];
+            const u64 data_addr = reinterpret_cast<u64>(scratch.data()) + off;
+            // 16 位值低字节在前 (little-endian)。
+            scratch[off + 0] = static_cast<u8>(cv & 0xFFu);
+            scratch[off + 1] = static_cast<u8>((cv >> 8) & 0xFFu);
+            const u64 expected = ref_movzx16(cv);
+            std::vector<u8> s;
+            // regs[0] = 绝对 VA
+            mov_imm64_into(s, /*dst*/0, /*scratch*/isa::kScratchFirst, data_addr);
+            isa::append_insn(s, isa::make_insn(isa::VmOp::MovzxMem,
+                                               isa::OpKind::Reg, 1,
+                                               isa::OpKind::Reg, 0,
+                                               static_cast<u32>(ir::Size::S16),  // aux bit 0 = 1
+                                               isa::size_field(ir::Size::S64)));
+            isa::append_insn(s, halt());
+            const auto ctx = run_stream(entry, s, scratch.data());
+            ASSERT_EQ(ctx.regs[1], expected)
+                << "MovzxMemS16 off=0x" << std::hex << off << " v=0x" << cv
+                << " data_addr=0x" << data_addr
+                << " -> got 0x" << ctx.regs[1] << " expected 0x" << expected;
+        }
+    }
+}
+
+TEST(Interpreter, MovzxS16SrcFuzzTenThousand) {
+    // 5 万条 fuzz: 5 个 Rng 种子 × 10000 iter, 16 位随机值, 验证 16→64
+    // 路径 (含 asmgen 运行时 cmp/jne 选 word ptr) bit-exact 正确.
+    for (u64 seed : {0xC0FFEEull, 0xBABEF00Dull, 0xDEADBEEFull,
+                     0xCAFEBABEull, 0xFEEDFACEull}) {
+        wvmp::Rng rng(seed);
+        const auto result = rt::generate_runtime(rng);
+        RwxImage rwx(result.image.code);
+        const auto entry = rwx.entry();
+        alignas(16) std::array<u8, 0x10000> scratch{};
+        for (int i = 0; i < 10000; ++i) {
+            const wvmp::u16 cv = static_cast<wvmp::u16>(rng.next() & 0xFFFFu);
+            const u64 expected = ref_movzx16(cv);
+            std::vector<u8> s;
+            isa::append_insn(s, mov_imm(0, cv, ir::Size::S64));
+            isa::append_insn(s, isa::make_insn(isa::VmOp::Movzx,
+                                               isa::OpKind::Reg, 1,
+                                               isa::OpKind::Reg, 0,
+                                               static_cast<u32>(ir::Size::S16),  // aux bit 0 = 1
+                                               isa::size_field(ir::Size::S64)));
+            isa::append_insn(s, halt());
+            const auto ctx = run_stream(entry, s, scratch.data());
+            ASSERT_EQ(ctx.regs[1], expected)
+                << "MovzxS16 fuzz seed=" << std::hex << seed << " iter=" << std::dec << i
+                << " cv=0x" << std::hex << cv
+                << " got 0x" << ctx.regs[1] << " expected 0x" << expected;
+            ASSERT_EQ(ctx.pc, 3u) << "MovzxS16 fuzz stream halts at instruction 3";
+        }
+    }
+}
+
+// =============================================================================
 // MIT-322 LeaRva 真执行测试
 // =============================================================================
 // VmOp::LeaRva: dst = reg_b 槽值 + image_base (与 LoadRva/StoreRva 配套,
