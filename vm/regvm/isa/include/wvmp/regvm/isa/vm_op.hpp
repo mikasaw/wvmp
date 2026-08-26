@@ -103,9 +103,23 @@ enum class VmOp : u16 {
     // 发 RVA, 运行时 +image_base 让 rcx = VA, 后续 `[rcx + rax*4]` Load 才
     // 能读到正确数组元素.
     LeaRva,
+
+    // —— MIT-333 字节序反转 (bswap reg32 / bswap reg64) ——
+    // Bswap (Reg): dst = byte_swap(dst), 单操作数 (dst only, no src).
+    // a_kind=Reg, reg_a=dst, b_kind=None, aux=0, cond_or_size=size (S32 或 S64).
+    // handler:
+    //   - S32 (无 REX.W): mov eax, dword ptr [ctx + reg_a*8 + 0x10]
+    //                     bswap eax
+    //                     mov qword ptr [ctx + reg_a*8 + 0x10], rax
+    //   - S64 (REX.W):   mov rax, qword ptr [ctx + reg_a*8 + 0x10]
+    //                     bswap rax
+    //                     mov qword ptr [ctx + reg_a*8 + 0x10], rax
+    // bswap 不影响 flags. S8/S16 bswap 不存在 (Intel SDM),
+    // lifter 仅产 S32/S64; handler S8/S16 块走 no-op (defensive).
+    Bswap,
 };
 
-inline constexpr u16 kVmOpMax = static_cast<u16>(VmOp::LeaRva);
+inline constexpr u16 kVmOpMax = static_cast<u16>(VmOp::Bswap);
 inline constexpr u16 kVmOpLimit = 1u << 14;  // 14 位编码空间上限
 
 constexpr const char* to_string(VmOp op) {
@@ -142,6 +156,7 @@ constexpr const char* to_string(VmOp op) {
         case VmOp::Movzx: return "movzx";
         case VmOp::MovzxMem: return "movzxmem";
         case VmOp::LeaRva: return "learva";
+        case VmOp::Bswap: return "bswap";
     }
     return "?";
 }

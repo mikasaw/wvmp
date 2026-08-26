@@ -1175,6 +1175,52 @@ public:
         return o;
     }
 
+    // MIT-333 Bswap: dst = byte_swap(dst), 单操作数 (dst only, no src).
+    // a_kind=Reg reg_a=dst, b_kind=None, aux=0, cond_or_size=size (S32/S64).
+    //
+    // size 链 4 路:
+    //   - s=3 (S64): mov rax, qword ptr [...] ; bswap rax ; mov qword ptr [...], rax
+    //   - s=2 (S32): mov eax, dword ptr [...] ; bswap eax ; mov qword ptr [...], rax
+    //                (32 位寄存器读自动 zero-extend 上 32 位, bswap 后上 32 位仍 0,
+    //                 qword 写回完整 64 位 = 上 32 位 0 + 下 32 位字节反转结果)
+    //   - s=0/1 (S8/S16): bswap 不存在 (Intel SDM Vol. 2 BSWAP 仅 32/64-bit);
+    //                     lifter 不产 S8/S16 bswap, 此处 defensive no-op
+    //
+    // bswap 不影响 flags (CF/OF/SF/ZF/PF 不变)。handler 不调用 setcc5 也不
+    // 走 flags_tail, 直接 advance(dispatch)。
+    std::string build_bswap(u64 dispatch) const {
+        const std::string tag = "bswap" + std::to_string(seq());
+        const std::string tail_lbl = "atail_" + tag;
+        std::array<std::string, 4> blocks;
+        for (int s = 0; s < 4; ++s) {
+            std::string o;
+            if (s == 3) {
+                // S64: 64 位读 + 64 位 bswap + 64 位写回
+                o += std::string("    mov ") + r64(t_[0]) + ", qword ptr [" + r64(ctx_) +
+                     " + " + r64(t_[4]) + "*8 + 0x10]\n";
+                o += std::string("    bswap ") + r64(t_[0]) + "\n";
+                o += std::string("    mov qword ptr [") + r64(ctx_) + " + " +
+                     r64(t_[4]) + "*8 + 0x10], " + r64(t_[0]) + "\n";
+            } else if (s == 2) {
+                // S32: 32 位读 (自动 zero-extend 上 32 位) + 32 位 bswap + qword 写回
+                //   mov eax, dword ptr [...] 上 32 位 rax 自动清 0
+                //   bswap eax  仅低 32 位字节反转, 上 32 位保持 0
+                //   mov qword ptr [...], rax  qword 写回完整 64 位 (上 32 位 0)
+                o += std::string("    mov ") + rs(t_[0], 2) + ", dword ptr [" + r64(ctx_) +
+                     " + " + r64(t_[4]) + "*8 + 0x10]\n";
+                o += std::string("    bswap ") + rs(t_[0], 2) + "\n";
+                o += std::string("    mov qword ptr [") + r64(ctx_) + " + " +
+                     r64(t_[4]) + "*8 + 0x10], " + r64(t_[0]) + "\n";
+            } else {
+                // S8/S16: defensive no-op (lifter 不产此 size bswap)
+            }
+            o += "    jmp " + tail_lbl + "\n";
+            blocks[s] = o;
+        }
+        return decode_prelude() + size_chain(blocks, tag) + tail_lbl + ":\n" +
+               advance(dispatch);
+    }
+
     // Adc: dst = dst + src + CF_in（Intel SDM Vol. 2 ADC）。
     // 与 Add/Sub 不可共用 build_binary：zero5() 用 xor 清 scratch 寄存器，
     // 副作用把宿主 CPU 的 CF 也清零（XOR 写 CF=0），后续 native adc 看到的
@@ -1460,6 +1506,7 @@ RuntimeGenResult generate_runtime(wvmp::Rng& rng) {
         {int(VmOp::MovsxdMem), "movsxdmem", &AsmGen::build_movsxd_mem},
         {int(VmOp::Movzx), "movzx", &AsmGen::build_movzx},
         {int(VmOp::MovzxMem), "movzxmem", &AsmGen::build_movzx_mem},
+        {int(VmOp::Bswap), "bswap", &AsmGen::build_bswap},
         {int(VmOp::Cmp), "cmp", &AsmGen::build_cmp},
         {int(VmOp::Test), "test", &AsmGen::build_test},
         {int(VmOp::Load), "load", &AsmGen::build_load},

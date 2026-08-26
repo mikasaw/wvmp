@@ -474,6 +474,35 @@ TranslateResult translate_movzx(const cs_insn& ci, const cs_x86& x, ir::Arch arc
     return unsupported(ci.address, ci.size);
 }
 
+// MIT-333 bswap reg32/reg64 (0F C8+rd, 可选 REX.W): 字节序反转。
+// MSVC /Od 默认 codegen:
+//   - bswap eax       (无 REX.W, S32): 32 位字节反转, 上 32 位 zero-extend
+//   - bswap rax       (REX.W,   S64): 64 位字节反转
+// 字节结构: [48] (REX.W 可选) | 0F C8 (opcode + reg 直接编码) | ModR/M
+// bswap 是单操作数 (dst only, no src), ModR/M 字节由 capstone 自动解析
+// 为 reg 操作数。
+// size 由 REX.W 标志决定: x.rex bit 3 (REX.W) → S64, 否则 → S32.
+// 不存在 8/16-bit bswap (Intel SDM Vol. 2 BSWAP), lifter 仅产 S32/S64.
+// updates_flags=false (bswap 不影响 CF/OF/SF/ZF/PF)。
+TranslateResult translate_bswap(const cs_insn& ci, const cs_x86& x, ir::Arch arch) {
+    if (x.op_count != 1) return unsupported(ci.address, ci.size);
+    if (x.operands[0].type != X86_OP_REG) return unsupported(ci.address, ci.size);
+    auto d = map_reg(x.operands[0].reg);
+    if (!d) return unsupported(ci.address, ci.size);
+
+    // REX.W 检测: x86 capstone 的 x.rex 是 REX 字节 (无 REX 时为 0).
+    // REX.W = bit 3 (0x48 与 0x49/0x4A/0x4B/0x4C/0x4D/0x4E/0x4F 均置位)。
+    const bool rex_w = (x.rex & 0x08) != 0;
+
+    ir::Insn out;
+    out.op = Op::Bswap;
+    out.addr = ci.address;
+    out.size = rex_w ? Size::S64 : Size::S32;
+    out.updates_flags = false;
+    out.dst = Operand::reg_(*d);
+    return ok(out);
+}
+
 } // namespace
 
 std::optional<ir::Reg> map_reg(x86_reg r) {
@@ -584,6 +613,7 @@ TranslateResult translate_insn(const cs_insn& ci, ir::Arch arch) {
     case X86_INS_MUL: return translate_mul(ci, x, arch);
     case X86_INS_MOVSXD: return translate_movsxd(ci, x, arch);
     case X86_INS_MOVZX: return translate_movzx(ci, x, arch);
+    case X86_INS_BSWAP: return translate_bswap(ci, x, arch);
     case X86_INS_NOP: {
         ir::Insn out;
         out.op = Op::Nop;

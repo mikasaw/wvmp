@@ -220,3 +220,18 @@ target_compile_options(wvmp_imul_sample PRIVATE
 target_link_options(wvmp_imul_sample PRIVATE
     $<$<CXX_COMPILER_ID:MSVC>:/INCREMENTAL:NO>
 )
+
+# MIT-333: 端到端正路径样本——区域内含 bswap (32-bit / 64-bit)，验证 bswap
+# 修复后翻译成功、运行时走真 Bswap handler、行为与原生逐字节一致。用
+# _byteswap_ulong / _byteswap_uint64 强制 MSVC /Od 下 codegen 为真 `bswap eax`
+# / `bswap rax` 指令 (非 REX.W → S32, REX.W → S64)，区域不含 rip-relative /
+# printf / call。
+add_executable(wvmp_bswap_sample bswap_sample_main.cpp)
+target_link_libraries(wvmp_bswap_sample PRIVATE wvmp::sdk)
+target_compile_options(wvmp_bswap_sample PRIVATE
+    $<$<CXX_COMPILER_ID:MSVC>:/Od;/Ob0;/utf-8>
+    $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-O0>
+)
+target_link_options(wvmp_bswap_sample PRIVATE
+    $<$<CXX_COMPILER_ID:MSVC>:/INCREMENTAL:NO>
+)

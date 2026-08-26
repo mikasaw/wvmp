@@ -21,7 +21,18 @@ enum class Op : u16 { Mov, Lea, Add, Sub, Adc, Sbb, And, Or, Xor, Not, Neg, Inc,
                       //              翻译器折 movzxMem）
                       // size 取目的位宽：8→32 为 S32, 8→64（REX.W）为 S64。
                       // updates_flags=false（movzx 不影响 CF/OF/SF/ZF/PF）。
-                      Movzx };
+                      Movzx,
+                      // MIT-333: 字节序反转（bswap reg32/reg64）。
+                      //   - REG only: src 空, dst=Reg, no mem 形式（bswap r/m 不存在）
+                      //   - 字节结构：[48] (REX.W 可选) | 0F C8+rd（ModR/M 直接编码 dst reg）
+                      //   - size 由 REX.W 决定：无 REX.W → S32, 有 REX.W → S64
+                      //   - bswap 不影响 flags (updates_flags=false)
+                      //   - x86 不存在 S8/S16 bswap, lifter 仅产 S32/S64, 翻译器
+                      //     直产 VmOp::Bswap (1 操作数 dst only), 运行时 handler
+                      //     按 cond_or_size 选 S32/S64 emit native bswap eax/rax.
+                      // 32-bit 操作时 native bswap 自动 zero-extend 上 32 位（x86-64
+                      // 32 位寄存器写语义），handler 用 qword 写回 vm 槽清零。
+                      Bswap };
 enum class Size : u8 { S8, S16, S32, S64 };
 enum class Cond : u8 { O, No, B, Ae, E, Ne, Be, A, S, Ns, P, Np, L, Ge, Le, G };
 constexpr u64 bits(Size s) { return s==Size::S8?8: s==Size::S16?16: s==Size::S32?32:64; }

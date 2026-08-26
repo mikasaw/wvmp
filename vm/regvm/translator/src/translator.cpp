@@ -298,6 +298,8 @@ struct Translator {
                 ok = translate_movsxd(em, sc, in, current_rva, next_ip);
             } else if (in.op == ir::Op::Movzx) {
                 ok = translate_movzx(em, sc, in, current_rva, next_ip);
+            } else if (in.op == ir::Op::Bswap) {
+                ok = translate_bswap(em, in);
             } else if (is_alu_binop(in.op)) {
                 ok = translate_alu_binop(em, sc, in, current_rva, next_ip);
             } else if (is_unary(in.op)) {
@@ -764,6 +766,26 @@ struct Translator {
             return true;
         }
         return skip(in, "movzx 操作数形态未支持", nullptr);
+    }
+
+    // ---- MIT-333: bswap (字节序反转) ----
+    //
+    // bswap 是单操作数 (dst only, no src), emit VmOp::Bswap 一条：
+    //   a_kind=Reg reg_a=dst, b_kind=None reg_b=0, aux=0, cond_or_size=size
+    //   (S32 或 S64 由 REX.W 决定, lifter 已传过来)。
+    //
+    // handler 在 asmgen.cpp 的 build_bswap：按 cond_or_size 分 S32/S64 emit
+    // native bswap eax/rax。S32 路径用 32 位寄存器读 + bswap, 写回 qword
+    // (上 32 位自动 zero-extend); S64 路径全 64 位。
+    //
+    // 不更新 flags（bswap 不影响 CF/OF/SF/ZF/PF）。
+    bool translate_bswap(Emitter& em, const ir::Insn& in) {
+        if (in.op != ir::Op::Bswap) return false;
+        if (in.dst.kind != ir::Operand::Kind::Reg) return false;
+        const u8 d = isa::vm_reg_of(in.dst.reg);
+        const u8 sz = isa::size_field(in.size);
+        em.emit(VmOp::Bswap, OpKind::Reg, d, OpKind::None, 0, 0, sz);
+        return true;
     }
 };
 
