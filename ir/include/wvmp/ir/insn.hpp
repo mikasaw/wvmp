@@ -75,7 +75,27 @@ enum class Op : u16 { Mov, Lea, Add, Sub, Adc, Sbb, And, Or, Xor, Not, Neg, Inc,
                       //     一条, 类似 movzx MEM 路径
                       //   - 派活单 §D 决策 4: Cmovcc 必 append-only 在 Setcc=50 之后 = 51
                       //     (pitfall #34 additive enum append-only)
-                      Cmovcc };
+                      Cmovcc,
+                      // MIT-341: 比较并交换 (cmpxchg r/m, r, 隐式 rax/al 累加器)。
+                      //   - 2 操作数 (dst=r/m + src=r, accumulator 隐式 Rax 槽)
+                      //   - 字节结构：[48] (REX.W 可选) | 0F B0/B1+rm (mod=11 REG,
+                      //     mod=00 MEM)；S8 用 0F B0, S16/S32/S64 用 0F B1
+                      //   - size 字段：S8/S16/S32/S64 由 ModR/M 与 REX.W 共同决定
+                      //   - 隐式 acc 字段（vm 寄存器槽 Reg::Rax, 不加新 IR 字段；
+                      //     沿用 pitfall #34 additive enum append-only 严格不破坏
+                      //     Insn 布局/大小；size 由 IR.size 决定，runtime 读 Rax 槽
+                      //     即可知道宽度）。
+                      //   - cmpxchg **read** Rax 槽 + dst, **write** dst 与 Rax 槽
+                      //     （依 cmp 结果：equal→dst=src; not equal→Rax=dst），
+                      //     同时 **write** flags (CF/OF/SF/ZF/PF 全更新，与 cmp 同
+                      //     语义)；updates_flags=true。
+                      //   - MEM 形式 (cmpxchg [m], r) lifter 直接 emit Operand::mem_
+                      //     到 dst；翻译器折 Load(tmp, [m], size) + Cmpxchg(tmp, r)
+                      //     + Store([m], tmp, size) 三条拆条（与 setcc MEM 路径同
+                      //     结构）。派活单限定不支持 lock prefix 与 mod=01/10。
+                      //   - 派活单 §D 决策 4: Cmpxchg 必 append-only 在 Cmovcc 之后
+                      //     (pitfall #34 additive enum append-only)。
+                      Cmpxchg };
 enum class Size : u8 { S8, S16, S32, S64 };
 enum class Cond : u8 { O, No, B, Ae, E, Ne, Be, A, S, Ns, P, Np, L, Ge, Le, G };
 constexpr u64 bits(Size s) { return s==Size::S8?8: s==Size::S16?16: s==Size::S32?32:64; }

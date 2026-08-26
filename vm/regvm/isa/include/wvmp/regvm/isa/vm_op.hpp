@@ -171,9 +171,34 @@ enum class VmOp : u16 {
     // 4 bits=16 variants); 真实位宽由 IR.size 字段另传 (S32 / S64 由 REX.W 决定)。
     // 派活单 §D 决策 4: Cmovcc 必 append-only 在 Setcc=50 之后 = 51 (pitfall #34)。
     Cmovcc,
+
+    // MIT-341: 比较并交换 (cmpxchg r/m, r, 隐式 rax/al 累加器)。
+    //   Cmpxchg (Reg-Reg / Mem-Reg):
+    //     if (Rax == dst) { ZF=1; dst = src }
+    //     else              { ZF=0; Rax = dst }
+    //   字节结构: [48] (REX.W 可选) | 0F B0/B1+rm (mod=11 REG-REG, mod=00 MEM-REG;
+    //     mod=01/10 派活单限定不支持)。S8 用 0F B0, S16/S32/S64 用 0F B1。
+    //   a_kind=Reg reg_a=dst, b_kind=Reg reg_b=src, aux=0,
+    //   cond_or_size=ir::Size (S8/S16/S32/S64, 与 ALU binop 共享 2 bits)。
+    //   REG-REG (cmpxchg r64, r64): a=dst, b=src。
+    //   MEM (cmpxchg [m], r): lifter 直接 emit Operand::mem_(...) 到 dst;
+    //     翻译器折 Load(tmp, [m], size) + Cmpxchg(tmp, r) + Store([m], tmp, size)
+    //     三条拆条 (与 setcc MEM 路径同结构, 沿用 pitfall #22h 启发)。
+    //     严格遵循派活单 §D 改动清单 (仅加 VmOp::Cmpxchg, 不加 CmpxchgMem)。
+    //   隐式 acc: handler 硬编码读 regs[Rax] (= vm_reg_of(Rax) 槽, slot 0),
+    //     按 cond_or_size 选 8/16/32/64 位宽度 native `cmpxchg`, 再写回 dst 槽
+    //     与 Rax 槽。Rax 槽是 VM 寄存器槽表的固定位置, 无需新增 IR 字段即可定位
+    //     (沿用 pitfall #34 additive enum append-only 不破坏 Insn 布局/大小)。
+    //   cmpxchg **writes** flags (CF/OF/SF/ZF/PF 全更新, 与 cmp 同语义);
+    //     handler 用 native cmpxchg 直读 host CPU flags, setcc5 捕获 — 与
+    //     imul/mul/shift 等 ALU 路径共享 zero5 + setcc5 + flags_tail 复用。
+    //   派活单 §D 决策 4: Cmpxchg 必 append-only 在 Cmovcc 之后
+    //     (pitfall #34 additive enum append-only); 派活单限定不支持 lock prefix
+    //     (lock cmpxchg 涉及 atomic 语义, 需独立 issue 调试 VM runtime)。
+    Cmpxchg,
 };
 
-inline constexpr u16 kVmOpMax = static_cast<u16>(VmOp::Cmovcc);
+inline constexpr u16 kVmOpMax = static_cast<u16>(VmOp::Cmpxchg);
 inline constexpr u16 kVmOpLimit = 1u << 14;  // 14 位编码空间上限
 
 constexpr const char* to_string(VmOp op) {
@@ -214,6 +239,7 @@ constexpr const char* to_string(VmOp op) {
         case VmOp::Xchg: return "xchg";
         case VmOp::Setcc: return "setcc";
         case VmOp::Cmovcc: return "cmovcc";
+        case VmOp::Cmpxchg: return "cmpxchg";
     }
     return "?";
 }

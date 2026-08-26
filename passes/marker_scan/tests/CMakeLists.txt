@@ -293,3 +293,21 @@ target_compile_options(wvmp_cmovcc_sample PRIVATE
 target_link_options(wvmp_cmovcc_sample PRIVATE
     $<$<CXX_COMPILER_ID:MSVC>:/INCREMENTAL:NO>
 )
+
+# MIT-341: 端到端正路径样本——区域内含 cmpxchg (REG-REG S32/S64), 验证
+# cmpxchg 修复后翻译成功、运行时走真 Cmpxchg handler、行为与原生逐字节一致。
+# MSVC x64 不支持 inline asm, cmpxchg 字节由 cmpxchg_sample_asm.asm (MASM)
+# 直接 emit, 链接进本 sample. 区域不含 rip-relative / printf / call (printf 在
+# main 区域外)。覆盖 equal (S32/S64) + not-equal (S32/S64) 两种 cmpxchg 语义。
+add_executable(wvmp_cmpxchg_sample
+    cmpxchg_sample_main.cpp
+    cmpxchg_sample_asm.asm
+)
+target_link_libraries(wvmp_cmpxchg_sample PRIVATE wvmp::sdk)
+target_compile_options(wvmp_cmpxchg_sample PRIVATE
+    $<$<CXX_COMPILER_ID:MSVC>:/Od;/Ob0;/utf-8>
+    $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-O0>
+)
+target_link_options(wvmp_cmpxchg_sample PRIVATE
+    $<$<CXX_COMPILER_ID:MSVC>:/INCREMENTAL:NO>
+)

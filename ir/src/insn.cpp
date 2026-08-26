@@ -36,6 +36,15 @@ std::string_view to_string(Op op) {
     case Op::Imul: return "imul";
     case Op::Mul: return "mul";
     case Op::Movsxd: return "movsxd";
+    // MIT-315/MIT-333/MIT-334/MIT-336/MIT-339/MIT-341 新增 Op 的 to_string。
+    // append-only 字符串（pitfall #34）；asm_dump / 日志可读性增强。原 insn.cpp
+    // 此前漏了 Movzx/Bswap/Xchg/Setcc/Cmovcc — 此处一并补齐保持 to_string 完备。
+    case Op::Movzx: return "movzx";
+    case Op::Bswap: return "bswap";
+    case Op::Xchg: return "xchg";
+    case Op::Setcc: return "setcc";
+    case Op::Cmovcc: return "cmovcc";
+    case Op::Cmpxchg: return "cmpxchg";
     }
     return "?";
 }

@@ -310,6 +310,12 @@ struct Translator {
                 // MIT-339: cmovcc dispatch — REG-REG 形式 emit 单条 VmOp::Cmovcc,
                 // MEM 形式 emit Load + Cmovcc 两条拆条 (translate_cmovcc 内部展开)。
                 ok = translate_cmovcc(em, sc, in, current_rva, next_ip);
+            } else if (in.op == ir::Op::Cmpxchg) {
+                // MIT-341: cmpxchg dispatch — REG-REG 形式 emit 单条 VmOp::Cmpxchg,
+                // MEM 形式 emit Load + Cmpxchg + Store 三条拆条
+                // (translate_cmpxchg 内部展开; 隐式 acc 字段不入 IR, 由 handler
+                // 硬编码 regs[Rax] 槽位 + IR.size 决定宽度)。
+                ok = translate_cmpxchg(em, sc, in, current_rva, next_ip);
             } else if (is_alu_binop(in.op)) {
                 ok = translate_alu_binop(em, sc, in, current_rva, next_ip);
             } else if (is_unary(in.op)) {
@@ -922,6 +928,65 @@ struct Translator {
         const u32 cond_aux = static_cast<u32>(in.cond) << 28;
         em.emit(VmOp::Cmovcc, OpKind::Reg, d, OpKind::Reg, tmp, cond_aux,
                 isa::size_field(in.size));
+        return true;
+    }
+
+    // ---- MIT-341: cmpxchg (比较并交换, 隐式 Rax 累加器) ----
+    //
+    // cmpxchg r/m, r 语义 (Intel SDM Vol. 2 CMPXCHG):
+    //   if (Rax == dst) { ZF=1; dst = src }
+    //   else              { ZF=0; Rax = dst }
+    //
+    // lifter 区分两种 dst 形式:
+    //   - REG-REG (mod=11): cmpxchg r, r → emit 单条 VmOp::Cmpxchg
+    //     (a_kind=Reg reg_a=dst, b_kind=Reg reg_b=src, aux=0, cond_or_size=ir::Size)。
+    //   - MEM (mod=00): cmpxchg [m], r → 翻译期把地址算到 scratch 槽 (emit_address
+    //     → acc), emit Load(tmp, [m], size) + Cmpxchg(tmp, src) + Store([m], tmp, size)
+    //     三条拆条; scratch 预算 = emit_address(1) + tmp(1) = 2, 在 6 预算内。
+    //     严格遵循派活单 §D 改动清单 (仅加 VmOp::Cmpxchg, 不加 CmpxchgMem)。
+    //
+    // 编码：cond_or_size = ir::Size (S8/S16/S32/S64, 与 ALU binop 共享 2 bits);
+    // 隐式 acc 由 handler 硬编码读 regs[Rax] (= vm_reg_of(Rax) 槽, slot 0),
+    //     按 cond_or_size 选 8/16/32/64 位宽度 native `cmpxchg`, 再写回 dst 槽
+    //     与 Rax 槽。Rax 槽是 VM 寄存器槽表的固定位置, 无需新增 IR 字段即可定位
+    //     (沿用 pitfall #34 additive enum append-only 不破坏 Insn 布局/大小)。
+    //
+    // cmpxchg **writes** flags (CF/OF/SF/ZF/PF 全更新, 与 cmp 同语义);
+    // handler 用 native cmpxchg 直读 host CPU flags, setcc5 捕获 — 与
+    // imul/mul/shift 等 ALU 路径共享 zero5 + setcc5 + flags_tail 复用。
+    bool translate_cmpxchg(Emitter& em, Scratch& sc, const ir::Insn& in,
+                           u64 current_rva, u64 next_ip) {
+        if (in.op != ir::Op::Cmpxchg) return false;
+        // src 必为寄存器 (cmpxchg r/m, r 第二操作数必是 r)
+        if (in.src.kind != ir::Operand::Kind::Reg) {
+            return skip(in, "cmpxchg src 操作数形态未支持", nullptr);
+        }
+        const u8 s = isa::vm_reg_of(in.src.reg);
+        const u8 sz = isa::size_field(in.size);
+
+        if (in.dst.kind == ir::Operand::Kind::Reg) {
+            // REG-REG: cmpxchg r, r — emit 单条 VmOp::Cmpxchg
+            // (handler 读 Rax 槽, native cmpxchg 完成条件赋值, 写回 dst + Rax)。
+            const u8 d = isa::vm_reg_of(in.dst.reg);
+            em.emit(VmOp::Cmpxchg, OpKind::Reg, d, OpKind::Reg, s, 0, sz);
+            return true;
+        }
+        if (in.dst.kind != ir::Operand::Kind::Mem) {
+            return skip(in, "cmpxchg 操作数形态未支持", nullptr);
+        }
+        // MEM: cmpxchg [m], r — emit_address 算 acc + emit Load + Cmpxchg + Store。
+        // scratch 预算: emit_address 用 1 scratch (acc) + 1 scratch (tmp) = 2, 在 6 预算内。
+        u8 acc = 0;
+        if (!emit_address(em, sc, in.dst.mem, current_rva, next_ip, acc))
+            return skip(in, "cmpxchg 地址形态未支持", &in.dst.mem);
+        const u8 tmp = sc.take();
+        const isa::VmOp load_op =
+            (in.dst.mem.base == ir::Reg::Rip) ? isa::VmOp::LoadRva : isa::VmOp::Load;
+        em.emit_rr(load_op, tmp, acc, sz);  // Load tmp, [acc]
+        em.emit(VmOp::Cmpxchg, OpKind::Reg, tmp, OpKind::Reg, s, 0, sz);  // Cmpxchg(tmp, src)
+        const isa::VmOp store_op =
+            (in.dst.mem.base == ir::Reg::Rip) ? isa::VmOp::StoreRva : isa::VmOp::Store;
+        em.emit_rr(store_op, acc, tmp, sz);  // Store [acc], tmp
         return true;
     }
 };

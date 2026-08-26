@@ -626,6 +626,59 @@ TranslateResult translate_cmovcc(const cs_insn& ci, const cs_x86& x, ir::Arch ar
     return ok(out);
 }
 
+// MIT-341 cmpxchg r/m, r (0F B0/B1+rm, mod=11 REG-REG / mod=00 MEM-REG)。
+//   - 字节结构：[48] (REX.W 可选) | 0F B0 (S8) | 0F B1 (S16/S32/S64) | ModR/M
+//     (mod=11 REG-REG, mod=00 MEM; mod=01/10 派活单限定不支持 → C1 gate 兜底)
+//   - 2 操作数 (dst=r/m + src=r), lifter 接收 REG-REG 与 MEM-REG 两种 dst 形式
+//   - 隐式累加器 Rax 槽 (8/16/32/64 位由 size 字段决定, 不加新 IR 字段;
+//     沿用 pitfall #34 additive enum append-only 不破坏 Insn 布局)
+//   - cmpxchg **read** Rax 槽 + dst, **write** dst 与 Rax 槽 (依 cmp 结果),
+//     且 **write** flags (CF/OF/SF/ZF/PF 全更新, 与 cmp 同语义); updates_flags=true
+//   - size 取真实操作数位宽 (capstone data_size(): r/m8 → S8, r/m32 → S32,
+//     r/m64 (REX.W) → S64); S16 cmpxchg 需要 0x66 operand-size prefix,
+//     lifter 的 prefix[0] 检查直接拒绝, S16 不走此路径 (派活单限定不支持)
+//   - MEM 形式 (cmpxchg [reg], r) lifter 直接 emit Operand::mem_(...) 到 dst;
+//     翻译器折 Load + Cmpxchg + Store 三条拆条 (与 setcc MEM 路径同结构)
+TranslateResult translate_cmpxchg(const cs_insn& ci, const cs_x86& x, ir::Arch arch) {
+    if (x.op_count != 2) return unsupported(ci.address, ci.size);
+    // dst 必为 r/m (REG 或 MEM); src 必为 REG
+    if (x.operands[0].type != X86_OP_REG && x.operands[0].type != X86_OP_MEM) {
+        return unsupported(ci.address, ci.size);
+    }
+    if (x.operands[1].type != X86_OP_REG) return unsupported(ci.address, ci.size);
+
+    // 取 size: capstone 报 r/m 操作数的真实位宽; data_size() 已处理 1/2/4/8 字节。
+    // S16 cmpxchg (0x66 0F B1+rm) 必带 0x66 prefix, 而 prefix[0] 检查在
+    // translate_insn 入口处已统一拒绝, 故本函数只可能收到 S8/S32/S64 三种 size。
+    const ir::Size sz = data_size(x.operands, x.op_count, arch);
+    if (sz != ir::Size::S8 && sz != ir::Size::S32 && sz != ir::Size::S64) {
+        // S16 (0x66 prefix) 在入口已拒; 此处 defensive 兜底。
+        return unsupported(ci.address, ci.size);
+    }
+
+    ir::Insn out;
+    out.op = Op::Cmpxchg;
+    out.addr = ci.address;
+    out.size = sz;
+    out.updates_flags = true;  // cmpxchg writes CF/OF/SF/ZF/PF (与 cmp 同语义)
+
+    // dst = r/m (REG 或 MEM), src = r (REG only)
+    if (x.operands[0].type == X86_OP_REG) {
+        auto d = map_reg(x.operands[0].reg);
+        if (!d) return unsupported(ci.address, ci.size);
+        out.dst = Operand::reg_(*d);
+    } else {
+        // MEM 形式: lifter 直接 emit Operand::mem_(...), 翻译器折 Load + Cmpxchg + Store
+        auto m = mem_operand(x.operands[0].mem);
+        if (!m) return unsupported(ci.address, ci.size);
+        out.dst = *m;
+    }
+    auto s = map_reg(x.operands[1].reg);
+    if (!s) return unsupported(ci.address, ci.size);
+    out.src = Operand::reg_(*s);
+    return ok(out);
+}
+
 } // namespace
 
 std::optional<ir::Reg> map_reg(x86_reg r) {
@@ -808,6 +861,12 @@ TranslateResult translate_insn(const cs_insn& ci, ir::Arch arch) {
     case X86_INS_CMOVP: case X86_INS_CMOVNP: case X86_INS_CMOVL: case X86_INS_CMOVLE:
     case X86_INS_CMOVG: case X86_INS_CMOVGE: case X86_INS_CMOVO: case X86_INS_CMOVNO:
         return translate_cmovcc(ci, x, arch);
+    // MIT-341: cmpxchg r/m, r (0F B0/B1+rm, mod=11 REG-REG / mod=00 MEM-REG).
+    // capstone 用单一 X86_INS_CMPXCHG 涵盖 S8 (0F B0) 和 S16/S32/S64 (0F B1)
+    // 全部形式, size 由 ModR/M 与 REX.W 决定. size 取 data_size() 自动识别.
+    // 隐式 acc 字段不入 IR (沿用 pitfall #34 additive enum append-only);
+    // handler 硬编码 regs[Rax] 槽位 + IR.size 决定宽度.
+    case X86_INS_CMPXCHG: return translate_cmpxchg(ci, x, arch);
     case X86_INS_NOP: {
         ir::Insn out;
         out.op = Op::Nop;

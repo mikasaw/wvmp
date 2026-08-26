@@ -1162,6 +1162,141 @@ public:
                advance(dispatch);
     }
 
+    // MIT-341 Cmpxchg: 比较并交换 r/m, r, 隐式 Rax 累加器。
+    //   字节结构: [48] (REX.W 可选) | 0F B0 (S8) / 0F B1 (S16/S32/S64) + ModR/M
+    //   语义 (Intel SDM Vol. 2 CMPXCHG):
+    //     IF (accumulator == r/m)  ZF ← 1; r/m ← r
+    //     ELSE                       ZF ← 0; accumulator ← r/m
+    //   隐式 accumulator = Rax (8/16/32/64 位由 IR.size 决定, 不入 IR 字段;
+    //     沿用 pitfall #34 additive enum append-only 不破坏 Insn 布局)。
+    //
+    // 编码约定: a_kind=Reg reg_a=dst, b_kind=Reg reg_b=src, aux=0,
+    //     cond_or_size=ir::Size (S8/S16/S32/S64, 与 ALU binop 共享 2 bits)。
+    //
+    // 实现思路 (与 build_imul/build_adc/build_mul 对齐):
+    //   1. load dst → T0 (按宽度读, alias_read 零扩展)
+    //   2. load src → T1 (按宽度读; src 不动以备 cmpxchg 消耗)
+    //   3. zero5() — 清 flag scratch; 副作用宿主 CF/OF/SF/ZF/PF ← 0
+    //   4. load Rax 槽 (= vm_reg_of(Rax), 固定 slot 0) → T5 (按宽度 alias_read)
+    //   5. mov rax/eax/ax/al, T5 — 物理 RAX = Rax 槽值 (native cmpxchg 隐式用)
+    //   6. cmpxchg <sz> T0, T1 — native 完成比较+条件赋值; 自动:
+    //      - ZF=1 时 T0 ← T1 (dst = src), RAX 不变
+    //      - ZF=0 时 RAX.low ← T0.low (accumulator = dst), T0 不变
+    //      - 全 flags 由 setcc5 捕 host CPU 真值 (与 cmp 一致)
+    //   7. setcc5() — 抽取 CF/OF/SF/ZF/PF 进 FLAGS 缓存
+    //   8. writeback RAX → Rax 槽 (按宽度 alias_write, 保留高位)
+    //   9. reextract_a(1) + writeback T0 → dst 槽 (按宽度 alias_write)
+    //
+    // 关键 catch:
+    //   - native cmpxchg 隐式用 RAX 作 accumulator, 故必须先把 regs[Rax] 搬到
+    //     物理 RAX (类似 build_mul 的隐式 RAX 处理)。这里 T5 仅作 slot 临时
+    //     (roll() 保证 T5 ∈ callee-saved 池, 不与 RAX 物理寄存器冲突),
+    //     然后 `mov rax/eax/ax/al, T5` 把 T5 拷到物理 RAX, 不论 T5 与 RAX
+    //     物理寄存器是否相同都能正确搬运。
+    //   - 写回 Rax 槽走 alias_write 模式 (与 build_mul Rax 写回同): S64 直写
+    //     qword; S32/S16/S8 读 qword 改低 32/16/8 位再写 qword (保留 Rax 槽高位
+    //     与 native 写语义一致 — native 写 8/16 位不影响高位, 写 32 位零扩展
+    //     高 32 位)。T1 在 setcc5 后被 reextract_a 占用, 此处先写回 Rax 再
+    //     reextract_a 不会冲突: 写回 Rax 用 T1 作临时; reextract_a 重写 T1。
+    //   - S8/S16 在 64-bit 模式下 REX.W 必不带, native cmpxchg 用 8/16 位物理
+    //     寄存器 (al/ax 等); 与 x64 cmp/test 隐式 acc 一致。lifter 不产 S16
+    //     cmpxchg (因 0x66 prefix 被 prefix[0] 检查拒, 见 translate_insn 入口),
+    //     此处 S16 块保留以保持 4 路 size_chain 完整。
+    //   - src 操作数 (reg_b → T1) 不被 cmpxchg 修改, 不需要 T6 保存 (与
+    //     build_cmovcc 的 cond_eval clobber T1 情形不同, pitfall #37 不适用)。
+    //   - S8 S16 路径保留 native cmpxchg emit, 但 defensive 兜底 (lifter 不产
+    //     此 size 时该分支不会被执行)。
+    std::string build_cmpxchg(u64 dispatch) const {
+        const std::string tag = "cmpxchg" + std::to_string(seq());
+        const std::string tail_lbl = "ftail_" + tag;
+        const u8 rax_slot = isa::vm_reg_of(ir::Reg::Rax);  // = 0
+        const std::string rax_slot_off =
+            imm(static_cast<u64>(rax_slot) * 8 + 0x10);
+        const std::string rax_slot_qp = std::string("qword ptr [") +
+                                        std::string(r64(ctx_)) + " + " + rax_slot_off + "]";
+        std::array<std::string, 4> blocks;
+        for (int s = 0; s < 4; ++s) {
+            const std::string stag = tag + "_" + std::to_string(s);
+            std::string o;
+            // 1) 读 dst → T0 (按宽度 alias_read 零扩展)
+            o += load_operand(s, 3, 4, 0, "a" + stag);
+            // 2) 读 src → T1 (按宽度 alias_read 零扩展; src 不动以备 cmpxchg 用)
+            o += load_operand(s, 6, 7, 1, "b" + stag);
+            // 3) zero5 — 清 flag scratch (副作用宿主 CF/OF/SF/ZF/PF ← 0)
+            o += zero5();
+            // 4) 读 Rax 槽 → T5 (按宽度 alias_read, 与 build_mul Rax 读同思路 —
+            //    必须先经临时再拷到物理 RAX, 不能直接 `mov rax, [...]`, 因为
+            //    `mov rax, [ctx + ...]` 与 load_operand 的 imm 路径都可能 clobber
+            //    T0/T1 等关键寄存器)。用 std::to_string(rax_slot) 输出字面量槽号 (0),
+            //    不能用 r64(rax_slot) — 那是 kPhys[0]="rax" 物理寄存器名, 与内存
+            //    地址混用会出错 (与 build_mul 同模式)。
+            if (s == 3)
+                o += std::string("    mov ") + r64(t_[5]) + ", qword ptr [" + r64(ctx_) +
+                     " + " + std::to_string(rax_slot) + "*8 + 0x10]\n";
+            else if (s == 2)
+                o += std::string("    mov ") + rs(t_[5], 2) + ", dword ptr [" + r64(ctx_) +
+                     " + " + std::to_string(rax_slot) + "*8 + 0x10]\n";
+            else if (s == 1)
+                o += std::string("    mov ") + rs(t_[5], 1) + ", word ptr [" + r64(ctx_) +
+                     " + " + std::to_string(rax_slot) + "*8 + 0x10]\n";
+            else
+                o += std::string("    movzx ") + r64(t_[5]) + ", byte ptr [" + r64(ctx_) +
+                     " + " + std::to_string(rax_slot) + "*8 + 0x10]\n";
+            // 5) 物理 RAX = Rax 槽值 (按宽度; native cmpxchg 隐式读 RAX 作 accumulator)
+            if (s == 3)
+                o += std::string("    mov rax, ") + r64(t_[5]) + "\n";
+            else if (s == 2)
+                o += std::string("    mov eax, ") + rs(t_[5], 2) + "\n";
+            else if (s == 1)
+                o += std::string("    mov ax, ") + rs(t_[5], 1) + "\n";
+            else
+                o += std::string("    mov al, ") + rs(t_[5], 0) + "\n";
+            // 6) native cmpxchg <sz> T0, T1 — 隐式用 RAX 作 accumulator。
+            //    ZF=1 时 T0 ← T1 (dst = src), 否则 RAX ← T0 (accumulator = dst)。
+            //    flags 全量更新 (CF/OF/SF/ZF/PF, 与 cmp 同语义)。
+            o += std::string("    cmpxchg ") + rs(t_[0], s) + ", " + rs(t_[1], s) + "\n";
+            // 6.5) [关键] 把 cmpxchg 之后的 RAX 拷到 T1, 避开 setcc5 对 T4 低字节
+            //      的 clobber (当 T4 == 物理 RAX 时, seto al 会覆盖 cmpxchg 结果的
+            //      al 字节; 这会导致 Rax 槽写回读到被污染的值)。
+            //      T1 在此之前是 src (reg_b 槽), 但 cmpxchg 不修改 src, 之后也
+            //      不再需要 src, 故可直接覆写 T1。T1 不在 setcc5 clobber 集合
+            //      {T3,T4,T6,T7,T9} 中, 安全。
+            o += std::string("    mov ") + r64(t_[1]) + ", " + r64(0) + "\n";
+            // 7) setcc5 — 抽取 CF/OF/SF/ZF/PF 进 FLAGS 缓存 (与 cmp 同语义)。
+            //    此时 RAX 低字节已被 seto al clobber, 但 T1 已保存完整 cmpxchg 结果。
+            o += setcc5();
+            // 8) writeback Rax 槽 (alias-write 保留高位)。
+            //    用 T1 (cmpxchg 结果) 与 T5 (原始 Rax 槽) 组合:
+            //    - S64: 直写 T1 到 Rax 槽 (full 64-bit overwrite)
+            //    - S32: T5.low32 = T1.low32; 写 T5 (preserve upper 32)
+            //    - S16: T5.low16 = T1.low16; 写 T5 (preserve upper 48)
+            //    - S8:  T5.low8  = T1.low8;  写 T5 (preserve upper 56)
+            //    注: T1 在 reextract_a(1) 后会被覆写为 reg_a 槽位, 顺序不能颠倒
+            //    (先做 Rax 写回再做 dst 写回)。
+            if (s == 3) {
+                o += std::string("    mov ") + rax_slot_qp + ", " + r64(t_[1]) + "\n";
+            } else if (s == 2) {
+                o += std::string("    mov ") + rs(t_[5], 2) + ", " + rs(t_[1], 2) + "\n";
+                o += std::string("    mov ") + rax_slot_qp + ", " + r64(t_[5]) + "\n";
+            } else if (s == 1) {
+                o += std::string("    mov ") + rs(t_[5], 1) + ", " + rs(t_[1], 1) + "\n";
+                o += std::string("    mov ") + rax_slot_qp + ", " + r64(t_[5]) + "\n";
+            } else {
+                o += std::string("    mov ") + rs(t_[5], 0) + ", " + rs(t_[1], 0) + "\n";
+                o += std::string("    mov ") + rax_slot_qp + ", " + r64(t_[5]) + "\n";
+            }
+            // 9) reextract_a(1) + writeback(s, 1): 把 T0 写回 dst 槽 (按宽度 alias_write)。
+            //    setcc5 clobber 了 T4 的低字节 (用作 OF 临时), 故 writeback 前必重提
+            //    reg_a 槽位到 T1 (reextract_a 模式), 与 build_imul/build_adc 同源。
+            o += reextract_a(1);
+            o += writeback(s, 1);
+            o += "    jmp " + tail_lbl + "\n";
+            blocks[s] = o;
+        }
+        return decode_prelude() + size_chain(blocks, tag) + tail_lbl + ":\n" +
+               flags_tail(dispatch, false);
+    }
+
     // cc_name: ir::Cond (0..15) → Intel 语法 cmovcc 后缀字符串
     // (与 cond_eval 的 cond 命名严格一致).
     static const char* cc_name(int cond) {
@@ -1752,6 +1887,7 @@ RuntimeGenResult generate_runtime(wvmp::Rng& rng) {
         {int(VmOp::Xchg), "xchg", &AsmGen::build_xchg},
         {int(VmOp::Setcc), "setcc", &AsmGen::build_setcc},
         {int(VmOp::Cmovcc), "cmovcc", &AsmGen::build_cmovcc},
+        {int(VmOp::Cmpxchg), "cmpxchg", &AsmGen::build_cmpxchg},
         {int(VmOp::Cmp), "cmp", &AsmGen::build_cmp},
         {int(VmOp::Test), "test", &AsmGen::build_test},
         {int(VmOp::Load), "load", &AsmGen::build_load},

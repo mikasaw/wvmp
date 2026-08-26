@@ -9,7 +9,8 @@
 #   - MIT-334: extend to wvmp_xchg_sample (xchg r, r REG-REG 真虚拟化).
 #   - MIT-336: extend to wvmp_setcc_sample (setcc REG-REG 真虚拟化).
 #   - MIT-339: extend to wvmp_cmovcc_sample (cmovcc REG-REG 真虚拟化).
-#     Total: 10 samples × 5 seeds = 50 runs.
+#   - MIT-341: extend to wvmp_cmpxchg_sample (cmpxchg REG-REG 真虚拟化).
+#     Total: 11 samples × 5 seeds = 55 runs.
 #   - MIT-306: REQUIRE_REAL=1 校验日志含 "已生成 N 个入口 stub" 防止 C1 gate
 #     兜底被误判 PASS（仅 byte-exact 不够, C1 gate 函数被跳过仍能输出相同
 #     stdout+rc）。与 multiseed_e2e_real.sh 配套使用。
@@ -35,6 +36,7 @@ samples=(
     "build/passes/marker_scan/tests/wvmp_xchg_sample.exe"
     "build/passes/marker_scan/tests/wvmp_setcc_sample.exe"
     "build/passes/marker_scan/tests/wvmp_cmovcc_sample.exe"
+    "build/passes/marker_scan/tests/wvmp_cmpxchg_sample.exe"
 )
 
 # Seeds: 1 (small), 12345 (default), 99999 (large), 0xDEADBEEF (magic), 0xCAFEBABE (magic).
