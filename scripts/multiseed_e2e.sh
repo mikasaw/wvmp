@@ -6,7 +6,8 @@
 #   - MIT-301: extend to wvmp_cl_shift_sample (cl 变体 shift 真虚拟化).
 #   - MIT-302: extend to wvmp_imul_sample (有符号乘法真虚拟化).
 #   - MIT-333: extend to wvmp_bswap_sample (bswap reg32/reg64 真虚拟化).
-#     Total: 7 samples × 5 seeds = 35 runs.
+#   - MIT-334: extend to wvmp_xchg_sample (xchg r, r REG-REG 真虚拟化).
+#     Total: 8 samples × 5 seeds = 40 runs.
 #   - MIT-306: REQUIRE_REAL=1 校验日志含 "已生成 N 个入口 stub" 防止 C1 gate
 #     兜底被误判 PASS（仅 byte-exact 不够, C1 gate 函数被跳过仍能输出相同
 #     stdout+rc）。与 multiseed_e2e_real.sh 配套使用。
@@ -29,6 +30,7 @@ samples=(
     "build/passes/marker_scan/tests/wvmp_cl_shift_sample.exe"
     "build/passes/marker_scan/tests/wvmp_imul_sample.exe"
     "build/passes/marker_scan/tests/wvmp_bswap_sample.exe"
+    "build/passes/marker_scan/tests/wvmp_xchg_sample.exe"
 )
 
 # Seeds: 1 (small), 12345 (default), 99999 (large), 0xDEADBEEF (magic), 0xCAFEBABE (magic).

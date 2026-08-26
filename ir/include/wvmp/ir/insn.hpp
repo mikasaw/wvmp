@@ -32,7 +32,19 @@ enum class Op : u16 { Mov, Lea, Add, Sub, Adc, Sbb, And, Or, Xor, Not, Neg, Inc,
                       //     按 cond_or_size 选 S32/S64 emit native bswap eax/rax.
                       // 32-bit 操作时 native bswap 自动 zero-extend 上 32 位（x86-64
                       // 32 位寄存器写语义），handler 用 qword 写回 vm 槽清零。
-                      Bswap };
+                      Bswap,
+                      // MIT-334: 寄存器/内存交换 (xchg r, r / xchg r, m)。
+                      //   - REG-REG 2 操作数 (dst + src), size 由 REX.W 决定 (S32/S64)
+                      //   - 字节结构：[48] (REX.W 可选) | 87 (opcode) | ModR/M
+                      //   - 特殊：`48 90` 是 xchg rax, rax 当 NOP, capstone 自动识别
+                      //     为 X86_INS_NOP, lifter 走 X86_INS_NOP case emit ir::Op::Nop
+                      //     (沿用现有 Nop Op, 不加新 enum)
+                      //   - xchg 是对称操作: xchg a, b == xchg b, a (Intel SDM);
+                      //     IR.dst 与 IR.src 编码为 VmOp::Xchg 的 a + b 槽
+                      //   - xchg 不影响 flags (updates_flags=false)
+                      //   - MEM 形式（xchg [reg], reg）派活单限定 REG-REG，
+                      //     lifter 拒 MEM-REG → C1 gate 兜底
+                      Xchg };
 enum class Size : u8 { S8, S16, S32, S64 };
 enum class Cond : u8 { O, No, B, Ae, E, Ne, Be, A, S, Ns, P, Np, L, Ge, Le, G };
 constexpr u64 bits(Size s) { return s==Size::S8?8: s==Size::S16?16: s==Size::S32?32:64; }

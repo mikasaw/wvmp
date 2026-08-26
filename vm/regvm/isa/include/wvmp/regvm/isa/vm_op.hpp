@@ -117,9 +117,32 @@ enum class VmOp : u16 {
     // bswap 不影响 flags. S8/S16 bswap 不存在 (Intel SDM),
     // lifter 仅产 S32/S64; handler S8/S16 块走 no-op (defensive).
     Bswap,
+
+    // —— MIT-334 寄存器/内存交换 (xchg r, r / xchg r, m) ——
+    // Xchg (Reg-Reg): dst ↔ src, 2 操作数 (a + b 都是寄存器).
+    // a_kind=Reg, reg_a=dst, b_kind=Reg, reg_b=src, aux=0, cond_or_size=size.
+    // xchg 是对称操作 (Intel SDM Vol. 2 XCHG: xchg a, b == xchg b, a),
+    // 翻译器在 REG-REG 时按 IR.dst / IR.src 直产 VmOp::Xchg (a=dst, b=src);
+    // MEM-REG 派活单限定不支持 (lifter 拒 MEM → C1 gate 兜底).
+    // handler:
+    //   - S32 (无 REX.W): mov eax, dword ptr [ctx + reg_a*8 + 0x10]  (低 32 位)
+    //                     mov ebx, dword ptr [ctx + reg_b*8 + 0x10]  (低 32 位)
+    //                     xchg eax, ebx                              (swap 低 32 位,
+    //                                                              上 32 位 rax/rbx 保留)
+    //                     mov dword ptr [ctx + reg_a*8 + 0x10], eax  (写回低 32 位,
+    //                                                              上 32 位 slot 保留)
+    //                     mov dword ptr [ctx + reg_b*8 + 0x10], ebx  (写回低 32 位)
+    //   - S64 (REX.W):   mov t0, qword ptr [ctx + reg_a*8 + 0x10]   (full 64)
+    //                     mov t1, qword ptr [ctx + reg_b*8 + 0x10]   (full 64)
+    //                     xchg t0, t1                                (swap full 64)
+    //                     mov qword ptr [ctx + reg_a*8 + 0x10], t0
+    //                     mov qword ptr [ctx + reg_b*8 + 0x10], t1
+    // xchg 不影响 flags (CF/OF/SF/ZF/PF 不变); 不更新 flags 槽.
+    // 派活单 §D 决策 4: Xchg 必 append-only 在 Bswap=48 之后 = 49 (pitfall #34).
+    Xchg,
 };
 
-inline constexpr u16 kVmOpMax = static_cast<u16>(VmOp::Bswap);
+inline constexpr u16 kVmOpMax = static_cast<u16>(VmOp::Xchg);
 inline constexpr u16 kVmOpLimit = 1u << 14;  // 14 位编码空间上限
 
 constexpr const char* to_string(VmOp op) {
@@ -157,6 +180,7 @@ constexpr const char* to_string(VmOp op) {
         case VmOp::MovzxMem: return "movzxmem";
         case VmOp::LeaRva: return "learva";
         case VmOp::Bswap: return "bswap";
+        case VmOp::Xchg: return "xchg";
     }
     return "?";
 }

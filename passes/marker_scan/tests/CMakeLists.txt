@@ -235,3 +235,23 @@ target_compile_options(wvmp_bswap_sample PRIVATE
 target_link_options(wvmp_bswap_sample PRIVATE
     $<$<CXX_COMPILER_ID:MSVC>:/INCREMENTAL:NO>
 )
+
+# MIT-334: 端到端正路径样本——区域内含 xchg (REG-REG 32-bit / 64-bit)，
+# 验证 xchg 修复后翻译成功、运行时走真 Xchg handler、行为与原生逐字节一致。
+# MSVC x64 不支持 inline asm, std::swap 等高 level C++ 全部编译成
+# mov+mov+mov, 不出 xchg. 真 xchg 字节由 xchg_helper.asm (MASM) 直接
+# emit, 链接进本 sample. 区域不含 rip-relative / printf / call（printf 在
+# main 区域外）。
+enable_language(ASM_MASM)
+add_executable(wvmp_xchg_sample
+    xchg_sample_main.cpp
+    xchg_helper.asm
+)
+target_link_libraries(wvmp_xchg_sample PRIVATE wvmp::sdk)
+target_compile_options(wvmp_xchg_sample PRIVATE
+    $<$<CXX_COMPILER_ID:MSVC>:/Od;/Ob0;/utf-8>
+    $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-O0>
+)
+target_link_options(wvmp_xchg_sample PRIVATE
+    $<$<CXX_COMPILER_ID:MSVC>:/INCREMENTAL:NO>
+)

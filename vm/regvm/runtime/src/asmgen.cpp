@@ -1221,6 +1221,61 @@ public:
                advance(dispatch);
     }
 
+    // MIT-334 Xchg: dst ↔ src, 2 操作数 (reg_a=dst, reg_b=src). xchg 是对称
+    // 操作 (Intel SDM: xchg a, b == xchg b, a), 但 IR.dst/src 顺序编码 (语义等价).
+    // a_kind=Reg, reg_a=dst, b_kind=Reg, reg_b=src, aux=0, cond_or_size=size (S32/S64).
+    //
+    // size 链 4 路:
+    //   - s=3 (S64): t0=t1=t_[0]/t_[1] qword 读两槽, native `xchg t0, t1` swap
+    //                full 64 位, qword 写回两槽
+    //   - s=2 (S32): dword 读两槽 (32 位寄存器读自动 zero-extend 上 32 位),
+    //                native `xchg eax, ebx` swap 低 32 位 (上 32 位 rax/rbx 保留),
+    //                dword 写回两槽 (上 32 位 slot 保留, 保留 slot 高位语义)
+    //   - s=0/1 (S8/S16): xchg 无 8/16-bit 形式 (Intel SDM Vol. 2 XCHG 仅 16/32/64-bit);
+    //                     lifter 不产 S8/S16 xchg, 此处 defensive no-op
+    //
+    // xchg 不影响 flags (CF/OF/SF/ZF/PF 不变). handler 不调用 setcc5 也不
+    // 走 flags_tail, 直接 advance(dispatch).
+    std::string build_xchg(u64 dispatch) const {
+        const std::string tag = "xchg" + std::to_string(seq());
+        const std::string tail_lbl = "atail_" + tag;
+        std::array<std::string, 4> blocks;
+        for (int s = 0; s < 4; ++s) {
+            std::string o;
+            if (s == 3) {
+                // S64: qword 读两槽 + native xchg swap full 64 + qword 写回
+                o += std::string("    mov ") + r64(t_[0]) + ", qword ptr [" + r64(ctx_) +
+                     " + " + r64(t_[4]) + "*8 + 0x10]\n";
+                o += std::string("    mov ") + r64(t_[1]) + ", qword ptr [" + r64(ctx_) +
+                     " + " + r64(t_[7]) + "*8 + 0x10]\n";
+                o += std::string("    xchg ") + r64(t_[0]) + ", " + r64(t_[1]) + "\n";
+                o += std::string("    mov qword ptr [") + r64(ctx_) + " + " +
+                     r64(t_[4]) + "*8 + 0x10], " + r64(t_[0]) + "\n";
+                o += std::string("    mov qword ptr [") + r64(ctx_) + " + " +
+                     r64(t_[7]) + "*8 + 0x10], " + r64(t_[1]) + "\n";
+            } else if (s == 2) {
+                // S32: dword 读两槽 (上 32 位 rax/rbx 自动 0) + native xchg swap
+                // 低 32 位 (上 32 位 rax/rbx 保留 = 0, 但只写 dword 故 slot 上
+                // 32 位保留) + dword 写回两槽 (slot 上 32 位保留)
+                o += std::string("    mov ") + rs(t_[0], 2) + ", dword ptr [" + r64(ctx_) +
+                     " + " + r64(t_[4]) + "*8 + 0x10]\n";
+                o += std::string("    mov ") + rs(t_[1], 2) + ", dword ptr [" + r64(ctx_) +
+                     " + " + r64(t_[7]) + "*8 + 0x10]\n";
+                o += std::string("    xchg ") + rs(t_[0], 2) + ", " + rs(t_[1], 2) + "\n";
+                o += std::string("    mov dword ptr [") + r64(ctx_) + " + " +
+                     r64(t_[4]) + "*8 + 0x10], " + rs(t_[0], 2) + "\n";
+                o += std::string("    mov dword ptr [") + r64(ctx_) + " + " +
+                     r64(t_[7]) + "*8 + 0x10], " + rs(t_[1], 2) + "\n";
+            } else {
+                // S8/S16: defensive no-op (lifter 不产此 size xchg)
+            }
+            o += "    jmp " + tail_lbl + "\n";
+            blocks[s] = o;
+        }
+        return decode_prelude() + size_chain(blocks, tag) + tail_lbl + ":\n" +
+               advance(dispatch);
+    }
+
     // Adc: dst = dst + src + CF_in（Intel SDM Vol. 2 ADC）。
     // 与 Add/Sub 不可共用 build_binary：zero5() 用 xor 清 scratch 寄存器，
     // 副作用把宿主 CPU 的 CF 也清零（XOR 写 CF=0），后续 native adc 看到的
@@ -1507,6 +1562,7 @@ RuntimeGenResult generate_runtime(wvmp::Rng& rng) {
         {int(VmOp::Movzx), "movzx", &AsmGen::build_movzx},
         {int(VmOp::MovzxMem), "movzxmem", &AsmGen::build_movzx_mem},
         {int(VmOp::Bswap), "bswap", &AsmGen::build_bswap},
+        {int(VmOp::Xchg), "xchg", &AsmGen::build_xchg},
         {int(VmOp::Cmp), "cmp", &AsmGen::build_cmp},
         {int(VmOp::Test), "test", &AsmGen::build_test},
         {int(VmOp::Load), "load", &AsmGen::build_load},

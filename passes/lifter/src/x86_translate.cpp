@@ -503,6 +503,45 @@ TranslateResult translate_bswap(const cs_insn& ci, const cs_x86& x, ir::Arch arc
     return ok(out);
 }
 
+// MIT-334 xchg r, r (87 /r, 可选 REX.W): 寄存器/内存交换。
+// MSVC /Od 默认 codegen:
+//   - xchg rax, rax (48 90)  → 1 字节 REX.W + 0x90, 单操作数隐式 rax → NOP
+//   - xchg rax, rbx (48 87 D8) → 3 字节 REX.W + 0x87 + ModR/M
+//   - xchg eax, ebx (87 D8)   → 2 字节 (无 REX.W, S32)
+// 字节结构: [48] (REX.W 可选) | 87 (opcode) | ModR/M (mod=11 表示 reg-reg)
+// 特殊: `48 90` / `90` 是 xchg rax,rax / xchg eax,eax 当 NOP, capstone 自动
+// 识别为 X86_INS_NOP (不进入本 case), 走 X86_INS_NOP 分支单独 emit
+// ir::Op::Nop (沿用现有 Nop Op, 不加新 enum).
+// xchg 是 2 操作数 (dst + src), ModR/M 字节由 capstone 自动解析为 2 个
+// reg 操作数. xchg 是对称操作 (Intel SDM: xchg a, b == xchg b, a), 但
+// IR 仍按 IR.dst / IR.src 顺序编码 dst 和 src (语义等价).
+// size 由 REX.W 标志决定: x.rex bit 3 (REX.W) → S64, 否则 → S32.
+// updates_flags=false (xchg 不影响 CF/OF/SF/ZF/PF)。
+// MEM 形式 (xchg [reg], reg) 派活单限定不支持 (需 temp 寄存器, 复杂),
+// lifter 拒 MEM → 触发 C1 gate 兜底 (与原生行为一致).
+TranslateResult translate_xchg(const cs_insn& ci, const cs_x86& x, ir::Arch arch) {
+    if (x.op_count != 2) return unsupported(ci.address, ci.size);
+    // xchg 是对称操作, 但 IR 仍按 dst/src 编码 (语义等价). 两个操作数都必须
+    // 是寄存器 (MEM-REG 派活单限定不支持, lifter 拒 → C1 gate 兜底)。
+    if (x.operands[0].type != X86_OP_REG) return unsupported(ci.address, ci.size);
+    if (x.operands[1].type != X86_OP_REG) return unsupported(ci.address, ci.size);
+    auto d = map_reg(x.operands[0].reg);
+    auto s = map_reg(x.operands[1].reg);
+    if (!d || !s) return unsupported(ci.address, ci.size);
+
+    // REX.W 检测: x.rex bit 3 (REX.W) → S64, 否则 → S32.
+    const bool rex_w = (x.rex & 0x08) != 0;
+
+    ir::Insn out;
+    out.op = Op::Xchg;
+    out.addr = ci.address;
+    out.size = rex_w ? Size::S64 : Size::S32;
+    out.updates_flags = false;
+    out.dst = Operand::reg_(*d);
+    out.src = Operand::reg_(*s);
+    return ok(out);
+}
+
 } // namespace
 
 std::optional<ir::Reg> map_reg(x86_reg r) {
@@ -614,6 +653,7 @@ TranslateResult translate_insn(const cs_insn& ci, ir::Arch arch) {
     case X86_INS_MOVSXD: return translate_movsxd(ci, x, arch);
     case X86_INS_MOVZX: return translate_movzx(ci, x, arch);
     case X86_INS_BSWAP: return translate_bswap(ci, x, arch);
+    case X86_INS_XCHG: return translate_xchg(ci, x, arch);
     case X86_INS_NOP: {
         ir::Insn out;
         out.op = Op::Nop;

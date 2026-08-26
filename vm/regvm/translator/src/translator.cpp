@@ -300,6 +300,8 @@ struct Translator {
                 ok = translate_movzx(em, sc, in, current_rva, next_ip);
             } else if (in.op == ir::Op::Bswap) {
                 ok = translate_bswap(em, in);
+            } else if (in.op == ir::Op::Xchg) {
+                ok = translate_xchg(em, in);
             } else if (is_alu_binop(in.op)) {
                 ok = translate_alu_binop(em, sc, in, current_rva, next_ip);
             } else if (is_unary(in.op)) {
@@ -785,6 +787,32 @@ struct Translator {
         const u8 d = isa::vm_reg_of(in.dst.reg);
         const u8 sz = isa::size_field(in.size);
         em.emit(VmOp::Bswap, OpKind::Reg, d, OpKind::None, 0, 0, sz);
+        return true;
+    }
+
+    // ---- MIT-334: xchg (寄存器交换) ----
+    //
+    // xchg 是 2 操作数 (dst + src 都是寄存器, 派活单限定 REG-REG, MEM-REG
+    // 由 lifter 拒为 unsupported → C1 gate 兜底). emit VmOp::Xchg 一条:
+    //   a_kind=Reg reg_a=dst, b_kind=Reg reg_b=src, aux=0, cond_or_size=size
+    //   (S32 或 S64 由 REX.W 决定, lifter 已传过来).
+    //
+    // xchg 是对称操作 (Intel SDM: xchg a, b == xchg b, a), IR.dst/src 顺序
+    // 不影响语义, 翻译器按 IR 直产 a=dst, b=src.
+    //
+    // handler 在 asmgen.cpp 的 build_xchg: 按 cond_or_size 分 S32/S64 emit
+    // native xchg eax,ebx (S32) 或 xchg rax,rbx (S64). S32 路径用 dword
+    // 读写 (上 32 位 slot 保留), S64 路径用 qword 读写 (full 64 互换).
+    //
+    // 不更新 flags (xchg 不影响 CF/OF/SF/ZF/PF).
+    bool translate_xchg(Emitter& em, const ir::Insn& in) {
+        if (in.op != ir::Op::Xchg) return false;
+        if (in.dst.kind != ir::Operand::Kind::Reg) return false;
+        if (in.src.kind != ir::Operand::Kind::Reg) return false;
+        const u8 d = isa::vm_reg_of(in.dst.reg);
+        const u8 s = isa::vm_reg_of(in.src.reg);
+        const u8 sz = isa::size_field(in.size);
+        em.emit_rr(VmOp::Xchg, d, s, sz);
         return true;
     }
 };
