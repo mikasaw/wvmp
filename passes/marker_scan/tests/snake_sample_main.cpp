@@ -91,11 +91,19 @@ static void io_init() {
 //   - 不调 std::rand (rand 在区域内是 call gate 整数 ABI, 但 std::rand 内部
 //     用全局 state, 触发 rip-relative; 这里用本地 LCG 模拟, 不调 std::rand)
 //
+// ate 食物重生用算术提交 (no `if`, no forward-jump), 避免 `je` 跨 WVMP_END 触发 C1 gate (MIT-326 方案 A):
+//   - g_score += ate                  (ate ∈ {0,1})
+//   - g_food_x += ate * (new_fx - g_food_x)
+//   - g_food_y += ate * (new_fy - g_food_y)
+//   ate=1 时等价于原 commit; ate=0 时所有 delta=0, 等价于 no-op。
+//   MSVC /Od codegen 出 `imul` (白名单内, MIT-247 无关), 无 je。
 __declspec(noinline) static void tick(int new_dir) {
+    unsigned int s = 0;
+
     WVMP_BEGIN(tick);
 
     // 局部 LCG PRNG (避免调 std::rand 触发 rip-relative)
-    unsigned int s = g_rng_state;
+    s = g_rng_state;
     s = s * 1103515245u + 12345u;
     g_rng_state = s;
 
@@ -147,35 +155,30 @@ __declspec(noinline) static void tick(int new_dir) {
     // 6) 更新蛇身
     //    ate=1: 头插到 [0], 旧身从 [0] 开始依次后移 (长度+1)
     //    ate=0: 头插到 [0], 旧身从 [0] 开始后移 (尾部丢弃, 长度不变)
-    int new_len = len + (ate != 0 ? 1 : 0);
+    int new_len = len + ate;
 
-    // 先移动: 从尾到头复制 (j = len-1; j >= 0; --j)  逆向避免覆写
-    int j = len - 1;
-    while (j >= 0) {
-        g_snake_x[j + 1] = g_snake_x[j];
-        g_snake_y[j + 1] = g_snake_y[j];
-        j = j - 1;
-    }
-    g_snake_x[0] = nx;
-    g_snake_y[0] = ny;
-    g_snake_len = new_len;
+        // 先移动: 从尾到头复制 (j = len-1; j >= 0; --j)  逆向避免覆写
+        int j = len - 1;
+        while (j >= 0) {
+            g_snake_x[j + 1] = g_snake_x[j];
+            g_snake_y[j + 1] = g_snake_y[j];
+            j = j - 1;
+        }
+        g_snake_x[0] = nx;
+        g_snake_y[0] = ny;
+        g_snake_len = new_len;
 
-    // 7) ate 时: 分数+1, 重生食物 (用 LCG 找一个不与蛇身重合的位置)
-    if (ate != 0) {
-        g_score = g_score + 1;
-        // 重生食物: 简化用固定算法 (确定性)
+        // 算术提交 (no je): food 位置无前向跳转跨 WVMP_END
         //   food_x = (s & (GW - 2))   ≡ s % 31  (GW=32 时)
         //   food_y = ((s >> 8) & (GH - 2)) ≡ (s >> 8) % 31  (GH=32 时)
-        // 用 & (N-2) 替代 % (N-1): MSVC /Od codegen 出 `and eax, 0x1E`,
-        // 在 lifter 白名单内, 避开 div 指令。
         int new_fx = (int)(s & (unsigned int)(GW - 2));
         int new_fy = (int)((s >> 8) & (unsigned int)(GH - 2));
-        g_food_x = new_fx;
-        g_food_y = new_fy;
-    }
+        g_score = g_score + ate;
+        g_food_x = g_food_x + ate * (new_fx - g_food_x);
+        g_food_y = g_food_y + ate * (new_fy - g_food_y);
 
-    WVMP_END(tick);
-}
+        WVMP_END(tick);
+    }
 
 // ─── 区域外 main: deterministic 100-tick 跑, 输出最终状态 ────────────────
 int main() {
