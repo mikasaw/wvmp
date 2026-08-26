@@ -112,7 +112,20 @@ enum class Op : u16 { Mov, Lea, Add, Sub, Adc, Sbb, And, Or, Xor, Not, Neg, Inc,
                       //   - 派活单 §D 决策: Movsx 必 append-only 在 Cmpxchg 之后
                       //     (pitfall #34 additive enum append-only)；派活单限定不支
                       //     持 movsx r16, r/m16 (16→16 no-op, 编译器不 emit)。
-                      Movsx };
+                      Movsx,
+                      // MIT-349: 比特计数 (popcnt r, r/m, SSE4.2)。
+                      //   - REG-REG (mod=11): popcnt r, r
+                      //     字节结构: [48] (REX.W 可选) | F3 0F B8 | ModR/M
+                      //     (3 字节无 REX.W → S32; 4 字节 REX.W → S64)
+                      //   - REG-MEM 派活单限定不支持 (沿用 movzx/movsx 限定风格,
+                      //     完全不支持 MEM 不像 movzx/movsx 沿用 MovzxMem/MovsxMem
+                      //     单独处理)
+                      //   - size 由 REX.W 决定: 无 REX.W → S32, 有 REX.W → S64
+                      //   - updates_flags=false (popcnt 不改 CF/OF/SF/ZF/PF;
+                      //     SSE4.2 popcnt 仅设 ZF 根据结果 0/非0, lifter 不关心)
+                      //   - 派活单 §D 决策 4: Popcnt 必 append-only 在 Movsx 之后
+                      //     (pitfall #34 additive enum append-only)。
+                      Popcnt };
 enum class Size : u8 { S8, S16, S32, S64 };
 enum class Cond : u8 { O, No, B, Ae, E, Ne, Be, A, S, Ns, P, Np, L, Ge, Le, G };
 constexpr u64 bits(Size s) { return s==Size::S8?8: s==Size::S16?16: s==Size::S32?32:64; }

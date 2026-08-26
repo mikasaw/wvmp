@@ -300,6 +300,10 @@ struct Translator {
                 ok = translate_movzx(em, sc, in, current_rva, next_ip);
             } else if (in.op == ir::Op::Movsx) {
                 ok = translate_movsx(em, sc, in, current_rva, next_ip);
+            } else if (in.op == ir::Op::Popcnt) {
+                // MIT-349: popcnt dispatch — REG-REG 形式 emit 单条 VmOp::Popcnt
+                // (handler 用 native popcnt 完成比特计数; src 必是 REG 派活单限定).
+                ok = translate_popcnt(em, in);
             } else if (in.op == ir::Op::Bswap) {
                 ok = translate_bswap(em, in);
             } else if (in.op == ir::Op::Xchg) {
@@ -836,6 +840,34 @@ struct Translator {
             return true;
         }
         return skip(in, "movsx 操作数形态未支持", nullptr);
+    }
+
+    // ---- MIT-349: popcnt (比特计数, SSE4.2) ----
+    //
+    // popcnt 是 2 操作数 (dst + src 都是寄存器, 派活单限定 REG-REG, MEM 派活单
+    // 限定不支持 → lifter 拒 MEM → C1 gate 兜底). emit VmOp::Popcnt 一条:
+    //   a_kind=Reg reg_a=dst, b_kind=Reg reg_b=src, aux=0, cond_or_size=size
+    //   (S32 或 S64 由 REX.W 决定, lifter 已传过来).
+    //
+    // popcnt 是 bit-counting (不修改 flags, CF/OF/SF/ZF/PF 不变; SSE4.2 popcnt
+    // 仅设 ZF 根据结果 0/非0, lifter 不关心). handler 用 native popcnt 直读 host
+    // CPU 完成计数, 不调 setcc5 也不走 flags_tail.
+    //
+    // handler 在 asmgen.cpp 的 build_popcnt: 按 cond_or_size 分 S32/S64 emit
+    // native popcnt eax,eax / popcnt rax,rax (S32/S64). S32 路径用 32 位寄存器
+    // (上 32 位自动 zero-extend), qword 写回完整 64 位; S64 路径全 64 位读写。
+    // 不更新 flags 槽。
+    bool translate_popcnt(Emitter& em, const ir::Insn& in) {
+        if (in.op != ir::Op::Popcnt) return false;
+        // dst = reg_a, src = reg_b (派活单限定 REG-REG, MEM 派活单限定不支持,
+        // lifter 拒 MEM → C1 gate 兜底).
+        if (in.dst.kind != ir::Operand::Kind::Reg ||
+            in.src.kind != ir::Operand::Kind::Reg)
+            return skip(in, "popcnt 操作数形态未支持", nullptr);
+        const u8 d = isa::vm_reg_of(in.dst.reg);
+        const u8 b = isa::vm_reg_of(in.src.reg);
+        em.emit_rr(VmOp::Popcnt, d, b, isa::size_field(in.size));
+        return true;
     }
 
     // ---- MIT-333: bswap (字节序反转) ----

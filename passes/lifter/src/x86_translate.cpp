@@ -560,10 +560,59 @@ TranslateResult translate_movsx(const cs_insn& ci, const cs_x86& x, ir::Arch arc
     return unsupported(ci.address, ci.size);
 }
 
-// MIT-333 bswap reg32/reg64 (0F C8+rd, 可选 REX.W): 字节序反转。
+// MIT-349 popcnt (F3 0F B8+rm, 可选 REX.W): SSE4.2 比特计数。
+// MSVC /Od 默认 codegen REG-REG (mod=11)：
+//   - 32-bit (no REX.W):    F3 0F B8 C0 = popcnt eax, eax
+//   - 32-bit 不同寄存器:    F3 0F B8 C8 = popcnt ecx, eax
+//   - 64-bit (REX.W):       48 F3 0F B8 C0 = popcnt rax, rax
+//   - 64-bit 不同寄存器:    48 F3 0F B8 C8 = popcnt rcx, rax
+// 字节结构: [48] (REX.W 可选) | F3 0F B8 | ModR/M (mod=11 REG-REG; mod=00/01/10
+//   MEM 派活单限定不支持)。
+//   - popcnt 2 操作数 (dst + src), src 必 REG (派活单限定不支持 MEM form)。
+//   - size 由 REX.W 决定: x.rex bit 3 (REX.W) → S64, 否则 → S32.
+//   - updates_flags=false (popcnt 不改 CF/OF/SF/ZF/PF; SSE4.2 popcnt 仅设 ZF
+//     根据结果 0/非0, lifter 不关心)。popcnt 不是 ALU binop, 不调 setcc5.
+TranslateResult translate_popcnt(const cs_insn& ci, const cs_x86& x, ir::Arch arch) {
+    if (x.op_count != 2) return unsupported(ci.address, ci.size);
+    // 两个操作数必都是寄存器 (popcnt r, r REG-REG); MEM 形式派活单限定不支持
+    if (x.operands[0].type != X86_OP_REG) return unsupported(ci.address, ci.size);
+    if (x.operands[1].type != X86_OP_REG) return unsupported(ci.address, ci.size);
+    auto d = map_reg(x.operands[0].reg);
+    auto s = map_reg(x.operands[1].reg);
+    if (!d || !s) return unsupported(ci.address, ci.size);
+
+    // size 由 REX.W 标志决定: REX.W (0x48..0x4F, bit 3 = 1) → S64, 否则 → S32.
+    // 派活单限定仅 32/64-bit REG-REG 形式 (Intel SDM Vol. 2 POPCNT 仅 32/64-bit 寄存器),
+    // 8/16-bit popcnt 不存在 (lifter 防 C1 gate 兜底, 但保留 size_chain 4 路 size)。
+    // 注: 这里**不**用 x.rex 也不**不**用 data_size() — capstone 对 popcnt 的
+    // operand size 报告与 REX.W 不一致 (与 movzx/movsx 行为不同). 直接扫描
+    // ci.bytes 找 REX byte (0x40-0x4F, 含 F3 前缀可能掩盖), bit 3 = REX.W.
+    bool rex_w = false;
+    for (size_t i = 0; i + 1 < ci.size; ++i) {
+        if (ci.bytes[i] == 0xF3 && ci.bytes[i + 1] >= 0x40 && ci.bytes[i + 1] <= 0x4F) {
+            rex_w = (ci.bytes[i + 1] & 0x08) != 0;
+            break;
+        }
+        if (ci.bytes[i] >= 0x40 && ci.bytes[i] <= 0x4F &&
+            ci.bytes[i + 1] == 0xF3) {
+            rex_w = (ci.bytes[i] & 0x08) != 0;
+            break;
+        }
+    }
+
+    ir::Insn out;
+    out.op = Op::Popcnt;
+    out.addr = ci.address;
+    out.size = rex_w ? Size::S64 : Size::S32;
+    out.updates_flags = false;  // popcnt 不改 flags
+    out.dst = Operand::reg_(*d);
+    out.src = Operand::reg_(*s);
+    return ok(out);
+}
 // MSVC /Od 默认 codegen:
 //   - bswap eax       (无 REX.W, S32): 32 位字节反转, 上 32 位 zero-extend
 //   - bswap rax       (REX.W,   S64): 64 位字节反转
+// MIT-333 bswap reg32/reg64 (0F C8+rd, 可选 REX.W): 字节序反转。
 // 字节结构: [48] (REX.W 可选) | 0F C8 (opcode + reg 直接编码) | ModR/M
 // bswap 是单操作数 (dst only, no src), ModR/M 字节由 capstone 自动解析
 // 为 reg 操作数。
@@ -930,6 +979,8 @@ TranslateResult translate_insn(const cs_insn& ci, ir::Arch arch) {
     case X86_INS_MOVSXD: return translate_movsxd(ci, x, arch);
     case X86_INS_MOVZX: return translate_movzx(ci, x, arch);
     case X86_INS_MOVSX: return translate_movsx(ci, x, arch);
+    // MIT-349: popcnt (F3 0F B8+rm, mod=11 REG-REG / mod=00/01/10 MEM 派活单限定不支持).
+    case X86_INS_POPCNT: return translate_popcnt(ci, x, arch);
     case X86_INS_BSWAP: return translate_bswap(ci, x, arch);
     case X86_INS_XCHG: return translate_xchg(ci, x, arch);
     // MIT-336: setcc 16 variants (0F 90+cc+rm, mod=11 REG / mod=00 MEM).

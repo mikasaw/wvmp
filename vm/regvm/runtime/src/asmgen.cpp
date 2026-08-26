@@ -1586,6 +1586,64 @@ public:
                advance(dispatch);
     }
 
+    // MIT-349 Popcnt: dst = count_ones(src), 2 操作数 (reg_a=dst, reg_b=src)。
+    // 字节结构: [48] (REX.W 可选) | F3 0F B8 | ModR/M (mod=11 REG-REG)。
+    // a_kind=Reg, reg_a=dst, b_kind=Reg, reg_b=src, aux=0, cond_or_size=size
+    //   (S32 或 S64 由 REX.W 决定, lifter 已传过来)。
+    //
+    // 派活单限定不支持 MEM 形式 (沿用 movzx/movsx 限定风格, 完全不支持 MEM 不像
+    // movzx/movsx 沿用 MovzxMem/MovsxMem 单独处理)——翻译器只产 REG-REG 路径。
+    //
+    // size 链 4 路:
+    //   - s=3 (S64): qword 读 src 槽 → popcnt r64, r64 → qword 写回 dst 槽
+    //   - s=2 (S32): dword 读 src 槽 (alias_read 自动 zero-extend 上 32 位)
+    //                → popcnt r32, r32 → qword 写回 dst 槽 (上 32 位 0, popcnt
+    //                  结果 0..32 自动 zero-extend 上 32 位, 与 native popcnt
+    //                  32-bit → 32-bit 寄存器零扩展上 32 位语义一致)
+    //   - s=0/1 (S8/S16): popcnt 无 8/16-bit 形式 (Intel SDM Vol. 2 POPCNT 仅
+    //                     16/32/64-bit); lifter 不产此 size, 此处 defensive no-op
+    //
+    // popcnt 不影响 flags (CF/OF/SF/ZF/PF 不变, SSE4.2 popcnt 仅 ZF 与结果 0/非0
+    // 相关)。handler 不调用 setcc5 也不走 flags_tail, 直接 advance(dispatch)。
+    //
+    // **pitfall #37 复用**: native popcnt 是 2 操作数 REG-REG, src 被 popcnt 消耗
+    // (不保留), 不需要 save src to T6 (与 build_cmpxchg 的 "src 不被 cmpxchg 修改,
+    // 不需 T6 保存" 同源)。但 T1 仍作 src slot index 临时——必须先 qword/dword 读
+    // src 槽到 T1, 再 popcnt T1, T1 in-place, 然后 qword 写回 T1 到 reg_a (dst)
+    // 槽。整个流程 T1 是唯一的载体寄存器, 不需要 T6 守恒。
+    std::string build_popcnt(u64 dispatch) const {
+        const std::string tag = "popcnt" + std::to_string(seq());
+        const std::string tail_lbl = "atail_" + tag;
+        std::array<std::string, 4> blocks;
+        for (int s = 0; s < 4; ++s) {
+            std::string o;
+            if (s == 3) {
+                // S64: qword 读 src 槽 → popcnt in-place → qword 写回 dst 槽
+                o += std::string("    mov ") + r64(t_[1]) + ", qword ptr [" + r64(ctx_) +
+                     " + " + r64(t_[7]) + "*8 + 0x10]\n";  // T1 = src (qword)
+                o += std::string("    popcnt ") + r64(t_[1]) + ", " + r64(t_[1]) + "\n";  // T1 = popcnt(T1)
+                o += std::string("    mov qword ptr [") + r64(ctx_) + " + " +
+                     r64(t_[4]) + "*8 + 0x10], " + r64(t_[1]) + "\n";  // qword 写回 dst
+            } else if (s == 2) {
+                // S32: dword 读 src (alias_read 自动 zero-extend 上 32 位)
+                //      → popcnt r32,r32 in-place → qword 写回 dst 槽
+                // 32 位寄存器 popcnt 结果 (eax) 自动 zero-extend 上 32 位, qword
+                // 写回完整 64 位 (上 32 位 0)。
+                o += std::string("    mov ") + rs(t_[1], 2) + ", dword ptr [" + r64(ctx_) +
+                     " + " + r64(t_[7]) + "*8 + 0x10]\n";  // T1 = src (alias_read)
+                o += std::string("    popcnt ") + rs(t_[1], 2) + ", " + rs(t_[1], 2) + "\n";
+                o += std::string("    mov qword ptr [") + r64(ctx_) + " + " +
+                     r64(t_[4]) + "*8 + 0x10], " + r64(t_[1]) + "\n";  // qword 写回
+            } else {
+                // S8/S16: defensive no-op (lifter 不产此 size popcnt)
+            }
+            o += "    jmp " + tail_lbl + "\n";
+            blocks[s] = o;
+        }
+        return decode_prelude() + size_chain(blocks, tag) + tail_lbl + ":\n" +
+               advance(dispatch);
+    }
+
     // MIT-334 Xchg: dst ↔ src, 2 操作数 (reg_a=dst, reg_b=src). xchg 是对称
     // 操作 (Intel SDM: xchg a, b == xchg b, a), 但 IR.dst/src 顺序编码 (语义等价).
     // a_kind=Reg, reg_a=dst, b_kind=Reg, reg_b=src, aux=0, cond_or_size=size (S32/S64).
@@ -1979,6 +2037,7 @@ RuntimeGenResult generate_runtime(wvmp::Rng& rng) {
         {int(VmOp::Cmpxchg), "cmpxchg", &AsmGen::build_cmpxchg},
         {int(VmOp::Movsx), "movsx", &AsmGen::build_movsx},
         {int(VmOp::MovsxMem), "movsxmem", &AsmGen::build_movsx_mem},
+        {int(VmOp::Popcnt), "popcnt", &AsmGen::build_popcnt},
         {int(VmOp::Cmp), "cmp", &AsmGen::build_cmp},
         {int(VmOp::Test), "test", &AsmGen::build_test},
         {int(VmOp::Load), "load", &AsmGen::build_load},

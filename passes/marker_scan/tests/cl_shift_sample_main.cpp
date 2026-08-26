@@ -31,6 +31,16 @@
 #include <cstdint>
 #include <cstdio>
 
+// popcnt 函数由 cl_shift_sample_asm.asm (MASM) 直接 emit 真 popcnt REG-REG
+// 字节 (32-bit: F3 0F B8 C0, 64-bit: 48 F3 0F B8 C0). MSVC __popcnt 内部函数
+// 在 /Od 下 emit MEM form (popcnt reg, [rsp+disp], 因 MSVC 把参数 spill 到栈),
+// 派活单限定不支持 MEM form, 故用 MASM helper 强制 emit REG-REG form.
+// 用 mangled C++ 名称声明 (Win64 名称修饰, 沿用 MIT-334 xchg_helper 模式).
+extern "C" {
+    unsigned int popcnt32_fn(unsigned int x);  // ?popcnt32_fn@@YAII@Z
+    unsigned int popcnt64_fn(unsigned long long x);  // ?popcnt64_fn@@YAIX@Z
+}
+
 // shl_cl: r = x << count (count 来自函数参数, MSVC codegen 为 cl 变体)。
 // MSVC /Od 下内联汇编:
 //   mov ecx, dword ptr [rsp+xxh]   ; 加载 count (32 位, 无 movzx)
@@ -139,6 +149,26 @@ __declspec(noinline) static long long movsx_16_64(short x) {
     return r;
 }
 
+// MIT-349: popcnt 32-bit (F3 0F B8 C0) SSE4.2 比特计数。
+// 真 popcnt REG-REG 字节由 cl_shift_sample_asm.asm (MASM) emit, 链接进本 sample。
+// 派活单限定仅 REG-REG (mod=11), 不支持 MEM form (沿用 movzx/movsx 派活单限定风格,
+// 但完全不支持 MEM, 不像 movzx/movsx 沿用 MovzxMem/MovsxMem 单独处理)。
+__declspec(noinline) static int popcnt_32(unsigned int x) {
+    WVMP_BEGIN(popcnt_32);
+    volatile int r = static_cast<int>(popcnt32_fn(x)); // MASM helper: popcnt eax, eax (F3 0F B8 C0)
+    WVMP_END(popcnt_32);
+    return r;
+}
+
+// MIT-349: popcnt 64-bit (48 F3 0F B8 C0) SSE4.2 比特计数。
+// 真 popcnt REG-REG 字节由 cl_shift_sample_asm.asm (MASM) emit, 链接进本 sample。
+__declspec(noinline) static int popcnt_64(unsigned long long x) {
+    WVMP_BEGIN(popcnt_64);
+    volatile int r = static_cast<int>(popcnt64_fn(x)); // MASM helper: popcnt rax, rax (48 F3 0F B8 C0)
+    WVMP_END(popcnt_64);
+    return r;
+}
+
 int main() {
     // 用函数参数传入 count —— MSVC codegen 为 cl 变体核心条件: count 不能
     // 是编译期常量 (用 literal 常量会让 MSVC 用 imm 形式 C1 /4 ib)。
@@ -165,7 +195,16 @@ int main() {
     const int i = movsx_16_32(-1);
     const long long j = movsx_16_64(-1);
 
-    std::printf("a=%llx b=%llx c=%lld d=%llx e=%x f=%llx g=%x h=%llx i=%x j=%llx\n",
+    // MIT-349: popcnt 2 形式测试 (32-bit + 64-bit REG-REG)。
+    // 区域不含 rip-relative / call / printf, MSVC /Od 配合 <intrin.h> 的
+    // __popcnt / __popcnt64 emit 真 popcnt 字节 (F3 0F B8 / 48 F3 0F B8)。
+    // 期望 (比特计数):
+    //   popcnt_32(0xFFFFFFFF)     = 32 (32 位全 1)
+    //   popcnt_64(0xFFFFFFFFFFFF) = 48 (低 48 位全 1, 高 16 位 0)
+    const int k = popcnt_32(0xFFFFFFFFu);
+    const int l = popcnt_64(0xFFFFFFFFFFFFull);
+
+    std::printf("a=%llx b=%llx c=%lld d=%llx e=%x f=%llx g=%x h=%llx i=%x j=%llx k=%x l=%x\n",
                 static_cast<unsigned long long>(a),
                 static_cast<unsigned long long>(b),
                 static_cast<long long>(c),
@@ -175,6 +214,8 @@ int main() {
                 static_cast<unsigned int>(g),
                 static_cast<unsigned long long>(h),
                 static_cast<unsigned int>(i),
-                static_cast<unsigned long long>(j));
+                static_cast<unsigned long long>(j),
+                static_cast<unsigned int>(k),
+                static_cast<unsigned int>(l));
     return 0;
 }

@@ -945,6 +945,87 @@ TEST_F(LifterTranslate, MovsxRegToReg16To32) {
     EXPECT_EQ(r.insn.src.reg, ir::Reg::Rcx);
 }
 
+// MIT-349: popcnt (F3 0F B8+rm) SSE4.2 比特计数。
+// 字节编码（来自项目主派活单 §A 反汇编验证, capstone 实测）：
+//   - REG-REG 32-bit (no REX.W):    F3 0F B8 C0 = popcnt eax, eax
+//   - REG-REG 32-bit 不同寄存器:    F3 0F B8 C8 = popcnt ecx, eax
+//   - REG-REG 64-bit (REX.W):       48 F3 0F B8 C0 = popcnt rax, rax
+//   - REG-REG 64-bit 不同寄存器:    48 F3 0F B8 C8 = popcnt rcx, rax
+// lifter 只接 REG-REG 形式 (mod=11)；MEM (mod=00/01/10) 派活单限定不支持
+// (lifter 拒为 unsupported → C1 gate 兜底)。
+// size 由 REX.W 决定：无 REX.W → S32, 有 REX.W → S64。
+// updates_flags=false (popcnt 不改 CF/OF/SF/ZF/PF; SSE4.2 popcnt 仅 ZF)。
+TEST_F(LifterTranslate, PopcntRegToReg32Same) {
+    // F3 0F B8 C0: popcnt eax, eax — REG-REG 32-bit 同寄存器
+    const wvmp::u8 b[] = {0xF3, 0x0F, 0xB8, 0xC0};
+    auto r = translate_bytes(x64, b, ir::Arch::X64);
+    ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r.insn.op, ir::Op::Popcnt);
+    EXPECT_EQ(r.insn.size, ir::Size::S32);        // 无 REX.W → S32
+    EXPECT_FALSE(r.insn.updates_flags);            // popcnt 不改 flags
+    ASSERT_EQ(r.insn.dst.kind, ir::Operand::Kind::Reg);
+    EXPECT_EQ(r.insn.dst.reg, ir::Reg::Rax);
+    ASSERT_EQ(r.insn.src.kind, ir::Operand::Kind::Reg);
+    EXPECT_EQ(r.insn.src.reg, ir::Reg::Rax);
+    EXPECT_EQ(r.insn.addr, 0u);
+}
+
+TEST_F(LifterTranslate, PopcntRegToReg32Different) {
+    // F3 0F B8 C8: popcnt ecx, eax — REG-REG 32-bit 不同寄存器
+    // F3 (REP prefix) | 0F B8 (opcode) | C8 (ModR/M: mod=11, reg=001=Rcx, r/m=000=Rax)
+    const wvmp::u8 b[] = {0xF3, 0x0F, 0xB8, 0xC8};
+    auto r = translate_bytes(x64, b, ir::Arch::X64);
+    ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r.insn.op, ir::Op::Popcnt);
+    EXPECT_EQ(r.insn.size, ir::Size::S32);
+    EXPECT_FALSE(r.insn.updates_flags);
+    ASSERT_EQ(r.insn.dst.kind, ir::Operand::Kind::Reg);
+    EXPECT_EQ(r.insn.dst.reg, ir::Reg::Rcx);
+    ASSERT_EQ(r.insn.src.kind, ir::Operand::Kind::Reg);
+    EXPECT_EQ(r.insn.src.reg, ir::Reg::Rax);
+}
+
+TEST_F(LifterTranslate, PopcntRegToReg64Same) {
+    // 48 F3 0F B8 C0: popcnt rax, rax — REG-REG 64-bit (REX.W) 同寄存器
+    // 48 (REX.W) | F3 (REP prefix) | 0F B8 | C0 (ModR/M: mod=11, reg=000=Rax, r/m=000=Rax)
+    const wvmp::u8 b[] = {0x48, 0xF3, 0x0F, 0xB8, 0xC0};
+    auto r = translate_bytes(x64, b, ir::Arch::X64);
+    ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r.insn.op, ir::Op::Popcnt);
+    EXPECT_EQ(r.insn.size, ir::Size::S64);        // REX.W → S64
+    EXPECT_FALSE(r.insn.updates_flags);
+    ASSERT_EQ(r.insn.dst.kind, ir::Operand::Kind::Reg);
+    EXPECT_EQ(r.insn.dst.reg, ir::Reg::Rax);
+    ASSERT_EQ(r.insn.src.kind, ir::Operand::Kind::Reg);
+    EXPECT_EQ(r.insn.src.reg, ir::Reg::Rax);
+}
+
+TEST_F(LifterTranslate, PopcntRegToReg64Different) {
+    // 48 F3 0F B8 C8: popcnt rcx, rax — REG-REG 64-bit 不同寄存器
+    const wvmp::u8 b[] = {0x48, 0xF3, 0x0F, 0xB8, 0xC8};
+    auto r = translate_bytes(x64, b, ir::Arch::X64);
+    ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r.insn.op, ir::Op::Popcnt);
+    EXPECT_EQ(r.insn.size, ir::Size::S64);
+    EXPECT_FALSE(r.insn.updates_flags);
+    ASSERT_EQ(r.insn.dst.kind, ir::Operand::Kind::Reg);
+    EXPECT_EQ(r.insn.dst.reg, ir::Reg::Rcx);
+    ASSERT_EQ(r.insn.src.kind, ir::Operand::Kind::Reg);
+    EXPECT_EQ(r.insn.src.reg, ir::Reg::Rax);
+}
+
+// MIT-349: popcnt MEM 形式派活单限定不支持 (lifter 拒为 unsupported)。
+// 派活单 §D 决策 9: 完全不支持 MEM, 不像 movzx/movsx 沿用 MovzxMem/MovsxMem
+// 单独处理。
+TEST_F(LifterTranslate, PopcntMemRejected) {
+    // F3 0F B8 44 24 20: popcnt eax, [rsp+0x20] — REG-MEM 含 SIB
+    // F3 (REP prefix) | 0F B8 | 44 (ModR/M: mod=01, reg=000=Rax, r/m=100=SIB)
+    //   | 24 (SIB: scale=00, index=100=none, base=100=Rsp) | 20 (disp8)
+    const wvmp::u8 b[] = {0xF3, 0x0F, 0xB8, 0x44, 0x24, 0x20};
+    auto r = translate_bytes(x64, b, ir::Arch::X64);
+    EXPECT_EQ(r.status, lifter::TranslateStatus::Unsupported);
+}
+
 TEST_F(LifterTranslate, SkippedInstructions) {
     // 0F A2: cpuid —— 超出白名单
     const wvmp::u8 cpuid[] = {0x0F, 0xA2};

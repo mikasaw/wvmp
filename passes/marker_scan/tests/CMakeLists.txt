@@ -197,7 +197,14 @@ target_link_options(wvmp_snake_sample PRIVATE
 # SarCl/RolCl/RorCl handler、行为与原生逐字节一致。用 volatile uint8_t
 # 计数强制 MSVC /Od 下 _rotl64 / _rotr64 codegen 为 cl 变体（D3 /5）而非
 # imm 形式 (C1 /r ib)。
-add_executable(wvmp_cl_shift_sample cl_shift_sample_main.cpp)
+# MIT-349: 区域内增加 popcnt 32-bit + 64-bit REG-REG 形式。MSVC __popcnt 内部函数
+# 在 /Od 下 emit `popcnt reg, [rsp+disp]` MEM 形式 (派活单限定不支持 MEM form),
+# 故 popcnt 字节由 cl_shift_sample_asm.asm (MASM) 直接 emit, 链接进本 sample.
+enable_language(ASM_MASM)
+add_executable(wvmp_cl_shift_sample
+    cl_shift_sample_main.cpp
+    cl_shift_sample_asm.asm
+)
 target_link_libraries(wvmp_cl_shift_sample PRIVATE wvmp::sdk)
 target_compile_options(wvmp_cl_shift_sample PRIVATE
     $<$<CXX_COMPILER_ID:MSVC>:/Od;/Ob0;/utf-8>

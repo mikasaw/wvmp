@@ -212,9 +212,21 @@ enum class VmOp : u16 {
     //         mov [ctx + reg_a*8 + 0x10], t_[0]      (写回 64 位 dst)
     // 不更新 flags。
     MovsxMem,
+    // —— MIT-349 比特计数 (popcnt r, r/m, SSE4.2) ——
+    // Popcnt (Reg-Reg): dst = count_ones(src)，native `popcnt <sz> dst, src`。
+    // a_kind=Reg, reg_a=dst, b_kind=Reg, reg_b=src, aux=0, cond_or_size=size
+    //   (S32 或 S64 由 REX.W 决定, lifter 已传过来)。
+    // 派活单限定不支持 MEM 形式 (沿用 movzx/movsx 限定风格, 完全不支持 MEM
+    // 不像 movzx/movsx 沿用 MovzxMem/MovsxMem 单独处理)——lifter 拒 MEM → C1
+    // gate 兜底。
+    // handler: popcnt <sz> t_[0], t_[1]                  (T0 = popcnt(T1))
+    //          mov qword ptr [ctx + reg_a*8 + 0x10], t_[0]  (写回 dst)
+    // popcnt 不影响 flags (CF/OF/SF/ZF/PF 不变); updates_flags=false。
+    // 派活单 §D 决策 4: Popcnt 必 append-only 在 MovsxMem 之后 (pitfall #34)。
+    Popcnt,
 };
 
-inline constexpr u16 kVmOpMax = static_cast<u16>(VmOp::MovsxMem);
+inline constexpr u16 kVmOpMax = static_cast<u16>(VmOp::Popcnt);
 inline constexpr u16 kVmOpLimit = 1u << 14;  // 14 位编码空间上限
 
 constexpr const char* to_string(VmOp op) {
@@ -258,6 +270,7 @@ constexpr const char* to_string(VmOp op) {
         case VmOp::Cmpxchg: return "cmpxchg";
         case VmOp::Movsx: return "movsx";
         case VmOp::MovsxMem: return "movsxmem";
+        case VmOp::Popcnt: return "popcnt";
     }
     return "?";
 }

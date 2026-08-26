@@ -2637,6 +2637,118 @@ TEST(Interpreter, MovsxMemSemanticsS8Src) {
 }
 
 // =============================================================================
+// MIT-349 Popcnt 真执行测试
+// =============================================================================
+// VmOp::Popcnt (Reg-Reg): dst = count_ones(src)。
+// 派活单限定支持 32-bit 与 64-bit REG-REG 形式 (S32/S64 由 IR.size 决定,
+// REX.W 派活单). handler 用 native popcnt 直读 host CPU 完成计数 (沿用 build_imul
+// 模式但无 RAX/RDX 隐式, 与 build_movsx 同形单步计数).
+//
+// 关键参考实现:
+//   - 32-bit: src 低 32 位 popcount (e.g. 0xFFFFFFFF → 32)
+//   - 64-bit: src 64 位 popcount (e.g. 0xFFFFFFFFFFFFFFFF → 64)
+// popcnt 不改 flags (CF/OF/SF/ZF/PF); SSE4.2 popcnt 仅设 ZF 与结果 0/非0 相关.
+
+namespace {
+// Popcnt 参考实现：取 32 位值 popcount。
+static u32 ref_popcnt32(wvmp::u32 v) {
+    v = v - ((v >> 1) & 0x55555555u);
+    v = (v & 0x33333333u) + ((v >> 2) & 0x33333333u);
+    v = (v + (v >> 4)) & 0x0F0F0F0Fu;
+    return (v * 0x01010101u) >> 24;
+}
+// Popcnt 参考实现：取 64 位值 popcount。
+static u32 ref_popcnt64(wvmp::u64 v) {
+    v = v - ((v >> 1) & 0x5555555555555555ull);
+    v = (v & 0x3333333333333333ull) + ((v >> 2) & 0x3333333333333333ull);
+    v = (v + (v >> 4)) & 0x0F0F0F0F0F0F0F0Full;
+    return static_cast<u32>((v * 0x0101010101010101ull) >> 56);
+}
+}  // namespace
+
+TEST(Interpreter, PopcntSemanticsS32) {
+    // S32: popcnt 低 32 位, src 高 32 位忽略。结果存到 regs[1] (S32 路径 qword
+    // 写回后上 32 位 0, 与 native popcnt r32 零扩展上 32 位一致)。
+    for (u64 seed : {0xC0FFEEull, 0xBABEF00Dull, 0xDEADBEEFull,
+                     0xCAFEBABEull, 0xFEEDFACEull}) {
+        wvmp::Rng rng(seed);
+        const auto result = rt::generate_runtime(rng);
+        RwxImage rwx(result.image.code);
+        const auto entry = rwx.entry();
+        alignas(16) std::array<u8, 0x10000> scratch{};
+
+        struct C { wvmp::u32 v; const char* tag; };
+        const C cases[] = {
+            {0x00000000u, "zero"},
+            {0x00000001u, "one_bit"},
+            {0xFFFFFFFFu, "all_ones_32"},
+            {0xAAAAAAAAu, "alternating_32"},  // 16 ones
+            {0x55555555u, "alternating_32b"},  // 16 ones
+            {0x12345678u, "mid_32"},
+            {0xDEADBEEFu, "deadbeef"},
+        };
+        for (const auto& c : cases) {
+            // regs[0] = 0xDEADBEEF12345678 (上 32 位塞垃圾, 验证 S32 路径只读低 32 位)
+            const wvmp::u64 full_v = 0xDEADBEEFull << 32 | static_cast<wvmp::u64>(c.v);
+            std::vector<u8> s;
+            mov_imm64_into(s, /*dst*/0, /*scratch*/isa::kScratchFirst, full_v);
+            isa::append_insn(s, isa::make_insn(isa::VmOp::Popcnt,
+                                               isa::OpKind::Reg, 1,
+                                               isa::OpKind::Reg, 0, 0,
+                                               isa::size_field(ir::Size::S32)));
+            isa::append_insn(s, halt());
+            const auto ctx = run_stream(entry, s, scratch.data());
+            const u64 expected = static_cast<u64>(ref_popcnt32(c.v));
+            ASSERT_EQ(ctx.regs[1], expected)
+                << "PopcntS32 " << c.tag << " seed=" << std::hex << seed
+                << " src=0x" << c.v
+                << " -> got 0x" << ctx.regs[1]
+                << " expected 0x" << expected;
+        }
+    }
+}
+
+TEST(Interpreter, PopcntSemanticsS64) {
+    // S64: popcnt 64 位, src 完整 64 位 popcount。结果存到 regs[1] (S64 路径
+    // qword 写回完整 64 位)。
+    for (u64 seed : {0xC0FFEEull, 0xBABEF00Dull, 0xDEADBEEFull,
+                     0xCAFEBABEull, 0xFEEDFACEull}) {
+        wvmp::Rng rng(seed);
+        const auto result = rt::generate_runtime(rng);
+        RwxImage rwx(result.image.code);
+        const auto entry = rwx.entry();
+        alignas(16) std::array<u8, 0x10000> scratch{};
+
+        struct C { wvmp::u64 v; const char* tag; };
+        const C cases[] = {
+            {0x0000000000000000ull, "zero"},
+            {0x0000000000000001ull, "one_bit"},
+            {0xFFFFFFFFFFFFFFFFull, "all_ones_64"},
+            {0xAAAAAAAAAAAAAAAAull, "alternating_64"},  // 32 ones
+            {0x5555555555555555ull, "alternating_64b"},  // 32 ones
+            {0x1234567890ABCDEFull, "mid_64"},
+            {0xDEADBEEFCAFEBABEull, "deadbeef_cafebabe"},
+        };
+        for (const auto& c : cases) {
+            std::vector<u8> s;
+            mov_imm64_into(s, /*dst*/0, /*scratch*/isa::kScratchFirst, c.v);
+            isa::append_insn(s, isa::make_insn(isa::VmOp::Popcnt,
+                                               isa::OpKind::Reg, 1,
+                                               isa::OpKind::Reg, 0, 0,
+                                               isa::size_field(ir::Size::S64)));
+            isa::append_insn(s, halt());
+            const auto ctx = run_stream(entry, s, scratch.data());
+            const u64 expected = static_cast<u64>(ref_popcnt64(c.v));
+            ASSERT_EQ(ctx.regs[1], expected)
+                << "PopcntS64 " << c.tag << " seed=" << std::hex << seed
+                << " src=0x" << c.v
+                << " -> got 0x" << ctx.regs[1]
+                << " expected 0x" << expected;
+        }
+    }
+}
+
+// =============================================================================
 // MIT-322 LeaRva 真执行测试
 // =============================================================================
 // VmOp::LeaRva: dst = reg_b 槽值 + image_base (与 LoadRva/StoreRva 配套,
