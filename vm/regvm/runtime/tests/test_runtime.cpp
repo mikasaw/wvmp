@@ -2354,4 +2354,61 @@ TEST(Interpreter, MovzxMemFuzzTenThousand) {
         }
     }
 }
+
+// =============================================================================
+// MIT-322 LeaRva 真执行测试
+// =============================================================================
+// VmOp::LeaRva: dst = reg_b 槽值 + image_base (与 LoadRva/StoreRva 配套,
+// lea 不访存直接写回 dst 槽). 用于翻译期把 `lea r, [rip+disp]` 转 RVA 的
+// 场景——结果供后续非 rip Load/Store 当绝对 VA 访存. 验证 RVA + image_base
+// = VA 写回 dst, 后续 `Load rva_addr` (这里用直接 Store/Load 验证 VA 正确).
+
+TEST(Interpreter, LeaRvaSemantics) {
+    // 5 个 Rng 种子: 不同寄存器分配下都正确.
+    for (u64 seed : {0xC0FFEEull, 0xBABEF00Dull, 0xDEADBEEFull,
+                     0xCAFEBABEull, 0xFEEDFACEull}) {
+        wvmp::Rng rng(seed);
+        const auto result = rt::generate_runtime(rng);
+        RwxImage rwx(result.image.code);
+        const auto entry = rwx.entry();
+        alignas(16) std::array<u8, 0x10000> scratch{};
+        scratch.fill(0);
+        constexpr u64 kImageBase = 0x8000;
+        // scratch + 0x8010 处放哨兵值, 验证 lea 结果指向该处.
+        scratch[0x8010] = 0x42;
+        scratch[0x8011] = 0x00;
+        scratch[0x8012] = 0x00;
+        scratch[0x8013] = 0x00;
+
+        std::vector<u8> s;
+        // regs[5] = RVA 0x10 (用 mov_imm 模拟翻译期发射的 RVA 立即数)
+        isa::append_insn(s, isa::make_insn(isa::VmOp::Mov, isa::OpKind::Reg, 5,
+                                           isa::OpKind::Imm, 0, 0x10,
+                                           isa::size_field(ir::Size::S64)));
+        // LeaRva dst=6, b=5: 6 槽 = regs[5] + image_base = 0x10 + 0x8000 = 0x8010 (VA)
+        isa::append_insn(s, isa::make_insn(isa::VmOp::LeaRva, isa::OpKind::Reg, 6,
+                                           isa::OpKind::Reg, 5, 0,
+                                           isa::size_field(ir::Size::S64)));
+        // Load dst=7, b=6: 从 regs[6] (VA = scratch+0x8010) 读 4 字节 → 应得 0x42
+        isa::append_insn(s, isa::make_insn(isa::VmOp::Load, isa::OpKind::Reg, 7,
+                                           isa::OpKind::Reg, 6, 0,
+                                           isa::size_field(ir::Size::S32)));
+        isa::append_insn(s, isa::make_insn(isa::VmOp::Halt, isa::OpKind::None, 0,
+                                           isa::OpKind::None, 0, 0, 0));
+        rt::VmContext ctx;
+        ctx.bytecode = s.data();
+        ctx.pc = 0;
+        ctx.scratch_mem = reinterpret_cast<u64>(scratch.data()) + kImageBase;
+        entry(&ctx);
+        // regs[6] 应是 VA = scratch + 0x8010
+        ASSERT_EQ(ctx.regs[6], reinterpret_cast<u64>(scratch.data()) + 0x8010)
+            << "LeaRva seed=" << std::hex << seed
+            << " got 0x" << ctx.regs[6] << " expected 0x"
+            << (reinterpret_cast<u64>(scratch.data()) + 0x8010);
+        // regs[7] 应是 0x42 (从 VA 读 4 字节)
+        ASSERT_EQ(ctx.regs[7], 0x42ull)
+            << "LeaRva downstream Load seed=" << std::hex << seed
+            << " got 0x" << ctx.regs[7] << " expected 0x42";
+    }
+}
 } // namespace

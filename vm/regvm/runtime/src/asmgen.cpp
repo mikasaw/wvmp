@@ -675,6 +675,31 @@ public:
         return decode_prelude() + size_chain(blocks, tag) + tail_lbl + ":\n" + advance(dispatch);
     }
 
+    // LeaRva: MIT-322 lea rip-relative 配套——a=目的寄存器(写入 VA), b=地址(RVA).
+    // 与 LoadRva 同形态但**不访存**: 读 reg_b 槽 (RVA) → 加 image_base → 直接
+    // 写回 reg_a 槽 (VA). 修复 snake_sample `lea rcx, [rip+0x6dfa]` 后
+    // 紧跟 `[rcx + rax*4]` Load 的 RVA→VA 转换缺失.
+    // a_kind=Reg reg_a=dst, b_kind=Reg reg_b=RVA 槽, aux=0.
+    // cond_or_size = size (lea 不写子寄存器别名, 但保持字节码格式一致).
+    std::string build_lea_rva(u64 dispatch) const {
+        const std::string tag = "learva" + std::to_string(seq());
+        const std::string tail_lbl = "atail_" + tag;
+        std::array<std::string, 4> blocks;
+        for (int s = 0; s < 4; ++s) {
+            std::string o;
+            // 读 reg_b 槽 (= RVA) 到 T1, 加 image_base (在 ctx+0x110) → VA
+            o += std::string("    mov ") + r64(t_[1]) + ", qword ptr [" + r64(ctx_) + " + " +
+                 r64(t_[7]) + "*8 + 0x10]\n";
+            o += std::string("    add ") + r64(t_[1]) + ", qword ptr [" + r64(ctx_) + " + 0x110]\n";
+            // VA 直接写回 reg_a 槽 (不访存, 不写子寄存器别名)
+            o += std::string("    mov qword ptr [") + r64(ctx_) + " + " + r64(t_[4]) +
+                 "*8 + 0x10], " + r64(t_[1]) + "\n";
+            o += "    jmp " + tail_lbl + "\n";
+            blocks[s] = o;
+        }
+        return decode_prelude() + size_chain(blocks, tag) + tail_lbl + ":\n" + advance(dispatch);
+    }
+
     // Store：a=地址，b=数据（按宽度掩码写）。
     std::string build_store(u64 dispatch) const {
         const std::string tag = "st" + std::to_string(seq());
@@ -1441,6 +1466,7 @@ RuntimeGenResult generate_runtime(wvmp::Rng& rng) {
         {int(VmOp::Store), "store", &AsmGen::build_store},
         {int(VmOp::LoadRva), "loadrva", &AsmGen::build_loadrva},
         {int(VmOp::StoreRva), "storeriva", &AsmGen::build_storerva},
+        {int(VmOp::LeaRva), "learva", &AsmGen::build_lea_rva},
         {int(VmOp::Push), "push", &AsmGen::build_push},
         {int(VmOp::Pop), "pop", &AsmGen::build_pop},
         {int(VmOp::Jmp), "jmp", &AsmGen::build_jmp},

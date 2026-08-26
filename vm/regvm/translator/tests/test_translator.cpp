@@ -419,6 +419,45 @@ TEST(Translate, RipRelativeNegativeDisp) {
               0x1000, kS64);  // base=0x1000 = next_ip(0x1004) + disp(-4)
 }
 
+// MIT-322: rip-relative lea 翻译期发 RVA, 运行时用 VmOp::LeaRva 自动加
+// image_base 还原 VA. 修复前 `lea rcx, [rip+disp]` 翻译后只发 RVA 进
+// rcx, 后续非 rip `[rcx + ...]` Load 把 rcx 当绝对 VA 访存 (M2-8 起
+// Load/Store 不再加 scratch_mem), 读到低地址 → SIGSEGV.
+// 翻译后两条: `Mov acc, imm(RVA)` + `LeaRva rcx, acc` —— 第二条让运行时
+// 把 RVA 转 VA 后写回 rcx 槽.
+TEST(Translate, LeaRipRelativeEmitsLeaRva) {
+    // lea rcx, [rip + 0x1234] -> IR Lea (base=Rip, disp=0x1234).
+    //   insn.addr = 0x1000; 单块单条; next_ip = fn.end_rva = 0x3000
+    //   RVA = 0x3000 + 0x1234 = 0x4234
+    ir::Insn lea = I(ir::Op::Lea, ir::Size::S64);
+    lea.dst = ir::Operand::reg_(ir::Reg::Rcx);
+    lea.src = ir::Operand::mem_(m(ir::Reg::Rip, ir::Reg::Flags, 0, 0x1234));
+    const auto r = wvmp::regvm::translator::translate_function(
+        fn_of({blk(0x1000, {lea})}));
+    EXPECT_TRUE(r.notes.empty()) << "rip-relative lea M2-8 起翻译期不记 skip note";
+    const Decoded d = decode_program(r.program);
+    // 第一条: Mov acc, imm(0x4234) —— acc 持有 RVA
+    ASSERT_GE(d.insns.size(), static_cast<size_t>(2));
+    expect_is(d.insns[0], VmOp::Mov, OpKind::Reg, isa::kScratchFirst, OpKind::Imm, 0,
+              0x4234, kS64);
+    // 第二条: LeaRva rcx, acc —— 运行时 acc + image_base → VA 写回 rcx 槽
+    expect_is(d.insns[1], VmOp::LeaRva, OpKind::Reg, kRcx, OpKind::Reg,
+              isa::kScratchFirst, 0, kS64);
+}
+
+// 非 rip lea 保持原 `Mov dst, acc` 路径 (acc 已是 VA).
+TEST(Translate, LeaNonRipStaysPlainMov) {
+    // lea rax, [rbx + rcx*4 + 0x20] (S64, 纯寄存器, 无访存)
+    ir::Insn lea = I(ir::Op::Lea, ir::Size::S64);
+    lea.dst = ir::Operand::reg_(ir::Reg::Rax);
+    lea.src = ir::Operand::mem_(m(ir::Reg::Rbx, ir::Reg::Rcx, 4, 0x20));
+    const Decoded d = one_insn(lea);
+    ASSERT_EQ(d.insns.size(), static_cast<size_t>(8)); // 6 + Jmp + Halt
+    // 末条 `Mov rax, scratch0`: 非 rip lea 不走 LeaRva (acc 已是 VA).
+    expect_is(d.insns[5], VmOp::Mov, OpKind::Reg, kRax, OpKind::Reg,
+              isa::kScratchFirst, 0, kS64);
+}
+
 // ---------------- 参考解释器（~150 行） ----------------
 // 只支持 Mov/Add/Sub/And/Or/Xor/Shl/Cmp/Jcc/Jmp/Halt + Load/Store，
 // alias_read/alias_write 复用 isa 实现，flags 维护 ZF/SF/CF/OF/PF。

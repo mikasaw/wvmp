@@ -26,6 +26,7 @@ const isa::VmOp kAllOps[] = {
     isa::VmOp::Push, isa::VmOp::Pop, isa::VmOp::Jmp, isa::VmOp::Jcc,
     isa::VmOp::Call, isa::VmOp::Ret, isa::VmOp::Load, isa::VmOp::Store,
     isa::VmOp::Nop, isa::VmOp::Halt, isa::VmOp::GetFlags, isa::VmOp::SetFlags,
+    isa::VmOp::LeaRva,
 };
 constexpr size_t kAllOpsCount = sizeof(kAllOps) / sizeof(kAllOps[0]);
 

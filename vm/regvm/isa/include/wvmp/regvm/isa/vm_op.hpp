@@ -86,9 +86,26 @@ enum class VmOp : u16 {
     //         mov [ctx + reg_a*8 + 0x10], t_[0]      (写回 64 位 dst)
     // 不更新 flags。
     MovzxMem,
+
+    // —— MIT-322 lea rip-relative 配套 ——
+    // LoadRva/StoreRva 把 RVA 转 VA 后访存, 但 lea 只需地址本身, 不访存.
+    // LeaaRva 与 LoadRva/StoreRva 形态相同 (a=Reg, b=Reg-地址), 运行时
+    // **额外**加上 VmContext.scratch_mem (=image_base) 还原 RVA → VA 后直接写回
+    // reg_a 槽 (不访存). 用于翻译期把 lea [rip+disp] 转 RVA 的场景——
+    // 后续非 rip Load/Store 把该地址当绝对 VA 访存 (M2-8 起 Load/Store 不再加
+    // scratch_mem, 见 LoadRva 注释).
+    // a_kind=Reg, reg_a=dst (写入 VA), b_kind=Reg, reg_b=RVA 槽, aux=0.
+    // handler: mov t_[1], [ctx + reg_b*8 + 0x10]    (读 reg_b 槽 = RVA)
+    //         add t_[1], [ctx + 0x110]             (RVA += image_base → VA)
+    //         mov [ctx + reg_a*8 + 0x10], t_[1]    (VA 写回 reg_a 槽)
+    // cond_or_size = size (lea 不写子寄存器别名, 但保持字节码格式一致).
+    // 修复 snake 真虚拟化 byte-exact 闭环: `lea rcx, [rip+0x6dfa]` 翻译期
+    // 发 RVA, 运行时 +image_base 让 rcx = VA, 后续 `[rcx + rax*4]` Load 才
+    // 能读到正确数组元素.
+    LeaRva,
 };
 
-inline constexpr u16 kVmOpMax = static_cast<u16>(VmOp::MovzxMem);
+inline constexpr u16 kVmOpMax = static_cast<u16>(VmOp::LeaRva);
 inline constexpr u16 kVmOpLimit = 1u << 14;  // 14 位编码空间上限
 
 constexpr const char* to_string(VmOp op) {
@@ -124,6 +141,7 @@ constexpr const char* to_string(VmOp op) {
         case VmOp::MovsxdMem: return "movsxdmem";
         case VmOp::Movzx: return "movzx";
         case VmOp::MovzxMem: return "movzxmem";
+        case VmOp::LeaRva: return "learva";
     }
     return "?";
 }

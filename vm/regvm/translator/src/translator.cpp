@@ -346,7 +346,18 @@ struct Translator {
         if (!emit_address(em, sc, in.src.mem, current_rva, next_ip, acc))
             return skip(in, "lea 地址形态未支持", &in.src.mem);
         // lea 不访存：地址值即结果；按原 size 写回（S32 lea 零扩展高位）。
-        em.emit_rr(VmOp::Mov, isa::vm_reg_of(in.dst.reg), acc, isa::size_field(in.size));
+        // MIT-322: rip-relative lea 的 emit_address 把 RVA 写进 acc, 但 lea
+        // 期望结果是 VA (供后续非 rip Load/Store 直接当绝对 VA 访存, M2-8 起
+        // Load/Store 不再加 scratch_mem). 用 VmOp::LeaRva 让运行时自动
+        // + image_base, 把 RVA 转 VA 后写回 dst 槽. 非 rip 分支保持
+        // 原有 `Mov dst, acc` (acc 已是 VA).
+        if (in.src.mem.base == ir::Reg::Rip) {
+            em.emit_rr(VmOp::LeaRva, isa::vm_reg_of(in.dst.reg), acc,
+                       isa::size_field(in.size));
+        } else {
+            em.emit_rr(VmOp::Mov, isa::vm_reg_of(in.dst.reg), acc,
+                       isa::size_field(in.size));
+        }
         return true;
     }
 
