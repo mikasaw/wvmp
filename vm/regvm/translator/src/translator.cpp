@@ -304,6 +304,14 @@ struct Translator {
                 // MIT-349: popcnt dispatch — REG-REG 形式 emit 单条 VmOp::Popcnt
                 // (handler 用 native popcnt 完成比特计数; src 必是 REG 派活单限定).
                 ok = translate_popcnt(em, in);
+            } else if (in.op == ir::Op::Lzcount) {
+                // MIT-353: lzcnt dispatch — REG-REG 形式 emit 单条 VmOp::Lzcount
+                // (handler 用 native lzcnt 完成前导零计数; src 必是 REG 派活单限定).
+                ok = translate_lzcnt(em, in);
+            } else if (in.op == ir::Op::Tzcount) {
+                // MIT-353: tzcnt dispatch — REG-REG 形式 emit 单条 VmOp::Tzcount
+                // (handler 用 native tzcnt 完成末尾零计数; src 必是 REG 派活单限定).
+                ok = translate_tzcnt(em, in);
             } else if (in.op == ir::Op::Bswap) {
                 ok = translate_bswap(em, in);
             } else if (in.op == ir::Op::Xchg) {
@@ -867,6 +875,71 @@ struct Translator {
         const u8 d = isa::vm_reg_of(in.dst.reg);
         const u8 b = isa::vm_reg_of(in.src.reg);
         em.emit_rr(VmOp::Popcnt, d, b, isa::size_field(in.size));
+        return true;
+    }
+
+    // ---- MIT-353: lzcnt (前导零计数, BMI1) ----
+    //
+    // lzcnt 是 2 操作数 (dst + src 都是寄存器, 派活单限定 REG-REG, MEM 派活单
+    // 限定不支持 → lifter 拒 MEM → C1 gate 兜底). emit VmOp::Lzcount 一条:
+    //   a_kind=Reg reg_a=dst, b_kind=Reg reg_b=src, aux=0, cond_or_size=size
+    //   (S32 或 S64 由 REX.W 决定, lifter 已传过来).
+    //
+    // lzcnt 是 bit-scan (前导零计数, 不修改 flags, CF/OF/SF/ZF/PF 不变; BMI1 lzcnt
+    // 仅设 ZF 根据结果 0/非0, lifter 不关心). handler 用 native lzcnt 直读 host
+    // CPU 完成计数, 不调 setcc5 也不走 flags_tail.
+    //
+    // handler 在 asmgen.cpp 的 build_lzcnt: 按 cond_or_size 分 S32/S64 emit
+    // native lzcnt eax,eax / lzcnt rax,rax (S32/S64). S32 路径用 32 位寄存器
+    // (上 32 位自动 zero-extend), qword 写回完整 64 位; S64 路径全 64 位读写。
+    //
+    // **关键 (pitfall #37)**: lzcnt 与 popcnt 不同 — lzcnt 不修改 src
+    // (native lzcnt r, r/m 只写 dst, src 寄存器保留), 但 handler 必须先
+    // `mov T6, T1` 保存 src (T1) 到 T6, 再 `lzcnt t_[0], t_[1]` (dst 写到 T0).
+    // 这与 popcnt "T1 in-place, 不需 T6 保存" 不同 — popcnt 的源寄存器被消耗
+    // 可重用 T1, lzcnt 的源寄存器必须保留. 不更新 flags 槽。
+    bool translate_lzcnt(Emitter& em, const ir::Insn& in) {
+        if (in.op != ir::Op::Lzcount) return false;
+        // dst = reg_a, src = reg_b (派活单限定 REG-REG, MEM 派活单限定不支持,
+        // lifter 拒 MEM → C1 gate 兜底).
+        if (in.dst.kind != ir::Operand::Kind::Reg ||
+            in.src.kind != ir::Operand::Kind::Reg)
+            return skip(in, "lzcnt 操作数形态未支持", nullptr);
+        const u8 d = isa::vm_reg_of(in.dst.reg);
+        const u8 b = isa::vm_reg_of(in.src.reg);
+        em.emit_rr(VmOp::Lzcount, d, b, isa::size_field(in.size));
+        return true;
+    }
+
+    // ---- MIT-353: tzcnt (末尾零计数, BMI1) ----
+    //
+    // tzcnt 是 2 操作数 (dst + src 都是寄存器, 派活单限定 REG-REG, MEM 派活单
+    // 限定不支持 → lifter 拒 MEM → C1 gate 兜底). emit VmOp::Tzcount 一条:
+    //   a_kind=Reg reg_a=dst, b_kind=Reg reg_b=src, aux=0, cond_or_size=size
+    //   (S32 或 S64 由 REX.W 决定, lifter 已传过来).
+    //
+    // tzcnt 是 bit-scan (末尾零计数, 不修改 flags, CF/OF/SF/ZF/PF 不变; BMI1 tzcnt
+    // 仅设 ZF 根据结果 0/非0, lifter 不关心). handler 用 native tzcnt 直读 host
+    // CPU 完成计数, 不调 setcc5 也不走 flags_tail.
+    //
+    // handler 在 asmgen.cpp 的 build_tzcnt: 按 cond_or_size 分 S32/S64 emit
+    // native tzcnt eax,eax / tzcnt rax,rax (S32/S64). S32 路径用 32 位寄存器
+    // (上 32 位自动 zero-extend), qword 写回完整 64 位; S64 路径全 64 位读写。
+    //
+    // **关键 (pitfall #37)**: tzcnt 与 popcnt 不同 — tzcnt 不修改 src
+    // (native tzcnt r, r/m 只写 dst, src 寄存器保留), 但 handler 必须先
+    // `mov T6, T1` 保存 src (T1) 到 T6, 再 `tzcnt t_[0], t_[1]` (dst 写到 T0).
+    // 与 lzcnt 路径同源 pitfall #37 守恒. 不更新 flags 槽。
+    bool translate_tzcnt(Emitter& em, const ir::Insn& in) {
+        if (in.op != ir::Op::Tzcount) return false;
+        // dst = reg_a, src = reg_b (派活单限定 REG-REG, MEM 派活单限定不支持,
+        // lifter 拒 MEM → C1 gate 兜底).
+        if (in.dst.kind != ir::Operand::Kind::Reg ||
+            in.src.kind != ir::Operand::Kind::Reg)
+            return skip(in, "tzcnt 操作数形态未支持", nullptr);
+        const u8 d = isa::vm_reg_of(in.dst.reg);
+        const u8 b = isa::vm_reg_of(in.src.reg);
+        em.emit_rr(VmOp::Tzcount, d, b, isa::size_field(in.size));
         return true;
     }
 

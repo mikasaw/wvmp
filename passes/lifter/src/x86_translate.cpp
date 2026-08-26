@@ -560,7 +560,100 @@ TranslateResult translate_movsx(const cs_insn& ci, const cs_x86& x, ir::Arch arc
     return unsupported(ci.address, ci.size);
 }
 
-// MIT-349 popcnt (F3 0F B8+rm, 可选 REX.W): SSE4.2 比特计数。
+// MIT-353 lzcnt (F3 0F BD+rm, 可选 REX.W): BMI1 前导零计数。
+// MSVC /Od 默认 codegen REG-REG (mod=11)：
+//   - 32-bit (no REX.W):    F3 0F BD C0 = lzcnt eax, eax
+//   - 32-bit 不同寄存器:    F3 0F BD C8 = lzcnt ecx, eax
+//   - 64-bit (REX.W):       48 F3 0F BD C0 = lzcnt rax, rax
+//   - 64-bit 不同寄存器:    48 F3 0F BD C8 = lzcnt rcx, rax
+// 字节结构: [48] (REX.W 可选) | F3 0F BD | ModR/M (mod=11 REG-REG; mod=00/01/10
+//   MEM 派活单限定不支持)。
+//   - lzcnt 2 操作数 (dst + src), src 必 REG (派活单限定不支持 MEM form)。
+//   - size 由 REX.W 决定: x.rex bit 3 (REX.W) → S64, 否则 → S32.
+//   - updates_flags=false (lzcnt 不改 CF/OF/SF/ZF/PF; BMI1 lzcnt 仅设 ZF
+//     根据结果 0/非0, lifter 不关心)。lzcnt 不是 ALU binop, 不调 setcc5.
+TranslateResult translate_lzcnt(const cs_insn& ci, const cs_x86& x, ir::Arch arch) {
+    if (x.op_count != 2) return unsupported(ci.address, ci.size);
+    // 两个操作数必都是寄存器 (lzcnt r, r REG-REG); MEM 形式派活单限定不支持
+    if (x.operands[0].type != X86_OP_REG) return unsupported(ci.address, ci.size);
+    if (x.operands[1].type != X86_OP_REG) return unsupported(ci.address, ci.size);
+    auto d = map_reg(x.operands[0].reg);
+    auto s = map_reg(x.operands[1].reg);
+    if (!d || !s) return unsupported(ci.address, ci.size);
+
+    // size 由 REX.W 标志决定: REX.W (0x48..0x4F, bit 3 = 1) → S64, 否则 → S32.
+    // 派活单限定仅 32/64-bit REG-REG 形式 (Intel SDM Vol. 2 LZCNT 仅 32/64-bit 寄存器),
+    // 8/16-bit lzcnt 不存在 (lifter 防 C1 gate 兜底, 但保留 size_chain 4 路 size)。
+    // 注: 这里**不**用 x.rex — capstone 对 lzcnt 的 REX 报告与实际字节位置不一致
+    // (与 popcnt 行为相同). 直接扫描 ci.bytes 找 REX byte (0x40-0x4F, 含 F3 前缀
+    // 可能掩盖), bit 3 = REX.W.
+    bool rex_w = false;
+    for (size_t i = 0; i + 1 < ci.size; ++i) {
+        if (ci.bytes[i] == 0xF3 && ci.bytes[i + 1] >= 0x40 && ci.bytes[i + 1] <= 0x4F) {
+            rex_w = (ci.bytes[i + 1] & 0x08) != 0;
+            break;
+        }
+        if (ci.bytes[i] >= 0x40 && ci.bytes[i] <= 0x4F &&
+            ci.bytes[i + 1] == 0xF3) {
+            rex_w = (ci.bytes[i] & 0x08) != 0;
+            break;
+        }
+    }
+
+    ir::Insn out;
+    out.op = Op::Lzcount;
+    out.addr = ci.address;
+    out.size = rex_w ? Size::S64 : Size::S32;
+    out.updates_flags = false;  // lzcnt 不改 flags
+    out.dst = Operand::reg_(*d);
+    out.src = Operand::reg_(*s);
+    return ok(out);
+}
+
+// MIT-353 tzcnt (F3 0F BC+rm, 可选 REX.W): BMI1 末尾零计数。
+// MSVC /Od 默认 codegen REG-REG (mod=11)：
+//   - 32-bit (no REX.W):    F3 0F BC C0 = tzcnt eax, eax
+//   - 32-bit 不同寄存器:    F3 0F BC C8 = tzcnt ecx, eax
+//   - 64-bit (REX.W):       48 F3 0F BC C0 = tzcnt rax, rax
+//   - 64-bit 不同寄存器:    48 F3 0F BC C8 = tzcnt rcx, rax
+// 字节结构: [48] (REX.W 可选) | F3 0F BC | ModR/M (mod=11 REG-REG; mod=00/01/10
+//   MEM 派活单限定不支持)。
+//   - tzcnt 2 操作数 (dst + src), src 必 REG (派活单限定不支持 MEM form)。
+//   - size 由 REX.W 决定: x.rex bit 3 (REX.W) → S64, 否则 → S32.
+//   - updates_flags=false (tzcnt 不改 CF/OF/SF/ZF/PF; BMI1 tzcnt 仅设 ZF
+//     根据结果 0/非0, lifter 不关心)。tzcnt 不是 ALU binop, 不调 setcc5.
+TranslateResult translate_tzcnt(const cs_insn& ci, const cs_x86& x, ir::Arch arch) {
+    if (x.op_count != 2) return unsupported(ci.address, ci.size);
+    // 两个操作数必都是寄存器 (tzcnt r, r REG-REG); MEM 形式派活单限定不支持
+    if (x.operands[0].type != X86_OP_REG) return unsupported(ci.address, ci.size);
+    if (x.operands[1].type != X86_OP_REG) return unsupported(ci.address, ci.size);
+    auto d = map_reg(x.operands[0].reg);
+    auto s = map_reg(x.operands[1].reg);
+    if (!d || !s) return unsupported(ci.address, ci.size);
+
+    // size 由 REX.W 标志决定 (与 lzcnt 同源): 见 translate_lzcnt 注释
+    bool rex_w = false;
+    for (size_t i = 0; i + 1 < ci.size; ++i) {
+        if (ci.bytes[i] == 0xF3 && ci.bytes[i + 1] >= 0x40 && ci.bytes[i + 1] <= 0x4F) {
+            rex_w = (ci.bytes[i + 1] & 0x08) != 0;
+            break;
+        }
+        if (ci.bytes[i] >= 0x40 && ci.bytes[i] <= 0x4F &&
+            ci.bytes[i + 1] == 0xF3) {
+            rex_w = (ci.bytes[i] & 0x08) != 0;
+            break;
+        }
+    }
+
+    ir::Insn out;
+    out.op = Op::Tzcount;
+    out.addr = ci.address;
+    out.size = rex_w ? Size::S64 : Size::S32;
+    out.updates_flags = false;  // tzcnt 不改 flags
+    out.dst = Operand::reg_(*d);
+    out.src = Operand::reg_(*s);
+    return ok(out);
+}
 // MSVC /Od 默认 codegen REG-REG (mod=11)：
 //   - 32-bit (no REX.W):    F3 0F B8 C0 = popcnt eax, eax
 //   - 32-bit 不同寄存器:    F3 0F B8 C8 = popcnt ecx, eax
@@ -981,6 +1074,10 @@ TranslateResult translate_insn(const cs_insn& ci, ir::Arch arch) {
     case X86_INS_MOVSX: return translate_movsx(ci, x, arch);
     // MIT-349: popcnt (F3 0F B8+rm, mod=11 REG-REG / mod=00/01/10 MEM 派活单限定不支持).
     case X86_INS_POPCNT: return translate_popcnt(ci, x, arch);
+    // MIT-353: lzcnt (F3 0F BD+rm, mod=11 REG-REG / mod=00/01/10 MEM 派活单限定不支持).
+    case X86_INS_LZCNT: return translate_lzcnt(ci, x, arch);
+    // MIT-353: tzcnt (F3 0F BC+rm, mod=11 REG-REG / mod=00/01/10 MEM 派活单限定不支持).
+    case X86_INS_TZCNT: return translate_tzcnt(ci, x, arch);
     case X86_INS_BSWAP: return translate_bswap(ci, x, arch);
     case X86_INS_XCHG: return translate_xchg(ci, x, arch);
     // MIT-336: setcc 16 variants (0F 90+cc+rm, mod=11 REG / mod=00 MEM).

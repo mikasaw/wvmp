@@ -125,7 +125,40 @@ enum class Op : u16 { Mov, Lea, Add, Sub, Adc, Sbb, And, Or, Xor, Not, Neg, Inc,
                       //     SSE4.2 popcnt 仅设 ZF 根据结果 0/非0, lifter 不关心)
                       //   - 派活单 §D 决策 4: Popcnt 必 append-only 在 Movsx 之后
                       //     (pitfall #34 additive enum append-only)。
-                      Popcnt };
+                      Popcnt,
+                      // MIT-353: 前导零计数 (lzcnt r, r/m, BMI1)。
+                      //   - REG-REG (mod=11): lzcnt r, r
+                      //     字节结构: [48] (REX.W 可选) | F3 0F BD | ModR/M
+                      //     (3 字节无 REX.W → S32; 4 字节 REX.W → S64)
+                      //   - REG-MEM 派活单限定不支持 (沿用 popcnt 限定风格,
+                      //     完全不支持 MEM, 不像 movzx/movsx 沿用 MovzxMem/MovsxMem
+                      //     单独处理)
+                      //   - size 由 REX.W 决定: 无 REX.W → S32, 有 REX.W → S64
+                      //   - updates_flags=false (lzcnt 不改 CF/OF/SF/ZF/PF;
+                      //     BMI1 lzcnt 仅设 ZF 根据结果 0/非0, lifter 不关心,
+                      //     与 popcnt 派活单限定一致)
+                      //   - src 不被修改 (lzcnt 是 dst = count_leading_zeros(src),
+                      //     与 popcnt 派活单 "src 被消耗 in-place" 不同 —
+                      //     asmgen handler 必 save src to T6 first, pitfall #37)
+                      //   - 派活单 §D 决策 4: Lzcount 必 append-only 在 Popcnt 之后
+                      //     (pitfall #34 additive enum append-only)。
+                      Lzcount,
+                      // MIT-353: 末尾零计数 (tzcnt r, r/m, BMI1)。
+                      //   - REG-REG (mod=11): tzcnt r, r
+                      //     字节结构: [48] (REX.W 可选) | F3 0F BC | ModR/M
+                      //     (3 字节无 REX.W → S32; 4 字节 REX.W → S64)
+                      //   - REG-MEM 派活单限定不支持 (沿用 popcnt 限定风格,
+                      //     完全不支持 MEM)
+                      //   - size 由 REX.W 决定: 无 REX.W → S32, 有 REX.W → S64
+                      //   - updates_flags=false (tzcnt 不改 CF/OF/SF/ZF/PF;
+                      //     BMI1 tzcnt 仅设 ZF 根据结果 0/非0, lifter 不关心,
+                      //     与 popcnt 派活单限定一致)
+                      //   - src 不被修改 (tzcnt 是 dst = count_trailing_zeros(src),
+                      //     与 popcnt 派活单 "src 被消耗 in-place" 不同 —
+                      //     asmgen handler 必 save src to T6 first, pitfall #37)
+                      //   - 派活单 §D 决策 4: Tzcount 必 append-only 在 Lzcount 之后
+                      //     (pitfall #34 additive enum append-only)。
+                      Tzcount };
 enum class Size : u8 { S8, S16, S32, S64 };
 enum class Cond : u8 { O, No, B, Ae, E, Ne, Be, A, S, Ns, P, Np, L, Ge, Le, G };
 constexpr u64 bits(Size s) { return s==Size::S8?8: s==Size::S16?16: s==Size::S32?32:64; }

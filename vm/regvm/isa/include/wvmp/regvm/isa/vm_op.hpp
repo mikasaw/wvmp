@@ -224,9 +224,38 @@ enum class VmOp : u16 {
     // popcnt 不影响 flags (CF/OF/SF/ZF/PF 不变); updates_flags=false。
     // 派活单 §D 决策 4: Popcnt 必 append-only 在 MovsxMem 之后 (pitfall #34)。
     Popcnt,
+    // —— MIT-353 前导零计数 (lzcnt r, r/m, BMI1) ——
+    // Lzcount (Reg-Reg): dst = count_leading_zeros(src)，native `lzcnt <sz> dst, src`。
+    // a_kind=Reg, reg_a=dst, b_kind=Reg, reg_b=src, aux=0, cond_or_size=size
+    //   (S32 或 S64 由 REX.W 决定, lifter 已传过来)。
+    // 派活单限定不支持 MEM 形式 (沿用 popcnt 限定风格, 完全不支持 MEM)。
+    // handler: lzcnt <sz> t_[0], t_[1]                    (T0 = lzcnt(T1))
+    //          mov qword ptr [ctx + reg_a*8 + 0x10], t_[0]  (写回 dst)
+    //   **关键 (pitfall #37)**: lzcnt 与 popcnt 不同 — lzcnt 不修改 src
+    //   (native lzcnt r, r/m 只写 dst, src 寄存器保留), 但 handler 必须
+    //   先 `mov T6, T1` 保存 src (T1) 到 T6, 再 `lzcnt t_[0], t_[1]`
+    //   (dst 写到 T0). 这与 popcnt "T1 in-place, 不需 T6 保存" 不同 —
+    //   popcnt 的源寄存器被消耗可重用 T1, lzcnt 的源寄存器必须保留.
+    // 不影响 flags (CF/OF/SF/ZF/PF 不变); updates_flags=false。
+    // 派活单 §D 决策 4: Lzcount 必 append-only 在 Popcnt 之后 (pitfall #34)。
+    Lzcount,
+    // —— MIT-353 末尾零计数 (tzcnt r, r/m, BMI1) ——
+    // Tzcount (Reg-Reg): dst = count_trailing_zeros(src)，native `tzcnt <sz> dst, src`。
+    // a_kind=Reg, reg_a=dst, b_kind=Reg, reg_b=src, aux=0, cond_or_size=size
+    //   (S32 或 S64 由 REX.W 决定, lifter 已传过来)。
+    // 派活单限定不支持 MEM 形式 (沿用 popcnt 限定风格, 完全不支持 MEM)。
+    // handler: tzcnt <sz> t_[0], t_[1]                    (T0 = tzcnt(T1))
+    //          mov qword ptr [ctx + reg_a*8 + 0x10], t_[0]  (写回 dst)
+    //   **关键 (pitfall #37)**: tzcnt 与 popcnt 不同 — tzcnt 不修改 src
+    //   (native tzcnt r, r/m 只写 dst, src 寄存器保留), 但 handler 必须
+    //   先 `mov T6, T1` 保存 src (T1) 到 T6, 再 `tzcnt t_[0], t_[1]`
+    //   (dst 写到 T0). 与 lzcnt 路径一致, 同源 pitfall #37 守恒.
+    // 不影响 flags (CF/OF/SF/ZF/PF 不变); updates_flags=false。
+    // 派活单 §D 决策 4: Tzcount 必 append-only 在 Lzcount 之后 (pitfall #34)。
+    Tzcount,
 };
 
-inline constexpr u16 kVmOpMax = static_cast<u16>(VmOp::Popcnt);
+inline constexpr u16 kVmOpMax = static_cast<u16>(VmOp::Tzcount);
 inline constexpr u16 kVmOpLimit = 1u << 14;  // 14 位编码空间上限
 
 constexpr const char* to_string(VmOp op) {
@@ -271,6 +300,8 @@ constexpr const char* to_string(VmOp op) {
         case VmOp::Movsx: return "movsx";
         case VmOp::MovsxMem: return "movsxmem";
         case VmOp::Popcnt: return "popcnt";
+        case VmOp::Lzcount: return "lzcnt";
+        case VmOp::Tzcount: return "tzcnt";
     }
     return "?";
 }

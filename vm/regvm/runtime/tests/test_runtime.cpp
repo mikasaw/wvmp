@@ -2749,6 +2749,215 @@ TEST(Interpreter, PopcntSemanticsS64) {
 }
 
 // =============================================================================
+// MIT-353 Lzcount + Tzcount 真执行测试
+// =============================================================================
+// VmOp::Lzcount (Reg-Reg): dst = count_leading_zeros(src)。
+// VmOp::Tzcount (Reg-Reg): dst = count_trailing_zeros(src)。
+// 派活单限定支持 32-bit 与 64-bit REG-REG 形式 (S32/S64 由 IR.size 决定,
+// REX.W 派活单). handler 用 native lzcnt/tzcnt 直读 host CPU 完成计数
+// (沿用 build_popcnt 模式但 src 必须保留, save T1→T6 first, pitfall #37).
+//
+// 关键参考实现:
+//   - 32-bit lzcnt: src 低 32 位前导零数 (e.g. 0x00010000 → 15)
+//   - 64-bit lzcnt: src 64 位前导零数 (e.g. 0x0000000100000000 → 31)
+//   - 32-bit tzcnt: src 低 32 位末尾零数 (e.g. 0x00010000 → 16)
+//   - 64-bit tzcnt: src 64 位末尾零数 (e.g. 0x0000000100000000 → 32)
+// lzcnt/tzcnt 不改 flags (CF/OF/SF/ZF/PF); BMI1 bit-scan 仅设 ZF 与结果 0/非0 相关.
+
+namespace {
+// Lzcnt 参考实现：32 位值前导零数。
+static u32 ref_lzcnt32(wvmp::u32 v) {
+    if (v == 0) return 32;
+    u32 r = 0;
+    while ((v & 0x80000000u) == 0) { v <<= 1; ++r; }
+    return r;
+}
+// Lzcnt 参考实现：64 位值前导零数。
+static u32 ref_lzcnt64(wvmp::u64 v) {
+    if (v == 0) return 64;
+    u32 r = 0;
+    while ((v & 0x8000000000000000ull) == 0) { v <<= 1; ++r; }
+    return r;
+}
+// Tzcount 参考实现：32 位值末尾零数 (CTZ)。
+static u32 ref_tzcnt32(wvmp::u32 v) {
+    if (v == 0) return 32;
+    u32 r = 0;
+    while ((v & 1u) == 0) { v >>= 1; ++r; }
+    return r;
+}
+// Tzcount 参考实现：64 位值末尾零数 (CTZ)。
+static u32 ref_tzcnt64(wvmp::u64 v) {
+    if (v == 0) return 64;
+    u32 r = 0;
+    while ((v & 1ull) == 0) { v >>= 1; ++r; }
+    return r;
+}
+}  // namespace
+
+TEST(Interpreter, LzcntSemanticsS32) {
+    // S32: lzcnt 低 32 位, src 高 32 位忽略。结果存到 regs[1] (S32 路径 qword
+    // 写回后上 32 位 0, 与 native lzcnt r32 零扩展上 32 位一致)。
+    for (u64 seed : {0xC0FFEEull, 0xBABEF00Dull, 0xDEADBEEFull,
+                     0xCAFEBABEull, 0xFEEDFACEull}) {
+        wvmp::Rng rng(seed);
+        const auto result = rt::generate_runtime(rng);
+        RwxImage rwx(result.image.code);
+        const auto entry = rwx.entry();
+        alignas(16) std::array<u8, 0x10000> scratch{};
+
+        struct C { wvmp::u32 v; const char* tag; };
+        const C cases[] = {
+            {0x00000000u, "zero"},          // lzcnt(0) = 32 (BMI1 定义)
+            {0x00000001u, "one_bit"},        // lzcnt(1) = 31
+            {0x80000000u, "top_bit_32"},     // lzcnt(0x80000000) = 0
+            {0x00010000u, "bit_16"},         // lzcnt(0x00010000) = 15
+            {0xFFFFFFFFu, "all_ones_32"},    // lzcnt(0xFFFFFFFF) = 0
+            {0xDEADBEEFu, "deadbeef"},
+        };
+        for (const auto& c : cases) {
+            // regs[0] = 0xDEADBEEF12345678 (上 32 位塞垃圾, 验证 S32 路径只读低 32 位)
+            const wvmp::u64 full_v = 0xDEADBEEFull << 32 | static_cast<wvmp::u64>(c.v);
+            std::vector<u8> s;
+            mov_imm64_into(s, /*dst*/0, /*scratch*/isa::kScratchFirst, full_v);
+            isa::append_insn(s, isa::make_insn(isa::VmOp::Lzcount,
+                                               isa::OpKind::Reg, 1,
+                                               isa::OpKind::Reg, 0, 0,
+                                               isa::size_field(ir::Size::S32)));
+            isa::append_insn(s, halt());
+            const auto ctx = run_stream(entry, s, scratch.data());
+            const u64 expected = static_cast<u64>(ref_lzcnt32(c.v));
+            ASSERT_EQ(ctx.regs[1], expected)
+                << "LzcntS32 " << c.tag << " seed=" << std::hex << seed
+                << " src=0x" << c.v
+                << " -> got 0x" << ctx.regs[1]
+                << " expected 0x" << expected;
+        }
+    }
+}
+
+TEST(Interpreter, LzcntSemanticsS64) {
+    // S64: lzcnt 64 位, src 完整 64 位前导零数。结果存到 regs[1] (S64 路径
+    // qword 写回完整 64 位)。
+    for (u64 seed : {0xC0FFEEull, 0xBABEF00Dull, 0xDEADBEEFull,
+                     0xCAFEBABEull, 0xFEEDFACEull}) {
+        wvmp::Rng rng(seed);
+        const auto result = rt::generate_runtime(rng);
+        RwxImage rwx(result.image.code);
+        const auto entry = rwx.entry();
+        alignas(16) std::array<u8, 0x10000> scratch{};
+
+        struct C { wvmp::u64 v; const char* tag; };
+        const C cases[] = {
+            {0x0000000000000000ull, "zero"},  // lzcnt(0) = 64 (BMI1 定义)
+            {0x0000000000000001ull, "one_bit"},
+            {0x8000000000000000ull, "top_bit_64"},
+            {0x0000000100000000ull, "bit_32"},
+            {0x0001000000000000ull, "bit_48"},
+            {0xFFFFFFFFFFFFFFFFull, "all_ones_64"},
+            {0xDEADBEEFCAFEBABEull, "deadbeef_cafebabe"},
+        };
+        for (const auto& c : cases) {
+            std::vector<u8> s;
+            mov_imm64_into(s, /*dst*/0, /*scratch*/isa::kScratchFirst, c.v);
+            isa::append_insn(s, isa::make_insn(isa::VmOp::Lzcount,
+                                               isa::OpKind::Reg, 1,
+                                               isa::OpKind::Reg, 0, 0,
+                                               isa::size_field(ir::Size::S64)));
+            isa::append_insn(s, halt());
+            const auto ctx = run_stream(entry, s, scratch.data());
+            const u64 expected = static_cast<u64>(ref_lzcnt64(c.v));
+            ASSERT_EQ(ctx.regs[1], expected)
+                << "LzcntS64 " << c.tag << " seed=" << std::hex << seed
+                << " src=0x" << c.v
+                << " -> got 0x" << ctx.regs[1]
+                << " expected 0x" << expected;
+        }
+    }
+}
+
+TEST(Interpreter, TzcountSemanticsS32) {
+    // S32: tzcnt 低 32 位, src 高 32 位忽略。结果存到 regs[1] (S32 路径 qword
+    // 写回后上 32 位 0, 与 native tzcnt r32 零扩展上 32 位一致)。
+    for (u64 seed : {0xC0FFEEull, 0xBABEF00Dull, 0xDEADBEEFull,
+                     0xCAFEBABEull, 0xFEEDFACEull}) {
+        wvmp::Rng rng(seed);
+        const auto result = rt::generate_runtime(rng);
+        RwxImage rwx(result.image.code);
+        const auto entry = rwx.entry();
+        alignas(16) std::array<u8, 0x10000> scratch{};
+
+        struct C { wvmp::u32 v; const char* tag; };
+        const C cases[] = {
+            {0x00000000u, "zero"},          // tzcnt(0) = 32 (BMI1 定义)
+            {0x00000001u, "one_bit"},        // tzcnt(1) = 0
+            {0x00010000u, "bit_16"},         // tzcnt(0x00010000) = 16
+            {0x80000000u, "top_bit_32"},     // tzcnt(0x80000000) = 31
+            {0xFFFFFFFFu, "all_ones_32"},    // tzcnt(0xFFFFFFFF) = 0
+            {0xDEADBEEFu, "deadbeef"},
+        };
+        for (const auto& c : cases) {
+            // regs[0] = 0xDEADBEEF12345678 (上 32 位塞垃圾, 验证 S32 路径只读低 32 位)
+            const wvmp::u64 full_v = 0xDEADBEEFull << 32 | static_cast<wvmp::u64>(c.v);
+            std::vector<u8> s;
+            mov_imm64_into(s, /*dst*/0, /*scratch*/isa::kScratchFirst, full_v);
+            isa::append_insn(s, isa::make_insn(isa::VmOp::Tzcount,
+                                               isa::OpKind::Reg, 1,
+                                               isa::OpKind::Reg, 0, 0,
+                                               isa::size_field(ir::Size::S32)));
+            isa::append_insn(s, halt());
+            const auto ctx = run_stream(entry, s, scratch.data());
+            const u64 expected = static_cast<u64>(ref_tzcnt32(c.v));
+            ASSERT_EQ(ctx.regs[1], expected)
+                << "TzcountS32 " << c.tag << " seed=" << std::hex << seed
+                << " src=0x" << c.v
+                << " -> got 0x" << ctx.regs[1]
+                << " expected 0x" << expected;
+        }
+    }
+}
+
+TEST(Interpreter, TzcountSemanticsS64) {
+    // S64: tzcnt 64 位, src 完整 64 位末尾零数。结果存到 regs[1] (S64 路径
+    // qword 写回完整 64 位)。
+    for (u64 seed : {0xC0FFEEull, 0xBABEF00Dull, 0xDEADBEEFull,
+                     0xCAFEBABEull, 0xFEEDFACEull}) {
+        wvmp::Rng rng(seed);
+        const auto result = rt::generate_runtime(rng);
+        RwxImage rwx(result.image.code);
+        const auto entry = rwx.entry();
+        alignas(16) std::array<u8, 0x10000> scratch{};
+
+        struct C { wvmp::u64 v; const char* tag; };
+        const C cases[] = {
+            {0x0000000000000000ull, "zero"},  // tzcnt(0) = 64 (BMI1 定义)
+            {0x0000000000000001ull, "one_bit"},
+            {0x0000000100000000ull, "bit_32"},
+            {0x0001000000000000ull, "bit_48"},
+            {0x8000000000000000ull, "top_bit_64"},
+            {0xFFFFFFFFFFFFFFFFull, "all_ones_64"},
+            {0xDEADBEEFCAFEBABEull, "deadbeef_cafebabe"},
+        };
+        for (const auto& c : cases) {
+            std::vector<u8> s;
+            mov_imm64_into(s, /*dst*/0, /*scratch*/isa::kScratchFirst, c.v);
+            isa::append_insn(s, isa::make_insn(isa::VmOp::Tzcount,
+                                               isa::OpKind::Reg, 1,
+                                               isa::OpKind::Reg, 0, 0,
+                                               isa::size_field(ir::Size::S64)));
+            isa::append_insn(s, halt());
+            const auto ctx = run_stream(entry, s, scratch.data());
+            const u64 expected = static_cast<u64>(ref_tzcnt64(c.v));
+            ASSERT_EQ(ctx.regs[1], expected)
+                << "TzcountS64 " << c.tag << " seed=" << std::hex << seed
+                << " src=0x" << c.v
+                << " -> got 0x" << ctx.regs[1]
+                << " expected 0x" << expected;
+        }
+    }
+}
+
+// =============================================================================
 // MIT-322 LeaRva 真执行测试
 // =============================================================================
 // VmOp::LeaRva: dst = reg_b 槽值 + image_base (与 LoadRva/StoreRva 配套,

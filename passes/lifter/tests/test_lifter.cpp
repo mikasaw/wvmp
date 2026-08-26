@@ -1026,6 +1026,163 @@ TEST_F(LifterTranslate, PopcntMemRejected) {
     EXPECT_EQ(r.status, lifter::TranslateStatus::Unsupported);
 }
 
+// =============================================================================
+// MIT-353: lzcnt (F3 0F BD+rm) BMI1 前导零计数 / tzcnt (F3 0F BC+rm) BMI1 末尾零计数
+// =============================================================================
+// 字节编码（来自项目主派活单 §A 反汇编验证, capstone 实测）：
+//   - lzcnt REG-REG 32-bit (no REX.W):    F3 0F BD C0 = lzcnt eax, eax
+//   - lzcnt REG-REG 32-bit 不同寄存器:    F3 0F BD C8 = lzcnt ecx, eax
+//   - lzcnt REG-REG 64-bit (REX.W):       48 F3 0F BD C0 = lzcnt rax, rax
+//   - lzcnt REG-REG 64-bit 不同寄存器:    48 F3 0F BD C8 = lzcnt rcx, rax
+//   - tzcnt REG-REG 32-bit (no REX.W):    F3 0F BC C0 = tzcnt eax, eax
+//   - tzcnt REG-REG 32-bit 不同寄存器:    F3 0F BC C8 = tzcnt ecx, eax
+//   - tzcnt REG-REG 64-bit (REX.W):       48 F3 0F BC C0 = tzcnt rax, rax
+//   - tzcnt REG-REG 64-bit 不同寄存器:    48 F3 0F BC C8 = tzcnt rcx, rax
+// lifter 只接 REG-REG 形式 (mod=11)；MEM (mod=00/01/10) 派活单限定不支持
+// (lifter 拒为 unsupported → C1 gate 兜底)。
+// size 由 REX.W 决定：无 REX.W → S32, 有 REX.W → S64。
+// updates_flags=false (lzcnt/tzcnt 不改 CF/OF/SF/ZF/PF; BMI1 bit-scan 仅 ZF)。
+TEST_F(LifterTranslate, LzcntRegToReg32Same) {
+    // F3 0F BD C0: lzcnt eax, eax — REG-REG 32-bit 同寄存器
+    // F3 (REP prefix) | 0F BD (opcode) | C0 (ModR/M: mod=11, reg=000=Rax, r/m=000=Rax)
+    const wvmp::u8 b[] = {0xF3, 0x0F, 0xBD, 0xC0};
+    auto r = translate_bytes(x64, b, ir::Arch::X64);
+    ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r.insn.op, ir::Op::Lzcount);
+    EXPECT_EQ(r.insn.size, ir::Size::S32);        // 无 REX.W → S32
+    EXPECT_FALSE(r.insn.updates_flags);            // lzcnt 不改 flags
+    ASSERT_EQ(r.insn.dst.kind, ir::Operand::Kind::Reg);
+    EXPECT_EQ(r.insn.dst.reg, ir::Reg::Rax);
+    ASSERT_EQ(r.insn.src.kind, ir::Operand::Kind::Reg);
+    EXPECT_EQ(r.insn.src.reg, ir::Reg::Rax);
+    EXPECT_EQ(r.insn.addr, 0u);
+}
+
+TEST_F(LifterTranslate, LzcntRegToReg32Different) {
+    // F3 0F BD C8: lzcnt ecx, eax — REG-REG 32-bit 不同寄存器
+    // F3 (REP prefix) | 0F BD (opcode) | C8 (ModR/M: mod=11, reg=001=Rcx, r/m=000=Rax)
+    const wvmp::u8 b[] = {0xF3, 0x0F, 0xBD, 0xC8};
+    auto r = translate_bytes(x64, b, ir::Arch::X64);
+    ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r.insn.op, ir::Op::Lzcount);
+    EXPECT_EQ(r.insn.size, ir::Size::S32);
+    EXPECT_FALSE(r.insn.updates_flags);
+    ASSERT_EQ(r.insn.dst.kind, ir::Operand::Kind::Reg);
+    EXPECT_EQ(r.insn.dst.reg, ir::Reg::Rcx);
+    ASSERT_EQ(r.insn.src.kind, ir::Operand::Kind::Reg);
+    EXPECT_EQ(r.insn.src.reg, ir::Reg::Rax);
+}
+
+TEST_F(LifterTranslate, LzcntRegToReg64Same) {
+    // 48 F3 0F BD C0: lzcnt rax, rax — REG-REG 64-bit (REX.W) 同寄存器
+    // 48 (REX.W) | F3 (REP prefix) | 0F BD | C0 (ModR/M: mod=11, reg=000=Rax, r/m=000=Rax)
+    const wvmp::u8 b[] = {0x48, 0xF3, 0x0F, 0xBD, 0xC0};
+    auto r = translate_bytes(x64, b, ir::Arch::X64);
+    ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r.insn.op, ir::Op::Lzcount);
+    EXPECT_EQ(r.insn.size, ir::Size::S64);        // REX.W → S64
+    EXPECT_FALSE(r.insn.updates_flags);
+    ASSERT_EQ(r.insn.dst.kind, ir::Operand::Kind::Reg);
+    EXPECT_EQ(r.insn.dst.reg, ir::Reg::Rax);
+    ASSERT_EQ(r.insn.src.kind, ir::Operand::Kind::Reg);
+    EXPECT_EQ(r.insn.src.reg, ir::Reg::Rax);
+}
+
+TEST_F(LifterTranslate, LzcntRegToReg64Different) {
+    // 48 F3 0F BD C8: lzcnt rcx, rax — REG-REG 64-bit 不同寄存器
+    const wvmp::u8 b[] = {0x48, 0xF3, 0x0F, 0xBD, 0xC8};
+    auto r = translate_bytes(x64, b, ir::Arch::X64);
+    ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r.insn.op, ir::Op::Lzcount);
+    EXPECT_EQ(r.insn.size, ir::Size::S64);
+    EXPECT_FALSE(r.insn.updates_flags);
+    ASSERT_EQ(r.insn.dst.kind, ir::Operand::Kind::Reg);
+    EXPECT_EQ(r.insn.dst.reg, ir::Reg::Rcx);
+    ASSERT_EQ(r.insn.src.kind, ir::Operand::Kind::Reg);
+    EXPECT_EQ(r.insn.src.reg, ir::Reg::Rax);
+}
+
+// MIT-353: lzcnt MEM 形式派活单限定不支持 (lifter 拒为 unsupported)。
+// 派活单 §D 决策 9: 完全不支持 MEM, 沿用 popcnt 限定风格, 不像 movzx/movsx
+// 沿用 MovzxMem/MovsxMem 单独处理。
+TEST_F(LifterTranslate, LzcntMemRejected) {
+    // F3 0F BD 44 24 20: lzcnt eax, [rsp+0x20] — REG-MEM 含 SIB
+    // F3 (REP prefix) | 0F BD | 44 (ModR/M: mod=01, reg=000=Rax, r/m=100=SIB)
+    //   | 24 (SIB: scale=00, index=100=none, base=100=Rsp) | 20 (disp8)
+    const wvmp::u8 b[] = {0xF3, 0x0F, 0xBD, 0x44, 0x24, 0x20};
+    auto r = translate_bytes(x64, b, ir::Arch::X64);
+    EXPECT_EQ(r.status, lifter::TranslateStatus::Unsupported);
+}
+
+TEST_F(LifterTranslate, TzcntRegToReg32Same) {
+    // F3 0F BC C0: tzcnt eax, eax — REG-REG 32-bit 同寄存器
+    // F3 (REP prefix) | 0F BC (opcode) | C0 (ModR/M: mod=11, reg=000=Rax, r/m=000=Rax)
+    const wvmp::u8 b[] = {0xF3, 0x0F, 0xBC, 0xC0};
+    auto r = translate_bytes(x64, b, ir::Arch::X64);
+    ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r.insn.op, ir::Op::Tzcount);
+    EXPECT_EQ(r.insn.size, ir::Size::S32);        // 无 REX.W → S32
+    EXPECT_FALSE(r.insn.updates_flags);            // tzcnt 不改 flags
+    ASSERT_EQ(r.insn.dst.kind, ir::Operand::Kind::Reg);
+    EXPECT_EQ(r.insn.dst.reg, ir::Reg::Rax);
+    ASSERT_EQ(r.insn.src.kind, ir::Operand::Kind::Reg);
+    EXPECT_EQ(r.insn.src.reg, ir::Reg::Rax);
+}
+
+TEST_F(LifterTranslate, TzcntRegToReg32Different) {
+    // F3 0F BC C8: tzcnt ecx, eax — REG-REG 32-bit 不同寄存器
+    // F3 (REP prefix) | 0F BC (opcode) | C8 (ModR/M: mod=11, reg=001=Rcx, r/m=000=Rax)
+    const wvmp::u8 b[] = {0xF3, 0x0F, 0xBC, 0xC8};
+    auto r = translate_bytes(x64, b, ir::Arch::X64);
+    ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r.insn.op, ir::Op::Tzcount);
+    EXPECT_EQ(r.insn.size, ir::Size::S32);
+    EXPECT_FALSE(r.insn.updates_flags);
+    ASSERT_EQ(r.insn.dst.kind, ir::Operand::Kind::Reg);
+    EXPECT_EQ(r.insn.dst.reg, ir::Reg::Rcx);
+    ASSERT_EQ(r.insn.src.kind, ir::Operand::Kind::Reg);
+    EXPECT_EQ(r.insn.src.reg, ir::Reg::Rax);
+}
+
+TEST_F(LifterTranslate, TzcntRegToReg64Same) {
+    // 48 F3 0F BC C0: tzcnt rax, rax — REG-REG 64-bit (REX.W) 同寄存器
+    // 48 (REX.W) | F3 (REP prefix) | 0F BC | C0 (ModR/M: mod=11, reg=000=Rax, r/m=000=Rax)
+    const wvmp::u8 b[] = {0x48, 0xF3, 0x0F, 0xBC, 0xC0};
+    auto r = translate_bytes(x64, b, ir::Arch::X64);
+    ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r.insn.op, ir::Op::Tzcount);
+    EXPECT_EQ(r.insn.size, ir::Size::S64);        // REX.W → S64
+    EXPECT_FALSE(r.insn.updates_flags);
+    ASSERT_EQ(r.insn.dst.kind, ir::Operand::Kind::Reg);
+    EXPECT_EQ(r.insn.dst.reg, ir::Reg::Rax);
+    ASSERT_EQ(r.insn.src.kind, ir::Operand::Kind::Reg);
+    EXPECT_EQ(r.insn.src.reg, ir::Reg::Rax);
+}
+
+TEST_F(LifterTranslate, TzcntRegToReg64Different) {
+    // 48 F3 0F BC C8: tzcnt rcx, rax — REG-REG 64-bit 不同寄存器
+    const wvmp::u8 b[] = {0x48, 0xF3, 0x0F, 0xBC, 0xC8};
+    auto r = translate_bytes(x64, b, ir::Arch::X64);
+    ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r.insn.op, ir::Op::Tzcount);
+    EXPECT_EQ(r.insn.size, ir::Size::S64);
+    EXPECT_FALSE(r.insn.updates_flags);
+    ASSERT_EQ(r.insn.dst.kind, ir::Operand::Kind::Reg);
+    EXPECT_EQ(r.insn.dst.reg, ir::Reg::Rcx);
+    ASSERT_EQ(r.insn.src.kind, ir::Operand::Kind::Reg);
+    EXPECT_EQ(r.insn.src.reg, ir::Reg::Rax);
+}
+
+// MIT-353: tzcnt MEM 形式派活单限定不支持 (lifter 拒为 unsupported)。
+TEST_F(LifterTranslate, TzcntMemRejected) {
+    // F3 0F BC 44 24 20: tzcnt eax, [rsp+0x20] — REG-MEM 含 SIB
+    // F3 (REP prefix) | 0F BC | 44 (ModR/M: mod=01, reg=000=Rax, r/m=100=SIB)
+    //   | 24 (SIB: scale=00, index=100=none, base=100=Rsp) | 20 (disp8)
+    const wvmp::u8 b[] = {0xF3, 0x0F, 0xBC, 0x44, 0x24, 0x20};
+    auto r = translate_bytes(x64, b, ir::Arch::X64);
+    EXPECT_EQ(r.status, lifter::TranslateStatus::Unsupported);
+}
+
 TEST_F(LifterTranslate, SkippedInstructions) {
     // 0F A2: cpuid —— 超出白名单
     const wvmp::u8 cpuid[] = {0x0F, 0xA2};

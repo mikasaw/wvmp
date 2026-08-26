@@ -39,6 +39,16 @@
 extern "C" {
     unsigned int popcnt32_fn(unsigned int x);  // ?popcnt32_fn@@YAII@Z
     unsigned int popcnt64_fn(unsigned long long x);  // ?popcnt64_fn@@YAIX@Z
+    // MIT-353: lzcnt/tzcnt BMI1 bit-scan 助手函数 (沿用 popcnt 派活单限定风格).
+    // 用 MASM (.asm) helper 强制 emit REG-REG 字节 (lzcnt rax,rax / tzcnt rax,rax),
+    // 因为 MSVC 没有 lzcnt/tzcnt 直接 intrinsic, 高层 _lzcnt_u32 / _tzcnt_u32
+    // 在 /Od 下可能 emit MEM form (沿用 popcnt 派活单限定风格, 派活单限定不支持
+    // MEM). 沿用 MIT-349 MASM helper 模式 + 64-NOP 填充 pitfall #39.
+    // 函数参数用 RCX (Win64 ABI), 返回 RAX.
+    unsigned int lzcnt32_fn(unsigned int x);  // ?lzcnt32_fn@@YAII@Z
+    unsigned int lzcnt64_fn(unsigned long long x);  // ?lzcnt64_fn@@YAIX@Z
+    unsigned int tzcnt32_fn(unsigned int x);  // ?tzcnt32_fn@@YAII@Z
+    unsigned int tzcnt64_fn(unsigned long long x);  // ?tzcnt64_fn@@YAIX@Z
 }
 
 // shl_cl: r = x << count (count 来自函数参数, MSVC codegen 为 cl 变体)。
@@ -169,6 +179,40 @@ __declspec(noinline) static int popcnt_64(unsigned long long x) {
     return r;
 }
 
+// MIT-353: lzcnt 32-bit (F3 0F BD C0) BMI1 前导零计数。
+// 真 lzcnt REG-REG 字节由 cl_shift_sample_asm.asm (MASM) emit, 链接进本 sample。
+// 派活单限定仅 REG-REG (mod=11), 不支持 MEM form (沿用 popcnt 派活单限定风格).
+__declspec(noinline) static int lzcnt_32(unsigned int x) {
+    WVMP_BEGIN(lzcnt_32);
+    volatile int r = static_cast<int>(lzcnt32_fn(x)); // MASM helper: lzcnt eax, eax (F3 0F BD C0)
+    WVMP_END(lzcnt_32);
+    return r;
+}
+
+// MIT-353: lzcnt 64-bit (48 F3 0F BD C0) BMI1 前导零计数。
+__declspec(noinline) static int lzcnt_64(unsigned long long x) {
+    WVMP_BEGIN(lzcnt_64);
+    volatile int r = static_cast<int>(lzcnt64_fn(x)); // MASM helper: lzcnt rax, rax (48 F3 0F BD C0)
+    WVMP_END(lzcnt_64);
+    return r;
+}
+
+// MIT-353: tzcnt 32-bit (F3 0F BC C0) BMI1 末尾零计数。
+__declspec(noinline) static int tzcnt_32(unsigned int x) {
+    WVMP_BEGIN(tzcnt_32);
+    volatile int r = static_cast<int>(tzcnt32_fn(x)); // MASM helper: tzcnt eax, eax (F3 0F BC C0)
+    WVMP_END(tzcnt_32);
+    return r;
+}
+
+// MIT-353: tzcnt 64-bit (48 F3 0F BC C0) BMI1 末尾零计数。
+__declspec(noinline) static int tzcnt_64(unsigned long long x) {
+    WVMP_BEGIN(tzcnt_64);
+    volatile int r = static_cast<int>(tzcnt64_fn(x)); // MASM helper: tzcnt rax, rax (48 F3 0F BC C0)
+    WVMP_END(tzcnt_64);
+    return r;
+}
+
 int main() {
     // 用函数参数传入 count —— MSVC codegen 为 cl 变体核心条件: count 不能
     // 是编译期常量 (用 literal 常量会让 MSVC 用 imm 形式 C1 /4 ib)。
@@ -204,7 +248,20 @@ int main() {
     const int k = popcnt_32(0xFFFFFFFFu);
     const int l = popcnt_64(0xFFFFFFFFFFFFull);
 
-    std::printf("a=%llx b=%llx c=%lld d=%llx e=%x f=%llx g=%x h=%llx i=%x j=%llx k=%x l=%x\n",
+    // MIT-353: lzcnt + tzcnt 4 形式测试 (32-bit + 64-bit REG-REG)。
+    // 区域不含 rip-relative / call / printf, MASM (.asm) helper 直接 emit 真
+    // lzcnt/tzcnt REG-REG 字节 (F3 0F BD/BC / 48 F3 0F BD/BC).
+    // 期望 (bit-scan):
+    //   lzcnt_32(0x00010000)         = 15 (bit 16 前导零数)
+    //   lzcnt_64(0x0000000100000000) = 31 (bit 32 前导零数)
+    //   tzcnt_32(0x00010000)         = 16 (bit 16 末尾零数)
+    //   tzcnt_64(0x0000000100000000) = 32 (bit 32 末尾零数)
+    const int m = lzcnt_32(0x00010000u);
+    const int n = lzcnt_64(0x0000000100000000ull);
+    const int o = tzcnt_32(0x00010000u);
+    const int p = tzcnt_64(0x0000000100000000ull);
+
+    std::printf("a=%llx b=%llx c=%lld d=%llx e=%x f=%llx g=%x h=%llx i=%x j=%llx k=%x l=%x m=%x n=%x o=%x p=%x\n",
                 static_cast<unsigned long long>(a),
                 static_cast<unsigned long long>(b),
                 static_cast<long long>(c),
@@ -216,6 +273,10 @@ int main() {
                 static_cast<unsigned int>(i),
                 static_cast<unsigned long long>(j),
                 static_cast<unsigned int>(k),
-                static_cast<unsigned int>(l));
+                static_cast<unsigned int>(l),
+                static_cast<unsigned int>(m),
+                static_cast<unsigned int>(n),
+                static_cast<unsigned int>(o),
+                static_cast<unsigned int>(p));
     return 0;
 }

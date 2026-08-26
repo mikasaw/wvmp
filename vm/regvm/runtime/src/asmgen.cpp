@@ -1644,6 +1644,126 @@ public:
                advance(dispatch);
     }
 
+    // MIT-353 Lzcount: 前导零计数 (lzcnt r, r/m, BMI1)。
+    //   字节结构: [48] (REX.W 可选) | F3 0F BD | ModR/M
+    //   语义 (Intel SDM Vol. 2 LZCNT): dst = count_leading_zeros(src),
+    //     src 寄存器保留 (不像 popcnt 派活单 "src 被消耗 in-place")。
+    //   a_kind=Reg, reg_a=dst, b_kind=Reg, reg_b=src, aux=0, cond_or_size=size
+    //     (S32 或 S64 由 REX.W 决定, lifter 已传过来)。
+    //
+    // 编码约定: a_kind=Reg reg_a=dst, b_kind=Reg reg_b=src, aux=0,
+    //     cond_or_size=ir::Size (S32/S64, 与 popcnt 共享 2 bits size_chain)。
+    //
+    // 实现思路 (与 build_popcnt 同模式但 src 必须保留):
+    //   1. load src → T1 (按宽度读, alias_read 零扩展)
+    //   2. save T1 → T6 (pitfall #37 — 避开未来 cond_eval / size_chain 扩展 clobber T1)
+    //   3. lzcnt <sz> T1, T6 — native 完成前导零计数; T1 = count(T6), T6 保留
+    //      (native lzcnt 只写 dst, src 寄存器保留 — 与 popcnt "src 被消耗可重用 T1"
+    //       的本质差异, popcnt 派活单不需 T6 守恒, lzcnt 派活单必 save src)
+    //   4. writeback T1 → dst 槽 (按宽度 alias_write, S32 自动零扩展上 32 位)
+    //
+    // 关键 catch:
+    //   - size_chain 不 clobber T1 (只用 T2 cmp/je 派发), 但保守 save T1→T6
+    //     留余地: 即使未来 cond_eval 加入或 size_chain 路径变化, src 仍可保.
+    //   - S32 lzcnt 路径用 32 位寄存器读 + lzcnt r32,r32, 上 32 位自动 zero-extend;
+    //     qword 写回完整 64 位 (上 32 位 0, lzcnt 32-bit 结果 0..32 自动 zero-extend).
+    //   - S64 lzcnt 路径全 64 位读写, T1 = lzcnt(T6).
+    //   - S8/S16: defensive no-op (lifter 不产此 size lzcnt, Intel SDM Vol. 2 LZCNT
+    //     仅 16/32/64-bit 寄存器形式).
+    //   - 不影响 flags (CF/OF/SF/ZF/PF 不变, BMI1 lzcnt 仅 ZF 与结果 0/非0 相关);
+    //     handler 不调用 setcc5 也不走 flags_tail, 直接 advance(dispatch).
+    std::string build_lzcnt(u64 dispatch) const {
+        const std::string tag = "lzcnt" + std::to_string(seq());
+        const std::string tail_lbl = "atail_" + tag;
+        std::array<std::string, 4> blocks;
+        for (int s = 0; s < 4; ++s) {
+            std::string o;
+            if (s == 3) {
+                // S64: qword 读 src 槽 → save to T6 → lzcnt r64, r64 → qword 写回 dst
+                o += std::string("    mov ") + r64(t_[1]) + ", qword ptr [" + r64(ctx_) +
+                     " + " + r64(t_[7]) + "*8 + 0x10]\n";  // T1 = src (qword)
+                o += std::string("    mov ") + r64(t_[6]) + ", " + r64(t_[1]) +
+                     "\n";  // T6 = src (save, pitfall #37)
+                o += std::string("    lzcnt ") + r64(t_[1]) + ", " + r64(t_[6]) +
+                     "\n";  // T1 = lzcnt(T6), T6 保留
+                o += std::string("    mov qword ptr [") + r64(ctx_) + " + " +
+                     r64(t_[4]) + "*8 + 0x10], " + r64(t_[1]) + "\n";  // qword 写回 dst
+            } else if (s == 2) {
+                // S32: dword 读 src (alias_read 自动 zero-extend 上 32 位)
+                //      → save to T6 → lzcnt r32, r32 → qword 写回 dst
+                // 32 位寄存器读自动 zero-extend 上 32 位, T1 上 32 位 0.
+                o += std::string("    mov ") + rs(t_[1], 2) + ", dword ptr [" + r64(ctx_) +
+                     " + " + r64(t_[7]) + "*8 + 0x10]\n";  // T1 = src (alias_read)
+                o += std::string("    mov ") + r64(t_[6]) + ", " + r64(t_[1]) +
+                     "\n";  // T6 = src (save, pitfall #37)
+                o += std::string("    lzcnt ") + rs(t_[1], 2) + ", " + rs(t_[6], 2) +
+                     "\n";  // T1 = lzcnt(T6), 32-bit 路径, 上 32 位自动 0
+                o += std::string("    mov qword ptr [") + r64(ctx_) + " + " +
+                     r64(t_[4]) + "*8 + 0x10], " + r64(t_[1]) + "\n";  // qword 写回
+            } else {
+                // S8/S16: defensive no-op (lifter 不产此 size lzcnt)
+            }
+            o += "    jmp " + tail_lbl + "\n";
+            blocks[s] = o;
+        }
+        return decode_prelude() + size_chain(blocks, tag) + tail_lbl + ":\n" +
+               advance(dispatch);
+    }
+
+    // MIT-353 Tzcount: 末尾零计数 (tzcnt r, r/m, BMI1)。
+    //   字节结构: [48] (REX.W 可选) | F3 0F BC | ModR/M
+    //   语义 (Intel SDM Vol. 2 TZCNT): dst = count_trailing_zeros(src),
+    //     src 寄存器保留 (与 lzcnt 同源, 与 popcnt 派活单 "src 被消耗 in-place" 不同)。
+    //   a_kind=Reg, reg_a=dst, b_kind=Reg, reg_b=src, aux=0, cond_or_size=size
+    //     (S32 或 S64 由 REX.W 决定, lifter 已传过来)。
+    //
+    // 实现思路 (与 build_lzcnt 同模式, src 必须保留):
+    //   1. load src → T1 (按宽度读, alias_read 零扩展)
+    //   2. save T1 → T6 (pitfall #37 — 避开未来 cond_eval / size_chain 扩展 clobber T1)
+    //   3. tzcnt <sz> T1, T6 — native 完成末尾零计数; T1 = count(T6), T6 保留
+    //   4. writeback T1 → dst 槽 (按宽度 alias_write, S32 自动零扩展上 32 位)
+    //
+    // 关键 catch: 与 build_lzcnt 完全同源 (lzcnt/tzcnt 是一对 BMI1 bit-scan 指令,
+    //   派活单 §D 限定一致, src 保留, 走同模式 save T6 + 写回 dst).
+    //   S32/S64 路径同 lzcnt, S8/S16 defensive no-op.
+    //   不影响 flags; 不调 setcc5; 直接 advance(dispatch).
+    std::string build_tzcnt(u64 dispatch) const {
+        const std::string tag = "tzcnt" + std::to_string(seq());
+        const std::string tail_lbl = "atail_" + tag;
+        std::array<std::string, 4> blocks;
+        for (int s = 0; s < 4; ++s) {
+            std::string o;
+            if (s == 3) {
+                // S64: qword 读 src 槽 → save to T6 → tzcnt r64, r64 → qword 写回 dst
+                o += std::string("    mov ") + r64(t_[1]) + ", qword ptr [" + r64(ctx_) +
+                     " + " + r64(t_[7]) + "*8 + 0x10]\n";  // T1 = src (qword)
+                o += std::string("    mov ") + r64(t_[6]) + ", " + r64(t_[1]) +
+                     "\n";  // T6 = src (save, pitfall #37)
+                o += std::string("    tzcnt ") + r64(t_[1]) + ", " + r64(t_[6]) +
+                     "\n";  // T1 = tzcnt(T6), T6 保留
+                o += std::string("    mov qword ptr [") + r64(ctx_) + " + " +
+                     r64(t_[4]) + "*8 + 0x10], " + r64(t_[1]) + "\n";  // qword 写回 dst
+            } else if (s == 2) {
+                // S32: dword 读 src (alias_read 自动 zero-extend 上 32 位)
+                //      → save to T6 → tzcnt r32, r32 → qword 写回 dst
+                o += std::string("    mov ") + rs(t_[1], 2) + ", dword ptr [" + r64(ctx_) +
+                     " + " + r64(t_[7]) + "*8 + 0x10]\n";  // T1 = src (alias_read)
+                o += std::string("    mov ") + r64(t_[6]) + ", " + r64(t_[1]) +
+                     "\n";  // T6 = src (save, pitfall #37)
+                o += std::string("    tzcnt ") + rs(t_[1], 2) + ", " + rs(t_[6], 2) +
+                     "\n";  // T1 = tzcnt(T6), 32-bit 路径, 上 32 位自动 0
+                o += std::string("    mov qword ptr [") + r64(ctx_) + " + " +
+                     r64(t_[4]) + "*8 + 0x10], " + r64(t_[1]) + "\n";  // qword 写回
+            } else {
+                // S8/S16: defensive no-op (lifter 不产此 size tzcnt)
+            }
+            o += "    jmp " + tail_lbl + "\n";
+            blocks[s] = o;
+        }
+        return decode_prelude() + size_chain(blocks, tag) + tail_lbl + ":\n" +
+               advance(dispatch);
+    }
+
     // MIT-334 Xchg: dst ↔ src, 2 操作数 (reg_a=dst, reg_b=src). xchg 是对称
     // 操作 (Intel SDM: xchg a, b == xchg b, a), 但 IR.dst/src 顺序编码 (语义等价).
     // a_kind=Reg, reg_a=dst, b_kind=Reg, reg_b=src, aux=0, cond_or_size=size (S32/S64).
@@ -2038,6 +2158,9 @@ RuntimeGenResult generate_runtime(wvmp::Rng& rng) {
         {int(VmOp::Movsx), "movsx", &AsmGen::build_movsx},
         {int(VmOp::MovsxMem), "movsxmem", &AsmGen::build_movsx_mem},
         {int(VmOp::Popcnt), "popcnt", &AsmGen::build_popcnt},
+        // MIT-353: lzcnt + tzcnt (BMI1 bit-scan, 沿用 popcnt 模板 + T6 save pitfall #37).
+        {int(VmOp::Lzcount), "lzcnt", &AsmGen::build_lzcnt},
+        {int(VmOp::Tzcount), "tzcnt", &AsmGen::build_tzcnt},
         {int(VmOp::Cmp), "cmp", &AsmGen::build_cmp},
         {int(VmOp::Test), "test", &AsmGen::build_test},
         {int(VmOp::Load), "load", &AsmGen::build_load},
