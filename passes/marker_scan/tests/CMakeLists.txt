@@ -255,3 +255,22 @@ target_compile_options(wvmp_xchg_sample PRIVATE
 target_link_options(wvmp_xchg_sample PRIVATE
     $<$<CXX_COMPILER_ID:MSVC>:/INCREMENTAL:NO>
 )
+
+# MIT-336: 端到端正路径样本——区域内含 setcc (REG-REG, 6 variants: setne/sete/
+# setb/seta/setl/setg), 验证 setcc 修复后翻译成功、运行时走真 Setcc handler、
+# 行为与原生逐字节一致。
+# MSVC x64 不支持 inline asm, setcc 字节由 setcc_sample_asm.asm (MASM) 直接
+# emit, 链接进本 sample. 区域不含 rip-relative / printf / call（printf 在
+# main 区域外）。
+add_executable(wvmp_setcc_sample
+    setcc_sample_main.cpp
+    setcc_sample_asm.asm
+)
+target_link_libraries(wvmp_setcc_sample PRIVATE wvmp::sdk)
+target_compile_options(wvmp_setcc_sample PRIVATE
+    $<$<CXX_COMPILER_ID:MSVC>:/Od;/Ob0;/utf-8>
+    $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-O0>
+)
+target_link_options(wvmp_setcc_sample PRIVATE
+    $<$<CXX_COMPILER_ID:MSVC>:/INCREMENTAL:NO>
+)

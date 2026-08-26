@@ -1276,6 +1276,52 @@ public:
                advance(dispatch);
     }
 
+    // MIT-336 Setcc: dst = (cond(flags) ? 1 : 0), 单操作数 (dst only, no src).
+    // a_kind=Reg reg_a=dst, b_kind=None, aux=0, cond_or_size=ir::Cond (0..15).
+    //
+    // 设计：
+    //   - MEM 形式 (setcc [m]) 由翻译器折成 Load+Setcc+Store 三条拆条；
+    //     本 handler 只接 REG-REG 路径 (a_kind=Reg)。
+    //   - setcc 不影响 flags (CF/OF/SF/ZF/PF 不变)；reads flags 决定结果 0/1。
+    //   - size 恒为 S8 (r/m8, 1 字节固定), 但 alias_write 必须保留 dst 高 56 位——
+    //     handler 读 full qword 到 T9, 评估 cond 到 T0 (0/1), 清 T9 低字节,
+    //     OR with T0, qword 写回。
+    //   - cond 来自 cond_or_size (T2, 4 位 0..15), 16 variants 共用 cond_eval。
+    //   - 16-way 链式分派 (仿 build_jcc): 每个 ccXX 块 emit cond_eval(XX),
+    //     末尾统一 tail 做 combine + writeback + advance(dispatch)。
+    std::string build_setcc(u64 dispatch) const {
+        const std::string tag = "setcc" + std::to_string(seq());
+        const std::string tail_lbl = "tail_" + tag;
+        std::string o = decode_prelude();  // T2=cond(0..15), T4=reg_a
+        // 1) 读 dst full qword 到 T9 (preserve 高 56 位; alias_write 前提)。
+        o += std::string("    mov ") + r64(t_[9]) + ", qword ptr [" + r64(ctx_) +
+             " + " + r64(t_[4]) + "*8 + 0x10]\n";
+        // 2) 16-way 链式分派：每 cond 评估 cond_eval 到 T0 (= 0 或 1)。
+        for (int i = 0; i < 15; ++i) {
+            const int c = cond_perm_[i];
+            o += std::string("    cmp ") + r64(t_[2]) + ", " + imm(c) + "\n";
+            o += "    je cc" + std::to_string(c) + "_" + tag + "\n";
+        }
+        o += "cc" + std::to_string(cond_perm_[15]) + "_" + tag + ":\n" +
+               cond_eval(cond_perm_[15]) + "    jmp " + tail_lbl + "\n";
+        for (int i = 0; i < 15; ++i) {
+            const int c = cond_perm_[i];
+            o += "cc" + std::to_string(c) + "_" + tag + ":\n";
+            o += cond_eval(c);
+            o += "    jmp " + tail_lbl + "\n";
+        }
+        // 3) tail: 清 T9 低字节, OR with T0 (= cond 结果 0/1), qword 写回。
+        o += tail_lbl + ":\n";
+        // 0xFFFFFFFFFFFFFF00 清低 8 位; imm 必须 0x 前缀避免 keystone 按 16 进制
+        // 解析 (pitfall #1 keystone Intel 裸数字按 16 进制解析)。
+        o += std::string("    and ") + r64(t_[9]) + ", 0xFFFFFFFFFFFFFF00\n";
+        o += std::string("    or ") + r64(t_[9]) + ", " + r64(t_[0]) + "\n";
+        o += std::string("    mov qword ptr [") + r64(ctx_) + " + " + r64(t_[4]) +
+             "*8 + 0x10], " + r64(t_[9]) + "\n";
+        o += advance(dispatch);
+        return o;
+    }
+
     // Adc: dst = dst + src + CF_in（Intel SDM Vol. 2 ADC）。
     // 与 Add/Sub 不可共用 build_binary：zero5() 用 xor 清 scratch 寄存器，
     // 副作用把宿主 CPU 的 CF 也清零（XOR 写 CF=0），后续 native adc 看到的
@@ -1563,6 +1609,7 @@ RuntimeGenResult generate_runtime(wvmp::Rng& rng) {
         {int(VmOp::MovzxMem), "movzxmem", &AsmGen::build_movzx_mem},
         {int(VmOp::Bswap), "bswap", &AsmGen::build_bswap},
         {int(VmOp::Xchg), "xchg", &AsmGen::build_xchg},
+        {int(VmOp::Setcc), "setcc", &AsmGen::build_setcc},
         {int(VmOp::Cmp), "cmp", &AsmGen::build_cmp},
         {int(VmOp::Test), "test", &AsmGen::build_test},
         {int(VmOp::Load), "load", &AsmGen::build_load},

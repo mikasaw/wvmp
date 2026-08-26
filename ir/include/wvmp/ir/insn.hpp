@@ -44,7 +44,21 @@ enum class Op : u16 { Mov, Lea, Add, Sub, Adc, Sbb, And, Or, Xor, Not, Neg, Inc,
                       //   - xchg 不影响 flags (updates_flags=false)
                       //   - MEM 形式（xchg [reg], reg）派活单限定 REG-REG，
                       //     lifter 拒 MEM-REG → C1 gate 兜底
-                      Xchg };
+                      Xchg,
+                      // MIT-336: 条件设置字节 (setcc r/m8, 16 variants: sete/setne/
+                      // setb/setbe/seta/setae/sets/setns/setp/setnp/setl/setle/setg/
+                      // setge/seto/setno)。
+                      //   - 单操作数 (dst only, no src), size 恒为 S8 (r/m8, 1 字节固定)
+                      //   - 字节结构：[0F] [90+cc] [ModR/M] (3 字节；mod=11 REG, mod=00 MEM)
+                      //   - 条件码复用 ir::Cond（与 Jcc 同一枚举；16 variants 与 setcc 1:1 对应），
+                      //     保 Insn.cond 字段（已有），lifter 走 X86_INS_SETE/SETNE/... 16 个 case
+                      //     直接 map 到 ir::Cond
+                      //   - setcc **read** flags (CF/OF/SF/ZF/PF), **write** r/m8 = 0/1, **不**改
+                      //     flags（updates_flags=false, 与 test/cmp 的标志"产生"语义相反）
+                      //   - MEM 形式 (setcc [reg]) lifter 直接 emit Operand::mem_(...); 翻译器
+                      //     折 Load + Setcc (REG-REG 路径) 或 SetccMem (MEM 路径), 类似 movsxd/movzx
+                      //   - 派活单 §D 决策 4: Setcc 必 append-only 在 Xchg=49 之后 = 50 (pitfall #34)
+                      Setcc };
 enum class Size : u8 { S8, S16, S32, S64 };
 enum class Cond : u8 { O, No, B, Ae, E, Ne, Be, A, S, Ns, P, Np, L, Ge, Le, G };
 constexpr u64 bits(Size s) { return s==Size::S8?8: s==Size::S16?16: s==Size::S32?32:64; }

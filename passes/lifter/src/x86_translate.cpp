@@ -542,6 +542,38 @@ TranslateResult translate_xchg(const cs_insn& ci, const cs_x86& x, ir::Arch arch
     return ok(out);
 }
 
+// MIT-336 setcc r/m8 (0F 90+cc+rm, 16 variants): 条件设置字节。
+// MSVC /Od 在 /O2 等优化下 codegen 紧凑, 但本派活单限定 /Od 路径 (per pitfall #22h
+// — lifter v1 不支持 setcc → C1 gate 兜底, 区域不虚拟化)。
+//   - 字节结构: [0F] [90+cc] [ModR/M] (3 字节；mod=11 REG, mod=00 MEM)
+//   - 单操作数 (dst only, no src), size 恒为 S8 (r/m8, 1 字节固定)
+//   - 条件码由 capstone `ci.id` 字段识别 (16 variants: SETE/SETNE/SETB/SETBE/
+//     SETA/SETAE/SETS/SETNS/SETP/SETNP/SETL/SETLE/SETG/SETGE/SETO/SETNO) —
+//     capstone 自动映射到 ir::Cond (复用 Jcc 已有的 16-条件枚举, 不加新 enum)。
+//   - setcc reads flags (CF/OF/SF/ZF/PF) 决定结果 0/1, **不**改 flags
+//     (updates_flags=false; 与 test/cmp 的"产生 flags"语义相反)。
+//   - MEM 形式 (setcc [reg]) lifter 直接 emit Operand::mem_(...); 翻译器折
+//     SetccMem (类似 MovsxdMem / MovzxMem 的 REG-MEM 拆条模式)。
+TranslateResult translate_setcc(const cs_insn& ci, const cs_x86& x, ir::Arch arch) {
+    if (x.op_count != 1) return unsupported(ci.address, ci.size);
+    auto d = to_operand(x.operands[0]);
+    if (!d || (d->kind != Operand::Kind::Reg && d->kind != Operand::Kind::Mem)) {
+        return unsupported(ci.address, ci.size);
+    }
+    // 16 setcc variants 全部统一映射到 ir::Cond (与 Jcc 共享 16 条件枚举)。
+    auto cond = map_setcc_cond(static_cast<x86_insn>(ci.id));
+    if (!cond) return unsupported(ci.address, ci.size);
+
+    ir::Insn out;
+    out.op = Op::Setcc;
+    out.addr = ci.address;
+    out.size = Size::S8;  // r/m8, 1 字节固定
+    out.updates_flags = false;  // setcc 不改 flags
+    out.cond = *cond;
+    out.dst = *d;
+    return ok(out);
+}
+
 } // namespace
 
 std::optional<ir::Reg> map_reg(x86_reg r) {
@@ -607,6 +639,33 @@ std::optional<ir::Cond> map_cond(x86_insn id) {
     }
 }
 
+// MIT-336: setcc 16 variants → ir::Cond (与 map_cond 一一对应, 不同 capstone id 命名)
+// 共享同一 16 条件枚举: SETO=O, SETNO=No, SETB=B, SETAE=Ae, SETE=E, SETNE=Ne,
+// SETBE=Be, SETA=A, SETS=S, SETNS=Ns, SETP=P, SETNP=Np, SETL=L, SETGE=Ge,
+// SETLE=Le, SETG=G。return nullopt 仅对理论上不存在的 X86_INS_SETcc 通用 ID
+// (capstone 实际产出 16 个独立 enum, 不产通用 SETcc)。
+std::optional<ir::Cond> map_setcc_cond(x86_insn id) {
+    switch (id) {
+    case X86_INS_SETO:  return Cond::O;
+    case X86_INS_SETNO: return Cond::No;
+    case X86_INS_SETB:  return Cond::B;
+    case X86_INS_SETAE: return Cond::Ae;
+    case X86_INS_SETE:  return Cond::E;
+    case X86_INS_SETNE: return Cond::Ne;
+    case X86_INS_SETBE: return Cond::Be;
+    case X86_INS_SETA:  return Cond::A;
+    case X86_INS_SETS:  return Cond::S;
+    case X86_INS_SETNS: return Cond::Ns;
+    case X86_INS_SETP:  return Cond::P;
+    case X86_INS_SETNP: return Cond::Np;
+    case X86_INS_SETL:  return Cond::L;
+    case X86_INS_SETGE: return Cond::Ge;
+    case X86_INS_SETLE: return Cond::Le;
+    case X86_INS_SETG:  return Cond::G;
+    default: return std::nullopt;
+    }
+}
+
 TranslateResult translate_insn(const cs_insn& ci, ir::Arch arch) {
     if (ci.detail == nullptr) return unsupported(ci.address, ci.size);
     const cs_x86& x = ci.detail->x86;
@@ -654,6 +713,14 @@ TranslateResult translate_insn(const cs_insn& ci, ir::Arch arch) {
     case X86_INS_MOVZX: return translate_movzx(ci, x, arch);
     case X86_INS_BSWAP: return translate_bswap(ci, x, arch);
     case X86_INS_XCHG: return translate_xchg(ci, x, arch);
+    // MIT-336: setcc 16 variants (0F 90+cc+rm, mod=11 REG / mod=00 MEM).
+    // capstone 对每 variant 独立命名 (X86_INS_SETE/SETNE/.../SETG), 走同一
+    // translate_setcc, 由 ci.id 字段确定条件码。
+    case X86_INS_SETE: case X86_INS_SETNE: case X86_INS_SETB: case X86_INS_SETBE:
+    case X86_INS_SETA: case X86_INS_SETAE: case X86_INS_SETS: case X86_INS_SETNS:
+    case X86_INS_SETP: case X86_INS_SETNP: case X86_INS_SETL: case X86_INS_SETLE:
+    case X86_INS_SETG: case X86_INS_SETGE: case X86_INS_SETO: case X86_INS_SETNO:
+        return translate_setcc(ci, x, arch);
     case X86_INS_NOP: {
         ir::Insn out;
         out.op = Op::Nop;

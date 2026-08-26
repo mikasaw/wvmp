@@ -35,6 +35,10 @@ std::optional<ir::Reg> map_reg(x86_reg r);
 // jcc 系列的 capstone 指令 id → ir::Cond（O,No,B,Ae,E,Ne,Be,A,S,Ns,P,Np,L,Ge,Le,G）。
 std::optional<ir::Cond> map_cond(x86_insn id);
 
+// MIT-336: setcc 16 variants (X86_INS_SETE/SETNE/...) → ir::Cond (与 map_cond 一一对应).
+// capstone 为 16 个 setcc variant 分别命名, 共享同一 16-条件枚举。
+std::optional<ir::Cond> map_setcc_cond(x86_insn id);
+
 enum class TranslateStatus : u8 {
     Ok,          // 成功映射
     Unsupported, // 超出 v1 白名单，跳过并记 Note

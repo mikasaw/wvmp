@@ -302,6 +302,10 @@ struct Translator {
                 ok = translate_bswap(em, in);
             } else if (in.op == ir::Op::Xchg) {
                 ok = translate_xchg(em, in);
+            } else if (in.op == ir::Op::Setcc) {
+                // MIT-336: setcc dispatch — REG 形式 emit 单条 VmOp::Setcc,
+                // MEM 形式 emit Load+Setcc+Store 三条拆条 (translate_setcc 内部展开)。
+                ok = translate_setcc(em, sc, in, current_rva, next_ip);
             } else if (is_alu_binop(in.op)) {
                 ok = translate_alu_binop(em, sc, in, current_rva, next_ip);
             } else if (is_unary(in.op)) {
@@ -813,6 +817,50 @@ struct Translator {
         const u8 s = isa::vm_reg_of(in.src.reg);
         const u8 sz = isa::size_field(in.size);
         em.emit_rr(VmOp::Xchg, d, s, sz);
+        return true;
+    }
+
+    // ---- MIT-336: setcc (条件设置字节) ----
+    //
+    // setcc 是单操作数 (dst only, no src), 支持 REG 与 MEM 两种 dst 形式：
+    //   - REG (mod=11): setcc al/bl/cl/... 子寄存器折叠到全寄存器 (lifter 已折叠),
+    //     直接 emit VmOp::Setcc (a_kind=Reg reg_a=dst)。
+    //   - MEM (mod=00): setcc [m]，走 Load(tmp, [m], S8) + Setcc(tmp) + Store([m], tmp, S8)
+    //     三条拆条；scratch 预算 = emit_address(1) + tmp(1) + emit_address 复用 = 2,在 6 预算内。
+    //     严格遵循派活单 §D 改动清单 (仅加 VmOp::Setcc, 不加 SetccMem)，
+    //     MEM 形式由 Load/Setcc/Store 三条组合实现 (类似 movzx MEM)。
+    //
+    // 编码：cond_or_size = ir::Cond (0..15, 与 Jcc 共享 4 位字段)；
+    // setcc 是**条件设置**, 不修改 flags (CF/OF/SF/ZF/PF 不变); reads flags 决定结果。
+    bool translate_setcc(Emitter& em, Scratch& sc, const ir::Insn& in,
+                         u64 current_rva, u64 next_ip) {
+        if (in.op != ir::Op::Setcc) return false;
+        const u8 sz = isa::size_field(in.size);  // S8 (setcc 必 S8, lifter 已强制)
+        if (in.dst.kind == ir::Operand::Kind::Reg) {
+            // REG-REG: emit Setcc 一条。
+            const u8 d = isa::vm_reg_of(in.dst.reg);
+            em.emit(VmOp::Setcc, isa::OpKind::Reg, d, isa::OpKind::None, 0, 0,
+                    static_cast<u8>(in.cond));
+            return true;
+        }
+        if (in.dst.kind != ir::Operand::Kind::Mem)
+            return skip(in, "setcc 操作数形态未支持", nullptr);
+        // REG-MEM: setcc [m] 走 Load+Setcc+Store 三条拆条。
+        // 1) Load tmp, [m] (S8) — emit_address 用 1 scratch (acc) + 1 scratch (tmp)。
+        u8 acc = 0;
+        if (!emit_address(em, sc, in.dst.mem, current_rva, next_ip, acc))
+            return skip(in, "setcc 地址形态未支持", &in.dst.mem);
+        const u8 tmp = sc.take();
+        const isa::VmOp load_op =
+            (in.dst.mem.base == ir::Reg::Rip) ? isa::VmOp::LoadRva : isa::VmOp::Load;
+        em.emit_rr(load_op, tmp, acc, sz);  // Load tmp, [acc] (S8)
+        // 2) Setcc tmp — 单操作数, 直接改 tmp 寄存器低 8 位。
+        em.emit(VmOp::Setcc, isa::OpKind::Reg, tmp, isa::OpKind::None, 0, 0,
+                static_cast<u8>(in.cond));
+        // 3) Store [acc], tmp (S8) — 写回低字节。
+        const isa::VmOp store_op =
+            (in.dst.mem.base == ir::Reg::Rip) ? isa::VmOp::StoreRva : isa::VmOp::Store;
+        em.emit_rr(store_op, acc, tmp, sz);  // Store [acc], tmp (S8)
         return true;
     }
 };
