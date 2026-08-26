@@ -58,7 +58,24 @@ enum class Op : u16 { Mov, Lea, Add, Sub, Adc, Sbb, And, Or, Xor, Not, Neg, Inc,
                       //   - MEM 形式 (setcc [reg]) lifter 直接 emit Operand::mem_(...); 翻译器
                       //     折 Load + Setcc (REG-REG 路径) 或 SetccMem (MEM 路径), 类似 movsxd/movzx
                       //   - 派活单 §D 决策 4: Setcc 必 append-only 在 Xchg=49 之后 = 50 (pitfall #34)
-                      Setcc };
+                      Setcc,
+                      // MIT-339: 条件移动 (cmovcc r, r/m, 16 variants: cmovo/cmovno/
+                      // cmovb/cmovae/cmove/cmovne/cmovbe/cmova/cmovs/cmovns/cmovp/
+                      // cmovnp/cmovl/cmovge/cmovle/cmovg)。
+                      //   - 2 操作数 (dst + src, src 可 REG 或 MEM)
+                      //   - 字节结构：[48] (REX.W 可选) | 0F 40+cc | ModR/M (3 字节 REX.W;
+                      //     3 字节无 REX.W; mod=11 REG-REG, mod=00 MEM)
+                      //   - 条件码复用 ir::Cond（与 Jcc/Setcc 同一枚举；16 variants
+                      //     与 cmovcc 1:1 对应），保 Insn.cond 字段（已有）
+                      //   - cmovcc **read** flags (CF/OF/SF/ZF/PF) 决定是否赋值,
+                      //     **不**改 flags（updates_flags=false, 与 setcc 同语义）
+                      //   - size 由 REX.W 决定: 无 REX.W → S32, 有 REX.W → S64
+                      //   - MEM 形式 (cmovcc [reg]) lifter 直接 emit Operand::mem_(...);
+                      //     翻译器折 Load + Cmovcc (REG-REG 路径, src 用 [addr] 的值)
+                      //     一条, 类似 movzx MEM 路径
+                      //   - 派活单 §D 决策 4: Cmovcc 必 append-only 在 Setcc=50 之后 = 51
+                      //     (pitfall #34 additive enum append-only)
+                      Cmovcc };
 enum class Size : u8 { S8, S16, S32, S64 };
 enum class Cond : u8 { O, No, B, Ae, E, Ne, Be, A, S, Ns, P, Np, L, Ge, Le, G };
 constexpr u64 bits(Size s) { return s==Size::S8?8: s==Size::S16?16: s==Size::S32?32:64; }

@@ -154,9 +154,26 @@ enum class VmOp : u16 {
     // size 字段作 16-condition (cc) 编码 (与 Jcc 共享 cond_or_size 字段, 4 bits=16 variants).
     // 派活单 §D 决策 4: Setcc 必 append-only 在 Xchg=49 之后 = 50 (pitfall #34).
     Setcc,
+
+    // —— MIT-339 条件移动 (cmovcc r, r/m, 16 variants) ——
+    // Cmovcc (Reg-Reg / Reg-Mem): dst = cond(flags) ? src : dst, 2 操作数.
+    // 字节结构：[48] (REX.W 可选) | 0F 40+cc | ModR/M (3 字节 REX.W;
+    // 3 字节无 REX.W; mod=11 REG-REG, mod=00 MEM).
+    // a_kind=Reg reg_a=dst, b_kind=Reg reg_b=src, aux=0, cond_or_size=ir::Cond 0..15.
+    //   - REG-REG (cmovcc r64, r64): a=dst 寄存器, b=src 寄存器。
+    //   - MEM (cmovcc r64, [m]): lifter 直接 emit Operand::mem_(...); 翻译器折
+    //     Load(tmp, [m], size) + Cmovcc(dst, tmp) 两条 (与 movzx MEM 路径同结构)。
+    //     严格遵循派活单 §D 改动清单 (仅加 VmOp::Cmovcc, 不加 CmovccMem)。
+    // cmovcc **reads** flags (CF/OF/SF/ZF/PF) 决定是否赋值, **不**改 flags
+    // (CF/OF/SF/ZF/PF 不变); updates_flags=false (与 Setcc 一致——flags 由前置
+    // cmp/test/sub 等产生, 这里只是消费)。
+    // size 字段作 16-condition (cc) 编码 (与 Jcc/Setcc 共享 cond_or_size 字段,
+    // 4 bits=16 variants); 真实位宽由 IR.size 字段另传 (S32 / S64 由 REX.W 决定)。
+    // 派活单 §D 决策 4: Cmovcc 必 append-only 在 Setcc=50 之后 = 51 (pitfall #34)。
+    Cmovcc,
 };
 
-inline constexpr u16 kVmOpMax = static_cast<u16>(VmOp::Setcc);
+inline constexpr u16 kVmOpMax = static_cast<u16>(VmOp::Cmovcc);
 inline constexpr u16 kVmOpLimit = 1u << 14;  // 14 位编码空间上限
 
 constexpr const char* to_string(VmOp op) {
@@ -196,6 +213,7 @@ constexpr const char* to_string(VmOp op) {
         case VmOp::Bswap: return "bswap";
         case VmOp::Xchg: return "xchg";
         case VmOp::Setcc: return "setcc";
+        case VmOp::Cmovcc: return "cmovcc";
     }
     return "?";
 }

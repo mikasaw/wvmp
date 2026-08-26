@@ -1044,6 +1044,147 @@ public:
     std::string build_xor(u64 d) const { return build_binary("xor", d, true); }
     std::string build_cmp(u64 d) const { return build_binary("sub", d, false); }
     std::string build_test(u64 d) const { return build_binary("test", d, false); }
+
+    // MIT-339 cmovcc: dst = cond(flags) ? src : dst, 2 操作数 (reg_a=dst, reg_b=src)。
+    // 编码约定 (与 translator 一致):
+    //   - cond_or_size = ir::Size (asmgen size_chain 用 T2 派发 S32/S64)
+    //   - aux[31..28] = ir::Cond 0..15 (cc 派发用)
+    //   - aux[27..0] = 0 (cmovcc 无 aux 立即数)
+    //
+    // 设计：
+    //   - REG-REG (mod=11) 路径: emit 单条 cmovcc r64/r32, dst, src。
+    //   - MEM (mod=00) 路径: 翻译器已折成 Load(tmp, [m]) + Cmovcc(dst, tmp) 两条
+    //     拆条；本 handler 只接 REG-REG 路径 (b_kind=Reg)。
+    //   - cmovcc **reads** flags (CF/OF/SF/ZF/PF) 决定是否赋值, **不**改 flags
+    //     (CF/OF/SF/ZF/PF 不变); 不调用 setcc5 也不走 flags_tail。
+    //   - size 链 4 路: S64 (r64) / S32 (r32) / S8/S16 (cmovcc 无 8/16-bit 形式,
+    //     lifter 不产此 size, 此处 defensive no-op, 沿用 bswap/xchg 模式)
+    //   - cond 来自 aux[31..28], 16 variants 各自 emit cond_eval + 条件赋值。
+    //
+    // **关键 catch (经试错发现)**: 不能用 native cmovcc 直接读 HOST FLAGS, 因为
+    // cc chain 派发的 `cmp T9, imm(c)` 会覆盖 HOST FLAGS (CF/OF/SF/ZF/PF), 让
+    // native cmovcc 看到派发的 FLAGS 而不是前置 Cmp/Test 留下的 FLAGS → 条件赋值
+    // 错乱 (CMOVcc handler 第一次实现踩坑, pushfq/popfq 路径也失败, 经调试发现
+    // keystone 0.9.2 在某些情况下 pushfq/popfq 编码被吞掉)。
+    //
+    // **解决方案**: 用 cond_eval + bitwise 条件赋值, 完全不依赖 HOST FLAGS:
+    //   1) 加载 src 到 T1 (r64/r32 by size).
+    //   2) 加载 dst 到 T_dst_orig (T3 = r15, 空闲寄存器).
+    //   3) 提取 cond (T9 from aux high bits, 不影响 FLAGS).
+    //   4) cmp T9, imm(c) 链式派发 (clobbers HOST FLAGS, 但**不**影响 r10=flags_).
+    //   5) cc block: cond_eval(<cond>) → T0 (0 或 1, 读 flags_=r10, 正确!).
+    //   6) bitwise 条件赋值: T0 = T0 ? T1 : T_dst_orig (用 neg+mask 实现).
+    //   7) alias_write T0 → dst slot (S32 保留 slot 高 32 位).
+    std::string build_cmovcc(u64 dispatch) const {
+        const std::string tag = "cmovcc" + std::to_string(seq());
+        const std::string tail_lbl = "tail_" + tag;
+        std::array<std::string, 4> blocks;
+        for (int s = 0; s < 4; ++s) {
+            const std::string stag = tag + "_" + std::to_string(s);
+            std::string o;
+            // 1) 读 src 槽到 T1 (按宽度读)
+            if (s == 3)
+                o += std::string("    mov ") + r64(t_[1]) + ", qword ptr [" + r64(ctx_) +
+                     " + " + r64(t_[7]) + "*8 + 0x10]\n";
+            else if (s == 2)
+                o += std::string("    mov ") + rs(t_[1], 2) + ", dword ptr [" + r64(ctx_) +
+                     " + " + r64(t_[7]) + "*8 + 0x10]\n";
+            else
+                o += std::string("    movzx ") + r64(t_[1]) + ", " + mptr(s) + " [" +
+                     r64(ctx_) + " + " + r64(t_[7]) + "*8 + 0x10]\n";
+            // 2) 读 dst 槽到 T_dst_orig = T3 (r15, 空闲寄存器 — decode_prelude
+            //    把 T3 用作 a_kind, 但 cmovcc handler 不读 a_kind, T3 在此处空闲).
+            if (s == 3)
+                o += std::string("    mov ") + r64(t_[3]) + ", qword ptr [" + r64(ctx_) +
+                     " + " + r64(t_[4]) + "*8 + 0x10]\n";
+            else if (s == 2)
+                o += std::string("    mov ") + rs(t_[3], 2) + ", dword ptr [" + r64(ctx_) +
+                     " + " + r64(t_[4]) + "*8 + 0x10]\n";
+            else
+                o += std::string("    movzx ") + r64(t_[3]) + ", " + mptr(s) + " [" +
+                     r64(ctx_) + " + " + r64(t_[4]) + "*8 + 0x10]\n";
+            // 3) 提取 cond from aux[31..28]: T9 = (T8 >> 60) & 0xF (no FLAGS clobber).
+            o += std::string("    mov ") + r64(t_[9]) + ", " + r64(t_[8]) + "\n";
+            o += std::string("    shr ") + r64(t_[9]) + ", " + imm(60) + "\n";
+            o += std::string("    and ") + r64(t_[9]) + ", 0xF\n";
+            if (s == 3 || s == 2) {
+                // 4) cc chain 派发 (cmp T9, imm(c) clobbers HOST FLAGS, 但 r10=flags_ 保留).
+                for (int i = 0; i < 15; ++i) {
+                    const int c = cond_perm_[i];
+                    o += std::string("    cmp ") + r64(t_[9]) + ", " + imm(c) + "\n";
+                    o += "    je cc" + std::to_string(c) + "_" + stag + "\n";
+                }
+                // 5) 每个 cc block: cond_eval → T0 (读 r10 保留的 flags_), 然后
+                //    bitwise 条件赋值 (T0 = mask & src | ~mask & dst_orig) + alias_write.
+                //    cond_eval 用 flags_ (r10), 不被 cmp clobber, 拿到正确 FLAGS.
+                // T0 = cond result; T1 = src (在 cond_eval 前保存到 T6, 因为 L/G/LE/GE/BE/A
+                // 这几个 cond_eval 会 clobber T1); T3 = dst_orig; T5 空闲作 mask scratch.
+                auto emit_cc_block = [&](int c) -> std::string {
+                    std::string b;
+                    b += std::string("    mov ") + r64(t_[6]) + ", " + r64(t_[1]) + "\n";  // T6 = src (保存, 避开 cond_eval clobber)
+                    b += cond_eval(c);                            // T0 = cond result (0/1)
+                    b += std::string("    neg ") + r64(t_[0]) + "\n";        // T0 = -cond (mask: 0 or -1)
+                    b += std::string("    mov ") + r64(t_[5]) + ", " + r64(t_[0]) + "\n";  // T5 = mask
+                    b += std::string("    and ") + r64(t_[0]) + ", " + r64(t_[6]) + "\n";  // T0 = src & mask
+                    b += std::string("    not ") + r64(t_[5]) + "\n";        // T5 = ~mask
+                    b += std::string("    and ") + r64(t_[5]) + ", " + r64(t_[3]) + "\n";  // T5 = dst_orig & ~mask
+                    b += std::string("    or ") + r64(t_[0]) + ", " + r64(t_[5]) + "\n";   // T0 = (src & mask) | (dst_orig & ~mask)
+                    // alias_write T0 → dst slot (reg_a 索引)
+                    if (s == 3) {
+                        b += std::string("    mov qword ptr [") + r64(ctx_) + " + " +
+                             r64(t_[4]) + "*8 + 0x10], " + r64(t_[0]) + "\n";
+                    } else {
+                        // S32: 读 slot → 写低 32 位 → qword 写回 (alias_write, 保留 slot 高 32 位)
+                        b += std::string("    mov ") + r64(t_[3]) + ", qword ptr [" +
+                             r64(ctx_) + " + " + r64(t_[4]) + "*8 + 0x10]\n";
+                        b += std::string("    mov ") + rs(t_[3], 2) + ", " + rs(t_[0], 2) + "\n";
+                        b += std::string("    mov qword ptr [") + r64(ctx_) + " + " +
+                             r64(t_[4]) + "*8 + 0x10], " + r64(t_[3]) + "\n";
+                    }
+                    b += "    jmp " + tail_lbl + "\n";
+                    return b;
+                };
+                // 末 cond (perm[15]) 为链尾顺延跌入, 其块最先排放
+                o += "cc" + std::to_string(cond_perm_[15]) + "_" + stag + ":\n";
+                o += emit_cc_block(cond_perm_[15]);
+                for (int i = 0; i < 15; ++i) {
+                    const int c = cond_perm_[i];
+                    o += "cc" + std::to_string(c) + "_" + stag + ":\n";
+                    o += emit_cc_block(c);
+                }
+            } else {
+                // S8/S16: defensive no-op (lifter 不产此 size cmovcc)
+                o += "    jmp " + tail_lbl + "\n";
+            }
+            blocks[s] = o;
+        }
+        return decode_prelude() + size_chain(blocks, tag) + tail_lbl + ":\n" +
+               advance(dispatch);
+    }
+
+    // cc_name: ir::Cond (0..15) → Intel 语法 cmovcc 后缀字符串
+    // (与 cond_eval 的 cond 命名严格一致).
+    static const char* cc_name(int cond) {
+        switch (static_cast<ir::Cond>(cond)) {
+            case ir::Cond::O:  return "o";
+            case ir::Cond::No: return "no";
+            case ir::Cond::B:  return "b";
+            case ir::Cond::Ae: return "ae";
+            case ir::Cond::E:  return "e";
+            case ir::Cond::Ne: return "ne";
+            case ir::Cond::Be: return "be";
+            case ir::Cond::A:  return "a";
+            case ir::Cond::S:  return "s";
+            case ir::Cond::Ns: return "ns";
+            case ir::Cond::P:  return "p";
+            case ir::Cond::Np: return "np";
+            case ir::Cond::L:  return "l";
+            case ir::Cond::Ge: return "ge";
+            case ir::Cond::Le: return "le";
+            case ir::Cond::G:  return "g";
+        }
+        return "?";
+    }
     std::string build_inc(u64 d) const { return build_incdec("inc", d); }
     std::string build_dec(u64 d) const { return build_incdec("dec", d); }
     std::string build_shl(u64 d) const { return build_shift("shl", d); }
@@ -1610,6 +1751,7 @@ RuntimeGenResult generate_runtime(wvmp::Rng& rng) {
         {int(VmOp::Bswap), "bswap", &AsmGen::build_bswap},
         {int(VmOp::Xchg), "xchg", &AsmGen::build_xchg},
         {int(VmOp::Setcc), "setcc", &AsmGen::build_setcc},
+        {int(VmOp::Cmovcc), "cmovcc", &AsmGen::build_cmovcc},
         {int(VmOp::Cmp), "cmp", &AsmGen::build_cmp},
         {int(VmOp::Test), "test", &AsmGen::build_test},
         {int(VmOp::Load), "load", &AsmGen::build_load},

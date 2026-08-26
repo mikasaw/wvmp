@@ -39,6 +39,11 @@ std::optional<ir::Cond> map_cond(x86_insn id);
 // capstone 为 16 个 setcc variant 分别命名, 共享同一 16-条件枚举。
 std::optional<ir::Cond> map_setcc_cond(x86_insn id);
 
+// MIT-339: cmovcc 16 variants (X86_INS_CMOVE/CMOVNE/...) → ir::Cond (与 map_cond 一一对应).
+// capstone 为 16 个 cmovcc variant 分别命名, 共享同一 16-条件枚举
+// (与 Jcc/Setcc 共享 4-bit cond_or_size 字段, 沿用 pitfall #22g 经验)。
+std::optional<ir::Cond> map_cmovcc_cond(x86_insn id);
+
 enum class TranslateStatus : u8 {
     Ok,          // 成功映射
     Unsupported, // 超出 v1 白名单，跳过并记 Note

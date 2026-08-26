@@ -306,6 +306,10 @@ struct Translator {
                 // MIT-336: setcc dispatch — REG 形式 emit 单条 VmOp::Setcc,
                 // MEM 形式 emit Load+Setcc+Store 三条拆条 (translate_setcc 内部展开)。
                 ok = translate_setcc(em, sc, in, current_rva, next_ip);
+            } else if (in.op == ir::Op::Cmovcc) {
+                // MIT-339: cmovcc dispatch — REG-REG 形式 emit 单条 VmOp::Cmovcc,
+                // MEM 形式 emit Load + Cmovcc 两条拆条 (translate_cmovcc 内部展开)。
+                ok = translate_cmovcc(em, sc, in, current_rva, next_ip);
             } else if (is_alu_binop(in.op)) {
                 ok = translate_alu_binop(em, sc, in, current_rva, next_ip);
             } else if (is_unary(in.op)) {
@@ -861,6 +865,63 @@ struct Translator {
         const isa::VmOp store_op =
             (in.dst.mem.base == ir::Reg::Rip) ? isa::VmOp::StoreRva : isa::VmOp::Store;
         em.emit_rr(store_op, acc, tmp, sz);  // Store [acc], tmp (S8)
+        return true;
+    }
+
+    // ---- MIT-339: cmovcc (条件移动, 16 variants) ----
+    //
+    // cmovcc 是 2 操作数 (dst + src)，支持 REG-REG 与 MEM-REG 两种 src 形式：
+    //   - REG-REG (mod=11): cmovcc r64, r64 → emit 单条 VmOp::Cmovcc
+    //     (a_kind=Reg reg_a=dst, b_kind=Reg reg_b=src, aux=0, cond_or_size=ir::Cond)。
+    //   - MEM-REG (mod=00): cmovcc r64, [m] → 翻译期把地址算到 scratch 槽 (emit_address
+    //     → acc), emit Load(tmp, [m], size) + Cmovcc(dst, tmp) 两条拆条；scratch 预算
+    //     = emit_address(1) + tmp(1) = 2, 在 6 预算内。
+    //     严格遵循派活单 §D 改动清单 (仅加 VmOp::Cmovcc, 不加 CmovccMem),
+    //     MEM 形式由 Load/Cmovcc 两条组合实现 (类似 movzx MEM 路径)。
+    //
+    // 编码：cond_or_size = ir::Cond (0..15, 与 Jcc/Setcc 共享 4 位字段)；
+    // cmovcc 是**条件移动**, 不修改 flags (CF/OF/SF/ZF/PF 不变); reads flags 决定
+    // 是否赋值。handler 用 native cmovcc 完成条件赋值, 不动 flags。
+    // size 由 IR.size 决定 (lifter 已传过来, S32 或 S64)。
+    bool translate_cmovcc(Emitter& em, Scratch& sc, const ir::Insn& in,
+                          u64 current_rva, u64 next_ip) {
+        if (in.op != ir::Op::Cmovcc) return false;
+        if (in.dst.kind != ir::Operand::Kind::Reg) {
+            return skip(in, "cmovcc 操作数形态未支持", nullptr);
+        }
+        const u8 d = isa::vm_reg_of(in.dst.reg);
+        const u8 sz = isa::size_field(in.size);
+
+        if (in.src.kind == ir::Operand::Kind::Reg) {
+            // REG-REG: cmovcc r, r — emit 单条 VmOp::Cmovcc
+            // (handler 用 native cmovcc 完成条件赋值, 保留 dst 高位)。
+            // 编码约定：cond_or_size = ir::Size (asmgen size_chain 用 T2 派发),
+            //           aux[31..28] = ir::Cond (16 conditions, asmgen cc chain 用);
+            //           aux[27..0] = 0 (cmovcc 无 aux 立即数)。这样与既有
+            //           build_setcc / build_xchg 等共享 size_chain 助手 (T2 = size),
+            //           cc 字段用 aux[31..28] 单独编码避免与 size 冲突。
+            const u8 s = isa::vm_reg_of(in.src.reg);
+            const u32 cond_aux = static_cast<u32>(in.cond) << 28;
+            em.emit(VmOp::Cmovcc, OpKind::Reg, d, OpKind::Reg, s, cond_aux,
+                    isa::size_field(in.size));
+            return true;
+        }
+        if (in.src.kind != ir::Operand::Kind::Mem) {
+            return skip(in, "cmovcc 操作数形态未支持", nullptr);
+        }
+        // REG-MEM: cmovcc r, [m] — emit_address 算 acc + emit Load + emit Cmovcc。
+        // scratch 预算: emit_address 用 1 scratch (acc) + 1 scratch (tmp) = 2, 在 6 预算内。
+        u8 acc = 0;
+        if (!emit_address(em, sc, in.src.mem, current_rva, next_ip, acc))
+            return skip(in, "cmovcc 地址形态未支持", &in.src.mem);
+        const u8 tmp = sc.take();
+        const isa::VmOp load_op =
+            (in.src.mem.base == ir::Reg::Rip) ? isa::VmOp::LoadRva : isa::VmOp::Load;
+        em.emit_rr(load_op, tmp, acc, sz);  // Load tmp, [acc]
+        // 同 REG-REG 编码约定：cond_or_size = size, aux[31..28] = cond。
+        const u32 cond_aux = static_cast<u32>(in.cond) << 28;
+        em.emit(VmOp::Cmovcc, OpKind::Reg, d, OpKind::Reg, tmp, cond_aux,
+                isa::size_field(in.size));
         return true;
     }
 };

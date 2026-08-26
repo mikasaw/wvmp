@@ -543,8 +543,6 @@ TranslateResult translate_xchg(const cs_insn& ci, const cs_x86& x, ir::Arch arch
 }
 
 // MIT-336 setcc r/m8 (0F 90+cc+rm, 16 variants): 条件设置字节。
-// MSVC /Od 在 /O2 等优化下 codegen 紧凑, 但本派活单限定 /Od 路径 (per pitfall #22h
-// — lifter v1 不支持 setcc → C1 gate 兜底, 区域不虚拟化)。
 //   - 字节结构: [0F] [90+cc] [ModR/M] (3 字节；mod=11 REG, mod=00 MEM)
 //   - 单操作数 (dst only, no src), size 恒为 S8 (r/m8, 1 字节固定)
 //   - 条件码由 capstone `ci.id` 字段识别 (16 variants: SETE/SETNE/SETB/SETBE/
@@ -571,6 +569,60 @@ TranslateResult translate_setcc(const cs_insn& ci, const cs_x86& x, ir::Arch arc
     out.updates_flags = false;  // setcc 不改 flags
     out.cond = *cond;
     out.dst = *d;
+    return ok(out);
+}
+
+// MIT-339 cmovcc r, r/m (0F 40+cc+rm, 16 variants): 条件移动。
+//   - 字节结构：[48] (REX.W 可选) | 0F 40+cc | ModR/M
+//     (3 字节 REX.W → 64-bit; 3 字节无 REX.W → 32-bit; mod=11 REG-REG,
+//      mod=00 MEM-REG; mod=01/10 派活单限定不支持 → C1 gate 兜底)
+//   - 2 操作数 (dst + src)，src 可 REG 或 MEM
+//   - 条件码由 capstone `ci.id` 字段识别 (16 variants: CMOVE/CMOVNE/CMOVB/CMOVBE/
+//     CMOVA/CMOVAE/CMOVS/CMOVNS/CMOVP/CMOVNP/CMOVL/CMOVLE/CMOVG/CMOVGE/CMOVO/
+//     CMOVNO) — capstone 自动映射到 ir::Cond (复用 Jcc/Setcc 已有的 16-条件枚举,
+//     不加新 enum; 沿用 MIT-337 setcc 经验)
+//   - cmovcc reads flags (CF/OF/SF/ZF/PF) 决定是否赋值 (cond 真则 dst = src,
+//     cond 假则 dst 保留), **不**改 flags (updates_flags=false; 与 setcc 同语义)
+//   - size 由 REX.W 决定: 无 REX.W → S32, 有 REX.W → S64
+//   - MEM 形式 (cmovcc [reg]) lifter 直接 emit Operand::mem_(...); 翻译器折
+//     Load + Cmovcc (REG-REG 路径, src 用 [addr] 的值) 一条, 类似 movzx MEM 路径。
+TranslateResult translate_cmovcc(const cs_insn& ci, const cs_x86& x, ir::Arch arch) {
+    if (x.op_count != 2) return unsupported(ci.address, ci.size);
+    // dst 必是寄存器（cmovcc r/m, r/m 不存在; cmovcc r, r/m 中 r 必是 dst）
+    if (x.operands[0].type != X86_OP_REG) return unsupported(ci.address, ci.size);
+    // src 可 REG 或 MEM；其他形式（IMM 等）不支持
+    if (x.operands[1].type != X86_OP_REG && x.operands[1].type != X86_OP_MEM) {
+        return unsupported(ci.address, ci.size);
+    }
+    auto d = map_reg(x.operands[0].reg);
+    if (!d) return unsupported(ci.address, ci.size);
+
+    // 16 cmovcc variants 全部统一映射到 ir::Cond（与 Jcc/Setcc 共享 16 条件枚举）。
+    auto cond = map_cmovcc_cond(static_cast<x86_insn>(ci.id));
+    if (!cond) return unsupported(ci.address, ci.size);
+
+    // REX.W 检测: x.rex bit 3 (REX.W) → S64, 否则 → S32 (cmovcc 无 8/16-bit 形式)
+    const bool rex_w = (x.rex & 0x08) != 0;
+
+    ir::Insn out;
+    out.op = Op::Cmovcc;
+    out.addr = ci.address;
+    out.size = rex_w ? Size::S64 : Size::S32;
+    out.updates_flags = false;  // cmovcc 不改 flags
+    out.cond = *cond;
+    out.dst = Operand::reg_(*d);
+
+    if (x.operands[1].type == X86_OP_REG) {
+        // REG-REG: cmovcc r, r
+        auto s = map_reg(x.operands[1].reg);
+        if (!s) return unsupported(ci.address, ci.size);
+        out.src = Operand::reg_(*s);
+    } else {
+        // REG-MEM: cmovcc r, [m] — 直接 emit Operand::mem_(...), 翻译器折 Load + Cmovcc
+        auto m = mem_operand(x.operands[1].mem);
+        if (!m) return unsupported(ci.address, ci.size);
+        out.src = *m;
+    }
     return ok(out);
 }
 
@@ -666,6 +718,33 @@ std::optional<ir::Cond> map_setcc_cond(x86_insn id) {
     }
 }
 
+// MIT-339: cmovcc 16 variants → ir::Cond (与 map_cond 一一对应, 不同 capstone id 命名)
+// 共享同一 16 条件枚举: CMOVE=E, CMOVNE=Ne, CMOVB=B, CMOVAE=Ae, CMOVA=A,
+// CMOVBE=Be, CMOVS=S, CMOVNS=Ns, CMOVP=P, CMOVNP=Np, CMOVL=L, CMOVGE=Ge,
+// CMOVLE=Le, CMOVG=G, CMOVO=O, CMOVNO=No (与 setcc 1:1 对应,
+// capstone 命名不同但 cc 值相同)。
+std::optional<ir::Cond> map_cmovcc_cond(x86_insn id) {
+    switch (id) {
+    case X86_INS_CMOVE:  return Cond::E;
+    case X86_INS_CMOVNE: return Cond::Ne;
+    case X86_INS_CMOVB:  return Cond::B;
+    case X86_INS_CMOVAE: return Cond::Ae;
+    case X86_INS_CMOVA:  return Cond::A;
+    case X86_INS_CMOVBE: return Cond::Be;
+    case X86_INS_CMOVS:  return Cond::S;
+    case X86_INS_CMOVNS: return Cond::Ns;
+    case X86_INS_CMOVP:  return Cond::P;
+    case X86_INS_CMOVNP: return Cond::Np;
+    case X86_INS_CMOVL:  return Cond::L;
+    case X86_INS_CMOVGE: return Cond::Ge;
+    case X86_INS_CMOVLE: return Cond::Le;
+    case X86_INS_CMOVG:  return Cond::G;
+    case X86_INS_CMOVO:  return Cond::O;
+    case X86_INS_CMOVNO: return Cond::No;
+    default: return std::nullopt;
+    }
+}
+
 TranslateResult translate_insn(const cs_insn& ci, ir::Arch arch) {
     if (ci.detail == nullptr) return unsupported(ci.address, ci.size);
     const cs_x86& x = ci.detail->x86;
@@ -721,6 +800,14 @@ TranslateResult translate_insn(const cs_insn& ci, ir::Arch arch) {
     case X86_INS_SETP: case X86_INS_SETNP: case X86_INS_SETL: case X86_INS_SETLE:
     case X86_INS_SETG: case X86_INS_SETGE: case X86_INS_SETO: case X86_INS_SETNO:
         return translate_setcc(ci, x, arch);
+    // MIT-339: cmovcc 16 variants (0F 40+cc+rm, mod=11 REG-REG / mod=00 MEM-REG).
+    // capstone 对每 variant 独立命名 (X86_INS_CMOVE/CMOVNE/.../CMOVG), 走同一
+    // translate_cmovcc, 由 ci.id 字段确定条件码 (复用 Jcc/Setcc 16-条件枚举)。
+    case X86_INS_CMOVE: case X86_INS_CMOVNE: case X86_INS_CMOVB: case X86_INS_CMOVBE:
+    case X86_INS_CMOVA: case X86_INS_CMOVAE: case X86_INS_CMOVS: case X86_INS_CMOVNS:
+    case X86_INS_CMOVP: case X86_INS_CMOVNP: case X86_INS_CMOVL: case X86_INS_CMOVLE:
+    case X86_INS_CMOVG: case X86_INS_CMOVGE: case X86_INS_CMOVO: case X86_INS_CMOVNO:
+        return translate_cmovcc(ci, x, arch);
     case X86_INS_NOP: {
         ir::Insn out;
         out.op = Op::Nop;

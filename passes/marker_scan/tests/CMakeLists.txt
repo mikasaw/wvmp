@@ -274,3 +274,22 @@ target_compile_options(wvmp_setcc_sample PRIVATE
 target_link_options(wvmp_setcc_sample PRIVATE
     $<$<CXX_COMPILER_ID:MSVC>:/INCREMENTAL:NO>
 )
+
+# MIT-339: 端到端正路径样本——区域内含 cmovcc (REG-REG, 6 variants: cmove/cmovne/
+# cmovb/cmovg/cmovl/cmovge), 验证 cmovcc 修复后翻译成功、运行时走真 Cmovcc handler、
+# 行为与原生逐字节一致。
+# MSVC x64 不支持 inline asm, cmovcc 字节由 cmovcc_sample_asm.asm (MASM) 直接
+# emit, 链接进本 sample. 区域不含 rip-relative / printf / call（printf 在
+# main 区域外）。
+add_executable(wvmp_cmovcc_sample
+    cmovcc_sample_main.cpp
+    cmovcc_sample_asm.asm
+)
+target_link_libraries(wvmp_cmovcc_sample PRIVATE wvmp::sdk)
+target_compile_options(wvmp_cmovcc_sample PRIVATE
+    $<$<CXX_COMPILER_ID:MSVC>:/Od;/Ob0;/utf-8>
+    $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-O0>
+)
+target_link_options(wvmp_cmovcc_sample PRIVATE
+    $<$<CXX_COMPILER_ID:MSVC>:/INCREMENTAL:NO>
+)
