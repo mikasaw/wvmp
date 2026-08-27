@@ -14,6 +14,24 @@
 namespace wvmp::regvm {
 namespace {
 
+// 在与 ctx.functions 下标平行的 metadata 列表中定位指定函数的 LiftMetadata:
+// 先按 begin_rva（区域内唯一）在 ctx.functions 反查下标, 再取平行元素。
+// LiftMetadata 本体无 begin_rva 字段（lifter 模块私有结构, 冻结不动）,
+// 平行下标是 lifter_pass.cpp 保证的契约（每个函数迭代恰好 push 一个）。
+// 返回 nullptr = 找不到对应 metadata（列表缺位 / 平行关系破坏）, 调用方
+// 须走保守兜底（放弃该函数虚拟化, 保持原生执行）。MIT-380。
+const wvmp::passes::lifter::LiftMetadata* find_metadata_by_begin_rva(
+    const ProtectionContext& ctx,
+    const std::vector<wvmp::passes::lifter::LiftMetadata>* meta_list,
+    u64 begin_rva) {
+    if (meta_list == nullptr) return nullptr;
+    for (size_t i = 0; i < ctx.functions.size(); ++i) {
+        if (ctx.functions[i].begin_rva != begin_rva) continue;
+        return i < meta_list->size() ? &(*meta_list)[i] : nullptr;
+    }
+    return nullptr;
+}
+
 class RegVmBackend final : public vm::VMBackend {
 public:
     std::string_view name() const override { return "regvm"; }
@@ -39,22 +57,31 @@ public:
                     wvmp::passes::lifter::kLiftedMetadata);
             meta_list != nullptr) {
             // LifterPass 写入的 meta_list 与 ctx.functions 按下标平行
-            // (lifter_pass.cpp 已保证此顺序). 函数间区分按 begin_rva
-            // 匹配 (FunctionRegion 是冻结契约不能加 id 字段; begin_rva
-            // 在区域内唯一)。
-            // v1 E2E 单函数 virtualize, 退化: 任一函数有 skipped 即兜底
-            // 当前函数——多函数并行虚拟化属于 M3+ 范畴。
-            if (!meta_list->empty()) {
-                const auto& m = meta_list->front();
-                if (!m.skipped_ranges.empty()) {
-                    char buf[160];
-                    std::snprintf(buf, sizeof(buf),
-                                  "函数 %s: lifter 跳过 %zu 条指令 (rva/size 列表), "
-                                  "IR 缺字节, 触发 C1 gate",
-                                  fn.name.c_str(), m.skipped_ranges.size());
-                    result.notes.emplace_back(buf);
-                    skipped = true;
-                }
+            // (lifter_pass.cpp 已保证此顺序)。函数间区分按 begin_rva
+            // 匹配——LiftMetadata 是 lifter 模块私有结构无 begin_rva 字段,
+            // FunctionRegion 是冻结契约不能加 id 字段, 故经
+            // find_metadata_by_begin_rva() 在 ctx.functions 反查下标取平行
+            // 元素 (begin_rva 在区域内唯一)。
+            // M3+ 多函数并行虚拟化: 按 begin_rva 匹配 metadata, 任一函数有
+            // skipped 即只兜底"该函数"（其余函数不受牵连）; 匹配不到对应
+            // metadata 时保守兜底, 同样只拦当前函数保持原生执行。
+            // MIT-380 修复: v1 的 meta_list->front() 永远读第 0 个函数的
+            // metadata, 多函数场景 gate 错位（该拦的不拦 → stub_link 覆写
+            // IR 缺字节的区域 → 运行时行为错）。
+            const auto* m =
+                find_metadata_by_begin_rva(ctx, meta_list, fn.begin_rva);
+            if (m == nullptr) {
+                result.notes.emplace_back("函数 " + fn.name +
+                                          ": 无对应 LiftMetadata, 保守兜底");
+                skipped = true;
+            } else if (!m->skipped_ranges.empty()) {
+                char buf[160];
+                std::snprintf(buf, sizeof(buf),
+                              "函数 %s: lifter 跳过 %zu 条指令 (rva/size 列表), "
+                              "IR 缺字节, 触发 C1 gate",
+                              fn.name.c_str(), m->skipped_ranges.size());
+                result.notes.emplace_back(buf);
+                skipped = true;
             }
         }
         if (!skipped) {

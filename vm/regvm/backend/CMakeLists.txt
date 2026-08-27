@@ -19,3 +19,8 @@ target_link_libraries(wvmp_regvm_backend PUBLIC
     wvmp::common
 )
 wvmp_target_warnings(wvmp_regvm_backend)
+
+if(WVMP_BUILD_TESTS)
+    # MIT-380：LiftMetadata 按 begin_rva 匹配的多函数场景回归测试。
+    add_subdirectory(tests)
+endif()
