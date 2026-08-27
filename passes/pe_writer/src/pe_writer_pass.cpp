@@ -26,18 +26,35 @@ constexpr size_t kNtPrefix = 4 + 20;
 
 // DllCharacteristics 位于 OptionalHeader +0x46 (PE32+/PE32 相同, 在 Subsystem
 // +0x02 处). 绝对偏移 = nt_off (PE 签名 4 + FILE_HEADER 20) + 0x46 = nt_off + 0x5e.
-// IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE = 0x40 (ASLR 标志). M2-8 起 rip-relative
-// 翻译期把 [rip+disp] 转 RVA, 运行时经 LoadRva/StoreRva + VmContext.scratch_mem
-// (=image_base) 还原 VA. Windows ASLR 把 image 重新定位到随机基址, 但 stub
-// 只知道 PE.ImageBase（写入 scratch_mem）— 二者不等 → 访存错位 → 段错误。
-// 简化方案（M2-8 局限）：保护后清除 DYNAMIC_BASE 标志，强制 Windows 加载到
-// ImageBase 声明位置. 完整 ASLR 兼容（MIT-340 派活单目标）需通过 .reloc 节
-// IMAGE_REL_BASED_DIR64 在 stub 的 image_base 立即上发布重定位——经实测
-// 在 snake 真虚拟化样本上仍触发 segfault（pitfall #33 §A 假设错 #11），推测
-// Windows 加载器对保护后 .reloc 扩展存在未排查的行为差异。完整 ASLR 兼容
-// 留待后续派活单；本 pass 沿用 M2-8 行为清 DYNAMIC_BASE。
+//
+// MVP P0 #3 替代方案 A (MIT-370 派活单): 派活单派发**前**已知完整 ASLR 兼容
+// (MIT-340 派活单 §A 假设错 #11) 与 FORCE_INTEGRITY 启用 (未签名 → Windows
+// "无法验证此文件的数字签名" → Permission denied rc=126) 两条路都不可行, 因
+// 而保沿用 M2-8 简化方案并扩增 FORCE_INTEGRITY 清除:
+//   1) IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE = 0x40 (ASLR). M2-8 起 rip-relative
+//      翻译期把 [rip+disp] 转 RVA, 运行时经 LoadRva/StoreRva + VmContext.scratch_mem
+//      (=image_base) 还原 VA. Windows ASLR 把 image 重新定位到随机基址, 但 stub
+//      只知道 PE.ImageBase（写入 scratch_mem）— 二者不等 → 访存错位 → 段错误。
+//      简化方案（M2-8 局限）：保护后清除 DYNAMIC_BASE 标志, 强制 Windows 加载到
+//      ImageBase 声明位置. 完整 ASLR 兼容（MIT-340 派活单目标）需通过 .reloc 节
+//      IMAGE_REL_BASED_DIR64 在 stub 的 image_base 立即上发布重定位——经实测
+//      在 snake 真虚拟化样本上仍触发 segfault（pitfall #33 §A 假设错 #11），推测
+//      Windows 加载器对保护后 .reloc 扩展存在未排查的行为差异. 完整 ASLR 兼容
+//      留待后续派活单; 本 pass 沿用 M2-8 行为清 DYNAMIC_BASE.
+//   2) IMAGE_DLLCHARACTERISTICS_FORCE_INTEGRITY = 0x80. 启用后 Windows loader
+//      强制校验数字签名, 未签名 PE → "无法验证此文件的数字签名" → 加载失败
+//      (Permission denied rc=126). MVP P0 #1 + #2 修复保持 (MIT-330 + MIT-367
+//      v2 verifier 独立确认) 要求保沿用 snake 真虚拟化 byte-exact 闭环, 与
+//      FORCE_INTEGRITY 启用互斥 (pitfall #54 候选, MIT-367 v2 verifier 实证).
+//      MVP P0 #4 (PE 签名 EV 证书采购 + 集成) MVP派发**前**到位**前**, 沿用派
+//      活单 §D 决策 1: 保护后清除 FORCE_INTEGRITY, 避免杀软扫描兼容路径被
+//      "Permission denied" 拦截. EV 证书到位后由后续派活单恢复 FORCE_INTEGRITY.
 constexpr size_t kDllCharsOffsetFromNt = 0x5e;  // 4 (签名) + 20 (FILE_HEADER) + 0x46 (opt)
 constexpr u16 kImageDllCharacteristicsDynamicBase = 0x0040;
+constexpr u16 kImageDllCharacteristicsForceIntegrity = 0x0080;
+// 保护后一律清除的两个位 (MVP P0 #3 替代方案 A): DYNAMIC_BASE + FORCE_INTEGRITY.
+constexpr u16 kDllCharsClearMask = static_cast<u16>(
+    kImageDllCharacteristicsDynamicBase | kImageDllCharacteristicsForceIntegrity);
 
 } // namespace
 
@@ -100,9 +117,10 @@ void PeWriterPass::run(ProtectionContext& ctx) {
     w.patch_u32(chk_off, 0);
     w.patch_u32(chk_off, pe_checksum(ctx.image, chk_off));
 
-    // 2.5) M2-8: 清除 DllCharacteristics.DYNAMIC_BASE (ASLR) — 仅在确实虚拟化
-    //   时（有 stub 产出）才需要. 没虚拟化的镜像保持原状（PE-writer 单元测试
-    //   往返断言要求 byte-identical）。
+    // 2.5) MVP P0 #3 替代方案 A (MIT-370): 仅在确实虚拟化时（有 stub 产出）
+    //   才需要清除 DllCharacteristics 的 DYNAMIC_BASE + FORCE_INTEGRITY 两个位。
+    //   没虚拟化的镜像保持原状（PE-writer 单元测试往返断言要求 byte-identical）。
+    //   MVP P0 #3 替代方案 A 完整动机: 详见 kDllCharsClearMask 上方注释块。
     const auto* new_sections_check = ctx.find_slot<std::vector<NewSection>>(kNewSections);
     const bool has_stub = new_sections_check != nullptr && !new_sections_check->empty();
     if (has_stub &&
@@ -110,12 +128,26 @@ void PeWriterPass::run(ProtectionContext& ctx) {
         const u16 old_dll =
             static_cast<u16>(static_cast<u16>(ctx.image[nt_off + kDllCharsOffsetFromNt]) |
                             (static_cast<u16>(ctx.image[nt_off + kDllCharsOffsetFromNt + 1]) << 8));
-        const u16 new_dll = static_cast<u16>(old_dll & ~kImageDllCharacteristicsDynamicBase);
+        const u16 new_dll = static_cast<u16>(old_dll & ~kDllCharsClearMask);
         if (new_dll != old_dll) {
             ctx.image[nt_off + kDllCharsOffsetFromNt] = static_cast<u8>(new_dll & 0xFF);
             ctx.image[nt_off + kDllCharsOffsetFromNt + 1] = static_cast<u8>((new_dll >> 8) & 0xFF);
-            ctx.diag.report(Severity::Note, name(),
-                            "M2-8: 已清除 DllCharacteristics.DYNAMIC_BASE (ASLR)，强制镜像加载到 ImageBase 声明位置（stub scratch_mem 兼容性）");
+            // 列出被实际清除的位便于 verifier + fresh verify 一眼核对
+            // (pitfall #50 多维验证, MIT-370 派活单 §D 决策 1).
+            std::string note =
+                "MVP P0 #3 替代方案 A: 已清除 DllCharacteristics 位 ";
+            const u16 cleared_bits = static_cast<u16>(old_dll & ~new_dll);
+            bool first = true;
+            if (cleared_bits & kImageDllCharacteristicsDynamicBase) {
+                note += "DYNAMIC_BASE(0x0040, ASLR)";
+                first = false;
+            }
+            if (cleared_bits & kImageDllCharacteristicsForceIntegrity) {
+                if (!first) note += " + ";
+                note += "FORCE_INTEGRITY(0x0080, 数字签名校验)";
+            }
+            note += "; 强制镜像加载到 ImageBase 声明位置, 避免未签名 Permission denied rc=126";
+            ctx.diag.report(Severity::Note, name(), note);
             // checksum 含 DllCharacters, 重新计算.
             ByteWriter w2(ctx.image);
             w2.patch_u32(chk_off, 0);
