@@ -1,0 +1,28 @@
+# MIT-350: tasklist.exe 现实世界 exe 回归测试集 (Windows 自带命令行)
+#
+# 类别: 命令行工具 (Windows 自带)
+# 验证目标: Win32 API 调用 + 命令行输出 + 简单进程枚举
+# 预期: 大概率走 C1 gate 兜底 (派活单限定不支持: syscall/部分 Win32 API thunk)
+#       verify_real_world.sh 会捕获 protect 失败或 byte-exact 差异作为 pitfall 实证.
+#
+# 用法: wvmp_cli.exe protect --config scripts/real_world_exe/tasklist.toml
+# 输出: ./build/real_world_exe/tasklist.protected.exe
+# 注意: tasklist.exe 默认输出动态进程列表 (PID 等运行时变化), 派活单派发**前**
+#       verify_real_world.sh 使用 tasklist /? 帮助文本作为确定性输出做 byte-exact 比对.
+#       默认无参数模式仅用于人工跑 (会触发 pitfall 实证), 不进自动化 pass/fail.
+input  = "C:/Windows/System32/tasklist.exe"
+output = "./build/real_world_exe/tasklist.protected.exe"
+seed   = 12345
+
+[[passes]]
+name = "pe_loader"
+[[passes]]
+name = "marker_scan"
+[[passes]]
+name = "lifter"
+[[passes]]
+name = "virtualize"
+[[passes]]
+name = "stub_link"
+[[passes]]
+name = "pe_writer"

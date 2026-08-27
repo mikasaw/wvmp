@@ -1,0 +1,29 @@
+# MIT-350: curl.exe 现实世界 exe 回归测试集 (开源 HTTP 客户端)
+#
+# 类别: 命令行 HTTP 客户端 (开源)
+# 验证目标: HTTP 协议 + 大量网络库 (OpenSSL/winsock) + 字符串处理
+# 预期: 大概率走 C1 gate 兜底 (派活单限定不支持: SSE/AVX/syscall/DLL imports)
+#       verify_real_world.sh 会捕获 protect 失败或 byte-exact 差异作为 pitfall 实证.
+#
+# 用法: wvmp_cli.exe protect --config scripts/real_world_exe/curl.toml
+# 输出: ./build/real_world_exe/curl.protected.exe
+# 注意: curl.exe 路径由 verify_real_world.sh 探测 (常见位置: C:/Program Files/Git/mingw64/bin/curl.exe,
+#       C:/Windows/System32/curl.exe, C:/Windows/System32/curl.exe),
+#       此处使用派活单派发**前**已验证的基线 C:/Program Files/Git/mingw64/bin/curl.exe
+#       (即 Git Bash 的 /mingw64/bin/curl.exe).
+input  = "C:/Program Files/Git/mingw64/bin/curl.exe"
+output = "./build/real_world_exe/curl.protected.exe"
+seed   = 12345
+
+[[passes]]
+name = "pe_loader"
+[[passes]]
+name = "marker_scan"
+[[passes]]
+name = "lifter"
+[[passes]]
+name = "virtualize"
+[[passes]]
+name = "stub_link"
+[[passes]]
+name = "pe_writer"

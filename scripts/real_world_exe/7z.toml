@@ -1,0 +1,27 @@
+# MIT-350: 7z.exe 现实世界 exe 回归测试集 (7-Zip 命令行)
+#
+# 类别: 命令行文件压缩工具 (开源, 7-Zip)
+# 验证目标: 文件压缩 + LZMA 算法 + 大量 SSE/AVX + 系统调用
+# 预期: 大概率走 C1 gate 兜底 (派活单限定不支持: SSE/AVX/x87 FPU/lock/rep/syscall)
+#       verify_real_world.sh 会捕获 protect 失败或 byte-exact 差异作为 pitfall 实证.
+#
+# 用法: wvmp_cli.exe protect --config scripts/real_world_exe/7z.toml
+# 输出: ./build/real_world_exe/7z.protected.exe
+# 注意: 7z.exe 在派活单派发前实测存在 C:/Program Files/7-Zip/7z.exe,
+#       本机未安装时 verify_real_world.sh 会跳过 (派活单 §B 风险点).
+input  = "C:/Program Files/7-Zip/7z.exe"
+output = "./build/real_world_exe/7z.protected.exe"
+seed   = 12345
+
+[[passes]]
+name = "pe_loader"
+[[passes]]
+name = "marker_scan"
+[[passes]]
+name = "lifter"
+[[passes]]
+name = "virtualize"
+[[passes]]
+name = "stub_link"
+[[passes]]
+name = "pe_writer"

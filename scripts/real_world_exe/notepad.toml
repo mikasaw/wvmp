@@ -1,0 +1,25 @@
+# MIT-350: notepad.exe 现实世界 exe 回归测试集 (Windows 自带 GUI)
+#
+# 类别: GUI 应用 (Windows 自带)
+# 验证目标: Win32 API 调用 + GUI 框架
+# 预期: 大概率走 C1 gate 兜底 (派活单限定不支持: MFC/WTL/Qt GUI 框架 + DirectX + syscall)
+#       verify_real_world.sh 会捕获 protect 失败或 byte-exact 差异作为 pitfall 实证.
+#
+# 用法: wvmp_cli.exe protect --config scripts/real_world_exe/notepad.toml
+# 输出: ./build/real_world_exe/notepad.protected.exe
+input  = "C:/Windows/System32/notepad.exe"
+output = "./build/real_world_exe/notepad.protected.exe"
+seed   = 12345
+
+[[passes]]
+name = "pe_loader"
+[[passes]]
+name = "marker_scan"
+[[passes]]
+name = "lifter"
+[[passes]]
+name = "virtualize"
+[[passes]]
+name = "stub_link"
+[[passes]]
+name = "pe_writer"
