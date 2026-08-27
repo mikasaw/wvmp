@@ -318,3 +318,25 @@ target_compile_options(wvmp_cmpxchg_sample PRIVATE
 target_link_options(wvmp_cmpxchg_sample PRIVATE
     $<$<CXX_COMPILER_ID:MSVC>:/INCREMENTAL:NO>
 )
+
+# MIT-371: 端到端正路径样本——区域内含 SSE 浮点加 addss/addps/addpd
+# (3 形式 REG-REG only), 验证 SSE 浮点加修复后翻译成功、运行时走真 Addss/
+# Addps/Addpd handler、行为与原生逐字节一致。MSVC x64 不支持 inline asm,
+# 高 level C++ 在 /Od 下对 _mm_add_ss/_mm_add_ps/_mm_add_pd 内部函数会**融合
+# load+add 为 MEM 形式**, 故 SSE 字节由 sse_add_sample_asm.asm (MASM)
+# 直接 emit 真 REG-REG addss/addps/addpd 字节（F3 0F 58 / 0F 58 / 66 0F 58,
+# mod=11）, 链接进本 sample。区域不含 rip-relative / printf / call
+# (printf 在 main 区域外)。
+enable_language(ASM_MASM)
+add_executable(wvmp_sse_add_sample
+    sse_add_sample_main.cpp
+    sse_add_sample_asm.asm
+)
+target_link_libraries(wvmp_sse_add_sample PRIVATE wvmp::sdk)
+target_compile_options(wvmp_sse_add_sample PRIVATE
+    $<$<CXX_COMPILER_ID:MSVC>:/Od;/Ob0;/utf-8>
+    $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-O0>
+)
+target_link_options(wvmp_sse_add_sample PRIVATE
+    $<$<CXX_COMPILER_ID:MSVC>:/INCREMENTAL:NO>
+)

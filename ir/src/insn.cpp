@@ -45,6 +45,13 @@ std::string_view to_string(Op op) {
     case Op::Setcc: return "setcc";
     case Op::Cmovcc: return "cmovcc";
     case Op::Cmpxchg: return "cmpxchg";
+    case Op::Movsx: return "movsx";
+    case Op::Popcnt: return "popcnt";
+    case Op::Lzcount: return "lzcnt";
+    case Op::Tzcount: return "tzcount";
+    case Op::Addss: return "addss";
+    case Op::Addps: return "addps";
+    case Op::Addpd: return "addpd";
     }
     return "?";
 }

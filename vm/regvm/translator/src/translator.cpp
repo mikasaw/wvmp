@@ -312,6 +312,13 @@ struct Translator {
                 // MIT-353: tzcnt dispatch — REG-REG 形式 emit 单条 VmOp::Tzcount
                 // (handler 用 native tzcnt 完成末尾零计数; src 必是 REG 派活单限定).
                 ok = translate_tzcnt(em, in);
+            } else if (in.op == ir::Op::Addss || in.op == ir::Op::Addps || in.op == ir::Op::Addpd) {
+                // MIT-371: SSE 浮点加 dispatch — REG-REG 形式 emit 单条
+                // VmOp::Addss/Addps/Addpd (handler 用 native addss/addps/addpd
+                // 完成浮点加; src 必是 XMM 派活单限定). IR.dst.reg/IR.src.reg
+                // 是 xmm0..xmm7 编号 (lifter 借用 ir::Reg 值 0..7), 翻译期
+                // 加 24 偏移映射到 VmContext.regs[24..31] 保留槽位.
+                ok = translate_sse_add(em, in);
             } else if (in.op == ir::Op::Bswap) {
                 ok = translate_bswap(em, in);
             } else if (in.op == ir::Op::Xchg) {
@@ -940,6 +947,33 @@ struct Translator {
         const u8 d = isa::vm_reg_of(in.dst.reg);
         const u8 b = isa::vm_reg_of(in.src.reg);
         em.emit_rr(VmOp::Tzcount, d, b, isa::size_field(in.size));
+        return true;
+    }
+
+    // ---- MIT-371: SSE 浮点加 addss/addps/addpd ----
+    //
+    // lifter 用 IR.dst.reg / IR.src.reg 借用 ir::Reg 值 0..7 (Rax..Rdi),
+    // 翻译期加 24 偏移映射到 VmContext.regs[24..31] 保留槽位 (vm_op.hpp
+    // 注释 v24..v31 保留, 这里用作 xmm0..xmm7 VM 槽). 翻译器只负责 emit
+    // 字节码, 真正 xmm 物理寄存器寻址在 handler (asmgen.cpp) 用 movups +
+    // native addss/addps/addpd 完成.
+    //
+    // 编码: a_kind=Reg reg_a=xmm_slot, b_kind=Reg reg_b=xmm_slot, aux=0,
+    //       cond_or_size=ir::Size (S32=Addss scalar, S64=Addps/Addpd packed).
+    //       字节码布局与 popcnt/lzcnt/tzcnt 完全一致 (2 操作数 REG-REG).
+    bool translate_sse_add(Emitter& em, const ir::Insn& in) {
+        if (in.op != ir::Op::Addss && in.op != ir::Op::Addps && in.op != ir::Op::Addpd)
+            return false;
+        if (in.dst.kind != ir::Operand::Kind::Reg ||
+            in.src.kind != ir::Operand::Kind::Reg)
+            return skip(in, "SSE 浮点加 操作数形态未支持", nullptr);
+        // IR.dst.reg / IR.src.reg 在 lifter 借用 ir::Reg 值 0..7 代表 xmm0..7.
+        // static_cast<u8> 拿到原始 u8 索引, 加 24 偏移到 VmContext.regs[24..31].
+        const u8 xmm_dst_slot = static_cast<u8>(in.dst.reg) + 24u;
+        const u8 xmm_src_slot = static_cast<u8>(in.src.reg) + 24u;
+        VmOp vop = (in.op == ir::Op::Addss) ? VmOp::Addss :
+                   (in.op == ir::Op::Addps) ? VmOp::Addps : VmOp::Addpd;
+        em.emit_rr(vop, xmm_dst_slot, xmm_src_slot, isa::size_field(in.size));
         return true;
     }
 

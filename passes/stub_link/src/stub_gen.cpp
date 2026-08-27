@@ -22,8 +22,12 @@ constexpr u64 kCtxRegs = 0x10;      // regs[0]
 constexpr u64 kCtxRsp = 0x30;       // regs[4]
 constexpr u64 kCtxScratch = 0x110;
 constexpr u64 kCtxNativeSp = 0x120; // M2-9 call gate: caller 原始 frame 基址
-// 结构 0x138 + 0x8 栈对齐余量 = 0x140。
-constexpr u64 kCtxSize = 0x140;
+// MIT-371: XMM VM 槽位。VmContext.xmm[8] @ 0x140（8 槽 16B = 128B）= xmm0..xmm7。
+// VmContext 总大小 = 0x1C0 (基址 0x138 + xmm[8] 128B + 自然对齐) → kCtxSize
+// = 0x1C8 (= 0x1C0 + 8B 16-字节栈对齐余量)。这些常量与 runtime.hpp 的 VmContext
+// 布局强耦合 (offsetof 校验), 改 VmContext 时**必须**同步更新 kCtxSize/kCtxXmmBase。
+constexpr u64 kCtxXmmBase = 0x140;
+constexpr u64 kCtxSize = 0x1C8;
 
 // 占位 disp32（回填目标 = blob 指令流）：选罕见值便于汇编后定位。
 constexpr u32 kBlobDispDummy = 0xDEAD'0001;
@@ -55,11 +59,11 @@ std::string build_stub_asm(u64 rt_entry_rva, u64 resume_rva, u64 image_base) {
         }
     }
     // v4 = 原始 rsp（区域代码按原函数帧的 rsp 相对寻址）：当前 rsp 比原始值
-    // 低 8*push(0x40) + kCtxSize(0x140) = 0x180，用 lea 还原。rax 的原值已在
+    // 低 8*push(0x40) + kCtxSize(0x1C8) = 0x208，用 lea 还原。rax 的原值已在
     // slot0 保存，可复用。同一份原始 rsp 同时写到 native_sp（M2-9 call gate
     // 需要稳定的 caller frame 基址——v4 会被 VM 自身 push/pop 改写，native_sp
     // 跨指令不变，供 callgate handler 把 rsp 切回 caller frame 跑 native）。
-    o += "lea rax, [rsp + 0x180]\n";
+    o += "lea rax, [rsp + 0x208]\n";
     o += "mov [rsp + " + hex(kCtxRsp) + "], rax\n";
     o += "mov [rsp + " + hex(kCtxNativeSp) + "], rax\n";
     // image_base（PE optional header 的 ImageBase 字段）→ scratch_mem 槽：
@@ -73,6 +77,15 @@ std::string build_stub_asm(u64 rt_entry_rva, u64 resume_rva, u64 image_base) {
     o += "mov qword ptr [rsp + 0x8], 0\n";                   // pc = 0
     o += "lea rax, [rip + " + hex(kBlobDispDummy) + "]\n";   // blob 指令流（回填）
     o += "mov [rsp], rax\n";                                 // ctx.bytecode
+    // MIT-371: 把宿主 xmm0..xmm7 同步到 VmContext.xmm[0..7]（VM 槽）。
+    // 区域代码如 addss/addps/addpd 需要读取当前 xmm 值（Win64 ABI 调用约定把
+    // 浮点参数 / 返回值放在 xmm0..xmm7），若不同步则 VM 读到的是 VmContext
+    // 槽位的未初始化值（栈内存）。movups 每次 16 字节；xmm0..xmm7 8 个
+    // 寄存器 = 128 字节写入。xmm 槽位位于 VmContext.xmm[8] @ 0x148。
+    for (int i = 0; i < 8; ++i) {
+        o += std::string("movups [rsp + ") + hex(kCtxXmmBase + u64(i) * 16) +
+             "], xmm" + std::to_string(i) + "\n";
+    }
     o += "mov rcx, rsp\n";                                   // Win64 第一参数 = ctx
     o += "call " + hex(rt_entry_rva) + "\n";
     // HALT 返回：回写易失寄存器（callee-saved 由 pop 恢复）。
@@ -86,6 +99,13 @@ std::string build_stub_asm(u64 rt_entry_rva, u64 resume_rva, u64 image_base) {
              {kCtxRegs + 11 * 8, "r11"},
          }) {
         o += std::string("mov ") + reg + ", [rsp + " + hex(slot) + "]\n";
+    }
+    // MIT-371: 把 VmContext.xmm[0..7] 同步回宿主 xmm0..xmm7。SSE 加 handler
+    // 写回的 xmm 值（addss/addps/addpd 的 dst 通常是 xmm0）通过此步骤回到
+    // 原 caller 可见的物理寄存器 — 与 Win64 ABI xmm caller-saved 语义一致。
+    for (int i = 0; i < 8; ++i) {
+        o += std::string("movups xmm") + std::to_string(i) + ", [rsp + " +
+             hex(kCtxXmmBase + u64(i) * 16) + "]\n";
     }
     o += "add rsp, " + hex(kCtxSize) + "\n";
     o += "pop r15\n pop r14\n pop r13\n pop r12\n";

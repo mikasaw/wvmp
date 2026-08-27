@@ -867,6 +867,66 @@ TranslateResult translate_cmovcc(const cs_insn& ci, const cs_x86& x, ir::Arch ar
 //     lifter 的 prefix[0] 检查直接拒绝, S16 不走此路径 (派活单限定不支持)
 //   - MEM 形式 (cmpxchg [reg], r) lifter 直接 emit Operand::mem_(...) 到 dst;
 //     翻译器折 Load + Cmpxchg + Store 三条拆条 (与 setcc MEM 路径同结构)
+// MIT-371: SSE 浮点加 addss/addps/addpd (REG-REG only, mod=11).
+// MSVC /Od 默认 codegen REG-REG (mod=11), MSVC x64 不支持 inline asm,
+// 高 level C++ 在 /Od 下用 <intrin.h> 的 _mm_add_ss/_mm_add_ps/_mm_add_pd
+// 内部函数直接 emit 真 SSE 字节（F3 0F 58 / 0F 58 / 66 0F 58）——
+// 无需 MASM helper 强制 codegen（与 MIT-349 popcnt MASM helper 强制 codegen
+// 路径不同, 沿用 MIT-353 lzcnt/tzcnt 的"MSVC /Od 直接 emit 真字节"路径）。
+//   - addss xmm1, xmm2/m32  F3 0F 58 /r  (scalar single, 1 element)
+//   - addps xmm1, xmm2/m128 0F 58 /r     (packed single, 4 elements)
+//   - addpd xmm1, xmm2/m128 66 0F 58 /r  (packed double, 2 elements)
+//   - 2 操作数 (dst + src), 必都是 XMM 寄存器 (派活单限定不支持 MEM form,
+//     lifter 拒 MEM → C1 gate 兜底)。
+//   - size 字段: addss=ir::Size::S32 (scalar 单精度), addps/addpd=ir::Size::S64
+//     (packed 128-bit; handler 用 movups 全 128-bit 读写)。size 不影响 codegen,
+//     仅作 addss/addps/addpd 的区分 tag（handler 也按 size 派发）。
+//   - updates_flags=false (SSE 浮点加不影响 x86 EFLAGS; MXCSR rounding mode
+//     v1 不追踪)。
+//
+// **XMM 寄存器编码 (关键设计)**:
+// 派活单限定不修改 ir/reg.hpp (冻结契约头文件, 沿用 MIT-345/347/349/353 pitfall #34
+// additive enum append-only). XMM 寄存器号 0..7 在 IR 层借用现有 ir::Reg 值 0..7
+// (Rax..Rdi) — 这些值在 Addss/Addps/Addpd 上下文中**重新解释**为 xmm0..xmm7,
+// 而非 GPR. translator 层按 Op 分派识别 "这是 SSE Op, 0..7 = xmm0..7",
+// 加 24 偏移映射到 VmContext.regs[24..31] (vm_op.hpp 保留槽位 v24..v31 沿用).
+// IR.dst/IR.src.kind 仍为 Kind::Reg, 但 reg 值 0..7 在 SSE Op 语义下
+// 复用为 xmm0..xmm7 (asmgen 看到 reg_a/reg_b 在 [24..31] 区间即按 xmm 处理).
+TranslateResult translate_sse_add(const cs_insn& ci, const cs_x86& x, ir::Arch arch, Op op,
+                                  ir::Size sz) {
+    if (x.op_count != 2) return unsupported(ci.address, ci.size);
+    // 两个操作数必都是 XMM 寄存器 (派活单限定不支持 MEM form).
+    if (x.operands[0].type != X86_OP_REG) return unsupported(ci.address, ci.size);
+    if (x.operands[1].type != X86_OP_REG) return unsupported(ci.address, ci.size);
+    // 手动 XMM 编号映射（X86_REG_XMM0..XMM7 → 0..7），不调 to_operand/map_reg
+    // (它们对 XMM* 返回 nullopt, 沿用 SEG/xmm 不可映射的现有约定).
+    auto xmm_idx = [&](x86_reg r) -> std::optional<u8> {
+        switch (r) {
+        case X86_REG_XMM0: return static_cast<u8>(0); case X86_REG_XMM1: return static_cast<u8>(1);
+        case X86_REG_XMM2: return static_cast<u8>(2); case X86_REG_XMM3: return static_cast<u8>(3);
+        case X86_REG_XMM4: return static_cast<u8>(4); case X86_REG_XMM5: return static_cast<u8>(5);
+        case X86_REG_XMM6: return static_cast<u8>(6); case X86_REG_XMM7: return static_cast<u8>(7);
+        default: return std::nullopt;
+        }
+    };
+    auto di = xmm_idx(x.operands[0].reg);
+    auto si = xmm_idx(x.operands[1].reg);
+    if (!di || !si) return unsupported(ci.address, ci.size);
+    // IR Insn.dst.reg / IR.src.reg 借用现有 ir::Reg 值 0..7 (Rax..Rdi), 翻译器
+    // 层在 dispatch Addss/Addps/Addpd 时识别 "这是 SSE Op, 加 24 偏移 → v24..v31".
+    // 用 static_cast 把 u8 xmm 索引写成 ir::Reg 枚举值（编译期已知 0..7 落在
+    // ir::Reg 值域内, 编译器接受该 cast）。
+    (void)arch;
+    ir::Insn out;
+    out.op = op;
+    out.addr = ci.address;
+    out.size = sz;
+    out.updates_flags = false;
+    out.dst = ir::Operand::reg_(static_cast<ir::Reg>(*di));
+    out.src = ir::Operand::reg_(static_cast<ir::Reg>(*si));
+    return ok(out);
+}
+
 TranslateResult translate_cmpxchg(const cs_insn& ci, const cs_x86& x, ir::Arch arch) {
     if (x.op_count != 2) return unsupported(ci.address, ci.size);
     // dst 必为 r/m (REG 或 MEM); src 必为 REG
@@ -1078,6 +1138,16 @@ TranslateResult translate_insn(const cs_insn& ci, ir::Arch arch) {
     case X86_INS_LZCNT: return translate_lzcnt(ci, x, arch);
     // MIT-353: tzcnt (F3 0F BC+rm, mod=11 REG-REG / mod=00/01/10 MEM 派活单限定不支持).
     case X86_INS_TZCNT: return translate_tzcnt(ci, x, arch);
+    // MIT-371: SSE 浮点加 addss/addps/addpd (REG-REG only, mod=11).
+    //   - addss xmm1, xmm2/m32  F3 0F 58 /r  (scalar single, size=S32)
+    //   - addps xmm1, xmm2/m128 0F 58 /r     (packed single, size=S64)
+    //   - addpd xmm1, xmm2/m128 66 0F 58 /r  (packed double, size=S64)
+    // MSVC /Od 默认 codegen REG-REG (mod=11), MSVC x64 不支持 inline asm,
+    // 高 level C++ 在 /Od 下用 <intrin.h> 的 _mm_add_ss/_mm_add_ps/_mm_add_pd
+    // 内部函数直接 emit 真 SSE 字节（无需 MASM helper 强制 codegen）。
+    case X86_INS_ADDSS: return translate_sse_add(ci, x, arch, Op::Addss, Size::S32);
+    case X86_INS_ADDPS: return translate_sse_add(ci, x, arch, Op::Addps, Size::S64);
+    case X86_INS_ADDPD: return translate_sse_add(ci, x, arch, Op::Addpd, Size::S64);
     case X86_INS_BSWAP: return translate_bswap(ci, x, arch);
     case X86_INS_XCHG: return translate_xchg(ci, x, arch);
     // MIT-336: setcc 16 variants (0F 90+cc+rm, mod=11 REG / mod=00 MEM).

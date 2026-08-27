@@ -1036,6 +1036,87 @@ public:
         return o;
     }
 
+    // MIT-371 Addss: scalar single-precision FP add (xmm1 = xmm1 + xmm2)。
+    //   字节结构: F3 0F 58 /r (3 字节 REG-REG, mod=11)。
+    //   编码: reg_a=xmm_dst_slot (24..31, translator 从 IR 0..7 加 24 偏移),
+    //         reg_b=xmm_src_slot (24..31), aux=0, cond_or_size=ir::Size::S32。
+    //   xmm 槽位: VmContext.xmm[8] @ +0x140（MIT-371 SSE 跟踪区）;
+    //   xmm 索引 = reg - 24, 槽位偏移 = 0x140 + (reg-24)*16。
+    //   handler: 算 dst/src 槽位偏移 → movups 读/写 128-bit → addss。
+    //   不影响 EFLAGS; 不调 setcc5 也不走 flags_tail, 直接 advance(dispatch)。
+    std::string build_addss(u64 dispatch) const {
+        const std::string tag = "addss" + std::to_string(seq());
+        std::string o = decode_prelude();
+        // T4 = reg_a (24..31). 算 xmm 槽位偏移到 T9 (Keystone 不支持 (reg-24)*16,
+        // 拆为 sub 24 → shl 4 → add 0x140)。
+        auto emit_xmm_offset_into_t9 = [&](int reg_t) {
+            o += std::string("    mov ") + r64(t_[9]) + ", " + r64(reg_t) + "\n";
+            o += std::string("    sub ") + r64(t_[9]) + ", 24\n";
+            o += std::string("    shl ") + r64(t_[9]) + ", 4\n";
+            o += std::string("    add ") + r64(t_[9]) + ", 0x140\n";
+        };
+        emit_xmm_offset_into_t9(t_[4]);  // T9 = dst 偏移
+        o += std::string("    movups xmm0, [") + r64(ctx_) + " + " + r64(t_[9]) + "]\n";
+        emit_xmm_offset_into_t9(t_[7]);  // T9 = src 偏移
+        o += std::string("    movups xmm1, [") + r64(ctx_) + " + " + r64(t_[9]) + "]\n";
+        o += "    addss xmm0, xmm1\n";
+        emit_xmm_offset_into_t9(t_[4]);  // 重算 dst 偏移写回
+        o += std::string("    movups [") + r64(ctx_) + " + " + r64(t_[9]) + "], xmm0\n";
+        o += advance(dispatch);
+        (void)tag;
+        return o;
+    }
+
+    // MIT-371 Addps: packed single-precision FP add (4xf32 lane-parallel)。
+    //   字节结构: 0F 58 /r (3 字节 REG-REG, mod=11)。
+    //   编码: reg_a=24..31 (xmm_dst_slot), reg_b=24..31 (xmm_src_slot),
+    //         aux=0, cond_or_size=ir::Size::S64 (packed 128-bit 占位)。
+    std::string build_addps(u64 dispatch) const {
+        const std::string tag = "addps" + std::to_string(seq());
+        std::string o = decode_prelude();
+        auto emit_xmm_offset_into_t9 = [&](int reg_t) {
+            o += std::string("    mov ") + r64(t_[9]) + ", " + r64(reg_t) + "\n";
+            o += std::string("    sub ") + r64(t_[9]) + ", 24\n";
+            o += std::string("    shl ") + r64(t_[9]) + ", 4\n";
+            o += std::string("    add ") + r64(t_[9]) + ", 0x140\n";
+        };
+        emit_xmm_offset_into_t9(t_[4]);
+        o += std::string("    movups xmm0, [") + r64(ctx_) + " + " + r64(t_[9]) + "]\n";
+        emit_xmm_offset_into_t9(t_[7]);
+        o += std::string("    movups xmm1, [") + r64(ctx_) + " + " + r64(t_[9]) + "]\n";
+        o += "    addps xmm0, xmm1\n";
+        emit_xmm_offset_into_t9(t_[4]);
+        o += std::string("    movups [") + r64(ctx_) + " + " + r64(t_[9]) + "], xmm0\n";
+        o += advance(dispatch);
+        (void)tag;
+        return o;
+    }
+
+    // MIT-371 Addpd: packed double-precision FP add (2xf64 lane-parallel)。
+    //   字节结构: 66 0F 58 /r (3 字节 REG-REG, mod=11, 0x66 prefix 隐式)。
+    //   编码: reg_a=24..31 (xmm_dst_slot), reg_b=24..31 (xmm_src_slot),
+    //         aux=0, cond_or_size=ir::Size::S64。
+    std::string build_addpd(u64 dispatch) const {
+        const std::string tag = "addpd" + std::to_string(seq());
+        std::string o = decode_prelude();
+        auto emit_xmm_offset_into_t9 = [&](int reg_t) {
+            o += std::string("    mov ") + r64(t_[9]) + ", " + r64(reg_t) + "\n";
+            o += std::string("    sub ") + r64(t_[9]) + ", 24\n";
+            o += std::string("    shl ") + r64(t_[9]) + ", 4\n";
+            o += std::string("    add ") + r64(t_[9]) + ", 0x140\n";
+        };
+        emit_xmm_offset_into_t9(t_[4]);
+        o += std::string("    movups xmm0, [") + r64(ctx_) + " + " + r64(t_[9]) + "]\n";
+        emit_xmm_offset_into_t9(t_[7]);
+        o += std::string("    movups xmm1, [") + r64(ctx_) + " + " + r64(t_[9]) + "]\n";
+        o += "    addpd xmm0, xmm1\n";
+        emit_xmm_offset_into_t9(t_[4]);
+        o += std::string("    movups [") + r64(ctx_) + " + " + r64(t_[9]) + "], xmm0\n";
+        o += advance(dispatch);
+        (void)tag;
+        return o;
+    }
+
     // ---- 一元包装（HandlerDef 需要无参差成员函数指针） ----
     std::string build_add(u64 d) const { return build_binary("add", d, true); }
     std::string build_sub(u64 d) const { return build_binary("sub", d, true); }
@@ -2161,6 +2242,12 @@ RuntimeGenResult generate_runtime(wvmp::Rng& rng) {
         // MIT-353: lzcnt + tzcnt (BMI1 bit-scan, 沿用 popcnt 模板 + T6 save pitfall #37).
         {int(VmOp::Lzcount), "lzcnt", &AsmGen::build_lzcnt},
         {int(VmOp::Tzcount), "tzcnt", &AsmGen::build_tzcnt},
+        // MIT-371: SSE 浮点加 addss/addps/addpd (3 形式, REG-REG only, 沿用
+        // popcnt/lzcnt/tzcnt 模板 + 硬编码 xmm0/xmm1 物理寄存器; 无需
+        // MASM helper 强制 codegen — MSVC /Od SSE 浮点编译直接 emit 真字节).
+        {int(VmOp::Addss), "addss", &AsmGen::build_addss},
+        {int(VmOp::Addps), "addps", &AsmGen::build_addps},
+        {int(VmOp::Addpd), "addpd", &AsmGen::build_addpd},
         {int(VmOp::Cmp), "cmp", &AsmGen::build_cmp},
         {int(VmOp::Test), "test", &AsmGen::build_test},
         {int(VmOp::Load), "load", &AsmGen::build_load},

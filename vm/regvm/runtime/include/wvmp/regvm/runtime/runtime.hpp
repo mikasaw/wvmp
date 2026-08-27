@@ -49,9 +49,28 @@ inline constexpr std::array<int, 8> kCalleeSavedIdx = {2, 3, 4, 5, 10, 11, 12, 1
 //                             在随机分配中可能落在 caller-saved 寄存器，原生
 //                             callee 会清掉）；ret 后从此槽恢复。
 //
+//   +0x138  u128 xmm[8]       MIT-371: SSE 浮点加 (addss/addps/addpd) 跟踪
+//                             物理 xmm0..xmm7 (各 128-bit)。stub 入口把宿主
+//                             xmm0..xmm7 同步到此处, VM 运行时 addss/addps/
+//                             addpd handler 经 movups 全 128-bit 读/写, stub
+//                             出口再同步回宿主 xmm。8 个槽位 = 128 字节;
+//                             偏移 0x138..0x1B8。
+//
 // v4 = Rsp（Push/Pop 操作的栈指针，相对 scratch_mem 的偏移）。
 // v17 偏移 = 0x10 + 17*8 = 0x98；v4 偏移 = 0x30。
 // =============================================================================
+// MIT-371 SSE 跟踪: 8 个 16-byte 槽位（xmm0..xmm7）。XmmSlot 模拟 __m128
+// layout (8 字节 lo + 8 字节 hi)。asmgen handler 用 movups 全 16B 读写。
+// 不引入 <emmintrin.h> 头依赖（emmintrin.h 链路较重）。vm_entry 调度 push 之前
+// VmContext 自身需 16 字节对齐以保证 movups 不产生 #GP 异常（与 x64 ABI 对齐
+// 约定一致；本 struct 总大小 0x1C0, sizeof 已 16B 对齐）。
+#pragma warning(push)
+#pragma warning(disable : 4324)  // XmmSlot struct padded due to alignas(16)
+struct alignas(16) XmmSlot { u64 xmm_lo, xmm_hi; };
+#pragma warning(pop)
+static_assert(sizeof(XmmSlot) == 16, "XmmSlot must be 16B (mimic __m128 layout)");
+#pragma warning(push)
+#pragma warning(disable : 4324)  // VmContext padded due to XmmSlot alignas(16) member
 struct VmContext {
     u8* bytecode = nullptr;   // +0x000
     u64 pc = 0;               // +0x008
@@ -61,8 +80,15 @@ struct VmContext {
     u64 native_sp = 0;        // +0x120
     u64 host_rsp = 0;         // +0x128
     u64 base_save = 0;        // +0x130
+    XmmSlot xmm[8] = {};      // +0x140 (xmm0..xmm7, 各 16B; movups 全 16B 读写)
 };
-static_assert(sizeof(VmContext) == 0x138, "VmContext 布局即 ABI，禁止改动");
+#pragma warning(pop)
+// MIT-371: VmContext 大小从 0x138 扩到 0x1C0（加 0x80 = xmm[8] 128B）。
+// 实际 sizeof 由编译器保证与 offset 一致, 加 8 字节栈对齐余量 = 0x1C8 (见
+// stub_gen.cpp 的 kCtxSize)。
+static_assert(sizeof(VmContext) >= 0x1C0, "VmContext must include xmm[8] (128B)");
+inline constexpr u64 kCtxXmmBase = 0x140;  // VmContext.xmm[0] RVA 偏移 = 0x140
+static_assert(offsetof(VmContext, xmm) == 0x140, "xmm must be 16-aligned at 0x140");
 static_assert(offsetof(VmContext, bytecode) == 0x00);
 static_assert(offsetof(VmContext, pc) == 0x08);
 static_assert(offsetof(VmContext, regs) == 0x10);
