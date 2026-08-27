@@ -22,7 +22,7 @@
 set -u
 
 repo="$(cd "$(dirname "$0")/.." && pwd)"
-cli="$repo/build/cli/wvmp_cli.exe"
+cli="$repo/build/vs/cli/Debug/wvmp_cli.exe"
 
 # MIT-306: REQUIRE_REAL 强校验. 设 1 时除 byte-exact 外, 还需 CLI 日志含
 # "已生成 N 个入口 stub" 标记（stub_link 在 virtualize 至少产生 1 个

@@ -17,3 +17,16 @@ CMakeUserPresets.json
 *.obj
 *.lib
 *.pdb
+
+# WVmp repo hygiene additions (MIT-382, 2026-08-27)
+.multica_tmp/
+multica_workspaces/
+/wvmp.slnx
+scripts/__pycache__/
+/test_output.txt
+/build_*.log
+/ctest_*.log
+/native_*.txt
+/protected_*.txt
+/cl_shift_e2e.txt
+/popcnt_test.asm
