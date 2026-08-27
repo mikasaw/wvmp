@@ -25,6 +25,12 @@ namespace wvmp::passes {
 // 解析 PE optional header 取出，经 stub_link 传给本函数。
 //
 // 所有立即数经 hex() 生成——keystone 裸数字按 16 进制解析（P6 教训）。
+//
+// MIT-340 派活单目标（ASLR 兼容）未达成：M2-8 stub 仍写入 ImageBase 立即；
+// Windows ASLR 重定位后 scratch_mem 错位导致 segfault。完整 ASLR 修复需在
+// stub 端用 RIP-relative lea 算 actual_image_base 或在 stub 的 image_base
+// 立即上发布 IMAGE_REL_BASED_DIR64 重定位——后者本派活单实测失败（pitfall
+// #33 §A 假设错 #11，详见 passes/pe_writer/src/pe_writer_pass.cpp 注释）。
 [[nodiscard]] std::vector<u8> generate_entry_stub(u64 stub_rva, u64 blob_stream_rva,
                                                   u64 rt_entry_rva, u64 resume_rva,
                                                   u64 image_base);

@@ -31,8 +31,11 @@ constexpr size_t kNtPrefix = 4 + 20;
 // (=image_base) 还原 VA. Windows ASLR 把 image 重新定位到随机基址, 但 stub
 // 只知道 PE.ImageBase（写入 scratch_mem）— 二者不等 → 访存错位 → 段错误。
 // 简化方案（M2-8 局限）：保护后清除 DYNAMIC_BASE 标志，强制 Windows 加载到
-// ImageBase 声明位置. 完整 ASLR 兼容需要 stub 在运行时通过 PE 重定位 / GetModuleHandle
-// 取真实基址——M2-9+ 排期。
+// ImageBase 声明位置. 完整 ASLR 兼容（MIT-340 派活单目标）需通过 .reloc 节
+// IMAGE_REL_BASED_DIR64 在 stub 的 image_base 立即上发布重定位——经实测
+// 在 snake 真虚拟化样本上仍触发 segfault（pitfall #33 §A 假设错 #11），推测
+// Windows 加载器对保护后 .reloc 扩展存在未排查的行为差异。完整 ASLR 兼容
+// 留待后续派活单；本 pass 沿用 M2-8 行为清 DYNAMIC_BASE。
 constexpr size_t kDllCharsOffsetFromNt = 0x5e;  // 4 (签名) + 20 (FILE_HEADER) + 0x46 (opt)
 constexpr u16 kImageDllCharacteristicsDynamicBase = 0x0040;
 
@@ -100,8 +103,6 @@ void PeWriterPass::run(ProtectionContext& ctx) {
     // 2.5) M2-8: 清除 DllCharacteristics.DYNAMIC_BASE (ASLR) — 仅在确实虚拟化
     //   时（有 stub 产出）才需要. 没虚拟化的镜像保持原状（PE-writer 单元测试
     //   往返断言要求 byte-identical）。
-    //   见 kDllCharsOffsetFromNt 注释——stub_link 写入 scratch_mem 用
-    //   PE.ImageBase, ASLR 重定位后不等于实际基址, 全局读写越界段错.
     const auto* new_sections_check = ctx.find_slot<std::vector<NewSection>>(kNewSections);
     const bool has_stub = new_sections_check != nullptr && !new_sections_check->empty();
     if (has_stub &&
