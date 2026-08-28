@@ -470,3 +470,49 @@ target_compile_options(wvmp_sse_movss_xmm_readback_sample PRIVATE
 target_link_options(wvmp_sse_movss_xmm_readback_sample PRIVATE
     $<$<CXX_COMPILER_ID:MSVC>:/INCREMENTAL:NO>
 )
+
+# MIT-376: 端到端主样本——区域内含 SSE 浮点位运算 xorps/orps/andps + 浮点比较
+# ucomiss/ucomisd (5 形式 REG-REG only), 验证 5 条新指令支持后翻译成功、运行时
+# 走真 Xorps/Orps/Andps/Ucomiss/Ucomisd handler、行为与原生逐字节一致。MSVC x64
+# 不支持 inline asm, /Od 下 intrinsic 会融合 load+op 为 MEM 形式, 故 SSE 字节由
+# sse_bwcmp_sample_asm.asm (MASM) 直接 emit 真 REG-REG 字节 (0F 57 / 0F 56 /
+# 0F 54 / 0F 2E / 66 0F 2E, mod=11), 链接进本 sample。比较类断言 ucomiss 后
+# 紧跟 seta 且 seta/movzx/store 都在 marker 区域内 (Setcc handler 读 Ucomiss
+# handler 写的 VM flags 槽, 证明 flags 真参与运行时, 派活单 §C 6)。区域不含
+# rip-relative / printf / call (printf 在 main 区域外)。
+enable_language(ASM_MASM)
+add_executable(wvmp_sse_bwcmp_sample
+    sse_bwcmp_sample_main.cpp
+    sse_bwcmp_sample_asm.asm
+)
+target_link_libraries(wvmp_sse_bwcmp_sample PRIVATE wvmp::sdk)
+# COMPILE_LANGUAGE 限定 C/C++: 兄弟样本块直接把 C++ 选项也传给 MASM 会 A4018。
+target_compile_options(wvmp_sse_bwcmp_sample PRIVATE
+    $<$<AND:$<CXX_COMPILER_ID:MSVC>,$<COMPILE_LANGUAGE:C,CXX>>:/Od;/Ob0;/utf-8>
+    $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-O0>
+)
+target_link_options(wvmp_sse_bwcmp_sample PRIVATE
+    $<$<CXX_COMPILER_ID:MSVC>:/INCREMENTAL:NO>
+)
+
+# MIT-376: 影子样本——ucomiss+seta 组合的 flags readback 断言 (派活单 §D D2.1:
+# SSE 类新指令族必须配 1 个 ctx.xmm/flags 读回影子样本 1:1 配对; ucomis* 的
+# 正确性在 VM flags 槽而非 xmm 槽)。与 wvmp_sse_bwcmp_sample 的 ucomiss+seta
+# 同 IR、独立 exe: 每个探针打印区域内 seta 结果 (Setcc handler 读 Ucomiss
+# handler 写的 VM flags 槽, greater/less/equal/unordered 四态覆盖 SDM 真值表
+# ZF/CF 全组合) + 8 槽 × 4 lane ctx.xmm 全量读回 (证明 handler 不污染任何
+# xmm 槽)。native vs virtualized byte-exact; handler 空转 (pitfall #79) →
+# seta 读 dispatch 残留 flags / 槽污染 → 与原生不一致 → FAIL。
+enable_language(ASM_MASM)
+add_executable(wvmp_sse_bwcmpss_flags_readback_sample
+    sse_bwcmpss_flags_readback_sample_main.cpp
+    sse_bwcmpss_flags_readback_sample_asm.asm
+)
+target_link_libraries(wvmp_sse_bwcmpss_flags_readback_sample PRIVATE wvmp::sdk)
+target_compile_options(wvmp_sse_bwcmpss_flags_readback_sample PRIVATE
+    $<$<AND:$<CXX_COMPILER_ID:MSVC>,$<COMPILE_LANGUAGE:C,CXX>>:/Od;/Ob0;/utf-8>
+    $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-O0>
+)
+target_link_options(wvmp_sse_bwcmpss_flags_readback_sample PRIVATE
+    $<$<CXX_COMPILER_ID:MSVC>:/INCREMENTAL:NO>
+)

@@ -207,7 +207,33 @@ enum class Op : u16 { Mov, Lea, Add, Sub, Adc, Sbb, And, Or, Xor, Not, Neg, Inc,
                       //   - updates_flags=false (SSE 浮点除不影响 x86 EFLAGS; MXCSR
                       //     rounding mode 在 v1 不追踪; 除零/NaN 语义由 native
                       //     handler 内真 div* 指令保真, 与 MIT-371/373 同口径)。
-                      Divss, Divps, Divpd, Movss, Movaps, Movapd, Movups, Movupd };
+                      Divss, Divps, Divpd,
+                      // MIT-375: SSE 浮点传送 5 op (movss / movaps / movapd / movups / movupd)。
+                      //   - load 方向 REG-REG (mod=11); store 方向与 MEM 形式 lifter 拒。
+                      //   - updates_flags=false。
+                      Movss, Movaps, Movapd, Movups, Movupd,
+                      // MIT-376: SSE 浮点位运算 + 浮点比较 5 op
+                      // (xorps / orps / andps / ucomiss / ucomisd)。
+                      //   - 字节结构 (REG-REG, capstone 实证):
+                      //       xorps xmm1, xmm2  0F 57 /r   (bitwise xor, 全 128-bit)
+                      //       orps  xmm1, xmm2  0F 56 /r   (bitwise or,  全 128-bit)
+                      //       andps xmm1, xmm2  0F 54 /r   (bitwise and, 全 128-bit)
+                      //       ucomiss xmm1, xmm2 0F 2E /r  (标量单精度无序比较)
+                      //       ucomisd xmm1, xmm2 66 0F 2E /r (标量双精度无序比较)
+                      //   - REG-REG 派活单限定 (mod=11): dst=xmm1, src=xmm2 —
+                      //     IR.dst/src 编码 2 槽 (借用 ir::Reg 0..7 = xmm0..7)。
+                      //     MEM 形式派活单限定不支持 (lifter 拒 MEM → C1 gate 兜底)。
+                      //   - 大小编码 (cond_or_size): 沿用 ir::Size 字段 —
+                      //     Xorps/Orps/Andps=S64 (128-bit 整体读写), Ucomiss=S32
+                      //     (scalar single), Ucomisd=S64 (scalar double)。
+                      //   - updates_flags: 位运算 3 条=false (xorps/orps/andps 不影响
+                      //     EFLAGS); ucomiss/ucomisd=**true** (真写 VM flags 槽 ZF/PF/CF,
+                      //     沿用 setcc/jcc 的 flags 通路, 派活单 §D D1.1 决策 — 禁止
+                      //     decode+advance 空转, pitfall #79; NaN → unordered →
+                      //     ZF=PF=CF=1 按 Intel SDM UCOMISD/UCOMISS 真值表)。
+                      //   - 派活单 §C 决策: 5 op 必 append-only 在 Movupd 之后、
+                      //     enum 闭合之前 (pitfall #34 + MIT-375 v2 bug 教训)。
+                      Xorps, Orps, Andps, Ucomiss, Ucomisd };
 enum class Size : u8 { S8, S16, S32, S64 };
 enum class Cond : u8 { O, No, B, Ae, E, Ne, Be, A, S, Ns, P, Np, L, Ge, Le, G };
 constexpr u64 bits(Size s) { return s==Size::S8?8: s==Size::S16?16: s==Size::S32?32:64; }

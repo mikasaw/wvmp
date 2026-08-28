@@ -20,7 +20,10 @@
 #     SSE/VMX/AVX 派活单每条新指令 1 个影子样本 1:1 配对).
 #   - MIT-374: extend to wvmp_sse_div_sample (SSE 浮点除 divss/divps/divpd 3 形式
 #     真虚拟化) + wvmp_sse_divss_xmm_readback_sample (divss 的 ctx.xmm 读回影子样本).
-#     Total: 16 samples × 5 seeds = 80 runs.
+#   - MIT-376: extend to wvmp_sse_bwcmp_sample (SSE 浮点位运算 xorps/orps/andps +
+#     浮点比较 ucomiss/ucomisd 5 形式真虚拟化) + wvmp_sse_bwcmpss_flags_readback_sample
+#     (ucomiss+seta 的 VM flags 读回影子样本, 派活单 §D D2.1 1:1 配对).
+#     Total: 20 samples × 5 seeds = 100 runs.
 #   - MIT-306: REQUIRE_REAL=1 校验日志含 "已生成 N 个入口 stub" 防止 C1 gate
 #     兜底被误判 PASS（仅 byte-exact 不够, C1 gate 函数被跳过仍能输出相同
 #     stdout+rc）。与 multiseed_e2e_real.sh 配套使用。
@@ -54,6 +57,8 @@ samples=(
     "build/passes/marker_scan/tests/wvmp_sse_divss_xmm_readback_sample.exe"
     "build/passes/marker_scan/tests/wvmp_sse_mov_sample.exe"
     "build/passes/marker_scan/tests/wvmp_sse_movss_xmm_readback_sample.exe"
+    "build/passes/marker_scan/tests/wvmp_sse_bwcmp_sample.exe"
+    "build/passes/marker_scan/tests/wvmp_sse_bwcmpss_flags_readback_sample.exe"
 )
 
 # Seeds: 1 (small), 12345 (default), 99999 (large), 0xDEADBEEF (magic), 0xCAFEBABE (magic).

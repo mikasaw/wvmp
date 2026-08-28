@@ -8,7 +8,8 @@ namespace wvmp::regvm::isa {
 // （asmgen.cpp kTableEntries=128，MIT-374 起；此前 6 位 = 64 项，Subpd=63 恰好
 // 占满，Divss=64 起越界静默折叠到 halt）。追加枚举前先看 asmgen.cpp 的
 // static_assert(kVmOpMax < kTableEntries) 是否仍成立。
-// 编码空间上限 14 位（kVmOpLimit）；MIT-375 起用到低 7 位（kVmOpMax=68），
+// 编码空间上限 14 位（kVmOpLimit）；MIT-376 起用到低 7 位（kVmOpMax=76，
+// Ucomisd；128 项跳表内，static_assert 见 asmgen.cpp kTableEntries），
 // runtime 跳转表掩码/项数与之联动（vm/regvm/runtime/src/asmgen.cpp kTableEntries）。
 enum class VmOp : u16 {
     Mov = 1, Lea, Add, Sub, Adc, Sbb, And, Or, Xor, Not, Neg, Inc, Dec,
@@ -372,9 +373,45 @@ enum class VmOp : u16 {
     //   派活单 §D 决策: Divss/Divps/Divpd 必 append-only 在 Subss/Subps/Subpd
     //   之后 (pitfall #34 additive enum append-only)。
     //   ⚠️ divsd (F2 0F 5E, scalar double) 不在本单范围 (派活单只列 3 形式)。
-    Divpd, Movss, Movaps, Movapd, Movups, Movupd };
+    Divpd, Movss, Movaps, Movapd, Movups, Movupd,
 
-inline constexpr u16 kVmOpMax = static_cast<u16>(VmOp::Movupd);
+    // —— MIT-376 SSE 浮点位运算 + 浮点比较 (xorps / orps / andps / ucomiss / ucomisd)——
+    // Xorps (Reg-Reg, packed bitwise xor):
+    //   xmm1 = xmm1 XOR xmm2 (全 128-bit 按位异或, 不解释浮点值)。
+    //   字节结构: 0F 57 /r (REG-REG, mod=11; capstone 实证 0F57C1)。
+    //   a_kind=Reg reg_a=dst (xmm1), b_kind=Reg reg_b=src (xmm2),
+    //   aux=0, cond_or_size=ir::Size::S64 (128-bit 整体读写)。
+    //   handler (沿用 MIT-375 build_xmm_transfer 四步模板, xmm 槽位 @ ctx+0x140):
+    //            movups xmm0, [ctx + 0x140 + (reg_a-24)*16]   读 dst
+    //            movups xmm1, [ctx + 0x140 + (reg_b-24)*16]   读 src
+    //            xorps xmm0, xmm1
+    //            movups [ctx + 0x140 + (reg_a-24)*16], xmm0   写回 dst
+    //   不影响 EFLAGS; updates_flags=false。
+    Xorps,
+    // Orps (Reg-Reg, packed bitwise or): 同 Xorps, 字节结构 0F 56 /r (实证 0F56C1)。
+    Orps,
+    // Andps (Reg-Reg, packed bitwise and): 同 Xorps, 字节结构 0F 54 /r (实证 0F54C1)。
+    Andps,
+    // Ucomiss (Reg-Reg, scalar single unordered compare):
+    //   比较 xmm1[31:0] 与 xmm2[31:0], **只写 EFLAGS ZF/PF/CF, 不改 xmm 操作数**。
+    //   字节结构: 0F 2E /r (REG-REG, mod=11; capstone 实证 0F2EC1; F3 0F 2E 不存在)。
+    //   a_kind=Reg reg_a=dst (xmm1), b_kind=Reg reg_b=src (xmm2),
+    //   aux=0, cond_or_size=ir::Size::S32 (scalar single)。
+    //   handler 走 ALU binop 同一条 flags 通路 (zero5 → native ucomiss → setcc5 →
+    //   flags_tail), setcc/jcc handler 读同一 flags_ 寄存器 (派活单 §D D1.1 决策,
+    //   禁止 decode+advance 空转, pitfall #79)。
+    //   Intel SDM UCOMISS 真值表: greater → ZF=CF=0 / less → CF=1 / equal → ZF=1 /
+    //   unordered (NaN) → ZF=PF=CF=1; OF/SF/AF 由 native ucomiss 清 0 (SDM:
+    //   "The OF, SF, AF flags are set to 0"), flags_tail 按位布局
+    //   ZF/CF/OF/SF/PF=bit0..4 装配即得 SDM 语义。
+    //   updates_flags=**true**。
+    Ucomiss,
+    // Ucomisd (Reg-Reg, scalar double unordered compare):
+    //   同 Ucomiss, 比较低 64 位 f64; 字节结构 66 0F 2E /r (实证 660F2EC1)。
+    //   cond_or_size=ir::Size::S64 (scalar double)。updates_flags=true。
+    Ucomisd };
+
+inline constexpr u16 kVmOpMax = static_cast<u16>(VmOp::Ucomisd);
 inline constexpr u16 kVmOpLimit = 1u << 14;  // 14 位编码空间上限
 
 constexpr const char* to_string(VmOp op) {
@@ -436,6 +473,12 @@ constexpr const char* to_string(VmOp op) {
         case VmOp::Movapd: return "movapd";
         case VmOp::Movups: return "movups";
         case VmOp::Movupd: return "movupd";
+        // MIT-376: SSE 浮点位运算 + 浮点比较 5 op.
+        case VmOp::Xorps: return "xorps";
+        case VmOp::Orps: return "orps";
+        case VmOp::Andps: return "andps";
+        case VmOp::Ucomiss: return "ucomiss";
+        case VmOp::Ucomisd: return "ucomisd";
     }
     return "?";
 }

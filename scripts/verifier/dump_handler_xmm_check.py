@@ -68,8 +68,17 @@ except ImportError:
 # new SSE/VMX/AVX ops land -- keep in sync with the verifier instructions).
 # MIT-374: divss/divps/divpd added (SSE float div, same movups slot-offset
 # prologue as add/sub -- the constants below are op-agnostic).
+# MIT-376: xorps/orps/andps added (SSE float bitwise, reuse the MIT-375
+# build_xmm_transfer four-step template -- same 3x movups + sub/shl/add
+# prologue, FP instruction swapped).  ucomiss/ucomisd deliberately NOT
+# registered: they are compare-only (no dst writeback -> 2 movups / 2-slot
+# prologue), so the writeback-shaped constants below would false-FAIL them;
+# their flags path is asserted by the sse_bwcmpss_flags_readback shadow
+# sample instead (dispatch sheet §D D2.1).  They are listed in
+# FP_MNEMONIC_RE, so they still surface as "unregistered" WARNING for review.
 SSE_HANDLERS = {"addss", "addps", "addpd", "subss", "subps", "subpd",
-                "divss", "divps", "divpd"}
+                "divss", "divps", "divpd",
+                "xorps", "orps", "andps"}
 
 # Expected xmm slot-offset prologue constants (asmgen emit_xmm_offset_into_t9):
 #   xmm slot offset = kCtxXmmBase(0x140) + (reg - 24) * 16

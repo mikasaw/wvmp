@@ -64,6 +64,12 @@ std::string_view to_string(Op op) {
     case Op::Movapd: return "movapd";
     case Op::Movups: return "movups";
     case Op::Movupd: return "movupd";
+    // MIT-376: SSE 浮点位运算 + 浮点比较 5 op (与 lifter/translator/asmgen 同名).
+    case Op::Xorps: return "xorps";
+    case Op::Orps: return "orps";
+    case Op::Andps: return "andps";
+    case Op::Ucomiss: return "ucomiss";
+    case Op::Ucomisd: return "ucomisd";
     }
     return "?";
 }

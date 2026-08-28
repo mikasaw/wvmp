@@ -1069,6 +1069,90 @@ TranslateResult translate_sse_mov(const cs_insn& ci, const cs_x86& x, ir::Arch a
     return ok(out);
 }
 
+// MIT-376: SSE 浮点位运算 xorps/orps/andps (REG-REG only, mod=11).
+// 与 translate_sse_div (MIT-374) 同构: XMM 寄存器编码借用 ir::Reg 值 0..7,
+// 翻译期加 24 偏移 → VmContext.regs[24..31] (XMM 编码设计见 MIT-371 注释块).
+//   - xorps xmm1, xmm2/m128  0F 57 /r   (bitwise xor, 全 128-bit 按位)
+//   - orps  xmm1, xmm2/m128  0F 56 /r   (bitwise or,  全 128-bit 按位)
+//   - andps xmm1, xmm2/m128 0F 54 /r    (bitwise and, 全 128-bit 按位)
+//   (capstone 实证: 0F57C1/0F56C1/0F54C1 → xorps/orps/andps xmm0, xmm1)
+//   - size 字段: 3 条均 ir::Size::S64 (128-bit 整体读写; handler 用 movups)。
+//     size 不影响 codegen, 仅作形式区分 tag。
+//   - updates_flags=false (SSE 位运算不影响 x86 EFLAGS — 位运算不解释浮点值,
+//     不产 NaN/无序; 与 add/sub/div 同口径)。
+TranslateResult translate_sse_bitwise(const cs_insn& ci, const cs_x86& x, ir::Arch arch, Op op,
+                                      ir::Size sz) {
+    if (x.op_count != 2) return unsupported(ci.address, ci.size);
+    // 两个操作数必都是 XMM 寄存器 (派活单限定不支持 MEM form).
+    if (x.operands[0].type != X86_OP_REG) return unsupported(ci.address, ci.size);
+    if (x.operands[1].type != X86_OP_REG) return unsupported(ci.address, ci.size);
+    // 手动 XMM 编号映射 (X86_REG_XMM0..XMM7 → 0..7), 不调 to_operand/map_reg.
+    auto xmm_idx = [&](x86_reg r) -> std::optional<u8> {
+        switch (r) {
+        case X86_REG_XMM0: return static_cast<u8>(0); case X86_REG_XMM1: return static_cast<u8>(1);
+        case X86_REG_XMM2: return static_cast<u8>(2); case X86_REG_XMM3: return static_cast<u8>(3);
+        case X86_REG_XMM4: return static_cast<u8>(4); case X86_REG_XMM5: return static_cast<u8>(5);
+        case X86_REG_XMM6: return static_cast<u8>(6); case X86_REG_XMM7: return static_cast<u8>(7);
+        default: return std::nullopt;
+        }
+    };
+    auto di = xmm_idx(x.operands[0].reg);
+    auto si = xmm_idx(x.operands[1].reg);
+    if (!di || !si) return unsupported(ci.address, ci.size);
+    (void)arch;
+    ir::Insn out;
+    out.op = op;
+    out.addr = ci.address;
+    out.size = sz;
+    out.updates_flags = false;
+    out.dst = ir::Operand::reg_(static_cast<ir::Reg>(*di));
+    out.src = ir::Operand::reg_(static_cast<ir::Reg>(*si));
+    return ok(out);
+}
+
+// MIT-376: SSE 浮点比较 ucomiss/ucomisd (REG-REG only, mod=11).
+// 与 translate_sse_bitwise 同构, 关键差异: **updates_flags=true** —
+// ucomiss/ucomisd 比较后只写 EFLAGS (ZF/PF/CF), 不改 xmm 操作数; 翻译器
+// emit 单条 VmOp::Ucomiss/Ucomisd, 运行时 handler 走 ALU binop 同一条
+// flags 通路 (zero5 → native ucomis* → setcc5 → flags_tail), 让区域内
+// 紧随的 setcc/jcc 读到真比较结果 (派活单 §C 6 + §D D1.1 决策, 禁止
+// decode+advance 空转, pitfall #79)。
+//   - ucomiss xmm1, xmm2/m32  0F 2E /r   (标量单精度无序比较, size=S32)
+//   - ucomisd xmm1, xmm2/m64  66 0F 2E /r (标量双精度无序比较, size=S64)
+//   (capstone 实证: 0F2EC1 → ucomiss, 660F2EC1 → ucomisd, 均 xmm0, xmm1;
+//    F3 0F 2E 编码不存在; comiss/comisd = 0F 2F 系, 不在本单范围 → C1 gate)
+//   - NaN → unordered → ZF=PF=CF=1, 按 Intel SDM UCOMISD/UCOMISS 真值表
+//     (OF/SF/AF 清 0); 完整 x87 式语义细分不做 (D1.1 限定)。
+TranslateResult translate_ucomis(const cs_insn& ci, const cs_x86& x, ir::Arch arch, Op op,
+                                 ir::Size sz) {
+    if (x.op_count != 2) return unsupported(ci.address, ci.size);
+    // 两个操作数必都是 XMM 寄存器 (派活单限定不支持 MEM form).
+    if (x.operands[0].type != X86_OP_REG) return unsupported(ci.address, ci.size);
+    if (x.operands[1].type != X86_OP_REG) return unsupported(ci.address, ci.size);
+    // 手动 XMM 编号映射 (X86_REG_XMM0..XMM7 → 0..7), 不调 to_operand/map_reg.
+    auto xmm_idx = [&](x86_reg r) -> std::optional<u8> {
+        switch (r) {
+        case X86_REG_XMM0: return static_cast<u8>(0); case X86_REG_XMM1: return static_cast<u8>(1);
+        case X86_REG_XMM2: return static_cast<u8>(2); case X86_REG_XMM3: return static_cast<u8>(3);
+        case X86_REG_XMM4: return static_cast<u8>(4); case X86_REG_XMM5: return static_cast<u8>(5);
+        case X86_REG_XMM6: return static_cast<u8>(6); case X86_REG_XMM7: return static_cast<u8>(7);
+        default: return std::nullopt;
+        }
+    };
+    auto di = xmm_idx(x.operands[0].reg);
+    auto si = xmm_idx(x.operands[1].reg);
+    if (!di || !si) return unsupported(ci.address, ci.size);
+    (void)arch;
+    ir::Insn out;
+    out.op = op;
+    out.addr = ci.address;
+    out.size = sz;
+    out.updates_flags = true;
+    out.dst = ir::Operand::reg_(static_cast<ir::Reg>(*di));
+    out.src = ir::Operand::reg_(static_cast<ir::Reg>(*si));
+    return ok(out);
+}
+
 TranslateResult translate_cmpxchg(const cs_insn& ci, const cs_x86& x, ir::Arch arch) {
     if (x.op_count != 2) return unsupported(ci.address, ci.size);
     // dst 必为 r/m (REG 或 MEM); src 必为 REG
@@ -1318,6 +1402,20 @@ TranslateResult translate_insn(const cs_insn& ci, ir::Arch arch) {
     case X86_INS_MOVAPD: return translate_sse_mov(ci, x, arch, Op::Movapd, Size::S64);
     case X86_INS_MOVUPS: return translate_sse_mov(ci, x, arch, Op::Movups, Size::S64);
     case X86_INS_MOVUPD: return translate_sse_mov(ci, x, arch, Op::Movupd, Size::S64);
+    // MIT-376: SSE 浮点位运算 xorps/orps/andps (REG-REG only, mod=11).
+    //   - xorps 0F 57 /r / orps 0F 56 /r / andps 0F 54 /r (全 128-bit 按位,
+    //     size=S64)。updates_flags=false (位运算不影响 EFLAGS)。
+    //   - AVX VEX 编码 (vpxor/vpor/vpand, VEX.NDS.128.0F.WIG 57/56/54) 由
+    //     capstone 报独立 INS id, 不在本单范围 → C1 gate 兜底。
+    case X86_INS_XORPS: return translate_sse_bitwise(ci, x, arch, Op::Xorps, Size::S64);
+    case X86_INS_ORPS: return translate_sse_bitwise(ci, x, arch, Op::Orps, Size::S64);
+    case X86_INS_ANDPS: return translate_sse_bitwise(ci, x, arch, Op::Andps, Size::S64);
+    // MIT-376: SSE 浮点比较 ucomiss/ucomisd (REG-REG only, mod=11).
+    //   - ucomiss 0F 2E /r (size=S32) / ucomisd 66 0F 2E /r (size=S64)。
+    //     updates_flags=**true** — 真写 VM flags 槽, 派活单 §D D1.1 (禁止
+    //     空转, pitfall #79)。comiss/comisd (0F 2F 系) 不在本单范围 → C1 gate。
+    case X86_INS_UCOMISS: return translate_ucomis(ci, x, arch, Op::Ucomiss, Size::S32);
+    case X86_INS_UCOMISD: return translate_ucomis(ci, x, arch, Op::Ucomisd, Size::S64);
     case X86_INS_BSWAP: return translate_bswap(ci, x, arch);
     case X86_INS_XCHG: return translate_xchg(ci, x, arch);
     // MIT-336: setcc 16 variants (0F 90+cc+rm, mod=11 REG / mod=00 MEM).

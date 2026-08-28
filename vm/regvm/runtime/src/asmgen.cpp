@@ -1335,6 +1335,60 @@ public:
     std::string build_movups(u64 d) const { return build_xmm_transfer(d, "movups"); }
     std::string build_movupd(u64 d) const { return build_xmm_transfer(d, "movupd"); }
 
+    // ---- MIT-376: SSE 浮点位运算 xorps / orps / andps ----
+    //
+    // 三条完全复用 MIT-375 build_xmm_transfer 四步模板 (读 dst 槽 → 读 src 槽
+    // → 就地执行被虚拟化的那条 native 指令 → 写回 dst 槽 → advance): 中间行
+    // 分别是 xorps/orps/andps xmm0, xmm1 (全 128-bit 按位, 不解释浮点值)。
+    // 与浮点传送唯一差别: 位运算不改 EFLAGS 也不产 NaN (无序不存在), 与 mov
+    // 族同为"无 flags 尾巴"路径。
+    // 硬约束: 槽位偏移公式的 24/4/0x140 一律经 imm(), 禁止裸多位数字
+    // (pitfall #78)。
+    std::string build_xorps(u64 d) const { return build_xmm_transfer(d, "xorps"); }
+    std::string build_orps(u64 d)  const { return build_xmm_transfer(d, "orps"); }
+    std::string build_andps(u64 d) const { return build_xmm_transfer(d, "andps"); }
+
+    // ---- MIT-376: SSE 浮点比较 ucomiss / ucomisd ----
+    //
+    // Ucomis* 与位运算/传送族本质不同: **只写 EFLAGS (ZF/PF/CF), 不改 xmm
+    // 操作数** — 没有写回步 (2 次 movups 读, 无 store), 但必须走 ALU binop
+    // 同一条 flags 通路, 让区域内紧随的 setcc/jcc (Setcc/Jcc handler 读同一
+    // flags_ 寄存器) 拿到真比较结果 (派活单 §D D1.1 决策: 禁止
+    // decode+advance 空转, pitfall #79)。
+    //
+    // 顺序严格性 (与 build_binary 一致): 槽位偏移计算 (sub/shl/add 会改宿主
+    // EFLAGS) → zero5() 清 flag scratch → native ucomis* 产真值 → setcc5()
+    // 紧随抽取 (中间不得插入任何改 EFLAGS 的指令) → flags_tail 装配。
+    //
+    // Intel SDM UCOMISD/UCOMISS 真值表 (native ucomis* 直产, setcc5 直读):
+    //   greater than → ZF=0 CF=0 / less than → ZF=0 CF=1 / equal → ZF=1 CF=0 /
+    //   unordered (NaN) → ZF=PF=CF=1; OF/SF/AF 由 native 清 0 (SDM: "The OF,
+    //   SF, AF flags are set to 0"), flags_tail 按 ZF/CF/OF/SF/PF=bit0..4
+    //   装配即得 SDM 语义, 与 setcc/jcc handler 的 cond_eval 布局一致。
+    //
+    // 无 size 链: 每条 VmOp 是独立 handler, 中间行固定 (ucomiss ↔ S32 tag /
+    // ucomisd ↔ S64 tag), 不像 ALU binop 按 cond_or_size 四路展开。
+    std::string build_ucomis_flags(u64 dispatch, const char* native_mn) const {
+        std::string o = decode_prelude();
+        auto emit_xmm_offset_into_t9 = [&](int reg_t) {
+            o += std::string("    mov ") + r64(t_[9]) + ", " + r64(reg_t) + "\n";
+            o += std::string("    sub ") + r64(t_[9]) + ", " + imm(24) + "\n";
+            o += std::string("    shl ") + r64(t_[9]) + ", " + imm(4) + "\n";
+            o += std::string("    add ") + r64(t_[9]) + ", " + imm(0x140) + "\n";
+        };
+        emit_xmm_offset_into_t9(t_[4]);  // T9 = dst 槽偏移 (reg_a = 24..31)
+        o += std::string("    movups xmm0, [") + r64(ctx_) + " + " + r64(t_[9]) + "]\n";
+        emit_xmm_offset_into_t9(t_[7]);  // T9 = src 槽偏移 (reg_b = 24..31)
+        o += std::string("    movups xmm1, [") + r64(ctx_) + " + " + r64(t_[9]) + "]\n";
+        o += zero5();                    // 清 flag scratch (T3/T4/T6/T7/T9)
+        o += std::string("    ") + native_mn + " xmm0, xmm1\n";
+        o += setcc5();                   // T3=CF T4=OF(=0) T6=ZF T7=SF(=0) T9=PF
+        o += flags_tail(dispatch, false);  // 装配 flags_ + 同步 ctx+0x98 + advance
+        return o;
+    }
+    std::string build_ucomiss(u64 d) const { return build_ucomis_flags(d, "ucomiss"); }
+    std::string build_ucomisd(u64 d) const { return build_ucomis_flags(d, "ucomisd"); }
+
     // ---- 一元包装（HandlerDef 需要无参差成员函数指针） ----
     std::string build_add(u64 d) const { return build_binary("add", d, true); }
     std::string build_sub(u64 d) const { return build_binary("sub", d, true); }
@@ -2483,6 +2537,18 @@ RuntimeGenResult generate_runtime(wvmp::Rng& rng) {
         {int(VmOp::Movapd), "movapd", &AsmGen::build_movapd},
         {int(VmOp::Movups), "movups", &AsmGen::build_movups},
         {int(VmOp::Movupd), "movupd", &AsmGen::build_movupd},
+        // MIT-376: SSE 浮点位运算 xorps/orps/andps (3 形式, REG-REG only, 复用
+        // MIT-375 build_xmm_transfer 四步模板, 中间行换成 native 位运算; 复用
+        // VmContext.xmm[8] 跟踪区 @ +0x140, 槽位偏移常量全走 imm()).
+        {int(VmOp::Xorps), "xorps", &AsmGen::build_xorps},
+        {int(VmOp::Orps), "orps", &AsmGen::build_orps},
+        {int(VmOp::Andps), "andps", &AsmGen::build_andps},
+        // MIT-376: SSE 浮点比较 ucomiss/ucomisd (REG-REG only, 只写 EFLAGS 不改
+        // xmm; 走 ALU binop 同一条 flags 通路 zero5 → native → setcc5 →
+        // flags_tail, 与 setcc/jcc handler 共享 flags_ 寄存器 — 派活单 §D D1.1,
+        // 禁止 decode+advance 空转 pitfall #79).
+        {int(VmOp::Ucomiss), "ucomiss", &AsmGen::build_ucomiss},
+        {int(VmOp::Ucomisd), "ucomisd", &AsmGen::build_ucomisd},
         {int(VmOp::Cmp), "cmp", &AsmGen::build_cmp},
         {int(VmOp::Test), "test", &AsmGen::build_test},
         {int(VmOp::Load), "load", &AsmGen::build_load},

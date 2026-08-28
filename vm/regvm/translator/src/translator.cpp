@@ -342,6 +342,21 @@ struct Translator {
                 // IR.src.reg 是 xmm0..xmm7 编号 (lifter 借用 ir::Reg 值 0..7),
                 // 翻译期加 24 偏移映射到 VmContext.regs[24..31] 保留槽位.
                 ok = translate_sse_mov(em, in);
+            } else if (in.op == ir::Op::Xorps || in.op == ir::Op::Orps || in.op == ir::Op::Andps) {
+                // MIT-376: SSE 浮点位运算 dispatch — REG-REG 形式 emit 单条
+                // VmOp::Xorps/Orps/Andps (handler 沿用 MIT-375 build_xmm_transfer
+                // 四步模板, 中间行为 native xorps/orps/andps; 操作数必是 XMM
+                // 派活单限定). IR.dst.reg/IR.src.reg 是 xmm0..xmm7 编号 (lifter
+                // 借用 ir::Reg 值 0..7), 翻译期加 24 偏移映射到
+                // VmContext.regs[24..31] 保留槽位.
+                ok = translate_sse_bitwise(em, in);
+            } else if (in.op == ir::Op::Ucomiss || in.op == ir::Op::Ucomisd) {
+                // MIT-376: SSE 浮点比较 dispatch — REG-REG 形式 emit 单条
+                // VmOp::Ucomiss/Ucomisd (handler 走 ALU binop 同一条 flags 通路
+                // zero5 → native ucomis* → setcc5 → flags_tail, 让区域内紧随的
+                // setcc/jcc 读到真比较结果; 派活单 §D D1.1, 禁止空转 pitfall #79).
+                // 操作数必是 XMM 派活单限定; xmm 槽映射同上.
+                ok = translate_ucomis(em, in);
             } else if (in.op == ir::Op::Bswap) {
                 ok = translate_bswap(em, in);
             } else if (in.op == ir::Op::Xchg) {
@@ -1079,6 +1094,63 @@ struct Translator {
                    (in.op == ir::Op::Movaps) ? VmOp::Movaps :
                    (in.op == ir::Op::Movapd) ? VmOp::Movapd :
                    (in.op == ir::Op::Movups) ? VmOp::Movups : VmOp::Movupd;
+        em.emit_rr(vop, xmm_dst_slot, xmm_src_slot, isa::size_field(in.size));
+        return true;
+    }
+
+    // ---- MIT-376: SSE 浮点位运算 xorps/orps/andps ----
+    //
+    // 与 MIT-375 translate_sse_mov 同构: lifter 用 IR.dst.reg / IR.src.reg
+    // 借用 ir::Reg 值 0..7 代表 xmm0..7, 翻译期加 24 偏移映射到
+    // VmContext.regs[24..31] 保留槽位; 真正 128-bit 按位运算在 handler
+    // (asmgen.cpp build_xorps/orps/andps) 沿用 build_xmm_transfer 四步模板
+    // (读 dst 槽 → 读 src 槽 → native xorps/orps/andps → 写回 dst 槽)。
+    //
+    // 编码: a_kind=Reg reg_a=xmm_slot, b_kind=Reg reg_b=xmm_slot, aux=0,
+    //       cond_or_size=ir::Size::S64 (128-bit 整体读写)。
+    bool translate_sse_bitwise(Emitter& em, const ir::Insn& in) {
+        if (in.op != ir::Op::Xorps && in.op != ir::Op::Orps && in.op != ir::Op::Andps)
+            return false;
+        if (in.dst.kind != ir::Operand::Kind::Reg ||
+            in.src.kind != ir::Operand::Kind::Reg)
+            return skip(in, "SSE 浮点位运算 操作数形态未支持", nullptr);
+        const u8 xmm_idx_dst = static_cast<u8>(in.dst.reg);
+        const u8 xmm_idx_src = static_cast<u8>(in.src.reg);
+        if (xmm_idx_dst > 7u || xmm_idx_src > 7u)
+            return skip(in, "SSE 浮点位运算 xmm 索引越界 (仅支持 xmm0..xmm7)", nullptr);
+        const u8 xmm_dst_slot = static_cast<u8>(xmm_idx_dst + 24u);
+        const u8 xmm_src_slot = static_cast<u8>(xmm_idx_src + 24u);
+        VmOp vop = (in.op == ir::Op::Xorps) ? VmOp::Xorps :
+                   (in.op == ir::Op::Orps)  ? VmOp::Orps : VmOp::Andps;
+        em.emit_rr(vop, xmm_dst_slot, xmm_src_slot, isa::size_field(in.size));
+        return true;
+    }
+
+    // ---- MIT-376: SSE 浮点比较 ucomiss/ucomisd ----
+    //
+    // 与 translate_sse_bitwise 同构, 关键差异: ucomis* **只写 EFLAGS (ZF/PF/CF),
+    // 不改 xmm 操作数**。handler (asmgen.cpp build_ucomiss/build_ucomisd) 走
+    // ALU binop 同一条 flags 通路 (zero5 → native ucomis* → setcc5 →
+    // flags_tail), 与 setcc/jcc handler 共享同一 flags_ 寄存器 (ctx+0x98,
+    // 位布局 ZF/CF/OF/SF/PF=bit0..4) — 区域内紧随的 setcc/jcc 读到真比较
+    // 结果 (派活单 §C 6 + §D D1.1, 禁止 decode+advance 空转, pitfall #79)。
+    //
+    // 编码: a_kind=Reg reg_a=xmm_slot, b_kind=Reg reg_b=xmm_slot, aux=0,
+    //       cond_or_size=ir::Size (S32=Ucomiss scalar single, S64=Ucomisd
+    //       scalar double)。
+    bool translate_ucomis(Emitter& em, const ir::Insn& in) {
+        if (in.op != ir::Op::Ucomiss && in.op != ir::Op::Ucomisd)
+            return false;
+        if (in.dst.kind != ir::Operand::Kind::Reg ||
+            in.src.kind != ir::Operand::Kind::Reg)
+            return skip(in, "SSE 浮点比较 操作数形态未支持", nullptr);
+        const u8 xmm_idx_dst = static_cast<u8>(in.dst.reg);
+        const u8 xmm_idx_src = static_cast<u8>(in.src.reg);
+        if (xmm_idx_dst > 7u || xmm_idx_src > 7u)
+            return skip(in, "SSE 浮点比较 xmm 索引越界 (仅支持 xmm0..xmm7)", nullptr);
+        const u8 xmm_dst_slot = static_cast<u8>(xmm_idx_dst + 24u);
+        const u8 xmm_src_slot = static_cast<u8>(xmm_idx_src + 24u);
+        VmOp vop = (in.op == ir::Op::Ucomiss) ? VmOp::Ucomiss : VmOp::Ucomisd;
         em.emit_rr(vop, xmm_dst_slot, xmm_src_slot, isa::size_field(in.size));
         return true;
     }
