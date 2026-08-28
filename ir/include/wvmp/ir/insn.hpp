@@ -174,7 +174,23 @@ enum class Op : u16 { Mov, Lea, Add, Sub, Adc, Sbb, And, Or, Xor, Not, Neg, Inc,
                       //     Tzcount 之后 (pitfall #34 additive enum append-only)。
                       //   - updates_flags=false (SSE 浮点加不影响 x86 EFLAGS; MXCSR
                       //     rounding mode 在 v1 不追踪)。
-                      Addss, Addps, Addpd };
+                      Addss, Addps, Addpd,
+                      // MIT-373: SSE 浮点减 (subss / subps / subpd)。
+                      //   - 字节结构 (REG-REG):
+                      //       subss xmm1, xmm2/m32  F3 0F 5C /r  (scalar single)
+                      //       subps xmm1, xmm2/m128 0F 5C /r     (packed single, 4 elem)
+                      //       subpd xmm1, xmm2/m128 66 0F 5C /r  (packed double, 2 elem)
+                      //   - REG-REG 派活单限定 (mod=11): xmm1 -= xmm2 (3 形式)。
+                      //     MEM 形式派活单限定不支持 (lifter 拒 MEM → C1 gate 兜底)。
+                      //   - 操作数: dst=xmm1 (reg), src=xmm2 (reg) — IR.dst/src 编码 2 槽。
+                      //   - 大小编码 (cond_or_size): 沿用 ir::Size 字段 —
+                      //     Subss=S32 (scalar single), Subps=S64 (4xf32 packed,
+                      //     对应 xmm 寄存器 128-bit 整体读), Subpd=S64 (2xf64)。
+                      //     派活单 §D 决策: Subss/Subps/Subpd 必 append-only 在
+                      //     Addss/Addps/Addpd 之后 (pitfall #34 additive enum append-only)。
+                      //   - updates_flags=false (SSE 浮点减不影响 x86 EFLAGS; MXCSR
+                      //     rounding mode 在 v1 不追踪)。
+                      Subss, Subps, Subpd };
 enum class Size : u8 { S8, S16, S32, S64 };
 enum class Cond : u8 { O, No, B, Ae, E, Ne, Be, A, S, Ns, P, Np, L, Ge, Le, G };
 constexpr u64 bits(Size s) { return s==Size::S8?8: s==Size::S16?16: s==Size::S32?32:64; }

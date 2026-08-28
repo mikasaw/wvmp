@@ -1051,9 +1051,9 @@ public:
         // 拆为 sub 24 → shl 4 → add 0x140)。
         auto emit_xmm_offset_into_t9 = [&](int reg_t) {
             o += std::string("    mov ") + r64(t_[9]) + ", " + r64(reg_t) + "\n";
-            o += std::string("    sub ") + r64(t_[9]) + ", 24\n";
-            o += std::string("    shl ") + r64(t_[9]) + ", 4\n";
-            o += std::string("    add ") + r64(t_[9]) + ", 0x140\n";
+            o += std::string("    sub ") + r64(t_[9]) + ", " + imm(24) + "\n";
+            o += std::string("    shl ") + r64(t_[9]) + ", " + imm(4) + "\n";
+            o += std::string("    add ") + r64(t_[9]) + ", " + imm(0x140) + "\n";
         };
         emit_xmm_offset_into_t9(t_[4]);  // T9 = dst 偏移
         o += std::string("    movups xmm0, [") + r64(ctx_) + " + " + r64(t_[9]) + "]\n";
@@ -1076,9 +1076,9 @@ public:
         std::string o = decode_prelude();
         auto emit_xmm_offset_into_t9 = [&](int reg_t) {
             o += std::string("    mov ") + r64(t_[9]) + ", " + r64(reg_t) + "\n";
-            o += std::string("    sub ") + r64(t_[9]) + ", 24\n";
-            o += std::string("    shl ") + r64(t_[9]) + ", 4\n";
-            o += std::string("    add ") + r64(t_[9]) + ", 0x140\n";
+            o += std::string("    sub ") + r64(t_[9]) + ", " + imm(24) + "\n";
+            o += std::string("    shl ") + r64(t_[9]) + ", " + imm(4) + "\n";
+            o += std::string("    add ") + r64(t_[9]) + ", " + imm(0x140) + "\n";
         };
         emit_xmm_offset_into_t9(t_[4]);
         o += std::string("    movups xmm0, [") + r64(ctx_) + " + " + r64(t_[9]) + "]\n";
@@ -1101,15 +1101,96 @@ public:
         std::string o = decode_prelude();
         auto emit_xmm_offset_into_t9 = [&](int reg_t) {
             o += std::string("    mov ") + r64(t_[9]) + ", " + r64(reg_t) + "\n";
-            o += std::string("    sub ") + r64(t_[9]) + ", 24\n";
-            o += std::string("    shl ") + r64(t_[9]) + ", 4\n";
-            o += std::string("    add ") + r64(t_[9]) + ", 0x140\n";
+            o += std::string("    sub ") + r64(t_[9]) + ", " + imm(24) + "\n";
+            o += std::string("    shl ") + r64(t_[9]) + ", " + imm(4) + "\n";
+            o += std::string("    add ") + r64(t_[9]) + ", " + imm(0x140) + "\n";
         };
         emit_xmm_offset_into_t9(t_[4]);
         o += std::string("    movups xmm0, [") + r64(ctx_) + " + " + r64(t_[9]) + "]\n";
         emit_xmm_offset_into_t9(t_[7]);
         o += std::string("    movups xmm1, [") + r64(ctx_) + " + " + r64(t_[9]) + "]\n";
         o += "    addpd xmm0, xmm1\n";
+        emit_xmm_offset_into_t9(t_[4]);
+        o += std::string("    movups [") + r64(ctx_) + " + " + r64(t_[9]) + "], xmm0\n";
+        o += advance(dispatch);
+        (void)tag;
+        return o;
+    }
+
+    // MIT-373 Subss: scalar single-precision FP sub (xmm1 = xmm1 - xmm2)。
+    //   字节结构: F3 0F 5C /r (REG-REG, mod=11)。
+    //   编码: reg_a=xmm_dst_slot (24..31, translator 从 IR 0..7 加 24 偏移),
+    //         reg_b=xmm_src_slot (24..31), aux=0, cond_or_size=ir::Size::S32。
+    //   xmm 槽位: VmContext.xmm[8] @ +0x140（MIT-371 SSE 跟踪区, MIT-373 复用,
+    //   无需改 VmContext 布局 / stub_gen kCtxSize）。
+    //   handler: 算 dst/src 槽位偏移 → movups 读/写 128-bit → subss。
+    //   不影响 EFLAGS; 不调 setcc5 也不走 flags_tail, 直接 advance(dispatch)。
+    std::string build_subss(u64 dispatch) const {
+        const std::string tag = "subss" + std::to_string(seq());
+        std::string o = decode_prelude();
+        // T4 = reg_a (24..31). 算 xmm 槽位偏移到 T9 (Keystone 不支持 (reg-24)*16,
+        // 拆为 sub 24 → shl 4 → add 0x140)。
+        auto emit_xmm_offset_into_t9 = [&](int reg_t) {
+            o += std::string("    mov ") + r64(t_[9]) + ", " + r64(reg_t) + "\n";
+            o += std::string("    sub ") + r64(t_[9]) + ", " + imm(24) + "\n";
+            o += std::string("    shl ") + r64(t_[9]) + ", " + imm(4) + "\n";
+            o += std::string("    add ") + r64(t_[9]) + ", " + imm(0x140) + "\n";
+        };
+        emit_xmm_offset_into_t9(t_[4]);  // T9 = dst 偏移
+        o += std::string("    movups xmm0, [") + r64(ctx_) + " + " + r64(t_[9]) + "]\n";
+        emit_xmm_offset_into_t9(t_[7]);  // T9 = src 偏移
+        o += std::string("    movups xmm1, [") + r64(ctx_) + " + " + r64(t_[9]) + "]\n";
+        o += "    subss xmm0, xmm1\n";
+        emit_xmm_offset_into_t9(t_[4]);  // 重算 dst 偏移写回
+        o += std::string("    movups [") + r64(ctx_) + " + " + r64(t_[9]) + "], xmm0\n";
+        o += advance(dispatch);
+        (void)tag;
+        return o;
+    }
+
+    // MIT-373 Subps: packed single-precision FP sub (4xf32 lane-parallel)。
+    //   字节结构: 0F 5C /r (REG-REG, mod=11)。
+    //   编码: reg_a=24..31 (xmm_dst_slot), reg_b=24..31 (xmm_src_slot),
+    //         aux=0, cond_or_size=ir::Size::S64 (packed 128-bit 占位)。
+    std::string build_subps(u64 dispatch) const {
+        const std::string tag = "subps" + std::to_string(seq());
+        std::string o = decode_prelude();
+        auto emit_xmm_offset_into_t9 = [&](int reg_t) {
+            o += std::string("    mov ") + r64(t_[9]) + ", " + r64(reg_t) + "\n";
+            o += std::string("    sub ") + r64(t_[9]) + ", " + imm(24) + "\n";
+            o += std::string("    shl ") + r64(t_[9]) + ", " + imm(4) + "\n";
+            o += std::string("    add ") + r64(t_[9]) + ", " + imm(0x140) + "\n";
+        };
+        emit_xmm_offset_into_t9(t_[4]);
+        o += std::string("    movups xmm0, [") + r64(ctx_) + " + " + r64(t_[9]) + "]\n";
+        emit_xmm_offset_into_t9(t_[7]);
+        o += std::string("    movups xmm1, [") + r64(ctx_) + " + " + r64(t_[9]) + "]\n";
+        o += "    subps xmm0, xmm1\n";
+        emit_xmm_offset_into_t9(t_[4]);
+        o += std::string("    movups [") + r64(ctx_) + " + " + r64(t_[9]) + "], xmm0\n";
+        o += advance(dispatch);
+        (void)tag;
+        return o;
+    }
+
+    // MIT-373 Subpd: packed double-precision FP sub (2xf64 lane-parallel)。
+    //   字节结构: 66 0F 5C /r (REG-REG, mod=11, 0x66 prefix 隐式)。
+    //   编码: reg_a=24..31 (xmm_dst_slot), reg_b=24..31 (xmm_src_slot),
+    //         aux=0, cond_or_size=ir::Size::S64。
+    std::string build_subpd(u64 dispatch) const {
+        const std::string tag = "subpd" + std::to_string(seq());
+        std::string o = decode_prelude();
+        auto emit_xmm_offset_into_t9 = [&](int reg_t) {
+            o += std::string("    mov ") + r64(t_[9]) + ", " + r64(reg_t) + "\n";
+            o += std::string("    sub ") + r64(t_[9]) + ", " + imm(24) + "\n";
+            o += std::string("    shl ") + r64(t_[9]) + ", " + imm(4) + "\n";
+            o += std::string("    add ") + r64(t_[9]) + ", " + imm(0x140) + "\n";
+        };
+        emit_xmm_offset_into_t9(t_[4]);
+        o += std::string("    movups xmm0, [") + r64(ctx_) + " + " + r64(t_[9]) + "]\n";
+        emit_xmm_offset_into_t9(t_[7]);
+        o += std::string("    movups xmm1, [") + r64(ctx_) + " + " + r64(t_[9]) + "]\n";
+        o += "    subpd xmm0, xmm1\n";
         emit_xmm_offset_into_t9(t_[4]);
         o += std::string("    movups [") + r64(ctx_) + " + " + r64(t_[9]) + "], xmm0\n";
         o += advance(dispatch);
@@ -2248,6 +2329,12 @@ RuntimeGenResult generate_runtime(wvmp::Rng& rng) {
         {int(VmOp::Addss), "addss", &AsmGen::build_addss},
         {int(VmOp::Addps), "addps", &AsmGen::build_addps},
         {int(VmOp::Addpd), "addpd", &AsmGen::build_addpd},
+        // MIT-373: SSE 浮点减 subss/subps/subpd (3 形式, REG-REG only, 沿用
+        // MIT-371 addss/addps/addpd 模板 + 硬编码 xmm0/xmm1 物理寄存器; 复用
+        // VmContext.xmm[8] 跟踪区, 无需 MASM helper 强制 codegen).
+        {int(VmOp::Subss), "subss", &AsmGen::build_subss},
+        {int(VmOp::Subps), "subps", &AsmGen::build_subps},
+        {int(VmOp::Subpd), "subpd", &AsmGen::build_subpd},
         {int(VmOp::Cmp), "cmp", &AsmGen::build_cmp},
         {int(VmOp::Test), "test", &AsmGen::build_test},
         {int(VmOp::Load), "load", &AsmGen::build_load},

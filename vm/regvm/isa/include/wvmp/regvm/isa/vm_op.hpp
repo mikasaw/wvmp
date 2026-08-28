@@ -291,9 +291,47 @@ enum class VmOp : u16 {
     //   派活单 §D 决策: Addss/Addps/Addpd 必 append-only 在 Tzcount 之后
     //   (pitfall #34 additive enum append-only)。
     Addpd,
+
+    // —— MIT-373 SSE 浮点减 (subss / subps / subpd)——
+    // Subss (Reg-Reg, scalar single):
+    //   xmm1 = xmm1 - xmm2 (low 32-bit float, scalar); upper 96 bits unchanged。
+    //   字节结构: F3 0F 5C /r (REG-REG, mod=11)。
+    //   a_kind=Reg reg_a=dst (xmm1), b_kind=Reg reg_b=src (xmm2),
+    //   aux=0, cond_or_size=ir::Size::S32 (scalar single)。
+    //   handler: movups xmm0, [ctx + reg_a*8 + 0x10]    (读 dst xmm)
+    //            movups xmm1, [ctx + reg_b*8 + 0x10]    (读 src xmm)
+    //            subss xmm0, xmm1                       (scalar 单精度浮点减)
+    //            movups [ctx + reg_a*8 + 0x10], xmm0    (写回 dst xmm)
+    //   不影响 EFLAGS (CF/OF/SF/ZF/PF 不变); updates_flags=false。
+    Subss,
+    // Subps (Reg-Reg, packed single):
+    //   xmm1 = xmm1 - xmm2 (4 个 f32 packed, lane-parallel); 全 128-bit。
+    //   字节结构: 0F 5C /r (REG-REG, mod=11)。
+    //   a_kind=Reg reg_a=dst (xmm1), b_kind=Reg reg_b=src (xmm2),
+    //   aux=0, cond_or_size=ir::Size::S64 (packed 128-bit; handler 用
+    //   movups 全 128-bit 读写; size 字段沿用 S64 占位表示 "xmm 宽")。
+    //   handler: movups xmm0, [ctx + reg_a*8 + 0x10]    (读 dst xmm)
+    //            movups xmm1, [ctx + reg_b*8 + 0x10]    (读 src xmm)
+    //            subps xmm0, xmm1                       (packed 单精度 4-lane 减)
+    //            movups [ctx + reg_a*8 + 0x10], xmm0    (写回 dst xmm)
+    //   不影响 EFLAGS; updates_flags=false。
+    Subps,
+    // Subpd (Reg-Reg, packed double):
+    //   xmm1 = xmm1 - xmm2 (2 个 f64 packed, lane-parallel); 全 128-bit。
+    //   字节结构: 66 0F 5C /r (REG-REG, mod=11, 0x66 prefix 隐式)。
+    //   a_kind=Reg reg_a=dst (xmm1), b_kind=Reg reg_b=src (xmm2),
+    //   aux=0, cond_or_size=ir::Size::S64 (packed 128-bit; 同 Subps)。
+    //   handler: movups xmm0, [ctx + reg_a*8 + 0x10]    (读 dst xmm)
+    //            movups xmm1, [ctx + reg_b*8 + 0x10]    (读 src xmm)
+    //            subpd xmm0, xmm1                       (packed 双精度 2-lane 减)
+    //            movups [ctx + reg_a*8 + 0x10], xmm0    (写回 dst xmm)
+    //   不影响 EFLAGS; updates_flags=false。
+    //   派活单 §D 决策: Subss/Subps/Subpd 必 append-only 在 Addss/Addps/Addpd
+    //   之后 (pitfall #34 additive enum append-only)。
+    Subpd,
 };
 
-inline constexpr u16 kVmOpMax = static_cast<u16>(VmOp::Addpd);
+inline constexpr u16 kVmOpMax = static_cast<u16>(VmOp::Subpd);
 inline constexpr u16 kVmOpLimit = 1u << 14;  // 14 位编码空间上限
 
 constexpr const char* to_string(VmOp op) {
@@ -343,6 +381,9 @@ constexpr const char* to_string(VmOp op) {
         case VmOp::Addss: return "addss";
         case VmOp::Addps: return "addps";
         case VmOp::Addpd: return "addpd";
+        case VmOp::Subss: return "subss";
+        case VmOp::Subps: return "subps";
+        case VmOp::Subpd: return "subpd";
     }
     return "?";
 }

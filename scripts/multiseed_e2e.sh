@@ -14,7 +14,8 @@
 #   - MIT-347: extend to wvmp_cl_shift_sample (movsx 4 形式 8→32/8→64/16→32/
 #     16→64 真虚拟化, sign-extend, 与 movzx 对偶 zero-extend).
 #   - MIT-371: extend to wvmp_sse_add_sample (SSE 浮点加 addss/addps/addpd 3 形式真虚拟化).
-#     Total: 12 samples × 5 seeds = 60 runs.
+#   - MIT-373: extend to wvmp_sse_sub_sample (SSE 浮点减 subss/subps/subpd 3 形式真虚拟化).
+#     Total: 13 samples × 5 seeds = 65 runs.
 #   - MIT-306: REQUIRE_REAL=1 校验日志含 "已生成 N 个入口 stub" 防止 C1 gate
 #     兜底被误判 PASS（仅 byte-exact 不够, C1 gate 函数被跳过仍能输出相同
 #     stdout+rc）。与 multiseed_e2e_real.sh 配套使用。
@@ -42,6 +43,7 @@ samples=(
     "build/passes/marker_scan/tests/wvmp_cmovcc_sample.exe"
     "build/passes/marker_scan/tests/wvmp_cmpxchg_sample.exe"
     "build/passes/marker_scan/tests/wvmp_sse_add_sample.exe"
+    "build/passes/marker_scan/tests/wvmp_sse_sub_sample.exe"
 )
 
 # Seeds: 1 (small), 12345 (default), 99999 (large), 0xDEADBEEF (magic), 0xCAFEBABE (magic).

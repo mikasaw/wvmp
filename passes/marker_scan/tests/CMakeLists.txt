@@ -340,3 +340,25 @@ target_compile_options(wvmp_sse_add_sample PRIVATE
 target_link_options(wvmp_sse_add_sample PRIVATE
     $<$<CXX_COMPILER_ID:MSVC>:/INCREMENTAL:NO>
 )
+
+# MIT-373: 端到端正路径样本——区域内含 SSE 浮点减 subss/subps/subpd
+# (3 形式 REG-REG only), 验证 SSE 浮点减支持后翻译成功、运行时走真 Subss/
+# Subps/Subpd handler、行为与原生逐字节一致。MSVC x64 不支持 inline asm,
+# 高 level C++ 在 /Od 下对 _mm_sub_ss/_mm_sub_ps/_mm_sub_pd 内部函数会**融合
+# load+sub 为 MEM 形式**, 故 SSE 字节由 sse_sub_sample_asm.asm (MASM)
+# 直接 emit 真 REG-REG subss/subps/subpd 字节（F3 0F 5C / 0F 5C / 66 0F 5C,
+# mod=11）, 链接进本 sample。区域不含 rip-relative / printf / call
+# (printf 在 main 区域外)。
+enable_language(ASM_MASM)
+add_executable(wvmp_sse_sub_sample
+    sse_sub_sample_main.cpp
+    sse_sub_sample_asm.asm
+)
+target_link_libraries(wvmp_sse_sub_sample PRIVATE wvmp::sdk)
+target_compile_options(wvmp_sse_sub_sample PRIVATE
+    $<$<CXX_COMPILER_ID:MSVC>:/Od;/Ob0;/utf-8>
+    $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-O0>
+)
+target_link_options(wvmp_sse_sub_sample PRIVATE
+    $<$<CXX_COMPILER_ID:MSVC>:/INCREMENTAL:NO>
+)
