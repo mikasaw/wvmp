@@ -973,6 +973,56 @@ TranslateResult translate_sse_sub(const cs_insn& ci, const cs_x86& x, ir::Arch a
     return ok(out);
 }
 
+// MIT-374: SSE 浮点除 divss/divps/divpd (REG-REG only, mod=11).
+// 与 translate_sse_sub (MIT-373) / translate_sse_add (MIT-371) 同构: XMM 寄存器
+// 编码借用 ir::Reg 值 0..7, 翻译期加 24 偏移 → VmContext.regs[24..31]
+// (XMM 编码设计见上方 MIT-371 注释块).
+//   - divss xmm1, xmm2/m32  F3 0F 5E /r  (scalar single, 1 element)
+//   - divps xmm1, xmm2/m128 0F 5E /r     (packed single, 4 elements)
+//   - divpd xmm1, xmm2/m128 66 0F 5E /r  (packed double, 2 elements)
+//   (capstone 5.0.7 实证: F30F5EC1/0F5EC1/660F5EC1 → divss/divps/divpd xmm0,xmm1)
+//   - size 字段: divss=ir::Size::S32 (scalar 单精度), divps/divpd=ir::Size::S64
+//     (packed 128-bit; handler 用 movups 全 128-bit 读写)。size 不影响 codegen,
+//     仅作 divss/divps/divpd 的区分 tag（handler 也按 size 派发）。
+//   - 除零 / NaN / 非规格化语义: 由 handler 内的真 div* 指令在 native MXCSR
+//     下保真执行 (与未保护路径同一舍入模式), v1 不额外追踪。
+//   - updates_flags=false (SSE 浮点除不影响 x86 EFLAGS; MXCSR rounding mode
+//     v1 不追踪)。
+TranslateResult translate_sse_div(const cs_insn& ci, const cs_x86& x, ir::Arch arch, Op op,
+                                  ir::Size sz) {
+    if (x.op_count != 2) return unsupported(ci.address, ci.size);
+    // 两个操作数必都是 XMM 寄存器 (派活单限定不支持 MEM form).
+    if (x.operands[0].type != X86_OP_REG) return unsupported(ci.address, ci.size);
+    if (x.operands[1].type != X86_OP_REG) return unsupported(ci.address, ci.size);
+    // 手动 XMM 编号映射（X86_REG_XMM0..XMM7 → 0..7），不调 to_operand/map_reg
+    // (它们对 XMM* 返回 nullopt, 沿用 SEG/xmm 不可映射的现有约定).
+    auto xmm_idx = [&](x86_reg r) -> std::optional<u8> {
+        switch (r) {
+        case X86_REG_XMM0: return static_cast<u8>(0); case X86_REG_XMM1: return static_cast<u8>(1);
+        case X86_REG_XMM2: return static_cast<u8>(2); case X86_REG_XMM3: return static_cast<u8>(3);
+        case X86_REG_XMM4: return static_cast<u8>(4); case X86_REG_XMM5: return static_cast<u8>(5);
+        case X86_REG_XMM6: return static_cast<u8>(6); case X86_REG_XMM7: return static_cast<u8>(7);
+        default: return std::nullopt;
+        }
+    };
+    auto di = xmm_idx(x.operands[0].reg);
+    auto si = xmm_idx(x.operands[1].reg);
+    if (!di || !si) return unsupported(ci.address, ci.size);
+    // IR Insn.dst.reg / IR.src.reg 借用现有 ir::Reg 值 0..7 (Rax..Rdi), 翻译器
+    // 层在 dispatch Divss/Divps/Divpd 时识别 "这是 SSE Op, 加 24 偏移 → v24..v31".
+    // 用 static_cast 把 u8 xmm 索引写成 ir::Reg 枚举值（编译期已知 0..7 落在
+    // ir::Reg 值域内, 编译器接受该 cast）。
+    (void)arch;
+    ir::Insn out;
+    out.op = op;
+    out.addr = ci.address;
+    out.size = sz;
+    out.updates_flags = false;
+    out.dst = ir::Operand::reg_(static_cast<ir::Reg>(*di));
+    out.src = ir::Operand::reg_(static_cast<ir::Reg>(*si));
+    return ok(out);
+}
+
 TranslateResult translate_cmpxchg(const cs_insn& ci, const cs_x86& x, ir::Arch arch) {
     if (x.op_count != 2) return unsupported(ci.address, ci.size);
     // dst 必为 r/m (REG 或 MEM); src 必为 REG
@@ -1203,6 +1253,16 @@ TranslateResult translate_insn(const cs_insn& ci, ir::Arch arch) {
     case X86_INS_SUBSS: return translate_sse_sub(ci, x, arch, Op::Subss, Size::S32);
     case X86_INS_SUBPS: return translate_sse_sub(ci, x, arch, Op::Subps, Size::S64);
     case X86_INS_SUBPD: return translate_sse_sub(ci, x, arch, Op::Subpd, Size::S64);
+    // MIT-374: SSE 浮点除 divss/divps/divpd (REG-REG only, mod=11).
+    //   - divss xmm1, xmm2/m32  F3 0F 5E /r  (scalar single, size=S32)
+    //   - divps xmm1, xmm2/m128 0F 5E /r     (packed single, size=S64)
+    //   - divpd xmm1, xmm2/m128 66 0F 5E /r  (packed double, size=S64)
+    // MASM helper 强制 codegen (pitfall #35): /Od 下 intrinsics 会融合
+    // load+div 为 MEM 形式, E2E 样本由 sse_div_sample_asm.asm emit 真 REG-REG 字节.
+    // divsd (F2 0F 5E, scalar double) 不在本单范围 → 落 C1 gate 兜底.
+    case X86_INS_DIVSS: return translate_sse_div(ci, x, arch, Op::Divss, Size::S32);
+    case X86_INS_DIVPS: return translate_sse_div(ci, x, arch, Op::Divps, Size::S64);
+    case X86_INS_DIVPD: return translate_sse_div(ci, x, arch, Op::Divpd, Size::S64);
     case X86_INS_BSWAP: return translate_bswap(ci, x, arch);
     case X86_INS_XCHG: return translate_xchg(ci, x, arch);
     // MIT-336: setcc 16 variants (0F 90+cc+rm, mod=11 REG / mod=00 MEM).

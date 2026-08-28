@@ -5,13 +5,14 @@
 //
 // ============================== 机器码布局 ==============================
 //
-//   [entry][dispatch][handler..（码序随机）][0x90 垫片至 8 对齐][跳转表 64xu64]
+//   [entry][dispatch][handler..（码序随机）][0x90 垫片至 8 对齐][跳转表 128xu64]
 //    ^入口    ^取指/跳表   ^各自独立 ks_asm          ^表项=handler 相对码基址偏移
 //
 //   - 入口在 code 偏移 0：`lea BASE,[rip-7]` 取得码基址（位置无关），
 //     保存 Win64 callee-saved（rbx/rbp/rdi/rsi/r12-r15 共 8 个），RCX 的
 //     VmContext* 存入随机指派的 CTX 寄存器，初始化后跌入 dispatch 循环；
-//   - dispatch：fetch `T8=[BYTE+PC*8]` → `and T0,0x3F` →
+//   - dispatch：fetch `T8=[BYTE+PC*8]` → `and T0,kTableEntries-1`（=0x7F，
+//     MIT-374 起 7 位）→
 //     `T1=[BASE+T0*8+表偏移]` → `add T1,BASE` → `jmp T1`（表偏移为 disp32）；
 //   - 每个 handler 末尾 `add PC,1; jmp dispatch`（Jmp/Jcc 直接改写 PC）；
 //   - Halt：写回 ctx->pc 与 ctx->ret_value(=regs[v0])，恢复现场 ret。
@@ -24,7 +25,7 @@
 //     逐 handler 以“运行地址 = 入口+dispatch 尺寸+已累计尺寸”独立汇编，
 //     各自内部标签互不冲突，天然拿到精确偏移；
 //     第 2 遍：dispatch 以真实表偏移重汇编——disp32 定宽，尺寸与第 1 遍
-//     一致（生成后断言校验），最后把 64 个 u64 表项原样追加进码尾。
+//     一致（生成后断言校验），最后把 kTableEntries 个 u64 表项原样追加进码尾。
 //
 // ============================ 寄存器随机化 ==============================
 //
@@ -176,8 +177,24 @@ constexpr PhysNames kPhys[14] = {
 constexpr int kPersistent = 4;
 static_assert(kPersistent + 10 == 14, "4 持久 + 10 临时 = 14 可分配");
 
-// 跳转表：opcode 低 6 位索引（合法 opcode 1..32；0/越界折叠到 Halt=非法停机）。
-constexpr u64 kTableEntries = 64;
+// 跳转表：dispatch 用 opcode 低 log2(kTableEntries) 位索引；0/越界折叠到
+// Halt=非法停机。
+//
+// MIT-374 阻断性缺陷（诚实披露，改修复方向）：本表原为 64 项 + `and T0,0x3F`
+// （6 位）。VmOp 是 append-only 枚举，MIT-373 合入后 Subpd 已占满最后一个
+// 6 位槽位（值 63），Divss/Divps/Divpd = 64/65/66 **越过 6 位跳表空间** →
+// `and 0x3F` 把它们掩成 0 → 折叠到 halt handler → Halt 写回 pc+1 且恢复 ctx
+// （陷阱 #7 的"恢复友好"语义），于是区域照跑、xmm 槽照恢复、退出码照 0，
+// 只是浮点除**整条空转**——与 MIT-371 裸立即数空转同一表象、不同根因。
+// 字节码字段的 opcode 本身是 14 位（isa/encoding.cpp kOpMask），不受此限制，
+// 需要加宽的只有运行时的跳表与掩码。故 64 → 128（7 位，Divpd 之后还能再放
+// 61 个 op，覆盖 MIT-375/376 的 SSE 传送/位运算批次），并加 static_assert
+// 把"枚举越界"从**运行时空转**升级为**编译期失败**。
+constexpr u64 kTableEntries = 128;
+static_assert(isa::kVmOpMax < kTableEntries,
+              "VmOp 枚举已越过 dispatch 跳表空间：新 opcode 会被掩码折叠到 halt "
+              "并静默空转（MIT-374 根因）。请加宽 kTableEntries（2 的幂）并同步 "
+              "build_dispatch 的掩码（自动由 kTableEntries-1 导出）。");
 
 // 立即数一律 0x 十六进制书写：keystone 的 Intel 语法把裸数字按 16 进制
 // 解析（`and r15, 15` 会编码成 0x15），十进制值必须显式 0x 换算。
@@ -330,7 +347,7 @@ public:
         o += std::string("    mov ") + r64(t_[8]) + ", qword ptr [" + r64(t_[0]) + " + " +
              r64(pc_) + "*8]\n";
         o += std::string("    mov ") + r64(t_[0]) + ", " + r64(t_[8]) + "\n";
-        o += std::string("    and ") + r64(t_[0]) + ", 0x3F\n";
+        o += std::string("    and ") + r64(t_[0]) + ", " + imm(kTableEntries - 1) + "\n";
         o += std::string("    mov ") + r64(t_[1]) + ", qword ptr [" + r64(base_) + " + " +
              r64(t_[0]) + "*8 + " + hex(table_off) + "]\n";
         o += std::string("    add ") + r64(t_[1]) + ", " + r64(base_) + "\n";
@@ -1191,6 +1208,89 @@ public:
         emit_xmm_offset_into_t9(t_[7]);
         o += std::string("    movups xmm1, [") + r64(ctx_) + " + " + r64(t_[9]) + "]\n";
         o += "    subpd xmm0, xmm1\n";
+        emit_xmm_offset_into_t9(t_[4]);
+        o += std::string("    movups [") + r64(ctx_) + " + " + r64(t_[9]) + "], xmm0\n";
+        o += advance(dispatch);
+        (void)tag;
+        return o;
+    }
+
+    // MIT-374 Divss: scalar single-precision FP div (xmm1 = xmm1 / xmm2)。
+    //   字节结构: F3 0F 5E /r (REG-REG, mod=11; capstone 实证 F30F5EC1)。
+    //   编码: reg_a=xmm_dst_slot (24..31, translator 从 IR 0..7 加 24 偏移),
+    //         reg_b=xmm_src_slot (24..31), aux=0, cond_or_size=ir::Size::S32。
+    //   xmm 槽位: VmContext.xmm[8] @ +0x140（MIT-371 SSE 跟踪区, MIT-374 复用,
+    //   无需改 VmContext 布局 / stub_gen kCtxSize）。
+    //   handler: 算 dst/src 槽位偏移 → movups 读/写 128-bit → divss。
+    //   硬约束 (SSE/Block 模板 #1): 槽位偏移公式的 24/4/0x140 一律经 imm(),
+    //   禁止裸多位数字 (MIT-371 空转 / MIT-373 8ed50b0 根因)。
+    //   不影响 EFLAGS; 不调 setcc5 也不走 flags_tail, 直接 advance(dispatch)。
+    std::string build_divss(u64 dispatch) const {
+        const std::string tag = "divss" + std::to_string(seq());
+        std::string o = decode_prelude();
+        // T4 = reg_a (24..31). 算 xmm 槽位偏移到 T9 (Keystone 不支持 (reg-24)*16,
+        // 拆为 sub 24 → shl 4 → add 0x140, 三个常量全走 imm())。
+        auto emit_xmm_offset_into_t9 = [&](int reg_t) {
+            o += std::string("    mov ") + r64(t_[9]) + ", " + r64(reg_t) + "\n";
+            o += std::string("    sub ") + r64(t_[9]) + ", " + imm(24) + "\n";
+            o += std::string("    shl ") + r64(t_[9]) + ", " + imm(4) + "\n";
+            o += std::string("    add ") + r64(t_[9]) + ", " + imm(0x140) + "\n";
+        };
+        emit_xmm_offset_into_t9(t_[4]);  // T9 = dst 偏移
+        o += std::string("    movups xmm0, [") + r64(ctx_) + " + " + r64(t_[9]) + "]\n";
+        emit_xmm_offset_into_t9(t_[7]);  // T9 = src 偏移
+        o += std::string("    movups xmm1, [") + r64(ctx_) + " + " + r64(t_[9]) + "]\n";
+        o += "    divss xmm0, xmm1\n";
+        emit_xmm_offset_into_t9(t_[4]);  // 重算 dst 偏移写回
+        o += std::string("    movups [") + r64(ctx_) + " + " + r64(t_[9]) + "], xmm0\n";
+        o += advance(dispatch);
+        (void)tag;
+        return o;
+    }
+
+    // MIT-374 Divps: packed single-precision FP div (4xf32 lane-parallel)。
+    //   字节结构: 0F 5E /r (REG-REG, mod=11; capstone 实证 0F5EC1)。
+    //   编码: reg_a=24..31 (xmm_dst_slot), reg_b=24..31 (xmm_src_slot),
+    //         aux=0, cond_or_size=ir::Size::S64 (packed 128-bit 占位)。
+    std::string build_divps(u64 dispatch) const {
+        const std::string tag = "divps" + std::to_string(seq());
+        std::string o = decode_prelude();
+        auto emit_xmm_offset_into_t9 = [&](int reg_t) {
+            o += std::string("    mov ") + r64(t_[9]) + ", " + r64(reg_t) + "\n";
+            o += std::string("    sub ") + r64(t_[9]) + ", " + imm(24) + "\n";
+            o += std::string("    shl ") + r64(t_[9]) + ", " + imm(4) + "\n";
+            o += std::string("    add ") + r64(t_[9]) + ", " + imm(0x140) + "\n";
+        };
+        emit_xmm_offset_into_t9(t_[4]);
+        o += std::string("    movups xmm0, [") + r64(ctx_) + " + " + r64(t_[9]) + "]\n";
+        emit_xmm_offset_into_t9(t_[7]);
+        o += std::string("    movups xmm1, [") + r64(ctx_) + " + " + r64(t_[9]) + "]\n";
+        o += "    divps xmm0, xmm1\n";
+        emit_xmm_offset_into_t9(t_[4]);
+        o += std::string("    movups [") + r64(ctx_) + " + " + r64(t_[9]) + "], xmm0\n";
+        o += advance(dispatch);
+        (void)tag;
+        return o;
+    }
+
+    // MIT-374 Divpd: packed double-precision FP div (2xf64 lane-parallel)。
+    //   字节结构: 66 0F 5E /r (REG-REG, mod=11, 0x66 prefix 隐式; 实证 660F5EC1)。
+    //   编码: reg_a=24..31 (xmm_dst_slot), reg_b=24..31 (xmm_src_slot),
+    //         aux=0, cond_or_size=ir::Size::S64。
+    std::string build_divpd(u64 dispatch) const {
+        const std::string tag = "divpd" + std::to_string(seq());
+        std::string o = decode_prelude();
+        auto emit_xmm_offset_into_t9 = [&](int reg_t) {
+            o += std::string("    mov ") + r64(t_[9]) + ", " + r64(reg_t) + "\n";
+            o += std::string("    sub ") + r64(t_[9]) + ", " + imm(24) + "\n";
+            o += std::string("    shl ") + r64(t_[9]) + ", " + imm(4) + "\n";
+            o += std::string("    add ") + r64(t_[9]) + ", " + imm(0x140) + "\n";
+        };
+        emit_xmm_offset_into_t9(t_[4]);
+        o += std::string("    movups xmm0, [") + r64(ctx_) + " + " + r64(t_[9]) + "]\n";
+        emit_xmm_offset_into_t9(t_[7]);
+        o += std::string("    movups xmm1, [") + r64(ctx_) + " + " + r64(t_[9]) + "]\n";
+        o += "    divpd xmm0, xmm1\n";
         emit_xmm_offset_into_t9(t_[4]);
         o += std::string("    movups [") + r64(ctx_) + " + " + r64(t_[9]) + "], xmm0\n";
         o += advance(dispatch);
@@ -2335,6 +2435,12 @@ RuntimeGenResult generate_runtime(wvmp::Rng& rng) {
         {int(VmOp::Subss), "subss", &AsmGen::build_subss},
         {int(VmOp::Subps), "subps", &AsmGen::build_subps},
         {int(VmOp::Subpd), "subpd", &AsmGen::build_subpd},
+        // MIT-374: SSE 浮点除 divss/divps/divpd (3 形式, REG-REG only, 沿用
+        // MIT-371 add / MIT-373 sub 模板 + 硬编码 xmm0/xmm1 物理寄存器; 复用
+        // VmContext.xmm[8] 跟踪区 @ +0x140, 槽位偏移常量全走 imm()).
+        {int(VmOp::Divss), "divss", &AsmGen::build_divss},
+        {int(VmOp::Divps), "divps", &AsmGen::build_divps},
+        {int(VmOp::Divpd), "divpd", &AsmGen::build_divpd},
         {int(VmOp::Cmp), "cmp", &AsmGen::build_cmp},
         {int(VmOp::Test), "test", &AsmGen::build_test},
         {int(VmOp::Load), "load", &AsmGen::build_load},
@@ -2404,7 +2510,8 @@ RuntimeGenResult generate_runtime(wvmp::Rng& rng) {
         dump += "; ---- handler " + std::string(h.name) + " @ +" + hex(handler_off.at(h.opcode)) +
                 " ----\n" + handler_text.at(h.opcode) + "\n";
     dump += "; ---- jump table @ +" + hex(table_off) +
-            " (64 x u64 LE, 项 = handler 相对码基址偏移；0/未实现 → halt) ----\n";
+            " (" + std::to_string(kTableEntries) +
+            " x u64 LE, 项 = handler 相对码基址偏移；0/未实现 → halt) ----\n";
     for (u64 op = 0; op < kTableEntries; ++op)
         if (handler_off.count(int(op)))
             dump += ";   [" + std::to_string(op) + "] = " + hex(handler_off.at(int(op))) + "\n";

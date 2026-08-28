@@ -384,3 +384,46 @@ target_compile_options(wvmp_sse_subss_xmm_readback_sample PRIVATE
 target_link_options(wvmp_sse_subss_xmm_readback_sample PRIVATE
     $<$<CXX_COMPILER_ID:MSVC>:/INCREMENTAL:NO>
 )
+
+# MIT-374: 端到端正路径样本——区域内含 SSE 浮点除 divss/divps/divpd
+# (3 形式 REG-REG only), 验证 SSE 浮点除支持后翻译成功、运行时走真 Divss/
+# Divps/Divpd handler、行为与原生逐字节一致。MSVC x64 不支持 inline asm,
+# 高 level C++ 在 /Od 下对 _mm_div_ss/_mm_div_ps/_mm_div_pd 内部函数会**融合
+# load+div 为 MEM 形式**, 故 SSE 字节由 sse_div_sample_asm.asm (MASM)
+# 直接 emit 真 REG-REG divss/divps/divpd 字节（F3 0F 5E / 0F 5E / 66 0F 5E,
+# mod=11）, 链接进本 sample。区域不含 rip-relative / printf / call
+# (printf 在 main 区域外)。
+enable_language(ASM_MASM)
+add_executable(wvmp_sse_div_sample
+    sse_div_sample_main.cpp
+    sse_div_sample_asm.asm
+)
+target_link_libraries(wvmp_sse_div_sample PRIVATE wvmp::sdk)
+# COMPILE_LANGUAGE 限定 C/C++: 避免 C++ 选项传给 MASM (A4018), 同 MIT-389 块。
+target_compile_options(wvmp_sse_div_sample PRIVATE
+    $<$<AND:$<CXX_COMPILER_ID:MSVC>,$<COMPILE_LANGUAGE:C,CXX>>:/Od;/Ob0;/utf-8>
+    $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-O0>
+)
+target_link_options(wvmp_sse_div_sample PRIVATE
+    $<$<CXX_COMPILER_ID:MSVC>:/INCREMENTAL:NO>
+)
+
+# MIT-374: 影子样本——divss 的 ctx.xmm 运行时读回断言 (WVmpVerifier 验收门 A.2,
+# 沿用 MIT-389 subss 影子样本模式)。与 wvmp_sse_div_sample 的 sse_divss 同 IR
+# 配对, 额外把 ctx.xmm 槽位经 stub 恢复路径的可见出口 (返回值 + 区域后原生
+# store) 全量打印: 返回值 = HALT 时 ctx.xmm[dst] 读回; 未触碰槽位必须保持 VM
+# 入口同步值。native vs virtualized byte-exact; handler 空转 (写错槽) 时读回 =
+# 入口旧值, 与原生不一致 → FAIL。
+enable_language(ASM_MASM)
+add_executable(wvmp_sse_divss_xmm_readback_sample
+    sse_divss_xmm_readback_sample_main.cpp
+    sse_divss_xmm_readback_sample_asm.asm
+)
+target_link_libraries(wvmp_sse_divss_xmm_readback_sample PRIVATE wvmp::sdk)
+target_compile_options(wvmp_sse_divss_xmm_readback_sample PRIVATE
+    $<$<AND:$<CXX_COMPILER_ID:MSVC>,$<COMPILE_LANGUAGE:C,CXX>>:/Od;/Ob0;/utf-8>
+    $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-O0>
+)
+target_link_options(wvmp_sse_divss_xmm_readback_sample PRIVATE
+    $<$<CXX_COMPILER_ID:MSVC>:/INCREMENTAL:NO>
+)

@@ -326,6 +326,13 @@ struct Translator {
                 // 是 xmm0..xmm7 编号 (lifter 借用 ir::Reg 值 0..7), 翻译期
                 // 加 24 偏移映射到 VmContext.regs[24..31] 保留槽位.
                 ok = translate_sse_sub(em, in);
+            } else if (in.op == ir::Op::Divss || in.op == ir::Op::Divps || in.op == ir::Op::Divpd) {
+                // MIT-374: SSE 浮点除 dispatch — REG-REG 形式 emit 单条
+                // VmOp::Divss/Divps/Divpd (handler 用 native divss/divps/divpd
+                // 完成浮点除; src 必是 XMM 派活单限定). IR.dst.reg/IR.src.reg
+                // 是 xmm0..xmm7 编号 (lifter 借用 ir::Reg 值 0..7), 翻译期
+                // 加 24 偏移映射到 VmContext.regs[24..31] 保留槽位.
+                ok = translate_sse_div(em, in);
             } else if (in.op == ir::Op::Bswap) {
                 ok = translate_bswap(em, in);
             } else if (in.op == ir::Op::Xchg) {
@@ -1007,6 +1014,32 @@ struct Translator {
         const u8 xmm_src_slot = static_cast<u8>(in.src.reg) + 24u;
         VmOp vop = (in.op == ir::Op::Subss) ? VmOp::Subss :
                    (in.op == ir::Op::Subps) ? VmOp::Subps : VmOp::Subpd;
+        em.emit_rr(vop, xmm_dst_slot, xmm_src_slot, isa::size_field(in.size));
+        return true;
+    }
+
+    // ---- MIT-374: SSE 浮点除 divss/divps/divpd ----
+    //
+    // 与 MIT-373 translate_sse_sub 完全同构: lifter 用 IR.dst.reg / IR.src.reg
+    // 借用 ir::Reg 值 0..7 (Rax..Rdi), 翻译期加 24 偏移映射到
+    // VmContext.regs[24..31] 保留槽位 (这里用作 xmm0..xmm7 VM 槽). 翻译器只
+    // emit 字节码, 真正 xmm 物理寄存器寻址在 handler (asmgen.cpp) 用 movups +
+    // native divss/divps/divpd 完成.
+    //
+    // 编码: a_kind=Reg reg_a=xmm_slot, b_kind=Reg reg_b=xmm_slot, aux=0,
+    //       cond_or_size=ir::Size (S32=Divss scalar, S64=Divps/Divpd packed).
+    bool translate_sse_div(Emitter& em, const ir::Insn& in) {
+        if (in.op != ir::Op::Divss && in.op != ir::Op::Divps && in.op != ir::Op::Divpd)
+            return false;
+        if (in.dst.kind != ir::Operand::Kind::Reg ||
+            in.src.kind != ir::Operand::Kind::Reg)
+            return skip(in, "SSE 浮点除 操作数形态未支持", nullptr);
+        // IR.dst.reg / IR.src.reg 在 lifter 借用 ir::Reg 值 0..7 代表 xmm0..7.
+        // static_cast<u8> 拿到原始 u8 索引, 加 24 偏移到 VmContext.regs[24..31].
+        const u8 xmm_dst_slot = static_cast<u8>(in.dst.reg) + 24u;
+        const u8 xmm_src_slot = static_cast<u8>(in.src.reg) + 24u;
+        VmOp vop = (in.op == ir::Op::Divss) ? VmOp::Divss :
+                   (in.op == ir::Op::Divps) ? VmOp::Divps : VmOp::Divpd;
         em.emit_rr(vop, xmm_dst_slot, xmm_src_slot, isa::size_field(in.size));
         return true;
     }

@@ -55,6 +55,9 @@ std::string_view to_string(Op op) {
     case Op::Subss: return "subss";
     case Op::Subps: return "subps";
     case Op::Subpd: return "subpd";
+    case Op::Divss: return "divss";
+    case Op::Divps: return "divps";
+    case Op::Divpd: return "divpd";
     }
     return "?";
 }

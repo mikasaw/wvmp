@@ -4,7 +4,10 @@
 namespace wvmp::regvm::isa {
 
 // VM 操作码：与 ir::Op 一一同义（值从 1 起，0 为非法哨兵），外加 VM 专属操作。
-// 编码空间上限 14 位（kVmOpLimit），当前仅用低 6 位。
+// 编码空间上限 14 位（kVmOpLimit）。运行时 dispatch 跳表按 opcode 低 7 位索引
+// （asmgen.cpp kTableEntries=128，MIT-374 起；此前 6 位 = 64 项，Subpd=63 恰好
+// 占满，Divss=64 起越界静默折叠到 halt）。追加枚举前先看 asmgen.cpp 的
+// static_assert(kVmOpMax < kTableEntries) 是否仍成立。
 enum class VmOp : u16 {
     Mov = 1, Lea, Add, Sub, Adc, Sbb, And, Or, Xor, Not, Neg, Inc, Dec,
     Shl, Shr, Sar, Rol, Ror, Cmp, Test, Push, Pop, Jmp, Jcc, Call, Ret,
@@ -329,9 +332,48 @@ enum class VmOp : u16 {
     //   派活单 §D 决策: Subss/Subps/Subpd 必 append-only 在 Addss/Addps/Addpd
     //   之后 (pitfall #34 additive enum append-only)。
     Subpd,
+
+    // —— MIT-374 SSE 浮点除 (divss / divps / divpd)——
+    // Divss (Reg-Reg, scalar single):
+    //   xmm1 = xmm1 / xmm2 (low 32-bit float, scalar); upper 96 bits unchanged。
+    //   字节结构: F3 0F 5E /r (REG-REG, mod=11; capstone 5.0.7 实证 F30F5EC1)。
+    //   a_kind=Reg reg_a=dst (xmm1), b_kind=Reg reg_b=src (xmm2),
+    //   aux=0, cond_or_size=ir::Size::S32 (scalar single)。
+    //   handler: movups xmm0, [ctx + reg_a*8 + 0x10]    (读 dst xmm)
+    //            movups xmm1, [ctx + reg_b*8 + 0x10]    (读 src xmm)
+    //            divss xmm0, xmm1                       (scalar 单精度浮点除)
+    //            movups [ctx + reg_a*8 + 0x10], xmm0    (写回 dst xmm)
+    //   不影响 EFLAGS (CF/OF/SF/ZF/PF 不变); updates_flags=false。
+    Divss,
+    // Divps (Reg-Reg, packed single):
+    //   xmm1 = xmm1 / xmm2 (4 个 f32 packed, lane-parallel); 全 128-bit。
+    //   字节结构: 0F 5E /r (REG-REG, mod=11; capstone 实证 0F5EC1)。
+    //   a_kind=Reg reg_a=dst (xmm1), b_kind=Reg reg_b=src (xmm2),
+    //   aux=0, cond_or_size=ir::Size::S64 (packed 128-bit; handler 用
+    //   movups 全 128-bit 读写; size 字段沿用 S64 占位表示 "xmm 宽")。
+    //   handler: movups xmm0, [ctx + reg_a*8 + 0x10]    (读 dst xmm)
+    //            movups xmm1, [ctx + reg_b*8 + 0x10]    (读 src xmm)
+    //            divps xmm0, xmm1                       (packed 单精度 4-lane 除)
+    //            movups [ctx + reg_a*8 + 0x10], xmm0    (写回 dst xmm)
+    //   不影响 EFLAGS; updates_flags=false。
+    Divps,
+    // Divpd (Reg-Reg, packed double):
+    //   xmm1 = xmm1 / xmm2 (2 个 f64 packed, lane-parallel); 全 128-bit。
+    //   字节结构: 66 0F 5E /r (REG-REG, mod=11, 0x66 prefix 隐式; 实证 660F5EC1)。
+    //   a_kind=Reg reg_a=dst (xmm1), b_kind=Reg reg_b=src (xmm2),
+    //   aux=0, cond_or_size=ir::Size::S64 (packed 128-bit; 同 Divps)。
+    //   handler: movups xmm0, [ctx + reg_a*8 + 0x10]    (读 dst xmm)
+    //            movups xmm1, [ctx + reg_b*8 + 0x10]    (读 src xmm)
+    //            divpd xmm0, xmm1                       (packed 双精度 2-lane 除)
+    //            movups [ctx + reg_a*8 + 0x10], xmm0    (写回 dst xmm)
+    //   不影响 EFLAGS; updates_flags=false。
+    //   派活单 §D 决策: Divss/Divps/Divpd 必 append-only 在 Subss/Subps/Subpd
+    //   之后 (pitfall #34 additive enum append-only)。
+    //   ⚠️ divsd (F2 0F 5E, scalar double) 不在本单范围 (派活单只列 3 形式)。
+    Divpd,
 };
 
-inline constexpr u16 kVmOpMax = static_cast<u16>(VmOp::Subpd);
+inline constexpr u16 kVmOpMax = static_cast<u16>(VmOp::Divpd);
 inline constexpr u16 kVmOpLimit = 1u << 14;  // 14 位编码空间上限
 
 constexpr const char* to_string(VmOp op) {
@@ -384,6 +426,9 @@ constexpr const char* to_string(VmOp op) {
         case VmOp::Subss: return "subss";
         case VmOp::Subps: return "subps";
         case VmOp::Subpd: return "subpd";
+        case VmOp::Divss: return "divss";
+        case VmOp::Divps: return "divps";
+        case VmOp::Divpd: return "divpd";
     }
     return "?";
 }

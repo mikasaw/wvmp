@@ -66,7 +66,10 @@ except ImportError:
 
 # Handlers that must satisfy the SSE ctx.xmm readback gate (extend here when
 # new SSE/VMX/AVX ops land -- keep in sync with the verifier instructions).
-SSE_HANDLERS = {"addss", "addps", "addpd", "subss", "subps", "subpd"}
+# MIT-374: divss/divps/divpd added (SSE float div, same movups slot-offset
+# prologue as add/sub -- the constants below are op-agnostic).
+SSE_HANDLERS = {"addss", "addps", "addpd", "subss", "subps", "subpd",
+                "divss", "divps", "divpd"}
 
 # Expected xmm slot-offset prologue constants (asmgen emit_xmm_offset_into_t9):
 #   xmm slot offset = kCtxXmmBase(0x140) + (reg - 24) * 16
