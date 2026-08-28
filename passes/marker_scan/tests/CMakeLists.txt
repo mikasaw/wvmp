@@ -362,3 +362,25 @@ target_compile_options(wvmp_sse_sub_sample PRIVATE
 target_link_options(wvmp_sse_sub_sample PRIVATE
     $<$<CXX_COMPILER_ID:MSVC>:/INCREMENTAL:NO>
 )
+
+# MIT-389: 影子样本——subss 的 ctx.xmm 运行时读回断言 (WVmpVerifier 验收门 A.2)。
+# 与 wvmp_sse_sub_sample 的 sse_subss 同 IR 配对, 额外把 ctx.xmm 槽位经 stub
+# 恢复路径的可见出口 (返回值 + 区域后原生 store) 全量打印: 返回值 = HALT 时
+# ctx.xmm[dst] 读回; 未触碰槽位必须保持 VM 入口同步值。native vs virtualized
+# byte-exact; handler 空转 (写错槽) 时读回 = 入口旧值, 与原生不一致 → FAIL。
+# 后续 SSE/VMX/AVX 派活单沿用此模式: 每条新指令 1 个影子样本 1:1 配对。
+enable_language(ASM_MASM)
+add_executable(wvmp_sse_subss_xmm_readback_sample
+    sse_subss_xmm_readback_sample_main.cpp
+    sse_subss_xmm_readback_sample_asm.asm
+)
+target_link_libraries(wvmp_sse_subss_xmm_readback_sample PRIVATE wvmp::sdk)
+# COMPILE_LANGUAGE 限定 C/C++: 兄弟样本块直接 $<$<CXX_COMPILER_ID:MSVC>:...>
+# 会把 C++ 选项也传给 MASM (A4018 invalid command-line option), 本目标收敛。
+target_compile_options(wvmp_sse_subss_xmm_readback_sample PRIVATE
+    $<$<AND:$<CXX_COMPILER_ID:MSVC>,$<COMPILE_LANGUAGE:C,CXX>>:/Od;/Ob0;/utf-8>
+    $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-O0>
+)
+target_link_options(wvmp_sse_subss_xmm_readback_sample PRIVATE
+    $<$<CXX_COMPILER_ID:MSVC>:/INCREMENTAL:NO>
+)
