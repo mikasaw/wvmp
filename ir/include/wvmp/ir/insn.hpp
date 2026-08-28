@@ -207,7 +207,7 @@ enum class Op : u16 { Mov, Lea, Add, Sub, Adc, Sbb, And, Or, Xor, Not, Neg, Inc,
                       //   - updates_flags=false (SSE 浮点除不影响 x86 EFLAGS; MXCSR
                       //     rounding mode 在 v1 不追踪; 除零/NaN 语义由 native
                       //     handler 内真 div* 指令保真, 与 MIT-371/373 同口径)。
-                      Divss, Divps, Divpd };
+                      Divss, Divps, Divpd, Movss, Movaps, Movapd, Movups, Movupd };
 enum class Size : u8 { S8, S16, S32, S64 };
 enum class Cond : u8 { O, No, B, Ae, E, Ne, Be, A, S, Ns, P, Np, L, Ge, Le, G };
 constexpr u64 bits(Size s) { return s==Size::S8?8: s==Size::S16?16: s==Size::S32?32:64; }

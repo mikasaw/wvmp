@@ -1023,6 +1023,52 @@ TranslateResult translate_sse_div(const cs_insn& ci, const cs_x86& x, ir::Arch a
     return ok(out);
 }
 
+// MIT-375: SSE 浮点传送 (movss / movaps / movapd / movups / movupd, REG-REG load 方向 only).
+// 与 translate_sse_div 同构: XMM 寄存器编码借用 ir::Reg 值 0..7, 翻译期加 24 偏移 →
+// VmContext.regs[24..31] (XMM 编码设计见 MIT-371 注释块).
+//   - movss  xmm1, xmm2       F3 0F 10 /r   (标量: **只搬低 32 位, 高 96 位保持不变**;
+//     清零语义只属于内存源形式 movss xmm,[m32], 本单不支持 —— 见 asmgen
+//     build_movss 注释里的本机实测真值表)
+//   - movaps xmm1, xmm2/m128  0F 28 /r      (对齐, 全 128-bit 搬)
+//   - movapd xmm1, xmm2/m128  66 0F 28 /r   (对齐, 全 128-bit 搬)
+//   - movups xmm1, xmm2/m128  0F 10 /r      (未对齐, 全 128-bit 搬)
+//   - movupd xmm1, xmm2/m128  66 0F 10 /r   (未对齐, 全 128-bit 搬)
+// capstone 实证: load 方向 reg,reg 报 X86_INS_MOVSS/MOVAPS/MOVAPD/MOVUPS/MOVUPD;
+//   store 方向 / MEM 形式 lifter 拒 → C1 gate 兜底保持原生.
+//   - size 字段: Movss=ir::Size::S32, 其余 4 条=ir::Size::S64.
+//   - updates_flags=false.
+TranslateResult translate_sse_mov(const cs_insn& ci, const cs_x86& x, ir::Arch arch, Op op,
+                                  ir::Size sz) {
+    if (x.op_count != 2) return unsupported(ci.address, ci.size);
+    // 两个操作数必都是 XMM 寄存器 (派活单限定不支持 MEM form).
+    if (x.operands[0].type != X86_OP_REG) return unsupported(ci.address, ci.size);
+    if (x.operands[1].type != X86_OP_REG) return unsupported(ci.address, ci.size);
+    // 手动 XMM 编号映射 (X86_REG_XMM0..XMM7 → 0..7).
+    auto xmm_idx = [&](x86_reg r) -> std::optional<u8> {
+        switch (r) {
+        case X86_REG_XMM0: return static_cast<u8>(0); case X86_REG_XMM1: return static_cast<u8>(1);
+        case X86_REG_XMM2: return static_cast<u8>(2); case X86_REG_XMM3: return static_cast<u8>(3);
+        case X86_REG_XMM4: return static_cast<u8>(4); case X86_REG_XMM5: return static_cast<u8>(5);
+        case X86_REG_XMM6: return static_cast<u8>(6); case X86_REG_XMM7: return static_cast<u8>(7);
+        default: return std::nullopt;
+        }
+    };
+    auto di = xmm_idx(x.operands[0].reg);
+    auto si = xmm_idx(x.operands[1].reg);
+    if (!di || !si) return unsupported(ci.address, ci.size);
+    // IR Insn.dst.reg / IR.src.reg 借用 ir::Reg 值 0..7, 翻译器层在 dispatch
+    // Movss/Movaps/Movapd/Movups/Movupd 时识别 SSE Op, 加 24 偏移 → v24..v31.
+    (void)arch;
+    ir::Insn out;
+    out.op = op;
+    out.addr = ci.address;
+    out.size = sz;
+    out.updates_flags = false;
+    out.dst = ir::Operand::reg_(static_cast<ir::Reg>(*di));
+    out.src = ir::Operand::reg_(static_cast<ir::Reg>(*si));
+    return ok(out);
+}
+
 TranslateResult translate_cmpxchg(const cs_insn& ci, const cs_x86& x, ir::Arch arch) {
     if (x.op_count != 2) return unsupported(ci.address, ci.size);
     // dst 必为 r/m (REG 或 MEM); src 必为 REG
@@ -1263,6 +1309,15 @@ TranslateResult translate_insn(const cs_insn& ci, ir::Arch arch) {
     case X86_INS_DIVSS: return translate_sse_div(ci, x, arch, Op::Divss, Size::S32);
     case X86_INS_DIVPS: return translate_sse_div(ci, x, arch, Op::Divps, Size::S64);
     case X86_INS_DIVPD: return translate_sse_div(ci, x, arch, Op::Divpd, Size::S64);
+    // MIT-375: SSE 浮点传送 movss/movaps/movapd/movups/movupd (REG-REG load only).
+    //   - movss  F3 0F 10 /r (标量, 只搬低 32 位/高位保持) / movaps 0F 28 /r /
+    //     movapd 66 0F 28 /r / movups 0F 10 /r / movupd 66 0F 10 /r
+    //   - store 方向与 MEM 形式 lifter 拒 → C1 gate 兜底 (详见 translate_sse_mov).
+    case X86_INS_MOVSS: return translate_sse_mov(ci, x, arch, Op::Movss, Size::S32);
+    case X86_INS_MOVAPS: return translate_sse_mov(ci, x, arch, Op::Movaps, Size::S64);
+    case X86_INS_MOVAPD: return translate_sse_mov(ci, x, arch, Op::Movapd, Size::S64);
+    case X86_INS_MOVUPS: return translate_sse_mov(ci, x, arch, Op::Movups, Size::S64);
+    case X86_INS_MOVUPD: return translate_sse_mov(ci, x, arch, Op::Movupd, Size::S64);
     case X86_INS_BSWAP: return translate_bswap(ci, x, arch);
     case X86_INS_XCHG: return translate_xchg(ci, x, arch);
     // MIT-336: setcc 16 variants (0F 90+cc+rm, mod=11 REG / mod=00 MEM).

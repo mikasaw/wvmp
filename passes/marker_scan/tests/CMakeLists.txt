@@ -427,3 +427,46 @@ target_compile_options(wvmp_sse_divss_xmm_readback_sample PRIVATE
 target_link_options(wvmp_sse_divss_xmm_readback_sample PRIVATE
     $<$<CXX_COMPILER_ID:MSVC>:/INCREMENTAL:NO>
 )
+
+# MIT-375: 端到端主样本——区域内含 SSE 浮点传送 movss/movaps/movapd/movups/movupd
+# (5 形式 REG-REG load only), 验证浮点传送支持后翻译成功、运行时走真 Movss/
+# Movaps/Movapd/Movups/Movupd handler、行为与原生逐字节一致。MSVC x64 不支持
+# inline asm, /Od 下 _mm_move_ss/_mm_load_ps/_mm_load_pd 内部函数会**融合
+# load+mov 为 MEM 形式**, 故 SSE 字节由 sse_mov_sample_asm.asm (MASM) 直接 emit
+# 真 REG-REG 字节 (F3 0F 10 / 0F 28 / 66 0F 28 / 0F 10 / 66 0F 10, mod=11),
+# 链接进本 sample。dst/src 槽刻意分散到 xmm0..xmm7 (非 0 槽才暴露 ctx.xmm 偏移
+# 公式错), dst 预置一律 != src (mov 类空转判别)。区域不含 rip-relative / printf /
+# call (printf 在 main 区域外)。
+enable_language(ASM_MASM)
+add_executable(wvmp_sse_mov_sample
+    sse_mov_sample_main.cpp
+    sse_mov_sample_asm.asm
+)
+target_link_libraries(wvmp_sse_mov_sample PRIVATE wvmp::sdk)
+# COMPILE_LANGUAGE 限定 C/C++: 兄弟样本块直接把 C++ 选项也传给 MASM 会 A4018。
+target_compile_options(wvmp_sse_mov_sample PRIVATE
+    $<$<AND:$<CXX_COMPILER_ID:MSVC>,$<COMPILE_LANGUAGE:C,CXX>>:/Od;/Ob0;/utf-8>
+    $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-O0>
+)
+target_link_options(wvmp_sse_mov_sample PRIVATE
+    $<$<CXX_COMPILER_ID:MSVC>:/INCREMENTAL:NO>
+)
+
+# MIT-375: 影子样本——SSE 浮点传送 5 条的 ctx.xmm 运行时读回断言 (验收门 A.2 模式)。
+# 与 wvmp_sse_mov_sample 同 IR、独立 exe: 每次调用把 VmContext.xmm[0..7] 全 8 槽
+# × 4 lane 的 32-bit 原始位图案打印出来。mov 类指令"handler 空转 → 输出=输入"的
+# 假阳性在此不成立: dst 槽预置 != src, 空转/写错槽 → 读回 = 入口旧值 (且 src/其他
+# 槽状态与原生不符) → native vs virtualized byte-exact 比对 FAIL。
+enable_language(ASM_MASM)
+add_executable(wvmp_sse_movss_xmm_readback_sample
+    sse_movss_xmm_readback_sample_main.cpp
+    sse_movss_xmm_readback_sample_asm.asm
+)
+target_link_libraries(wvmp_sse_movss_xmm_readback_sample PRIVATE wvmp::sdk)
+target_compile_options(wvmp_sse_movss_xmm_readback_sample PRIVATE
+    $<$<AND:$<CXX_COMPILER_ID:MSVC>,$<COMPILE_LANGUAGE:C,CXX>>:/Od;/Ob0;/utf-8>
+    $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-O0>
+)
+target_link_options(wvmp_sse_movss_xmm_readback_sample PRIVATE
+    $<$<CXX_COMPILER_ID:MSVC>:/INCREMENTAL:NO>
+)

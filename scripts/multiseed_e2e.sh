@@ -52,6 +52,8 @@ samples=(
     "build/passes/marker_scan/tests/wvmp_sse_subss_xmm_readback_sample.exe"
     "build/passes/marker_scan/tests/wvmp_sse_div_sample.exe"
     "build/passes/marker_scan/tests/wvmp_sse_divss_xmm_readback_sample.exe"
+    "build/passes/marker_scan/tests/wvmp_sse_mov_sample.exe"
+    "build/passes/marker_scan/tests/wvmp_sse_movss_xmm_readback_sample.exe"
 )
 
 # Seeds: 1 (small), 12345 (default), 99999 (large), 0xDEADBEEF (magic), 0xCAFEBABE (magic).

@@ -1298,6 +1298,43 @@ public:
         return o;
     }
 
+
+    // ---- MIT-375: SSE 浮点传送 movss / movaps / movapd / movups / movupd ----
+    //
+    // 五条共用模板 (hotfix v6 重建, 独立成员函数): 读 dst 槽 -> 读 src 槽 ->
+    // 就地执行被虚拟化的那条 native 指令 -> 写回 dst 槽 -> advance。
+    // 与 div 族唯一差别: 浮点传送不影响 EFLAGS, 不调 setcc5/flags_tail。
+    // 读 dst 槽这一步对 movss 是语义必需 (寄存器形式只改低 32 位, 高 96 位
+    // 保持不变), 对 aps/apd/ups/upd 是无害统一模板。
+    // 硬约束: 槽位偏移公式的 24/4/0x140 一律经 imm(), 禁止裸多位数字
+    // (pitfall #78: Keystone Intel 语法裸数字按 16 进制解析)。
+    std::string build_xmm_transfer(u64 dispatch, const char* native_mn) const {
+        std::string o = decode_prelude();
+        auto emit_xmm_offset_into_t9 = [&](int reg_t) {
+            o += std::string("    mov ") + r64(t_[9]) + ", " + r64(reg_t) + "\n";
+            o += std::string("    sub ") + r64(t_[9]) + ", " + imm(24) + "\n";
+            o += std::string("    shl ") + r64(t_[9]) + ", " + imm(4) + "\n";
+            o += std::string("    add ") + r64(t_[9]) + ", " + imm(0x140) + "\n";
+        };
+        emit_xmm_offset_into_t9(t_[4]);  // T9 = dst 槽偏移
+        o += std::string("    movups xmm0, [") + r64(ctx_) + " + " + r64(t_[9]) + "]\n";
+        emit_xmm_offset_into_t9(t_[7]);  // T9 = src 槽偏移
+        o += std::string("    movups xmm1, [") + r64(ctx_) + " + " + r64(t_[9]) + "]\n";
+        o += std::string("    ") + native_mn + " xmm0, xmm1\n";
+        emit_xmm_offset_into_t9(t_[4]);  // 重算 dst 偏移写回
+        o += std::string("    movups [") + r64(ctx_) + " + " + r64(t_[9]) + "], xmm0\n";
+        o += advance(dispatch);
+        return o;
+    }
+
+    // 五条各自的中间指令文本不同, 其余完全一致 (movss 只改 lane0/高位保持,
+    // aps/apd/ups/upd 全 128-bit 搬)。
+    std::string build_movss(u64 d)  const { return build_xmm_transfer(d, "movss"); }
+    std::string build_movaps(u64 d) const { return build_xmm_transfer(d, "movaps"); }
+    std::string build_movapd(u64 d) const { return build_xmm_transfer(d, "movapd"); }
+    std::string build_movups(u64 d) const { return build_xmm_transfer(d, "movups"); }
+    std::string build_movupd(u64 d) const { return build_xmm_transfer(d, "movupd"); }
+
     // ---- 一元包装（HandlerDef 需要无参差成员函数指针） ----
     std::string build_add(u64 d) const { return build_binary("add", d, true); }
     std::string build_sub(u64 d) const { return build_binary("sub", d, true); }
@@ -2441,6 +2478,11 @@ RuntimeGenResult generate_runtime(wvmp::Rng& rng) {
         {int(VmOp::Divss), "divss", &AsmGen::build_divss},
         {int(VmOp::Divps), "divps", &AsmGen::build_divps},
         {int(VmOp::Divpd), "divpd", &AsmGen::build_divpd},
+        {int(VmOp::Movss), "movss", &AsmGen::build_movss},
+        {int(VmOp::Movaps), "movaps", &AsmGen::build_movaps},
+        {int(VmOp::Movapd), "movapd", &AsmGen::build_movapd},
+        {int(VmOp::Movups), "movups", &AsmGen::build_movups},
+        {int(VmOp::Movupd), "movupd", &AsmGen::build_movupd},
         {int(VmOp::Cmp), "cmp", &AsmGen::build_cmp},
         {int(VmOp::Test), "test", &AsmGen::build_test},
         {int(VmOp::Load), "load", &AsmGen::build_load},

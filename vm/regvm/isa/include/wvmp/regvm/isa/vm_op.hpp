@@ -8,6 +8,8 @@ namespace wvmp::regvm::isa {
 // （asmgen.cpp kTableEntries=128，MIT-374 起；此前 6 位 = 64 项，Subpd=63 恰好
 // 占满，Divss=64 起越界静默折叠到 halt）。追加枚举前先看 asmgen.cpp 的
 // static_assert(kVmOpMax < kTableEntries) 是否仍成立。
+// 编码空间上限 14 位（kVmOpLimit）；MIT-375 起用到低 7 位（kVmOpMax=68），
+// runtime 跳转表掩码/项数与之联动（vm/regvm/runtime/src/asmgen.cpp kTableEntries）。
 enum class VmOp : u16 {
     Mov = 1, Lea, Add, Sub, Adc, Sbb, And, Or, Xor, Not, Neg, Inc, Dec,
     Shl, Shr, Sar, Rol, Ror, Cmp, Test, Push, Pop, Jmp, Jcc, Call, Ret,
@@ -370,10 +372,9 @@ enum class VmOp : u16 {
     //   派活单 §D 决策: Divss/Divps/Divpd 必 append-only 在 Subss/Subps/Subpd
     //   之后 (pitfall #34 additive enum append-only)。
     //   ⚠️ divsd (F2 0F 5E, scalar double) 不在本单范围 (派活单只列 3 形式)。
-    Divpd,
-};
+    Divpd, Movss, Movaps, Movapd, Movups, Movupd };
 
-inline constexpr u16 kVmOpMax = static_cast<u16>(VmOp::Divpd);
+inline constexpr u16 kVmOpMax = static_cast<u16>(VmOp::Movupd);
 inline constexpr u16 kVmOpLimit = 1u << 14;  // 14 位编码空间上限
 
 constexpr const char* to_string(VmOp op) {
@@ -429,6 +430,12 @@ constexpr const char* to_string(VmOp op) {
         case VmOp::Divss: return "divss";
         case VmOp::Divps: return "divps";
         case VmOp::Divpd: return "divpd";
+        // MIT-375: SSE 浮点传送 5 op.
+        case VmOp::Movss: return "movss";
+        case VmOp::Movaps: return "movaps";
+        case VmOp::Movapd: return "movapd";
+        case VmOp::Movups: return "movups";
+        case VmOp::Movupd: return "movupd";
     }
     return "?";
 }

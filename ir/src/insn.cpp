@@ -58,6 +58,12 @@ std::string_view to_string(Op op) {
     case Op::Divss: return "divss";
     case Op::Divps: return "divps";
     case Op::Divpd: return "divpd";
+    // MIT-375: SSE 浮点传送 5 op (与 lifter/translator/asmgen 同名).
+    case Op::Movss: return "movss";
+    case Op::Movaps: return "movaps";
+    case Op::Movapd: return "movapd";
+    case Op::Movups: return "movups";
+    case Op::Movupd: return "movupd";
     }
     return "?";
 }
