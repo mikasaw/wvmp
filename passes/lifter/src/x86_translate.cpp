@@ -854,6 +854,79 @@ TranslateResult translate_cmovcc(const cs_insn& ci, const cs_x86& x, ir::Arch ar
     return ok(out);
 }
 
+// MIT-404: cdqe (48 98) — 隐式 eax→rax 符号扩展, x64 专用。
+// 语义 == movsxd rax, eax → **归一到既有 Op::Movsxd** (D1.1 决策, 不加
+// Op::Cdqe): dst=src=Rax 槽, size 恒 S64, 与 translate_movsxd 的 REG-REG
+// 路径共用翻译器/asmgen 通路。capstone 对 cdqe 报 0 显式操作数 (隐式)。
+// vendored capstone 分裂枚举陷阱: X86_INS_CDQE=452 与 X86_INS_MOVSXD=880 是
+// 两个独立枚举 (pip capstone 5.x 合并报 movsxd — 以 vendored 为准, 两个
+// case 都要显式收口, MIT-313 教训)。
+TranslateResult translate_cdqe(const cs_insn& ci, const cs_x86& x, ir::Arch arch) {
+    (void)x;  // 操作数全隐式 (eax→rax), 无显式操作数可查
+    if (arch != ir::Arch::X64) return unsupported(ci.address, ci.size);
+    ir::Insn out;
+    out.op = Op::Movsxd;      // 归一 (D1.1): cdqe == movsxd rax, eax
+    out.addr = ci.address;
+    out.size = Size::S64;     // movsxd 必 32→64
+    out.updates_flags = false;
+    out.dst = Operand::reg_(ir::Reg::Rax);
+    out.src = Operand::reg_(ir::Reg::Rax);
+    return ok(out);
+}
+
+// MIT-404: cdq (99) / cqo (48 99) — 隐式 rax→rdx 符号扩展, 共用新 Op::Cdq。
+// 无显式操作数 (全隐式); size 由 REX.W 决定: 无 REX.W → S32 (cdq),
+// 有 REX.W → S64 (cqo)。updates_flags=false (Intel SDM: CDQ/CQO 不影响
+// EFLAGS)。asmgen build_cdq 按 size 选 native 99 / 48 99 直通。
+// 注: cwd (66 99, S16) 的 0x66 落 prefix[0], translate_insn 入口统一拒绝,
+// 不可达 — handler 的 S16 分支仅为模板完备的防御路径。
+TranslateResult translate_cdq(const cs_insn& ci, const cs_x86& x, ir::Arch arch) {
+    if (arch != ir::Arch::X64) return unsupported(ci.address, ci.size);
+    const bool rex_w = (x.rex & 0x08) != 0;
+    ir::Insn out;
+    out.op = Op::Cdq;
+    out.addr = ci.address;
+    out.size = rex_w ? Size::S64 : Size::S32;
+    out.updates_flags = false;  // CDQ/CQO 不影响 CF/OF/SF/ZF/PF
+    return ok(out);
+}
+
+// MIT-404: div (F7 /6) / idiv (F7 /7) — 无符号/有符号除, 单显式操作数 = 除数。
+// 隐式 dividend = rdx:rax (S32: edx:eax) **不经 lifter 表达** — dst=Rdx 槽
+// tag (对齐 Op::Mul 约定), VM handler 内部从 Rax/Rdx 双槽拼装, 商写 Rax 槽、
+// 余写 Rdx 槽 (native 语义直通)。支持 REG + MEM 形式 (capstone 实证
+// `F7 31` = div dword ptr [rcx]; MEM 由翻译器折 Load + Div/Idiv, rip 形式
+// 除数走既有 LoadRva 通路)。除零/商溢出 = 真 #DE, handler native 直通
+// (D2.1 决策, 崩溃行为与未加壳一致)。size 取 S32/S64:
+//   - S8 (F6 /6, dividend=AX 写 AL:AH) 与 rdx:rax 双槽协议不符 → 拒 (§F);
+//   - S16 需 0x66 prefix, translate_insn 入口已拒。
+// updates_flags=true — flags 按 Intel undefined, 处置照抄 build_imul
+// (setcc5 捕获同 CPU 真值, 与 native 执行一致, D4.1)。
+TranslateResult translate_div_idiv(const cs_insn& ci, const cs_x86& x, ir::Arch arch, Op op) {
+    if (x.op_count != 1) return unsupported(ci.address, ci.size);
+    auto sz = data_size(x.operands, x.op_count, arch);
+    if (sz == Size::S8 || sz == Size::S16) return unsupported(ci.address, ci.size);
+    ir::Insn out;
+    out.op = op;
+    out.addr = ci.address;
+    out.size = sz;
+    out.updates_flags = true;  // flags undefined — 照抄 build_imul 处置
+    out.dst = Operand::reg_(ir::Reg::Rdx);  // 隐式高半槽 tag (对齐 Mul)
+    if (x.operands[0].type == X86_OP_REG) {
+        auto s = map_reg(x.operands[0].reg);
+        if (!s) return unsupported(ci.address, ci.size);
+        out.src = Operand::reg_(*s);
+        return ok(out);
+    }
+    if (x.operands[0].type == X86_OP_MEM) {
+        auto m = mem_operand(x.operands[0].mem);
+        if (!m) return unsupported(ci.address, ci.size);
+        out.src = *m;
+        return ok(out);
+    }
+    return unsupported(ci.address, ci.size);
+}
+
 // MIT-341 cmpxchg r/m, r (0F B0/B1+rm, mod=11 REG-REG / mod=00 MEM-REG)。
 //   - 字节结构：[48] (REX.W 可选) | 0F B0 (S8) | 0F B1 (S16/S32/S64) | ModR/M
 //     (mod=11 REG-REG, mod=00 MEM; mod=01/10 派活单限定不支持 → C1 gate 兜底)
@@ -1356,6 +1429,16 @@ TranslateResult translate_insn(const cs_insn& ci, ir::Arch arch) {
     case X86_INS_IMUL: return translate_imul(ci, x, arch);
     case X86_INS_MUL: return translate_mul(ci, x, arch);
     case X86_INS_MOVSXD: return translate_movsxd(ci, x, arch);
+    // MIT-404: cdqe (48 98) 归一 Movsxd (D1.1) — vendored capstone 分裂枚举,
+    // X86_INS_CDQE=452 与 X86_INS_MOVSXD=880 两个 case 显式收口 (MIT-313)。
+    case X86_INS_CDQE: return translate_cdqe(ci, x, arch);
+    // MIT-404: cdq (99) / cqo (48 99) 共用 Op::Cdq, size 由 REX.W 区分。
+    case X86_INS_CDQ: return translate_cdq(ci, x, arch);
+    case X86_INS_CQO: return translate_cdq(ci, x, arch);
+    // MIT-404: div (F7 /6) / idiv (F7 /7) — REG + MEM 形式, 隐式 dividend
+    // rdx:rax 由 VM handler 内部拼装 (双结果槽协议)。
+    case X86_INS_DIV: return translate_div_idiv(ci, x, arch, Op::Div);
+    case X86_INS_IDIV: return translate_div_idiv(ci, x, arch, Op::Idiv);
     case X86_INS_MOVZX: return translate_movzx(ci, x, arch);
     case X86_INS_MOVSX: return translate_movsx(ci, x, arch);
     // MIT-349: popcnt (F3 0F B8+rm, mod=11 REG-REG / mod=00/01/10 MEM 派活单限定不支持).

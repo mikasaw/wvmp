@@ -70,6 +70,12 @@ std::string_view to_string(Op op) {
     case Op::Andps: return "andps";
     case Op::Ucomiss: return "ucomiss";
     case Op::Ucomisd: return "ucomisd";
+    // MIT-404: 整数除法族 + 符号扩展 3 op (与 lifter/translator/asmgen 同名).
+    // 注意 to_string 的 "div"/"idiv" 与 SSE 的 divss/divps/divpd 勿混淆 —
+    // Op::Div 是整数除 (F7 /6), Op::Divss 是 SSE 单精度除 (F3 0F 5E)。
+    case Op::Cdq: return "cdq";
+    case Op::Div: return "div";
+    case Op::Idiv: return "idiv";
     }
     return "?";
 }

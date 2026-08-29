@@ -8,8 +8,8 @@ namespace wvmp::regvm::isa {
 // （asmgen.cpp kTableEntries=128，MIT-374 起；此前 6 位 = 64 项，Subpd=63 恰好
 // 占满，Divss=64 起越界静默折叠到 halt）。追加枚举前先看 asmgen.cpp 的
 // static_assert(kVmOpMax < kTableEntries) 是否仍成立。
-// 编码空间上限 14 位（kVmOpLimit）；MIT-376 起用到低 7 位（kVmOpMax=76，
-// Ucomisd；128 项跳表内，static_assert 见 asmgen.cpp kTableEntries），
+// 编码空间上限 14 位（kVmOpLimit）；MIT-404 起用到低 7 位（kVmOpMax=79，
+// Idiv；128 项跳表内，static_assert 见 asmgen.cpp kTableEntries），
 // runtime 跳转表掩码/项数与之联动（vm/regvm/runtime/src/asmgen.cpp kTableEntries）。
 enum class VmOp : u16 {
     Mov = 1, Lea, Add, Sub, Adc, Sbb, And, Or, Xor, Not, Neg, Inc, Dec,
@@ -409,9 +409,37 @@ enum class VmOp : u16 {
     // Ucomisd (Reg-Reg, scalar double unordered compare):
     //   同 Ucomiss, 比较低 64 位 f64; 字节结构 66 0F 2E /r (实证 660F2EC1)。
     //   cond_or_size=ir::Size::S64 (scalar double)。updates_flags=true。
-    Ucomisd };
+    Ucomisd,
 
-inline constexpr u16 kVmOpMax = static_cast<u16>(VmOp::Ucomisd);
+    // —— MIT-404 整数除法族 + 符号扩展 (Cdq / Div / Idiv) ——
+    // Cdq (零操作数): 隐式 rax → rdx 符号扩展。cdq=99 (S32) / cqo=48 99 (S64),
+    //   cond_or_size=size 区分 (handler 按 size 选 native 指令)。
+    //   a_kind/b_kind/reg_a/reg_b/aux 一律空 (隐式操作数不经字节码表达)。
+    //   handler: 读 Rax 槽 → 物理 RAX → native cdq/cqo 直通 (真 99 字节,
+    //   §D.6 capstone 回读锚点) → 物理 RDX 写回 Rdx 槽 → advance。
+    //   不影响 EFLAGS (Intel SDM) — 不调 setcc5 也不走 flags_tail (零 flags
+    //   写回, flags_ 原样保留); 仅需生成器期防护 pc_/flags_ 落在物理
+    //   rax/rdx (native cdq/cqo 直写)。cwd (66 99, S16) 因 0x66 prefix 在
+    //   lifter 入口被拒不可达, handler S16 分支为模板完备的防御路径。
+    Cdq,
+    // Div (单操作数): 无符号除, 隐式 dividend = rdx:rax (S32: edx:eax)。
+    //   a_kind=Reg reg_a=Rdx 槽 tag (对齐 Mul 约定), b_kind=Reg reg_b=除数槽
+    //   (REG 直发; MEM 形式由翻译器折 Load + Div, rip 形式除数走 LoadRva),
+    //   aux=0, cond_or_size=size (S32/S64; S8 dividend=AX 语义不符 lifter 拒,
+    //   S16 需 0x66 prefix 入口已拒)。
+    //   handler (对齐 build_mul 双结果槽协议): 除数 → T0 (callee-saved) →
+    //   zero5 → 物理 RDX:RAX ← Rdx/Rax 双槽 → native div <sz> T0 直通 →
+    //   商 (rax) 写 Rax 槽 + 余 (rdx) 写 Rdx 槽 → setcc5 → flags_tail。
+    //   flags 按 Intel undefined — 处置照抄 build_imul (zero5 → native →
+    //   setcc5 → flags_tail, 同 CPU 真值与 native 执行一致, D4.1)。
+    //   除零/商溢出 = 真 #DE, native 直通崩溃形态与未加壳一致 (D2.1)。
+    Div,
+    // Idiv (单操作数): 有符号除, 余数截断向零 (Intel 语义, D3.1)。其余与
+    //   Div 完全同构 (native idiv, F7 /7); 负被除数经 cqo/cdq 符号扩展进
+    //   Rdx 槽后 native idiv 直接处理, 无需额外逻辑。
+    Idiv };
+
+inline constexpr u16 kVmOpMax = static_cast<u16>(VmOp::Idiv);
 inline constexpr u16 kVmOpLimit = 1u << 14;  // 14 位编码空间上限
 
 constexpr const char* to_string(VmOp op) {
@@ -479,6 +507,10 @@ constexpr const char* to_string(VmOp op) {
         case VmOp::Andps: return "andps";
         case VmOp::Ucomiss: return "ucomiss";
         case VmOp::Ucomisd: return "ucomisd";
+        // MIT-404: 整数除法族 + 符号扩展 3 op.
+        case VmOp::Cdq: return "cdq";
+        case VmOp::Div: return "div";
+        case VmOp::Idiv: return "idiv";
     }
     return "?";
 }

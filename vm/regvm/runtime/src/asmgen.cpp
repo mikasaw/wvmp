@@ -1428,6 +1428,176 @@ public:
     std::string build_ucomiss(u64 d) const { return build_ucomis_flags(d, "ucomiss"); }
     std::string build_ucomisd(u64 d) const { return build_ucomis_flags(d, "ucomisd"); }
 
+    // ---- MIT-404: 整数除法族 div/idiv + 符号扩展 cdq/cqo ----
+    //
+    // 生成器期防护 (本族 handler 特有): div/idiv/cdq 是首批**直写物理
+    // rax/rdx** 的 handler (native 指令隐式操作数), 而 pc_/flags_ 随机分配
+    // 可能落在物理 rax(kPhys[0])/rdx(kPhys[1]) 上 — roll() 的 10 寄存器
+    // pool 恒含 rax/rdx (4 个固定位 ctx_/base_/t_[0]/t_[5] 全在 callee-saved
+    // 池 kCalleeSavedIdx, 不含 rax/rdx, 免疫)。pc_/flags_ 落在 rax/rdx 时
+    // native 直写会摧毁 VM 状态 → 生成器期检测并 push/pop 暂存/恢复
+    // (build_callgate 中途 push 有先例)。T3/T4/T6/T7/T9 (=pool[2..9] 子集)
+    // 与 pc_/flags_ (=pool[0]/pool[1]) 互斥, setcc5/zero5 无需防护。
+    std::string spill_pcflags_raxrdx_pre() const {
+        std::string o;
+        if (pc_ == 0 || pc_ == 1)
+            o += std::string("    push ") + r64(pc_) + "\n";
+        if (flags_ == 0 || flags_ == 1)
+            o += std::string("    push ") + r64(flags_) + "\n";
+        return o;
+    }
+    // 恢复序 = 压栈序的严格镜像 (LIFO)。div 路径里 flags_ 稍后由 flags_tail
+    // 重赋值, 恢复无害; cdq 路径不写 flags, 恢复是语义必需。
+    std::string spill_pcflags_raxrdx_post() const {
+        std::string o;
+        if (flags_ == 0 || flags_ == 1)
+            o += std::string("    pop ") + r64(flags_) + "\n";
+        if (pc_ == 0 || pc_ == 1)
+            o += std::string("    pop ") + r64(pc_) + "\n";
+        return o;
+    }
+
+    // MIT-404 Cdq: 隐式 rax → rdx 符号扩展 (cdq=99 S32 / cqo=48 99 S64 /
+    // cwd=66 99 S16)。零显式操作数 (a/b/aux 全空), cond_or_size=size。
+    // 读 Rax 槽 → 物理 RAX → native cdq/cqo 直通 (§D.6 真 99 字节回读锚点)
+    // → 物理 RDX 写回 Rdx 槽 (S32 dword store 保槽高位, 对齐 build_xchg S32)
+    // → advance。Intel SDM: CDQ/CQO 不影响 EFLAGS — 不调 setcc5 也不走
+    // flags_tail (零 flags 写回, flags_ 原样保留); 仅需 pc_/flags_ 落在物理
+    // rax/rdx 的 push/pop 防护。S8 分支 defensive no-op (cbw=98 是独立指令,
+    // dividend=AX 语义不同, 不在本单 §F); S16 (cwd) 因 0x66 prefix 在 lifter
+    // 入口被拒不可达, 保留分支仅为改动 5 模板完备 (66 99 / 99 / 48 99)。
+    std::string build_cdq(u64 dispatch) const {
+        const std::string tag = "cdq" + std::to_string(seq());
+        const std::string tail_lbl = "atail_" + tag;
+        const u8 rax_slot = isa::vm_reg_of(ir::Reg::Rax);  // = 0
+        const u8 rdx_slot = isa::vm_reg_of(ir::Reg::Rdx);  // = 2
+        // 槽号是字面量 (0/2), 偏移经 imm() 派生 — 禁裸数字 (MIT-B2 纪律);
+        // 与 build_mul 同款: 槽号拼进乘法地址, 不走 r64() (那是物理寄存器名)。
+        const std::string rax_slot_off = imm(static_cast<u64>(rax_slot) * 8 + 0x10);
+        const std::string rdx_slot_off = imm(static_cast<u64>(rdx_slot) * 8 + 0x10);
+        std::array<std::string, 4> blocks;
+        for (int s = 0; s < 4; ++s) {
+            std::string o;
+            if (s == 2) {
+                // S32: cdq (99) — edx = sext(eax)
+                o += spill_pcflags_raxrdx_pre();
+                o += std::string("    mov eax, dword ptr [") + r64(ctx_) + " + " +
+                     rax_slot_off + "]\n";
+                o += "    cdq\n";
+                o += std::string("    mov dword ptr [") + r64(ctx_) + " + " +
+                     rdx_slot_off + "], edx\n";
+                o += spill_pcflags_raxrdx_post();
+            } else if (s == 3) {
+                // S64: cqo (48 99) — rdx = sext(rax)
+                o += spill_pcflags_raxrdx_pre();
+                o += std::string("    mov rax, qword ptr [") + r64(ctx_) + " + " +
+                     rax_slot_off + "]\n";
+                o += "    cqo\n";
+                o += std::string("    mov qword ptr [") + r64(ctx_) + " + " +
+                     rdx_slot_off + "], rdx\n";
+                o += spill_pcflags_raxrdx_post();
+            } else if (s == 1) {
+                // S16: cwd (66 99) — 防御路径 (lifter 入口拒 0x66, 不可达)
+                o += spill_pcflags_raxrdx_pre();
+                o += std::string("    mov ax, word ptr [") + r64(ctx_) + " + " +
+                     rax_slot_off + "]\n";
+                o += "    cwd\n";
+                o += std::string("    mov word ptr [") + r64(ctx_) + " + " +
+                     rdx_slot_off + "], dx\n";
+                o += spill_pcflags_raxrdx_post();
+            } else {
+                // S8: cbw (98) 独立指令不在本单 — defensive no-op (§F)
+            }
+            o += "    jmp " + tail_lbl + "\n";
+            blocks[s] = o;
+        }
+        return decode_prelude() + size_chain(blocks, tag) + tail_lbl + ":\n" +
+               advance(dispatch);
+    }
+
+    // MIT-404 Div/Idiv: 隐式 dividend = rdx:rax (S32: edx:eax), 商→Rax 槽,
+    // 余→Rdx 槽 (native 语义直通, 对齐 build_mul 双结果槽写回先例)。
+    //   1) 除数 → T0 (t_[0] ∈ callee-saved 池, 后续物理 rax/rdx 写不触及)
+    //   2) zero5 — 清 flag scratch; 必须在物理 RAX/RDX 载入**之前** (xor 的
+    //      scratch 可能就是物理 rax/rdx, 载入后再 zero 会毁 dividend)
+    //   3) 物理 RDX ← Rdx 槽 / RAX ← Rax 槽 (先高位后低位, 槽偏移经 imm())
+    //   4) native div/idiv <sz> T0 直通 — 除零/商溢出 = 真 #DE (D2.1),
+    //      崩溃形态与未加壳一致, 不做 VM 内拦截
+    //   5) 商 (rax) 写 Rax 槽 + 余 (rdx) 写 Rdx 槽 — S64 qword store;
+    //      S32 dword store 保槽高位 (build_xchg S32 同款, 沿用 slot 高位
+    //      保留语义); 写回全部经内存直写, 不经 T 寄存器 (setcc5 之前,
+    //      中间无改 EFLAGS 指令)
+    //   6) 恢复 pc_/flags_ 防护 + setcc5 → flags_tail
+    // flags 按 Intel undefined (D4.1): 处置方式**照抄 build_imul 现状**
+    // (asmgen.cpp build_imul: load → load → zero5 → native → setcc5 →
+    // flags_tail(dispatch,false), 本函数对齐其 2371-2381 行同序) — VM flags
+    // = 同一 CPU 同一指令的真值, 与 native 执行逐位一致。
+    // S8/S16 defensive no-op (div r/m8 dividend=AX 语义不符; S16 需 0x66
+    // prefix 入口已拒, §F)。
+    std::string build_div_idiv(u64 dispatch, const char* native_mn) const {
+        const std::string tag = std::string(native_mn) + std::to_string(seq());
+        const std::string tail_lbl = "ftail_" + tag;
+        const u8 rax_slot = isa::vm_reg_of(ir::Reg::Rax);  // = 0
+        const u8 rdx_slot = isa::vm_reg_of(ir::Reg::Rdx);  // = 2
+        const std::string rax_slot_off = imm(static_cast<u64>(rax_slot) * 8 + 0x10);
+        const std::string rdx_slot_off = imm(static_cast<u64>(rdx_slot) * 8 + 0x10);
+        std::array<std::string, 4> blocks;
+        for (int s = 0; s < 4; ++s) {
+            std::string o;
+            if (s == 2 || s == 3) {
+                // 0) pc_/flags_ 落在物理 rax/rdx 时 push 暂存 (漏 push 会让
+                //    pop 读栈垃圾 → pc_ 错乱 → 0xC0000005, seed 99999 实测)
+                o += spill_pcflags_raxrdx_pre();
+                // 1) 除数 → T0
+                if (s == 3)
+                    o += std::string("    mov ") + r64(t_[0]) + ", qword ptr [" +
+                         r64(ctx_) + " + " + r64(t_[7]) + "*8 + 0x10]\n";
+                else
+                    o += std::string("    mov ") + rs(t_[0], 2) + ", dword ptr [" +
+                         r64(ctx_) + " + " + r64(t_[7]) + "*8 + 0x10]\n";
+                // 2) zero5 (物理 RAX/RDX 载入前)
+                o += zero5();
+                // 3) 物理 RDX:RAX ← 双槽 (先 RDX 后 RAX; T0 callee-saved 不受影响)
+                if (s == 3) {
+                    o += std::string("    mov rdx, qword ptr [") + r64(ctx_) + " + " +
+                         rdx_slot_off + "]\n";
+                    o += std::string("    mov rax, qword ptr [") + r64(ctx_) + " + " +
+                         rax_slot_off + "]\n";
+                } else {
+                    o += std::string("    mov edx, dword ptr [") + r64(ctx_) + " + " +
+                         rdx_slot_off + "]\n";
+                    o += std::string("    mov eax, dword ptr [") + r64(ctx_) + " + " +
+                         rax_slot_off + "]\n";
+                }
+                // 4) native 直通: rdx:rax ÷ T0 → 商 rax, 余 rdx
+                o += std::string("    ") + native_mn + " " + rs(t_[0], s) + "\n";
+                // 5) 商/余双槽写回 (内存直写, 不经 T 寄存器)
+                if (s == 3) {
+                    o += std::string("    mov qword ptr [") + r64(ctx_) + " + " +
+                         rax_slot_off + "], rax\n";
+                    o += std::string("    mov qword ptr [") + r64(ctx_) + " + " +
+                         rdx_slot_off + "], rdx\n";
+                } else {
+                    o += std::string("    mov dword ptr [") + r64(ctx_) + " + " +
+                         rax_slot_off + "], eax\n";
+                    o += std::string("    mov dword ptr [") + r64(ctx_) + " + " +
+                         rdx_slot_off + "], edx\n";
+                }
+                // 6) 恢复 pc_/flags_ → setcc5 (捕获 native 直产真值)
+                o += spill_pcflags_raxrdx_post();
+                o += setcc5();
+            } else {
+                // S8/S16: defensive no-op (§F)
+            }
+            o += "    jmp " + tail_lbl + "\n";
+            blocks[s] = o;
+        }
+        return decode_prelude() + size_chain(blocks, tag) + tail_lbl + ":\n" +
+               flags_tail(dispatch, false);
+    }
+    std::string build_div(u64 d) const { return build_div_idiv(d, "div"); }
+    std::string build_idiv(u64 d) const { return build_div_idiv(d, "idiv"); }
+
     // ---- 一元包装（HandlerDef 需要无参差成员函数指针） ----
     std::string build_add(u64 d) const { return build_binary("add", d, true); }
     std::string build_sub(u64 d) const { return build_binary("sub", d, true); }
@@ -2588,6 +2758,12 @@ RuntimeGenResult generate_runtime(wvmp::Rng& rng) {
         // 禁止 decode+advance 空转 pitfall #79).
         {int(VmOp::Ucomiss), "ucomiss", &AsmGen::build_ucomiss},
         {int(VmOp::Ucomisd), "ucomisd", &AsmGen::build_ucomisd},
+        // MIT-404: 整数除法族 div/idiv + 符号扩展 cdq/cqo (native 直通, 双槽
+        // rax/rdx 协议对齐 build_mul; CDQE 归一 Movsxd 走既有 build_movsxd
+        // handler, 不单独注册)。
+        {int(VmOp::Cdq), "cdq", &AsmGen::build_cdq},
+        {int(VmOp::Div), "div", &AsmGen::build_div},
+        {int(VmOp::Idiv), "idiv", &AsmGen::build_idiv},
         {int(VmOp::Cmp), "cmp", &AsmGen::build_cmp},
         {int(VmOp::Test), "test", &AsmGen::build_test},
         {int(VmOp::Load), "load", &AsmGen::build_load},

@@ -233,7 +233,27 @@ enum class Op : u16 { Mov, Lea, Add, Sub, Adc, Sbb, And, Or, Xor, Not, Neg, Inc,
                       //     ZF=PF=CF=1 按 Intel SDM UCOMISD/UCOMISS 真值表)。
                       //   - 派活单 §C 决策: 5 op 必 append-only 在 Movupd 之后、
                       //     enum 闭合之前 (pitfall #34 + MIT-375 v2 bug 教训)。
-                      Xorps, Orps, Andps, Ucomiss, Ucomisd };
+                      Xorps, Orps, Andps, Ucomiss, Ucomisd,
+                      // MIT-404: 整数除法族 + 符号扩展 3 op (Cdq / Div / Idiv)。
+                      //   - Cdq: 隐式 rax → rdx 符号扩展, 零显式操作数
+                      //     (cdq=99 → S32; cqo=48 99 → S64)。cdqe (48 98) 不加
+                      //     新 Op——lifter 归一到既有 Movsxd (D1.1 决策, dst=src=
+                      //     Rax 槽, 语义 == movsxd rax,eax)。updates_flags=false
+                      //     (Intel SDM: CDQ/CQO 不影响 EFLAGS)。
+                      //   - Div/Idiv: 无符号/有符号除, 单显式操作数 = 除数
+                      //     (src=Reg 或 Mem, MEM 由翻译器折 Load + Div/Idiv);
+                      //     隐式 dividend = rdx:rax (S32: edx:eax) **不经 IR
+                      //     表达**, dst=Rdx 槽 tag (对齐 Mul 约定), VM handler
+                      //     内部从 Rax/Rdx 双槽拼装; 商写 Rax 槽、余写 Rdx 槽
+                      //     (native 语义直通)。除零/商溢出 = 真 #DE, handler
+                      //     native 直通 (D2.1 决策, 不做 VM 内拦截)。
+                      //     size 取 S32/S64 (S8 dividend=AX 语义不符拒收 §F;
+                      //     S16 需 0x66 prefix, translate_insn 入口已拒)。
+                      //     updates_flags=true — flags 按 Intel undefined,
+                      //     处置照抄 build_imul (setcc5 捕获同 CPU 真值)。
+                      //   - 派活单 §B: 3 op 必 append-only 在 Ucomisd 之后、
+                      //     enum 闭合之前 (pitfall #34 additive append-only)。
+                      Cdq, Div, Idiv };
 enum class Size : u8 { S8, S16, S32, S64 };
 enum class Cond : u8 { O, No, B, Ae, E, Ne, Be, A, S, Ns, P, Np, L, Ge, Le, G };
 constexpr u64 bits(Size s) { return s==Size::S8?8: s==Size::S16?16: s==Size::S32?32:64; }

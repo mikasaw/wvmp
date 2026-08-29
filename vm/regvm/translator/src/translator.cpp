@@ -357,6 +357,15 @@ struct Translator {
                 // setcc/jcc 读到真比较结果; 派活单 §D D1.1, 禁止空转 pitfall #79).
                 // 操作数必是 XMM 派活单限定; xmm 槽映射同上.
                 ok = translate_ucomis(em, in);
+            } else if (in.op == ir::Op::Cdq) {
+                // MIT-404: cdq/cqo dispatch — 零操作数 (隐式 rax→rdx 符号扩展),
+                // emit 单条 VmOp::Cdq, handler 按 size 选 native 99 / 48 99 直通。
+                ok = translate_cdq(em, in);
+            } else if (in.op == ir::Op::Div || in.op == ir::Op::Idiv) {
+                // MIT-404: div/idiv dispatch — 隐式 dividend rdx:rax 不经字节码
+                // 表达 (handler 内部拼装); reg_b = 除数槽 (REG 直发, MEM 经
+                // emit_load 折条, rip 形式除数走既有 LoadRva 通路)。
+                ok = translate_div_idiv(em, sc, in, current_rva, next_ip);
             } else if (in.op == ir::Op::Bswap) {
                 ok = translate_bswap(em, in);
             } else if (in.op == ir::Op::Xchg) {
@@ -1152,6 +1161,53 @@ struct Translator {
         const u8 xmm_src_slot = static_cast<u8>(xmm_idx_src + 24u);
         VmOp vop = (in.op == ir::Op::Ucomiss) ? VmOp::Ucomiss : VmOp::Ucomisd;
         em.emit_rr(vop, xmm_dst_slot, xmm_src_slot, isa::size_field(in.size));
+        return true;
+    }
+
+    // ---- MIT-404: cdq/cqo (隐式 rax→rdx 符号扩展) ----
+    //
+    // lifter 把 cdq (99) 与 cqo (48 99) 共用为 Op::Cdq, size 区分 S32/S64。
+    // 零显式操作数 (全隐式): emit 单条 VmOp::Cdq, a/b/aux 全空,
+    // cond_or_size=size。handler (asmgen build_cdq) 读 Rax 槽 → native
+    // cdq/cqo 直通 → 写 Rdx 槽; 不影响 EFLAGS (零 flags 写回)。
+    bool translate_cdq(Emitter& em, const ir::Insn& in) {
+        if (in.op != ir::Op::Cdq) return false;
+        em.emit(VmOp::Cdq, OpKind::None, 0, OpKind::None, 0, 0,
+                isa::size_field(in.size));
+        return true;
+    }
+
+    // ---- MIT-404: div/idiv (整数除法族) ----
+    //
+    // 隐式 dividend = rdx:rax (S32: edx:eax) 不经字节码表达 — handler 内部
+    // 从 Rax/Rdx 双槽拼装 (对齐 build_mul 双结果槽协议)。emit 单条
+    // VmOp::Div/Idiv:
+    //   a_kind=Reg reg_a=Rdx 槽 tag (对齐 Mul, handler 不消费),
+    //   b_kind=Reg reg_b=除数槽, aux=0, cond_or_size=size (S32/S64)。
+    // 除数两种来源 (lifter 区分):
+    //   - REG: 直接 emit (reg_b = 除数槽)。
+    //   - MEM: emit_load 折条 (emit_address 算 acc + Load tmp), rip 形式
+    //     除数在 emit_load 内自动走 LoadRva 通路 — 派活单 §B.4 的 LoadRva
+    //     搭车覆盖。scratch 预算: emit_load 用 2, 在 6 预算内。
+    // flags 按 Intel undefined, handler 照抄 build_imul 处置 (zero5 → native
+    // → setcc5 → flags_tail); 除零/商溢出 = 真 #DE native 直通 (D2.1)。
+    bool translate_div_idiv(Emitter& em, Scratch& sc, const ir::Insn& in,
+                            u64 current_rva, u64 next_ip) {
+        if (in.op != ir::Op::Div && in.op != ir::Op::Idiv) return false;
+        if (in.dst.kind != ir::Operand::Kind::Reg)
+            return skip(in, "div/idiv 操作数形态未支持", nullptr);
+        const u8 sz = isa::size_field(in.size);
+        const VmOp vop = (in.op == ir::Op::Div) ? VmOp::Div : VmOp::Idiv;
+        u8 b = 0;
+        if (in.src.kind == ir::Operand::Kind::Reg) {
+            b = isa::vm_reg_of(in.src.reg);
+        } else if (in.src.kind == ir::Operand::Kind::Mem) {
+            b = emit_load(em, sc, in.src.mem, in.size, current_rva, next_ip);
+        } else {
+            return skip(in, "div/idiv 除数形态未支持", nullptr);
+        }
+        em.emit(vop, OpKind::Reg, isa::vm_reg_of(in.dst.reg), OpKind::Reg, b,
+                0, sz);
         return true;
     }
 

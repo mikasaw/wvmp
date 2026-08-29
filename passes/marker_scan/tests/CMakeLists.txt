@@ -516,3 +516,47 @@ target_compile_options(wvmp_sse_bwcmpss_flags_readback_sample PRIVATE
 target_link_options(wvmp_sse_bwcmpss_flags_readback_sample PRIVATE
     $<$<CXX_COMPILER_ID:MSVC>:/INCREMENTAL:NO>
 )
+
+# MIT-404: 端到端主样本——区域内含整数除法族 cdq/cdqe/cqo + div/idiv
+# (REG + MEM + rip 形式除数, 32/64 位), 验证整数除法支持后翻译成功、运行时
+# 走真 Cdq/Div/Idiv handler、行为与原生逐字节一致 (商/余/负数组合值正确)。
+# MSVC x64 不支持 inline asm, C++ volatile 除法只能产 cdq+idiv MEM 形式 —
+# REG 形式 / cdqe / rip 除数由 div_sample_asm.asm (MASM) 直接 emit, 链接进
+# 本 sample。主函数末尾 div_zero_crash (C++ volatile, cdq+idiv [rsp+..] MEM)
+# 除零 → 真 #DE native 直通 (D2.1) — native 与 packed 同为 0xC0000094 形态
+# 崩溃 (AC #5 除零对拍), printf+fflush 之后触发。区域不含 printf / call
+# (printf 在 main 区域外)。
+enable_language(ASM_MASM)
+add_executable(wvmp_div_sample
+    div_sample_main.cpp
+    div_sample_asm.asm
+)
+target_link_libraries(wvmp_div_sample PRIVATE wvmp::sdk)
+# COMPILE_LANGUAGE 限定 C/C++: C++ 选项传给 MASM 会 A4018, 同 MIT-389 块。
+target_compile_options(wvmp_div_sample PRIVATE
+    $<$<AND:$<CXX_COMPILER_ID:MSVC>,$<COMPILE_LANGUAGE:C,CXX>>:/Od;/Ob0;/utf-8>
+    $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-O0>
+)
+target_link_options(wvmp_div_sample PRIVATE
+    $<$<CXX_COMPILER_ID:MSVC>:/INCREMENTAL:NO>
+)
+
+# MIT-404: 影子样本——div/idiv 的 Rax/Rdx 双槽 + flags 运行时读回断言
+# (对齐 MIT-376 bwcmpss flags readback 影子模式, 派活单 §B.6 / §C D4.1)。
+# 与 wvmp_div_sample 同 IR 族、独立 exe: 每个探针打印 商/余双槽 + setz/setc/
+# seto/sets/setp 五 flags 探针 (Setcc handler 读 Div/Idiv handler flags_tail
+# 写的 VM flags 槽; flags 按 Intel undefined, 但 VM 与 native 同 CPU 同指令
+# → 真值逐位一致)。handler 空转/写错槽 → 与原生不一致 → FAIL。ctx.xmm 无关。
+enable_language(ASM_MASM)
+add_executable(wvmp_div_flags_readback_sample
+    div_flags_readback_sample_main.cpp
+    div_flags_readback_sample_asm.asm
+)
+target_link_libraries(wvmp_div_flags_readback_sample PRIVATE wvmp::sdk)
+target_compile_options(wvmp_div_flags_readback_sample PRIVATE
+    $<$<AND:$<CXX_COMPILER_ID:MSVC>,$<COMPILE_LANGUAGE:C,CXX>>:/Od;/Ob0;/utf-8>
+    $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-O0>
+)
+target_link_options(wvmp_div_flags_readback_sample PRIVATE
+    $<$<CXX_COMPILER_ID:MSVC>:/INCREMENTAL:NO>
+)
