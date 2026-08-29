@@ -109,14 +109,32 @@ public:
                 }
                 return pe->find_function_end_rva(begin_rva);
             };
-            result = translator::translate_function(fn, std::move(upper_bound_of));
+            // MIT-409: 跳转表条目读取。表体 RVA + 下标 → u32 小端条目；
+            // rva_to_offset 未映射（表越界/落间隙）或越镜像尾 → nullopt →
+            // 翻译器保守 gate。表长严禁靠"扫到非法值"推导（D1 锁死），
+            // 本函数只按下标读，绝不扫描。
+            translator::JumpTableReadFn table_read =
+                [pe, &ctx](u64 table_rva, u32 index) -> std::optional<u32> {
+                if (pe == nullptr) return std::nullopt;
+                const u64 entry_rva = table_rva + 4ull * index;
+                const auto off = pe->rva_to_offset(entry_rva);
+                if (!off || *off + 4 > ctx.image.size()) return std::nullopt;
+                const u8* p = ctx.image.data() + *off;
+                return static_cast<u32>(p[0]) | (static_cast<u32>(p[1]) << 8) |
+                       (static_cast<u32>(p[2]) << 16) | (static_cast<u32>(p[3]) << 24);
+            };
+            result = translator::translate_function(fn, std::move(upper_bound_of),
+                                                    std::move(table_read));
             // MIT-407: exit-native 站点 diag note 不进 gate 通道——virtualize
             // 对 kLastTranslateNotes 的**任一** note 即放弃该函数虚拟化
             // （v1 把站点 note 塞进 notes 的隐患：启用后每个 ExitNative 函数
             // 都会被误 gate）。按前缀过滤，经 ctx.diag 直报（note 级每站点）。
+            // MIT-409: jump-table 命中 note 同通道过滤（命中即翻译成功，
+            // note 只是 diag 证据，不能触发 gate）。
             auto& notes = result.notes;
             for (size_t i = 0; i < notes.size();) {
-                if (notes[i].rfind("exit-native @", 0) == 0) {
+                if (notes[i].rfind("exit-native @", 0) == 0 ||
+                    notes[i].rfind("jump-table @", 0) == 0) {
                     ctx.diag.report(Severity::Note, name(), notes[i]);
                     notes.erase(notes.begin() + i);
                 } else {

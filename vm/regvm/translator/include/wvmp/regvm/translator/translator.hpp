@@ -27,6 +27,12 @@ struct TranslateResult {
 //   捕获 PeImage 引用传入，并叠加 lifter 的 exit_native_blocked 判定。
 using FunctionUpperBoundFn = std::function<std::optional<u64>(u64 /*begin_rva*/)>;
 
+// MIT-409: MSVC 跳转表条目读取函数。
+//   输入: 表体 RVA + 条目下标 i；输出: 表项 u32（小端）；nullopt = 越界 /
+//   不可读（表体落在未映射区间等）→ 触发 C1 gate。
+//   实现：调用方捕获 PeImage 引用，rva_to_offset + 4 字节读。
+using JumpTableReadFn = std::function<std::optional<u32>(u64 /*table_rva*/, u32 /*index*/)>;
+
 // 纯函数：把一个函数区域的 IR 逐指令翻译为 regvm 字节码。
 //   - 无跨指令分析、无状态残留；同输入同输出。
 //   - 遇到 v1 未支持形态（call [mem] / 间接 call / 目标块缺失等）
@@ -99,6 +105,18 @@ using FunctionUpperBoundFn = std::function<std::optional<u64>(u64 /*begin_rva*/)
 // MIT-407: 越区跳转 ExitNative（当 upper_bound_fn 非空且 target ∈
 // [end_rva, upper_bound_fn(begin_rva)) 时 emit VmOp::ExitNative, aux =
 // target RVA, cond_or_size = ir::Cond；不满足 → 维持原 gate）。
+//
+// MIT-409: MSVC 跳转表特化（jmp reg 间接跳转的静态展开）。
+//   翻译期在 translate_function 内做预扫描：对每个以 `Jmp(dst=Reg)` 结尾
+//   的块，按受限四件套模板匹配 —— 前溯 `lea <b>,[rip+T]` → `mov <ix>,
+//   [<b>+<idx>*4+off]`（u32）→ `add <t>,<b>` → `jmp <t>`，且 t==ix、idx
+//   载入指令（`mov <idx>, [mem]`）在 lea 前一指令；表长 K 取前一块尾部
+//   防御 `cmp <idx>, K-1; ja <越区>`（cond=A、被比较值链接 idx 载入源）。
+//   命中后从 PE 镜像读 K 项（u32 delta，经 JumpTableReadFn），目标 RVA =
+//   lea 目标 RVA + delta；全部目标 ∈ 区域且为已 lift 指令地址才展开：
+//   运行时比较链 `Mov s,rva_i; LeaRva s,s; Cmp t,s; Jcc eq → 块_i` ×K
+//   （零新 VmOp）。任一环节失败（模板不符 / 无防御常数 / 读表越界 / 目标
+//   出区 / K>32 预算）→ 维持原 gate（保守底线零让步）。
 // =====================================================================================
 
 // 单参数版：保持原签名向后兼容（无 .pdata 上界 → 维持 gate 行为）。
@@ -108,5 +126,12 @@ using FunctionUpperBoundFn = std::function<std::optional<u64>(u64 /*begin_rva*/)
 // 的 lambda 传入。upper_bound_fn 为空 lambda 时与单参数版行为一致。
 [[nodiscard]] TranslateResult translate_function(const ir::FunctionRegion& fn,
                                                  FunctionUpperBoundFn upper_bound_fn);
+
+// 三参数版：MIT-409 跳转表读取函数。table_read_fn 为空 → 不启用跳转表
+// 特化（与双参数版行为完全一致）；启用后跳转表特化仅在模板全命中且表
+// 验证通过时展开，否则维持原 gate。
+[[nodiscard]] TranslateResult translate_function(const ir::FunctionRegion& fn,
+                                                 FunctionUpperBoundFn upper_bound_fn,
+                                                 JumpTableReadFn table_read_fn);
 
 } // namespace wvmp::regvm::translator

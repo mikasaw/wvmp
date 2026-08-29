@@ -12,8 +12,10 @@
 #include <cinttypes>
 #include <cstdio>
 #include <limits>
+#include <set>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace wvmp::regvm::translator {
@@ -57,6 +59,199 @@ void add_note(std::vector<std::string>& notes, u64 addr, std::string_view what) 
     char buf[64];
     std::snprintf(buf, sizeof(buf), " (rva=0x%" PRIX64 ")", addr);
     notes.emplace_back(std::string(what) + buf);
+}
+
+// ==================== MIT-409: MSVC 跳转表特化 ====================
+//
+// 识别模式 = 受限四件套模板（D1 决策，派活单 §A.2 实测模板），翻译期预扫描：
+//   块尾 `jmp <t>`（Reg 间接跳转，C1 gate 挂点）前溯 5 条：
+//     [-5] mov <idx>, [mem]             idx 载入（链接防御 cmp 的桥）
+//     [-4] lea <b>, [rip+T]             b = 表基址（运行时 VA = image_base+lea_tgt）
+//     [-3] mov <ix>, [<b>+<idx>*4+off]  u32 表项读入（要求 t==ix，四件套语义：
+//                                         add 只改 dst，表值必须已在 jmp 目标寄存器）
+//     [-2] add <t>, <b>                 delta + 基址 → 目标 VA
+//     [-1] jmp <t>
+//   前一块尾部防御（表长 K 唯一合法来源，D1 锁死"严禁靠扫非法值推导"）：
+//     cmp <idx>, K-1 ; ja <越区>（cond=A，被比较值经 idx 链接 = 表索引）
+//   表长 K = cmp 立即数 + 1；命中后从 PE 镜像读 K 项 u32 delta，
+//   目标 RVA = lea 目标 RVA + delta（lea 目标 = next_ip(lea)+T，运行时
+//   b = image_base + lea_tgt，add 后 t = delta + b → 目标 RVA = lea_tgt+delta）。
+//   硬判据（D3）：全部目标 ∈ [begin_rva, end_rva) 且为已 lift 指令地址
+//   （落在表体/数据段 → gate）。运行时展开 = 比较链（D2 决策，零新 VmOp）：
+//     Mov s, rva_i ; LeaRva s,s ; Cmp t,s ; Jcc eq → 块_i   ×K
+//   任一环节不符 → 维持原 gate（保守底线零让步）。
+
+// 预扫描产物：模板锚点（Jmp(dst=Reg) 指令地址）→ 处置。
+struct JumpTableHandle {
+    bool ok = false;          // true = 已验证可展开（targets 有效）
+    u64 table_rva = 0;        // 表体 RVA（diag 用）
+    std::vector<u64> targets; // ok=true: 目标 RVA（∈ 区域、已 lift 指令地址）
+    std::string gate_note;    // ok=false: 披露 note（触发 C1 gate，替代通用 skip note）
+};
+
+// 四件套模板匹配 + 表验证。返回 nullopt = 非跳转表形态（维持原 gate note）；
+// 返回 handle(ok=false) = 形态符合但验证失败（读表越界 / 目标出区 / 超预算），
+// gate_note 披露原因。
+std::optional<JumpTableHandle> try_match_jump_table(
+    const ir::BasicBlock& cur, const ir::BasicBlock& prev,
+    const std::unordered_map<u64, u64>& next_ip_of,
+    const std::unordered_set<u64>& insn_addrs, u64 begin_rva, u64 end_rva,
+    const JumpTableReadFn& read_fn) {
+    const auto& ins = cur.insns;
+    if (ins.size() < 5) return std::nullopt;
+    const ir::Insn& jmp = ins.back();
+    if (jmp.op != ir::Op::Jmp || jmp.dst.kind != ir::Operand::Kind::Reg)
+        return std::nullopt;
+    const ir::Insn& add = ins[ins.size() - 2];
+    const ir::Insn& ld = ins[ins.size() - 3];
+    const ir::Insn& lea = ins[ins.size() - 4];
+    const ir::Insn& il = ins[ins.size() - 5];
+
+    // 1) add <t>, <b>（S64，Reg/Reg——目标 VA 的 64 位拼装）
+    if (add.op != ir::Op::Add || add.size != ir::Size::S64 ||
+        add.dst.kind != ir::Operand::Kind::Reg ||
+        add.src.kind != ir::Operand::Kind::Reg)
+        return std::nullopt;
+    const ir::Reg t = add.dst.reg;
+    const ir::Reg b = add.src.reg;
+    // 2) mov <ix>, [<b>+<idx>*4+off]（S32 = 4B 表项；t==ix 硬要求）
+    if (ld.op != ir::Op::Load || ld.size != ir::Size::S32 ||
+        ld.dst.kind != ir::Operand::Kind::Reg ||
+        ld.src.kind != ir::Operand::Kind::Mem)
+        return std::nullopt;
+    if (ld.dst.reg != t) return std::nullopt;
+    const ir::MemOperand& lm = ld.src.mem;
+    if (lm.base != b || lm.index == ir::Reg::Flags || lm.scale != 4)
+        return std::nullopt;
+    const ir::Reg idx = lm.index;
+    // 3) lea <b>, [rip+T]（S64；b 是表基址）
+    if (lea.op != ir::Op::Lea || lea.size != ir::Size::S64 ||
+        lea.dst.kind != ir::Operand::Kind::Reg || lea.dst.reg != b ||
+        lea.src.kind != ir::Operand::Kind::Mem ||
+        lea.src.mem.base != ir::Reg::Rip)
+        return std::nullopt;
+    // 4) idx 载入：mov <idx>, [mem]（表索引寄存器 = jmp 目标寄存器的来源）
+    if (il.op != ir::Op::Load || il.dst.kind != ir::Operand::Kind::Reg ||
+        il.dst.reg != idx || il.src.kind != ir::Operand::Kind::Mem)
+        return std::nullopt;
+    // 5) 前一块尾部防御：cmp <idx>, K-1 ; ja <越区>（cond=A，MSVC 恒 emit）
+    if (prev.insns.size() < 2) return std::nullopt;
+    const ir::Insn& jcc = prev.insns.back();
+    const ir::Insn& cmp = prev.insns[prev.insns.size() - 2];
+    if (jcc.op != ir::Op::Jcc || jcc.cond != ir::Cond::A ||
+        jcc.dst.kind != ir::Operand::Kind::Imm)
+        return std::nullopt;
+    if (cmp.op != ir::Op::Cmp || cmp.src.kind != ir::Operand::Kind::Imm)
+        return std::nullopt;
+    // 被比较值与表索引链接：cmp dst 是 Mem → 与 idx 载入源同址；是 Reg → 同 idx
+    if (cmp.dst.kind == ir::Operand::Kind::Mem) {
+        const ir::MemOperand& cm = cmp.dst.mem;
+        const ir::MemOperand& im = il.src.mem;
+        if (cm.base != im.base || cm.index != im.index ||
+            cm.scale != im.scale || cm.disp != im.disp)
+            return std::nullopt;
+    } else if (cmp.dst.kind == ir::Operand::Kind::Reg) {
+        if (cmp.dst.reg != idx) return std::nullopt;
+    } else {
+        return std::nullopt;
+    }
+    if (cmp.src.imm < 0) return std::nullopt;
+    const u64 k = static_cast<u64>(cmp.src.imm) + 1;
+
+    // lea 目标 RVA = next_ip(lea) + T（翻译期常数，与 emit_address 的
+    // rip 规则一致）；表体 RVA = lea 目标 RVA + 表读位移 off。
+    const auto lea_it = next_ip_of.find(lea.addr);
+    if (lea_it == next_ip_of.end()) return std::nullopt; // 不该发生（next_ip_of 全量）
+    const i64 lea_tgt = static_cast<i64>(lea_it->second) + lea.src.mem.disp;
+    if (lea_tgt < 0 || lea_tgt > static_cast<i64>(std::numeric_limits<u32>::max()) ||
+        lm.disp < 0)
+        return std::nullopt;
+    const u64 lea_tgt_rva = static_cast<u64>(lea_tgt);
+    const u64 table_rva = lea_tgt_rva + static_cast<u64>(lm.disp);
+    if (table_rva > static_cast<u64>(std::numeric_limits<u32>::max()))
+        return std::nullopt;
+
+    const u64 kJmpTableBudget = 32; // 比较链条目预算（D2：≤32，超预算披露后 gate）
+    JumpTableHandle h;
+    h.table_rva = table_rva;
+    if (k < 1 || k > kJmpTableBudget) {
+        char note[160];
+        std::snprintf(note, sizeof(note),
+                      "jump-table @ 0x%" PRIX64
+                      ": 表长 K=%llu 超出比较链预算 %llu，保守 gate",
+                      table_rva, static_cast<unsigned long long>(k),
+                      static_cast<unsigned long long>(kJmpTableBudget));
+        h.gate_note = note;
+        return h;
+    }
+    std::vector<u64> targets;
+    targets.reserve(k);
+    for (u32 i = 0; i < k; ++i) {
+        const auto e = read_fn(table_rva, i);
+        if (!e) {
+            char note[160];
+            std::snprintf(note, sizeof(note),
+                          "jump-table @ 0x%" PRIX64 ": 读表项 %u 失败（越界），保守 gate",
+                          table_rva, static_cast<unsigned>(i));
+            h.gate_note = note;
+            return h;
+        }
+        const u64 target_rva = lea_tgt_rva + static_cast<u64>(*e);
+        if (target_rva < begin_rva || target_rva >= end_rva ||
+            target_rva > static_cast<u64>(std::numeric_limits<u32>::max()) ||
+            insn_addrs.find(target_rva) == insn_addrs.end()) {
+            char note[192];
+            std::snprintf(note, sizeof(note),
+                          "jump-table @ 0x%" PRIX64 ": 目标 0x%" PRIX64
+                          " 不在区域/非指令地址，保守 gate",
+                          table_rva, target_rva);
+            h.gate_note = note;
+            return h;
+        }
+        targets.push_back(target_rva);
+    }
+    h.ok = true;
+    h.targets = std::move(targets);
+    return h;
+}
+
+// 把 split_addrs（预扫描已验证为已 lift 指令地址）从所在块中切出为新块。
+// fn.blocks 是冻结只读契约，翻译期在本地副本上切分：链跳转目标由此获得
+// 块起点（block_of_addr 反查 + block_start 回填的既有机制零改动复用）。
+std::vector<ir::BasicBlock> split_blocks(std::vector<ir::BasicBlock> blocks,
+                                         const std::set<u64>& split_addrs) {
+    if (split_addrs.empty()) return blocks;
+    std::vector<ir::BasicBlock> out;
+    out.reserve(blocks.size() + split_addrs.size());
+    for (const ir::BasicBlock& b : blocks) {
+        std::vector<u64> cuts;
+        for (u64 a : split_addrs)
+            if (a > b.addr) cuts.push_back(a); // 块首切分点 = 既有块起点，无操作
+        if (cuts.empty()) {
+            out.push_back(b);
+            continue;
+        }
+        std::sort(cuts.begin(), cuts.end());
+        size_t from = 0;
+        u64 cur_start = b.addr;
+        for (u64 c : cuts) {
+            size_t ii = from;
+            while (ii < b.insns.size() && b.insns[ii].addr < c) ++ii;
+            if (ii >= b.insns.size() || b.insns[ii].addr != c) continue; // 防御
+            if (ii == from) continue;
+            ir::BasicBlock sub;
+            sub.addr = cur_start;
+            sub.insns.assign(b.insns.begin() + from, b.insns.begin() + ii);
+            out.push_back(std::move(sub));
+            from = ii;
+            cur_start = c;
+        }
+        ir::BasicBlock tail;
+        tail.addr = cur_start;
+        tail.insns.assign(b.insns.begin() + from, b.insns.end());
+        out.push_back(std::move(tail));
+    }
+    return out;
 }
 
 // ir::Op -> VmOp（值从 1 起的一一同义段；显式 switch 防枚举漂移）。
@@ -271,6 +466,9 @@ struct Translator {
     FunctionUpperBoundFn upper_bound_of_;
     u64 begin_rva_ = 0;   // 区域起始（用于 ExitNative 上界查询）
     u64 end_rva_ = 0;     // 区域结束（用于 ExitNative 目标判定）
+    // MIT-409: 跳转表处置表（锚点 jmp insn addr → 预扫描产物）。nullptr =
+    // 未启用跳转表特化（维持原 gate）。translate_jump 命中时展开比较链。
+    const std::unordered_map<u64, JumpTableHandle>* jump_tables_ = nullptr;
 
     bool skip(const ir::Insn& in, std::string_view what, const ir::MemOperand* rip) {
         if (rip && rip->base == ir::Reg::Rip)
@@ -320,7 +518,7 @@ struct Translator {
                     isa::size_field(in.size));
             break;
         case ir::Op::Jmp:
-        case ir::Op::Jcc: ok = translate_jump(em, in); break;
+        case ir::Op::Jcc: ok = translate_jump(em, sc, in); break;
         case ir::Op::Call:
             ok = translate_call(em, in, next_ip);
             break;
@@ -541,9 +739,20 @@ struct Translator {
 
     // ---- 控制流 ----
 
-    bool translate_jump(Emitter& em, const ir::Insn& in) {
-        if (in.op == ir::Op::Jmp && in.dst.kind == ir::Operand::Kind::Reg)
+    bool translate_jump(Emitter& em, Scratch& sc, const ir::Insn& in) {
+        if (in.op == ir::Op::Jmp && in.dst.kind == ir::Operand::Kind::Reg) {
+            // MIT-409: 跳转表特化挂点。预扫描命中（含"命中但 gate"）时按
+            // 处置表走；未命中维持原 gate note（保守底线零让步）。
+            if (jump_tables_) {
+                const auto it = jump_tables_->find(in.addr);
+                if (it != jump_tables_->end()) {
+                    if (it->second.ok)
+                        return translate_jump_table(em, sc, in, it->second);
+                    return false; // 预扫描已披露 gate note，不追加通用 note
+                }
+            }
             return skip(in, "间接 jmp 未支持，建议 gate", nullptr);
+        }
         if (in.dst.kind != ir::Operand::Kind::Imm)
             return skip(in, "跳转目标非立即数，未支持", nullptr);
         const auto it = block_of_addr.find(static_cast<u64>(in.dst.imm));
@@ -596,6 +805,32 @@ struct Translator {
                     isa::size_field(in.size));
         // 跳转恒为本 IR 指令展开的最后一条：最终序号 = 已有 code 长度 + 偏移。
         pending.push_back({code.size() + em.out.size() - 1, it->second});
+        return true;
+    }
+
+    // MIT-409: 跳转表比较链展开（D2 决策：零新 VmOp 零新 handler）。
+    //   目标 i：Mov s, target_rva_i (S64) → LeaRva s,s (RVA+image_base→VA)
+    //   → Cmp t,s (S64, 写 VM flags) → Jcc eq → 块_i（pending 回填）。
+    //   t = jmp 目标寄存器槽，运行时值 = delta + image_base + lea_tgt（表项
+    //   闭集）；链全覆盖 + ja 防御约束 idx ≤ K-1 → 链尾不可达，兜底 Halt
+    //   （不静默落入下一块代码）。scratch 单槽逐项复用（预算 1）。
+    bool translate_jump_table(Emitter& em, Scratch& sc, const ir::Insn& in,
+                              const JumpTableHandle& h) {
+        const u8 t = isa::vm_reg_of(in.dst.reg);
+        const u8 s = sc.take();
+        const u8 sz64 = isa::size_field(ir::Size::S64);
+        for (u64 target : h.targets) {
+            const auto it = block_of_addr.find(target);
+            if (it == block_of_addr.end())
+                return skip(in, "跳转表目标块缺失，保守 gate", nullptr); // 防御（预扫描已验）
+            em.emit_ri(VmOp::Mov, s, static_cast<u32>(target), sz64);
+            em.emit_rr(VmOp::LeaRva, s, s, sz64);
+            em.emit_rr(VmOp::Cmp, t, s, sz64);
+            em.emit(VmOp::Jcc, OpKind::None, 0, OpKind::None, 0, 0,
+                    static_cast<u8>(ir::Cond::E));
+            pending.push_back({code.size() + em.out.size() - 1, it->second});
+        }
+        em.emit(VmOp::Halt, OpKind::None, 0, OpKind::None, 0, 0, 0);
         return true;
     }
 
@@ -1601,17 +1836,19 @@ struct Translator {
 TranslateResult translate_function(const ir::FunctionRegion& fn) {
     // 无 .pdata 上界 → 维持原行为。FunctionUpperBoundFn 默认构造为 nullptr
     // 调用，等价于"无上界"，translate_jump 走原 C1 gate 路径。
-    return translate_function(fn, FunctionUpperBoundFn{});
+    return translate_function(fn, FunctionUpperBoundFn{}, JumpTableReadFn{});
 }
 
 TranslateResult translate_function(const ir::FunctionRegion& fn,
                                  FunctionUpperBoundFn upper_bound_fn) {
-    TranslateResult result;
+    // 无跳转表读取函数 → 不启用跳转表特化（与双参数版行为一致）。
+    return translate_function(fn, std::move(upper_bound_fn), JumpTableReadFn{});
+}
 
-    // 地址 -> 块下标（块按向量顺序即布局顺序排放）。
-    std::unordered_map<u64, size_t> block_of_addr;
-    for (size_t i = 0; i < fn.blocks.size(); ++i)
-        block_of_addr.emplace(fn.blocks[i].addr, i);
+TranslateResult translate_function(const ir::FunctionRegion& fn,
+                                 FunctionUpperBoundFn upper_bound_fn,
+                                 JumpTableReadFn table_read_fn) {
+    TranslateResult result;
 
     // 地址 -> next_ip（每条 insn 的结束 RVA; rip-relative 翻译用 next_ip+disp 算 RVA）。
     // 推断规则：同一块内下一条 insn.addr; 块末尾下一条 = 下一块 .addr; 函数末尾
@@ -1635,9 +1872,55 @@ TranslateResult translate_function(const ir::FunctionRegion& fn,
         }
     }
 
+    // MIT-409: 跳转表特化预扫描。对每个以 Jmp(dst=Reg) 结尾的块跑四件套
+    // 模板匹配 + 表验证（读表经调用方提供的 JumpTableReadFn）；命中且验证
+    // 通过 → 记 jump-table diag note（上层过滤，不触发 gate）+ 收集块切分
+    // 点；命中但验证失败 → 披露 note（触发 gate）；模板不符 → 维持原
+    // translate_jump 的通用 skip note。切分点在本地块副本上生效——fn.blocks
+    // 是冻结只读契约不可原地改；切分后 block_of_addr 重建（链跳转目标由此
+    // 进入块表，Jcc/Jmp rel 同款反查 + block_start 回填零新机制）。
+    std::unordered_map<u64, JumpTableHandle> jump_tables;
+    std::set<u64> split_addrs;
+    if (table_read_fn) {
+        std::unordered_set<u64> insn_addrs;
+        insn_addrs.reserve(fn.blocks.size() * 8);
+        for (const ir::BasicBlock& b : fn.blocks)
+            for (const ir::Insn& in : b.insns) insn_addrs.insert(in.addr);
+        for (size_t bi = 1; bi < fn.blocks.size(); ++bi) {
+            const ir::BasicBlock& cur = fn.blocks[bi];
+            const ir::BasicBlock& prev = fn.blocks[bi - 1];
+            if (cur.insns.empty()) continue;
+            const ir::Insn& last = cur.insns.back();
+            if (last.op != ir::Op::Jmp || last.dst.kind != ir::Operand::Kind::Reg)
+                continue;
+            auto h = try_match_jump_table(cur, prev, next_ip_of, insn_addrs,
+                                          fn.begin_rva, fn.end_rva, table_read_fn);
+            if (!h) continue; // 非跳转表形态 → 维持原 gate note
+            if (h->ok) {
+                char note[160];
+                std::snprintf(note, sizeof(note),
+                              "jump-table @ 0x%" PRIX64 " entries=%zu targets-in-region",
+                              h->table_rva, h->targets.size());
+                result.notes.emplace_back(note);
+                for (u64 tgt : h->targets) split_addrs.insert(tgt);
+            } else {
+                result.notes.emplace_back(std::move(h->gate_note));
+            }
+            jump_tables.emplace(last.addr, std::move(*h));
+        }
+    }
+
+    // 本地块副本：按预扫描切分点切块（无命中时不切，行为与主 bbc93e6 全等）。
+    std::vector<ir::BasicBlock> blocks = split_blocks(fn.blocks, split_addrs);
+
+    // 地址 -> 块下标（块按向量顺序即布局顺序排放）。预扫描切分后重建。
+    std::unordered_map<u64, size_t> block_of_addr;
+    for (size_t i = 0; i < blocks.size(); ++i)
+        block_of_addr.emplace(blocks[i].addr, i);
+
     std::vector<VmInsn> code;
     std::vector<PendingJump> pending;
-    std::vector<size_t> block_start(fn.blocks.size());
+    std::vector<size_t> block_start(blocks.size());
     Translator tr{code, pending, block_of_addr, result.notes, &next_ip_of};
     // MIT-407: 把上界查询与区域端点写入 Translator, translate_jump 据此判定
     // 是否 emit ExitNative。upper_bound_fn 为空时 upper_bound_of_ 留空,
@@ -1647,10 +1930,12 @@ TranslateResult translate_function(const ir::FunctionRegion& fn,
         tr.begin_rva_ = fn.begin_rva;
         tr.end_rva_ = fn.end_rva;
     }
+    // MIT-409: 跳转表处置表（可为空——未命中时 translate_jump 维持原 gate）。
+    tr.jump_tables_ = &jump_tables;
     const u8 sz64 = isa::size_field(ir::Size::S64);
 
-    for (size_t bi = 0; bi < fn.blocks.size(); ++bi) {
-        const ir::BasicBlock& b = fn.blocks[bi];
+    for (size_t bi = 0; bi < blocks.size(); ++bi) {
+        const ir::BasicBlock& b = blocks[bi];
         block_start[bi] = code.size();
         for (const ir::Insn& in : b.insns)
             tr.run(in);
