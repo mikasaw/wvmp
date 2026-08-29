@@ -53,6 +53,12 @@
 #     零新 VmOp) + 负例 andnps gate) + wvmp_sse_memop_xmm_readback_sample
 #     (comiss/comisd flags + pd 位运算 ctx.xmm 读回影子样本).
 #     Total: 32 samples × 5 seeds = 160 runs.
+#   - MIT-413 (G2): extend to wvmp_jmp_table8_sample (跳转表残余形态主样本:
+#     REG 源 8B 绝对表 / REG 源 8B delta 表 / REG 源 delta-from-jmp (GCC .L4
+#     风格) / MEM 源 jmp [tbl+idx*8] (lea 基址) / MEM 源 movabs 基址 五形态
+#     真虚拟化; 同 exe 3 负例 (无防御/目标出区/表项指向数据段) 照旧 gate,
+#     行为 byte-exact 由双跑兜底).
+#     Total: 33 samples × 5 seeds = 165 runs.
 #   - MIT-306: REQUIRE_REAL=1 校验日志含 "已生成 N 个入口 stub" 防止 C1 gate
 #     兜底被误判 PASS（仅 byte-exact 不够, C1 gate 函数被跳过仍能输出相同
 #     stdout+rc）。与 multiseed_e2e_real.sh 配套使用。
@@ -126,6 +132,11 @@ samples=(
     # 新形态真虚拟化非 gate。
     "build/passes/marker_scan/tests/wvmp_sse_memop_sample.exe"
     "build/passes/marker_scan/tests/wvmp_sse_memop_xmm_readback_sample.exe"
+    # MIT-413 (G2): 跳转表残余形态主样本 — REG 8B 绝对/delta/delta-from-jmp
+    # + MEM 源 jmp [tbl+idx*8] (lea/movabs 基址) 五形态真虚拟化
+    # (REQUIRE_REAL ≥1 stub); 同 exe 3 负例 (无防御/目标出区/表项指向数据段)
+    # 照旧 gate, 行为 byte-exact 由双跑兜底。
+    "build/passes/marker_scan/tests/wvmp_jmp_table8_sample.exe"
 )
 
 # Seeds: 1 (small), 12345 (default), 99999 (large), 0xDEADBEEF (magic), 0xCAFEBABE (magic).

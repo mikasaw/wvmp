@@ -692,6 +692,35 @@ target_link_options(wvmp_jmp_table_sample PRIVATE
     $<$<CXX_COMPILER_ID:MSVC>:/INCREMENTAL:NO>
 )
 
+# MIT-413 (G2): 跳转表残余形态样本——5 正 (REQUIRE_REAL 真虚拟化) + 3 负例
+# (gate) 单 exe, MASM 手拼字节形态 (clang/GCC 本机不存在, 派活单 §F.1):
+#   ① wv_jt8_abs    REG 源 8B 绝对表 (无 add, 表项=完整 VA, 翻译期减
+#                    image_base 还原 RVA)
+#   ② wv_jt8_delta  REG 源 8B delta 表 (带 add, 表项=case−表基址, 负值
+#                    两补码 8B signed)
+#   ③ wv_jt8_djmp   REG 源 delta-from-jmp (GCC .L4 风格: lea 基址=jmp 指令
+#                    地址; 基址即跳转点时与 delta-from-base 静态不可分, §F.3)
+#   ④ wv_jtm_abs    MEM 源直跳 jmp [rcx+rax*8] (lea 基址, 绝对 VA 表项)
+#   ⑤ wv_jtm_movabs MEM 源 + movabs 基址 (disp 常量形态)
+#   ⑥ wv_jt_undef   无防御 (无 cmp/ja) → 永久 gate (G2-c 裁决)
+#   ⑦ wv_jt_oob     表项指向另一函数入口 → 出区 gate
+#   ⑧ wv_jt_data    表项指向数据段全局 → 非指令地址 gate
+# 证据: 保护日志 5 条 "jump-table @ ... entries=8 reg-8B-abs/reg-8B-delta/
+# mem-8B-abs" 命中 + 3 条 gate note (未检出防御常数 / 不在区域各 ≥1)。
+enable_language(ASM_MASM)
+add_executable(wvmp_jmp_table8_sample
+    jmp_table8_sample_main.cpp
+    jmp_table8_sample_asm.asm
+)
+target_link_libraries(wvmp_jmp_table8_sample PRIVATE wvmp::sdk)
+target_compile_options(wvmp_jmp_table8_sample PRIVATE
+    $<$<AND:$<CXX_COMPILER_ID:MSVC>,$<COMPILE_LANGUAGE:C,CXX>>:/Od;/Ob0;/utf-8>
+    $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-O0>
+)
+target_link_options(wvmp_jmp_table8_sample PRIVATE
+    $<$<CXX_COMPILER_ID:MSVC>:/INCREMENTAL:NO>
+)
+
 # MIT-411 (G1): SSE 尾扫包主样本——双访存语义 + comiss/comisd + pd 位运算族。
 # 区域覆盖 (派活单 §A.2 三挂点, 编译器形态实测定形):
 #   - 双访存读改写 triple (movsd+addsd+movsd 全 rip, C++ g_d += 1.0 天然产;

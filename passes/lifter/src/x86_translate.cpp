@@ -239,12 +239,13 @@ TranslateResult translate_pop(const cs_insn& ci, const cs_x86& x, ir::Arch arch)
     return ok(out);
 }
 
-// jmp（rel/abs/reg 均为 Jmp，目标在 dst）；间接内存跳转 jmp [..] v1 跳过。
+// jmp（rel/abs/reg 均为 Jmp，目标在 dst）。MIT-413 (G2-b): 间接内存跳转
+// `jmp [mem]`（clang/GCC `jmp [tbl+idx*8]` 平台表）lift 为 Jmp(dst=Mem)——
+// 翻译器跳转表匹配器按 MEM 源形态静态展开；非表形态在翻译器侧照旧
+// skip → C1 gate（行为与 409 前逐字节一致，仅 gate note 文本由 lifter
+// skip 变为 translator skip）。
 TranslateResult translate_jmp(const cs_insn& ci, const cs_x86& x, ir::Arch arch) {
     if (x.op_count != 1) return unsupported(ci.address, ci.size);
-    if (x.operands[0].type != X86_OP_IMM && x.operands[0].type != X86_OP_REG) {
-        return unsupported(ci.address, ci.size);
-    }
     auto d = to_operand(x.operands[0]);
     if (!d) return unsupported(ci.address, ci.size);
     ir::Insn out;

@@ -27,11 +27,16 @@ struct TranslateResult {
 //   捕获 PeImage 引用传入，并叠加 lifter 的 exit_native_blocked 判定。
 using FunctionUpperBoundFn = std::function<std::optional<u64>(u64 /*begin_rva*/)>;
 
-// MIT-409: MSVC 跳转表条目读取函数。
-//   输入: 表体 RVA + 条目下标 i；输出: 表项 u32（小端）；nullopt = 越界 /
-//   不可读（表体落在未映射区间等）→ 触发 C1 gate。
-//   实现：调用方捕获 PeImage 引用，rva_to_offset + 4 字节读。
-using JumpTableReadFn = std::function<std::optional<u32>(u64 /*table_rva*/, u32 /*index*/)>;
+// MIT-409 + MIT-413 (G2): 跳转表条目读取函数。
+//   输入: 表体 RVA + 条目下标 i + 条目宽度 width（4/8，匹配器从表读指令
+//   的 scale 推出，早于读表）；输出: 表项 u64 小端（width=4 时零扩展，
+//   高 4 字节 0）；nullopt = 越界 / 不可读（表体落在未映射区间等）→
+//   触发 C1 gate。
+//   实现：调用方捕获 PeImage 引用，rva_to_offset + width 字节读（越镜像
+//   尾界即 nullopt——表体恰在镜像末尾的退化情形保守 gate）。
+using JumpTableReadFn = std::function<std::optional<u64>(u64 /*table_rva*/,
+                                                         u32 /*index*/,
+                                                         u8 /*width 4|8*/)>;
 
 // 纯函数：把一个函数区域的 IR 逐指令翻译为 regvm 字节码。
 //   - 无跨指令分析、无状态残留；同输入同输出。
@@ -117,6 +122,19 @@ using JumpTableReadFn = std::function<std::optional<u32>(u64 /*table_rva*/, u32 
 //   运行时比较链 `Mov s,rva_i; LeaRva s,s; Cmp t,s; Jcc eq → 块_i` ×K
 //   （零新 VmOp）。任一环节失败（模板不符 / 无防御常数 / 读表越界 / 目标
 //   出区 / K>32 预算）→ 维持原 gate（保守底线零让步）。
+//
+// MIT-413 (G2): 匹配器参数化扩面（D4：单匹配器三参数，禁复制第二套）。
+//   ① 表项宽度 4B/8B 双形态：8B 读 qword（signed 语义，含负 delta）；
+//   ② 基址语义三候选 —— DeltaFromBase（表项 = 目标 RVA − 表基址 RVA，
+//      REG 源带 `add t,b`）、DeltaFromJmp（表项 = 目标 RVA − jmp 指令
+//      RVA，GCC `.L4` 风格）、AbsoluteVa（表项 = 完整 VA，无 `add`，
+//      目标 RVA = 表项 − image_base，需调用方提供 image_base）；
+//   ③ jmp 源形态 Reg/Mem：`jmp [tbl+idx*8]`（clang/GCC 风格）MEM 源直跳，
+//      运行时先物化表项（Mov s,idx; Shl s; Add s,base; Add s,disp; Load t,
+//      [s]），delta 系再锚定（Add t, anchor_rva; LeaRva t,t）后与 REG 源
+//      共用同一条 LeaRva 比较链。防御条件兼容 `cmp idx,K-1; ja`（MSVC）
+//      与 `cmp idx,K; jae`（GCC，K 直接取立即数）；无防御 → 保持 gate
+//      （D2 永久裁决），但以"疑似表形态但未检出防御常数"note 披露原因链。
 // =====================================================================================
 
 // 单参数版：保持原签名向后兼容（无 .pdata 上界 → 维持 gate 行为）。
@@ -133,5 +151,14 @@ using JumpTableReadFn = std::function<std::optional<u32>(u64 /*table_rva*/, u32 
 [[nodiscard]] TranslateResult translate_function(const ir::FunctionRegion& fn,
                                                  FunctionUpperBoundFn upper_bound_fn,
                                                  JumpTableReadFn table_read_fn);
+
+// 四参数版：MIT-413 (G2) 增加 image_base（PE optional header ImageBase）。
+// image_base = 0（调用方未提供）→ 绝对 VA 表项语义候选跳过（该语义
+// 需要翻译期减 image_base 还原目标 RVA），其余语义照常。既有调用方
+// 不传即保持三参数版行为。
+[[nodiscard]] TranslateResult translate_function(const ir::FunctionRegion& fn,
+                                                 FunctionUpperBoundFn upper_bound_fn,
+                                                 JumpTableReadFn table_read_fn,
+                                                 u64 image_base);
 
 } // namespace wvmp::regvm::translator

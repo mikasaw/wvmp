@@ -285,6 +285,37 @@ TEST_F(LifterTranslate, JmpRegister) {
     EXPECT_EQ(r.insn.dst.reg, ir::Reg::Rax);
 }
 
+TEST_F(LifterTranslate, JmpMemLifted) {
+    // MIT-413 (G2-b): FF 24 C8: jmp qword ptr [rax+rcx*8] — mem 源间接跳转
+    // （clang/GCC `jmp [tbl+idx*8]` 平台表）lift 为 Jmp(dst=Mem)；翻译器
+    // 跳转表匹配器按 MEM 源形态展开，非表形态在翻译器侧照旧 gate。
+    const wvmp::u8 b[] = {0xFF, 0x24, 0xC8};
+    auto r = translate_bytes(x64, b, ir::Arch::X64);
+    ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r.insn.op, ir::Op::Jmp);
+    EXPECT_EQ(r.insn.size, ir::Size::S64);
+    ASSERT_EQ(r.insn.dst.kind, ir::Operand::Kind::Mem);
+    EXPECT_EQ(r.insn.dst.mem.base, ir::Reg::Rax);
+    EXPECT_EQ(r.insn.dst.mem.index, ir::Reg::Rcx);
+    EXPECT_EQ(r.insn.dst.mem.scale, 8);
+    EXPECT_EQ(r.insn.dst.mem.disp, 0);
+}
+
+TEST_F(LifterTranslate, QwordIndexedLoadScale8) {
+    // MIT-413 (G2-a): 48 8B 04 C8: mov rax, qword ptr [rax+rcx*8] — 8B 表项
+    // 读入（G2-a 双语义表形态的表读指令）。
+    const wvmp::u8 b[] = {0x48, 0x8B, 0x04, 0xC8};
+    auto r = translate_bytes(x64, b, ir::Arch::X64);
+    ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r.insn.op, ir::Op::Load);
+    EXPECT_EQ(r.insn.size, ir::Size::S64);
+    ASSERT_EQ(r.insn.src.kind, ir::Operand::Kind::Mem);
+    EXPECT_EQ(r.insn.src.mem.base, ir::Reg::Rax);
+    EXPECT_EQ(r.insn.src.mem.index, ir::Reg::Rcx);
+    EXPECT_EQ(r.insn.src.mem.scale, 8);
+    EXPECT_EQ(r.insn.src.mem.disp, 0);
+}
+
 TEST_F(LifterTranslate, CallRelative) {
     // E8 00 00 00 00: call +0（@0 → 目标 5）
     const wvmp::u8 b[] = {0xE8, 0x00, 0x00, 0x00, 0x00};

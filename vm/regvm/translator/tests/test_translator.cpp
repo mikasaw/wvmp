@@ -710,4 +710,319 @@ TEST(Translate, CallMemIsSkipped) {
     EXPECT_NE(r.notes.front().find("call"), std::string::npos);
 }
 
+// ---------------- MIT-413 (G2): 跳转表残余形态匹配器 ----------------
+
+// 设置 insn 地址（I() 默认 0x401000；本组测试的 next_ip_of 依赖块内布局）。
+ir::Insn at(ir::Insn i, u64 a) {
+    i.addr = a;
+    return i;
+}
+
+// G2 测试夹具：区域 [0x1000, 0x3000)，表体 RVA 0x2000（测试内表位置不影响
+// 匹配——read_fn 是假读，仅目标 RVA 参与区判据）。块布局（布局序 = 地址序）：
+//   b0 @0x1000 防御: [mov rax,[rsp+8]; cmp rax,7; ja 0x2008]（尾部 cmp+ja）
+//   b1 @0x1020 表块:  形态由测试自定（il@0x1020 7B / lea@0x1027 7B →
+//                      lea 目标 = 0x102E+disp = 0x2000 / 表读 / [add] / jmp）
+//   b2..b9 case body @0x1100..0x1170（每块 16 字节错开）
+//   b10 @0x2008 default；b11 @0x2010 join（nop 收尾 → fallthrough → Halt）
+struct G2JtFixture {
+    ir::FunctionRegion fn;
+    G2JtFixture(ir::BasicBlock tail_block, ir::BasicBlock prev_block) {
+        std::vector<ir::BasicBlock> blocks;
+        blocks.push_back(std::move(prev_block));
+        blocks.push_back(std::move(tail_block));
+        for (u64 a = 0x1100; a < 0x1180; a += 0x10)
+            blocks.push_back(blk(a, {at(mov_imm(ir::Reg::Rax, 0x10 + a, ir::Size::S64), a),
+                                    at(jump(ir::Op::Jmp, 0x2010), a + 0xE)}));
+        blocks.push_back(blk(0x2008,
+                             {at(mov_imm(ir::Reg::Rax, 0xA5, ir::Size::S64), 0x2008),
+                              at(jump(ir::Op::Jmp, 0x2010), 0x2010 - 2)}));
+        blocks.push_back(blk(0x2010, {at(I(ir::Op::Nop, ir::Size::S64), 0x2010)}));
+        fn = fn_of(std::move(blocks));
+    }
+};
+
+// 防御块（idx=rax）：mov rax,[rsp+8] + cmp rax,7 + ja default。
+ir::BasicBlock g2_defense_block() {
+    return blk(0x1000, {at(mov(ir::Reg::Rax, ir::Reg::Rsp, ir::Size::S64), 0x1000),
+                        at(alu(ir::Op::Cmp, ir::Operand::reg_(ir::Reg::Rax),
+                               ir::Operand::imm_(7), ir::Size::S64),
+                           0x1003),
+                        at(jump(ir::Op::Jcc, 0x2008, ir::Cond::A), 0x1006)});
+}
+
+// 8B delta 表块（REG 源带 add；G2-a delta 语义）。
+ir::BasicBlock g2_delta8_tail_block() {
+    const ir::Insn il = at([] {
+        ir::Insn i = I(ir::Op::Load, ir::Size::S64);
+        i.dst = ir::Operand::reg_(ir::Reg::Rax);
+        i.src = ir::Operand::mem_(m(ir::Reg::Rsp, ir::Reg::Flags, 0, 8));
+        return i;
+    }(), 0x1020);
+    ir::Insn lea_i = I(ir::Op::Lea, ir::Size::S64);
+    lea_i.addr = 0x1027;
+    lea_i.dst = ir::Operand::reg_(ir::Reg::Rcx);
+    lea_i.src = ir::Operand::mem_(m(ir::Reg::Rip, ir::Reg::Flags, 0, 0xFD2));
+    const ir::Insn ld = at([] {
+        ir::Insn i = I(ir::Op::Load, ir::Size::S64);
+        i.dst = ir::Operand::reg_(ir::Reg::Rax);
+        i.src = ir::Operand::mem_(m(ir::Reg::Rcx, ir::Reg::Rax, 8, 0));
+        return i;
+    }(), 0x102E);
+    const ir::Insn add_i = at(alu(ir::Op::Add, ir::Operand::reg_(ir::Reg::Rax),
+                                  ir::Operand::reg_(ir::Reg::Rcx), ir::Size::S64),
+                              0x1033);
+    const ir::Insn j = at([] {
+        ir::Insn i = I(ir::Op::Jmp, ir::Size::S64);
+        i.dst = ir::Operand::reg_(ir::Reg::Rax);
+        return i;
+    }(), 0x1036);
+    return blk(0x1020, {il, lea_i, ld, add_i, j});
+}
+
+// 8B 绝对 VA 表块（REG 源无 add；G2-a abs 语义）。
+ir::BasicBlock g2_abs8_tail_block() {
+    const ir::Insn il = at([] {
+        ir::Insn i = I(ir::Op::Load, ir::Size::S64);
+        i.dst = ir::Operand::reg_(ir::Reg::Rax);
+        i.src = ir::Operand::mem_(m(ir::Reg::Rsp, ir::Reg::Flags, 0, 8));
+        return i;
+    }(), 0x1020);
+    ir::Insn lea_i = I(ir::Op::Lea, ir::Size::S64);
+    lea_i.addr = 0x1027;
+    lea_i.dst = ir::Operand::reg_(ir::Reg::Rcx);
+    lea_i.src = ir::Operand::mem_(m(ir::Reg::Rip, ir::Reg::Flags, 0, 0xFD2));
+    const ir::Insn ld = at([] {
+        ir::Insn i = I(ir::Op::Load, ir::Size::S64);
+        i.dst = ir::Operand::reg_(ir::Reg::Rax);
+        i.src = ir::Operand::mem_(m(ir::Reg::Rcx, ir::Reg::Rax, 8, 0));
+        return i;
+    }(), 0x102E);
+    const ir::Insn j = at([] {
+        ir::Insn i = I(ir::Op::Jmp, ir::Size::S64);
+        i.dst = ir::Operand::reg_(ir::Reg::Rax);
+        return i;
+    }(), 0x1033);
+    return blk(0x1020, {il, lea_i, ld, j});
+}
+
+// MEM 源表块（G2-b）：il + lea + jmp [rcx+rax*8]。
+ir::BasicBlock g2_mem_tail_block() {
+    const ir::Insn il = at([] {
+        ir::Insn i = I(ir::Op::Load, ir::Size::S64);
+        i.dst = ir::Operand::reg_(ir::Reg::Rax);
+        i.src = ir::Operand::mem_(m(ir::Reg::Rsp, ir::Reg::Flags, 0, 8));
+        return i;
+    }(), 0x1020);
+    ir::Insn lea_i = I(ir::Op::Lea, ir::Size::S64);
+    lea_i.addr = 0x1027;
+    lea_i.dst = ir::Operand::reg_(ir::Reg::Rcx);
+    lea_i.src = ir::Operand::mem_(m(ir::Reg::Rip, ir::Reg::Flags, 0, 0xFD2));
+    const ir::Insn j = at([] {
+        ir::Insn i = I(ir::Op::Jmp, ir::Size::S64);
+        i.dst = ir::Operand::mem_(m(ir::Reg::Rcx, ir::Reg::Rax, 8, 0));
+        return i;
+    }(), 0x102E);
+    return blk(0x1020, {il, lea_i, j});
+}
+
+// 假表读取：rva 必须 0x2000，越界即 nullopt（保守 gate 路径）。
+wvmp::regvm::translator::JumpTableReadFn g2_read_fn(std::vector<u64> tbl) {
+    return [tbl = std::move(tbl)](u64 rva, u32 i, u8 width)
+               -> std::optional<u64> {
+        if (rva != 0x2000 || i >= tbl.size()) return std::nullopt;
+        if (width == 8) return tbl[i];
+        if (width == 4) return static_cast<u32>(tbl[i]);
+        return std::nullopt;
+    };
+}
+
+// 表目标：0x1100 + i*0x10（8 项，∈ [0x1000,0x3000) 且为 case body 块首）。
+std::vector<u64> g2_targets() {
+    std::vector<u64> v;
+    for (u64 t = 0x1100; t < 0x1180; t += 0x10) v.push_back(t);
+    return v;
+}
+
+TEST(Translate, JumpTable8DeltaRegExpandsChain) {
+    // G2-a: 8B delta（REG 源带 add）。表项 = 目标 − 表基址(0x2000)（负值
+    // 两补码——8B signed 语义）。验证: ok note + 8×[Mov s,rva; LeaRva;
+    // Cmp t,s; Jcc eq] + 链尾 Halt。
+    G2JtFixture fx(g2_delta8_tail_block(), g2_defense_block());
+    std::vector<u64> tbl;
+    for (u64 t : g2_targets()) tbl.push_back(t - 0x2000); // 8B signed 负 delta
+    const auto r = wvmp::regvm::translator::translate_function(
+        fx.fn, wvmp::regvm::translator::FunctionUpperBoundFn{}, g2_read_fn(tbl), 0);
+    ASSERT_EQ(r.notes.size(), static_cast<size_t>(1));
+    EXPECT_NE(r.notes[0].find("jump-table @ 0x2000 entries=8 reg-8B-delta"),
+              std::string::npos);
+    const Decoded d = decode_program(r.program);
+    // 链首：Mov s,0x1100（首个 aux==0x1100 的 Mov-imm；il/lea/地址计算的
+    // Mov-imm aux 分别为 0x2000/位移等，均不冲突）
+    size_t first = d.insns.size();
+    for (size_t i = 0; i < d.insns.size(); ++i)
+        if (d.insns[i].op == VmOp::Mov && d.insns[i].b_kind == OpKind::Imm &&
+            d.insns[i].aux == 0x1100) {
+            first = i;
+            break;
+        }
+    ASSERT_LT(first, d.insns.size());
+    const auto& g = d.insns;
+    // 从链首按 4 拍步进，逐拍核对 [Mov s,rva; LeaRva s,s; Cmp t,s; Jcc eq]
+    size_t jcc_e = 0;
+    for (size_t i = first; i + 4 <= g.size() && jcc_e < 8; i += 4) {
+        if (g[i].op == VmOp::Mov && g[i].b_kind == OpKind::Imm &&
+            g[i + 1].op == VmOp::LeaRva && g[i + 2].op == VmOp::Cmp &&
+            g[i + 3].op == VmOp::Jcc &&
+            g[i + 3].cond_or_size == static_cast<u8>(ir::Cond::E))
+            ++jcc_e;
+    }
+    EXPECT_EQ(jcc_e, 8u);
+    EXPECT_EQ(g[first + 1].op, VmOp::LeaRva);
+    EXPECT_EQ(g[first + 2].op, VmOp::Cmp);
+    EXPECT_EQ(g[first + 3].op, VmOp::Jcc);
+    EXPECT_EQ(g.back().op, VmOp::Halt);
+}
+
+TEST(Translate, JumpTable8AbsRegExpandsChain) {
+    // G2-a: 8B 绝对 VA（REG 源无 add）。表项 = 完整 VA → 目标 RVA = 表项
+    // − image_base(0x140000000)。验证 ok note + 8 条 Jcc(E) + Halt。
+    G2JtFixture fx(g2_abs8_tail_block(), g2_defense_block());
+    const u64 kImageBase = 0x140000000ull;
+    std::vector<u64> tbl;
+    for (u64 t : g2_targets()) tbl.push_back(kImageBase + t);
+    const auto r = wvmp::regvm::translator::translate_function(
+        fx.fn, wvmp::regvm::translator::FunctionUpperBoundFn{}, g2_read_fn(tbl),
+        kImageBase);
+    ASSERT_EQ(r.notes.size(), static_cast<size_t>(1));
+    EXPECT_NE(r.notes[0].find("jump-table @ 0x2000 entries=8 reg-8B-abs"),
+              std::string::npos);
+    const Decoded d = decode_program(r.program);
+    size_t jcc_e = 0;
+    for (const VmInsn& g : d.insns)
+        if (g.op == VmOp::Jcc && g.cond_or_size == static_cast<u8>(ir::Cond::E))
+            ++jcc_e;
+    EXPECT_EQ(jcc_e, 8u);
+    EXPECT_EQ(d.insns.back().op, VmOp::Halt);
+}
+
+TEST(Translate, JumpTableMemAbsExpandsChain) {
+    // G2-b: `jmp [rcx+rax*8]` mem 源直跳 + 绝对 VA 表项。链前缀须物化表项：
+    // Mov s,rax; Shl s,3; Add s,rcx; Load t,[s]（无 add/无锚定——表项即 VA）。
+    G2JtFixture fx(g2_mem_tail_block(), g2_defense_block());
+    const u64 kImageBase = 0x140000000ull;
+    std::vector<u64> tbl;
+    for (u64 t : g2_targets()) tbl.push_back(kImageBase + t);
+    const auto r = wvmp::regvm::translator::translate_function(
+        fx.fn, wvmp::regvm::translator::FunctionUpperBoundFn{}, g2_read_fn(tbl),
+        kImageBase);
+    ASSERT_EQ(r.notes.size(), static_cast<size_t>(1));
+    EXPECT_NE(r.notes[0].find("jump-table @ 0x2000 entries=8 mem-8B-abs"),
+              std::string::npos);
+    const Decoded d = decode_program(r.program);
+    const auto& g = d.insns;
+    // 指令流前缀：b0 防御块 4 拍（Mov rax,rsp; Cmp rax,7; Jcc ja + 块尾
+    // fallthrough Jmp+1）→ insns[4..6] = il 翻译（Mov acc,rsp; Add acc,8;
+    // Load rax,acc），insns[7..8] = lea 翻译（Mov acc,0x2000; LeaRva
+    // rcx,acc——直接进 dst 槽），insns[9..12] = 物化（Mov s,rax; Shl s,3;
+    // Add s,rcx; Load t,[s]）。
+    ASSERT_GE(g.size(), static_cast<size_t>(17));
+    expect_is(g[9], VmOp::Mov, OpKind::Reg, isa::kScratchFirst, OpKind::Reg, kRax, 0,
+              kS64);
+    expect_is(g[10], VmOp::Shl, OpKind::Reg, isa::kScratchFirst, OpKind::Imm, 0, 3,
+              kS64);
+    expect_is(g[11], VmOp::Add, OpKind::Reg, isa::kScratchFirst, OpKind::Reg, kRcx, 0,
+              kS64);
+    expect_is(g[12], VmOp::Load, OpKind::Reg, isa::kScratchFirst + 1, OpKind::Reg,
+              isa::kScratchFirst, 0, kS64);
+    // 链首（s 复用为比较槽）：Mov s,0x1100; LeaRva s,s; Cmp t,s; Jcc(E)
+    expect_is(g[13], VmOp::Mov, OpKind::Reg, isa::kScratchFirst, OpKind::Imm, 0,
+              0x1100, kS64);
+    expect_is(g[14], VmOp::LeaRva, OpKind::Reg, isa::kScratchFirst, OpKind::Reg,
+              isa::kScratchFirst, 0, kS64);
+    expect_is(g[15], VmOp::Cmp, OpKind::Reg, isa::kScratchFirst + 1, OpKind::Reg,
+              isa::kScratchFirst, 0, kS64);
+    // Jcc 的 aux 是回填后的相对偏移（非 0），只断言 op + cond。
+    EXPECT_EQ(g[16].op, VmOp::Jcc);
+    EXPECT_EQ(g[16].cond_or_size, static_cast<u8>(ir::Cond::E));
+    size_t jcc_e = 0;
+    for (const VmInsn& v : g)
+        if (v.op == VmOp::Jcc && v.cond_or_size == static_cast<u8>(ir::Cond::E))
+            ++jcc_e;
+    EXPECT_EQ(jcc_e, 8u);
+    EXPECT_EQ(g.back().op, VmOp::Halt);
+}
+
+TEST(Translate, JumpTableMemDeltaJmpExpandsChain) {
+    // G2-b: mem 源 + delta-from-jmp 表项（GCC `.L4` 风格：项 = 目标 − jmp
+    // 指令地址）。链前缀须物化 + 锚定：Add t,0x102E; LeaRva t,t 后与 REG 源
+    // 共用同一条 LeaRva 比较链。
+    G2JtFixture fx(g2_mem_tail_block(), g2_defense_block());
+    const u64 kJmpRva = 0x102E;
+    std::vector<u64> tbl;
+    for (u64 t : g2_targets()) tbl.push_back(t - kJmpRva);
+    const auto r = wvmp::regvm::translator::translate_function(
+        fx.fn, wvmp::regvm::translator::FunctionUpperBoundFn{}, g2_read_fn(tbl), 0);
+    ASSERT_EQ(r.notes.size(), static_cast<size_t>(1));
+    EXPECT_NE(r.notes[0].find("jump-table @ 0x2000 entries=8 mem-8B-djmp"),
+              std::string::npos);
+    const Decoded d = decode_program(r.program);
+    const auto& g = d.insns;
+    // b0 防御块 4 拍 + il 3 拍 + lea 2 拍 + 物化 4 拍（g[9..12]）后，delta
+    // 系追加锚定两拍（g[13..14]）：
+    ASSERT_GE(g.size(), static_cast<size_t>(17));
+    expect_is(g[13], VmOp::Add, OpKind::Reg, isa::kScratchFirst + 1, OpKind::Imm, 0,
+              0x102E, kS64);
+    expect_is(g[14], VmOp::LeaRva, OpKind::Reg, isa::kScratchFirst + 1, OpKind::Reg,
+              isa::kScratchFirst + 1, 0, kS64);
+    expect_is(g[15], VmOp::Mov, OpKind::Reg, isa::kScratchFirst, OpKind::Imm, 0,
+              0x1100, kS64);
+    size_t jcc_e = 0;
+    for (const VmInsn& v : g)
+        if (v.op == VmOp::Jcc && v.cond_or_size == static_cast<u8>(ir::Cond::E))
+            ++jcc_e;
+    EXPECT_EQ(jcc_e, 8u);
+    EXPECT_EQ(g.back().op, VmOp::Halt);
+}
+
+TEST(Translate, JumpTableUndefendedGates) {
+    // G2-c: 形态齐全但前块尾部无防御常数（无 cmp/ja）→ 表长不可推 →
+    // 永久 gate；以"未检出防御常数"note 披露原因链（D2 裁决），不展开。
+    // 防御块改为单条 mov（无 cmp+ja 尾部）。
+    G2JtFixture fx(g2_delta8_tail_block(),
+                   blk(0x1000, {at(mov(ir::Reg::Rax, ir::Reg::Rsp, ir::Size::S64),
+                                   0x1000)}));
+    const auto r = wvmp::regvm::translator::translate_function(
+        fx.fn, wvmp::regvm::translator::FunctionUpperBoundFn{}, g2_read_fn({}), 0);
+    ASSERT_FALSE(r.notes.empty());
+    EXPECT_NE(r.notes[0].find("未检出防御常数"), std::string::npos);
+    // gate：jmp 处无展开 → 无 Jcc(E) 比较链（lea 自身的 LeaRva 不受影响）
+    const Decoded d = decode_program(r.program);
+    EXPECT_EQ(d.insns.back().op, VmOp::Halt);
+    for (const VmInsn& v : d.insns)
+        if (v.op == VmOp::Jcc)
+            EXPECT_NE(v.cond_or_size, static_cast<u8>(ir::Cond::E));
+}
+
+TEST(Translate, JumpTableOutOfRegionGates) {
+    // 负例: 绝对 VA 表一项指向区域外（0x9000 ∈ .data）→ 全部候选不过区
+    // 判据 → gate note（"不在区域/非指令地址"），不展开。
+    G2JtFixture fx(g2_abs8_tail_block(), g2_defense_block());
+    const u64 kImageBase = 0x140000000ull;
+    std::vector<u64> tbl;
+    const auto ts = g2_targets();
+    for (size_t i = 0; i < ts.size(); ++i)
+        tbl.push_back(kImageBase + (i == 3 ? 0x9000 : ts[i]));
+    const auto r = wvmp::regvm::translator::translate_function(
+        fx.fn, wvmp::regvm::translator::FunctionUpperBoundFn{}, g2_read_fn(tbl),
+        kImageBase);
+    ASSERT_FALSE(r.notes.empty());
+    EXPECT_NE(r.notes[0].find("不在区域/非指令地址"), std::string::npos);
+    // gate：无 Jcc(E) 比较链
+    const Decoded d = decode_program(r.program);
+    for (const VmInsn& v : d.insns)
+        if (v.op == VmOp::Jcc)
+            EXPECT_NE(v.cond_or_size, static_cast<u8>(ir::Cond::E));
+}
+
 } // namespace

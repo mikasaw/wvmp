@@ -109,22 +109,33 @@ public:
                 }
                 return pe->find_function_end_rva(begin_rva);
             };
-            // MIT-409: 跳转表条目读取。表体 RVA + 下标 → u32 小端条目；
+            // MIT-409 + MIT-413 (G2): 跳转表条目读取。表体 RVA + 下标 +
+            // 宽度(4/8) → u64 小端条目（4B 表项零扩展，8B 表项全 8 字节——
+            // G2-a 绝对 VA / delta 双语义与 G2-b mem 源表共用此读取面；
+            // 步长 = width 而非固定 8，4B 表读取绝不越项）；
             // rva_to_offset 未映射（表越界/落间隙）或越镜像尾 → nullopt →
             // 翻译器保守 gate。表长严禁靠"扫到非法值"推导（D1 锁死），
             // 本函数只按下标读，绝不扫描。
             translator::JumpTableReadFn table_read =
-                [pe, &ctx](u64 table_rva, u32 index) -> std::optional<u32> {
-                if (pe == nullptr) return std::nullopt;
-                const u64 entry_rva = table_rva + 4ull * index;
+                [pe, &ctx](u64 table_rva, u32 index, u8 width)
+                -> std::optional<u64> {
+                if (pe == nullptr || (width != 4 && width != 8))
+                    return std::nullopt;
+                const u64 entry_rva = table_rva + static_cast<u64>(width) * index;
                 const auto off = pe->rva_to_offset(entry_rva);
-                if (!off || *off + 4 > ctx.image.size()) return std::nullopt;
+                if (!off || *off + width > ctx.image.size()) return std::nullopt;
                 const u8* p = ctx.image.data() + *off;
-                return static_cast<u32>(p[0]) | (static_cast<u32>(p[1]) << 8) |
-                       (static_cast<u32>(p[2]) << 16) | (static_cast<u32>(p[3]) << 24);
+                if (width == 4)
+                    return static_cast<u64>(p[0]) | (static_cast<u64>(p[1]) << 8) |
+                           (static_cast<u64>(p[2]) << 16) | (static_cast<u64>(p[3]) << 24);
+                return static_cast<u64>(p[0]) | (static_cast<u64>(p[1]) << 8) |
+                       (static_cast<u64>(p[2]) << 16) | (static_cast<u64>(p[3]) << 24) |
+                       (static_cast<u64>(p[4]) << 32) | (static_cast<u64>(p[5]) << 40) |
+                       (static_cast<u64>(p[6]) << 48) | (static_cast<u64>(p[7]) << 56);
             };
             result = translator::translate_function(fn, std::move(upper_bound_of),
-                                                    std::move(table_read));
+                                                    std::move(table_read),
+                                                    pe != nullptr ? pe->image_base : 0);
             // MIT-407: exit-native 站点 diag note 不进 gate 通道——virtualize
             // 对 kLastTranslateNotes 的**任一** note 即放弃该函数虚拟化
             // （v1 把站点 note 塞进 notes 的隐患：启用后每个 ExitNative 函数
