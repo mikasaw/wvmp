@@ -965,8 +965,14 @@ TranslateResult translate_div_idiv(const cs_insn& ci, const cs_x86& x, ir::Arch 
 // 复用为 xmm0..xmm7 (asmgen 看到 reg_a/reg_b 在 [24..31] 区间即按 xmm 处理).
 //
 // MIT-408 (C4b): MEM 形式放开。dst 必为 XMM 寄存器; src 为 XMM 寄存器或
-// 内存 (mem_operand 通用通道, :37)。dst=mem 的读写双访存形态不在首轮范围
-// (派活单 D3 可砍面) → unsupported → C1 gate 兜底。
+// 内存 (mem_operand 通用通道, :37)。
+// MIT-411 (G1-a) 实测结论: "dst=mem 双访存" (addsd [mem],xmm) **在 x86
+// ISA 层不存在** — SSE ALU/位运算/比较指令的目标操作数恒为 XMM 寄存器,
+// 内存只可能是源 (SDM 编码表 + ml64 A2000 "memory operand not allowed in
+// context" + capstone 实证 F2 0F 58 rm=mem 反汇编为 `addsd xmm0,[mem]`)。
+// "读→算→写回" 双访存语义在真实代码里 = movsd load + op + movsd store
+// 三条指令, 各自 408/MIT-411 已支持。本函数 op0=REG 检查因此是防御性
+// 死代码 (对非法手写 IR 仍兜底 unsupported → C1 gate)。
 TranslateResult translate_sse_add(const cs_insn& ci, const cs_x86& x, ir::Arch arch, Op op,
                                   ir::Size sz) {
     if (x.op_count != 2) return unsupported(ci.address, ci.size);
@@ -1277,7 +1283,8 @@ TranslateResult translate_sse_bitwise(const cs_insn& ci, const cs_x86& x, ir::Ar
 //   - ucomiss xmm1, xmm2/m32  0F 2E /r   (标量单精度无序比较, size=S32)
 //   - ucomisd xmm1, xmm2/m64  66 0F 2E /r (标量双精度无序比较, size=S64)
 //   (capstone 实证: 0F2EC1 → ucomiss, 660F2EC1 → ucomisd, 均 xmm0, xmm1;
-//    F3 0F 2E 编码不存在; comiss/comisd = 0F 2F 系, 不在本单范围 → C1 gate)
+//    F3 0F 2E 编码不存在; comiss/comisd = 0F 2F 系, MIT-411 折叠为
+//    Ucomiss/Ucomisd (flags 语义逐位相同, 见 translate_insn case 注释))
 //   - NaN → unordered → ZF=PF=CF=1, 按 Intel SDM UCOMISD/UCOMISS 真值表
 //     (OF/SF/AF 清 0); 完整 x87 式语义细分不做 (D1.1 限定)。
 // MIT-408 (C4b): MEM 形式放开。dst 必为 XMM 寄存器; src 为 XMM 寄存器或内存。
@@ -1596,15 +1603,35 @@ TranslateResult translate_insn(const cs_insn& ci, ir::Arch arch) {
     //     size=S64)。updates_flags=false (位运算不影响 EFLAGS)。
     //   - AVX VEX 编码 (vpxor/vpor/vpand, VEX.NDS.128.0F.WIG 57/56/54) 由
     //     capstone 报独立 INS id, 不在本单范围 → C1 gate 兜底。
+    // MIT-411 (G1-c): pd 位运算族 (66 0F 54/56/57) — andpd/orpd/xorpd 与
+    // ps 同名位运算逐位同语义 (全 128-bit 按位, 不解释浮点值, 零 flags,
+    // 零异常) → **零新 VmOp** 复用 ps 编码 (派活单 §C D1)。实证: ml64
+    // 汇编 66 0F 54C1/56C1/57C1 → capstone 报独立 id ANDPD/ORPD/XORPD,
+    // prefix[0]=0 (0x66 被吸收进 id, 不经入口前缀拒绝); MSVC /Od 对
+    // _mm_and_pd/_mm_or_pd/_mm_xor_pd 甚至直接 emit andps/orps/xorps
+    // (ps/pd 互换无损, 编译器自身即证据)。
     case X86_INS_XORPS: return translate_sse_bitwise(ci, x, arch, Op::Xorps, Size::S64);
     case X86_INS_ORPS: return translate_sse_bitwise(ci, x, arch, Op::Orps, Size::S64);
     case X86_INS_ANDPS: return translate_sse_bitwise(ci, x, arch, Op::Andps, Size::S64);
+    case X86_INS_XORPD: return translate_sse_bitwise(ci, x, arch, Op::Xorps, Size::S64);
+    case X86_INS_ORPD:  return translate_sse_bitwise(ci, x, arch, Op::Orps, Size::S64);
+    case X86_INS_ANDPD: return translate_sse_bitwise(ci, x, arch, Op::Andps, Size::S64);
     // MIT-376: SSE 浮点比较 ucomiss/ucomisd (REG-REG only, mod=11).
     //   - ucomiss 0F 2E /r (size=S32) / ucomisd 66 0F 2E /r (size=S64)。
     //     updates_flags=**true** — 真写 VM flags 槽, 派活单 §D D1.1 (禁止
-    //     空转, pitfall #79)。comiss/comisd (0F 2F 系) 不在本单范围 → C1 gate。
+    //     空转, pitfall #79)。
+    // MIT-411 (G1-b): comiss/comisd (0F 2F / 66 0F 2F) — flags 语义与
+    // ucomis* 逐位相同 (SDM 真值表一致: ZF/PF/CF 按比较结果装配, OF/SF/AF
+    // 双清 0) → **参数化复用 translate_ucomis** 折叠为 Op::Ucomiss/Ucomisd
+    // (ir::Op 冻结不可增枚举; 派活单 §C D2)。实测: 编码 0F 2F C1 →
+    // capstone id COMISS (mem 源 0F 2F 05.. 同 id, op0=REG op1=MEM);
+    // MSVC /Od 对 `g_f < 常量` 天然 emit comiss (有序比较), 对 `==`
+    // 用 ucomiss。已知妥协: comiss 对 QNaN 会 #IA (有序比较), VM 不模拟
+    // 浮点异常, handler 执行 native ucomiss — flags 结果不变, 披露于报告。
     case X86_INS_UCOMISS: return translate_ucomis(ci, x, arch, Op::Ucomiss, Size::S32);
     case X86_INS_UCOMISD: return translate_ucomis(ci, x, arch, Op::Ucomisd, Size::S64);
+    case X86_INS_COMISS:  return translate_ucomis(ci, x, arch, Op::Ucomiss, Size::S32);
+    case X86_INS_COMISD:  return translate_ucomis(ci, x, arch, Op::Ucomisd, Size::S64);
     case X86_INS_BSWAP: return translate_bswap(ci, x, arch);
     case X86_INS_XCHG: return translate_xchg(ci, x, arch);
     // MIT-336: setcc 16 variants (0F 90+cc+rm, mod=11 REG / mod=00 MEM).

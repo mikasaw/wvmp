@@ -108,9 +108,17 @@
   支持面：addss/addps/addpd/addsd、subss/subps/subpd/subsd、
   divss/divps/divpd/divsd、movss/movsd/movaps/movapd/movups/movupd、
   xorps/orps/andps、ucomiss/ucomisd（读 src=mem / 写 dst=mem 两类）。
-- **不支持面（越界即 C1 gate 兜底）**：`add/sub [mem], xmm` 读写双访存形态
-  （D3 砍面留 C4c）、comiss/comisd（0F 2F 系）、AVX/x87/SSE2 整数族
-  （movd/movdqa p 形式）、string movsd（A5，capstone 与 SSE movsd 同 id，
+- **MIT-411 (G1) 收口**：comiss/comisd（0F 2F / 66 0F 2F）折叠复用
+  Ucomiss/Ucomisd（flags 语义逐位相同，SDM 真值表；#IA-on-QNaN 异常语义
+  v1 不模拟，披露于 MIT-411 报告）；andpd/orpd/xorpd（66 0F 54/56/57）
+  零新 VmOp 折叠复用 Andps/Orps/Xorps（128-bit 按位与后缀宽度无关，MSVC
+  对 _mm_and_pd 等 intrinsic 自身即直出 ps 编码）。"`add/sub [mem],xmm`
+  双访存"（C4c）经 MIT-411 实测判伪：SSE ALU 指令目标恒为 XMM 寄存器、
+  内存只可能是源（ml64 A2000 + capstone 实证），真实"读→算→写回"语义 =
+  movsd/addsd/movsd 三连，逐条已支持。
+- **不支持面（越界即 C1 gate 兜底）**：andnps/andnpd（0F 55 系，留 412+）、
+  AVX/x87/SSE2 整数族（movd/movdqa p 形式）、SSE mul 族
+  （mulss/mulps/mulpd）、string movsd（A5，capstone 与 SSE movsd 同 id，
   由双 MEM 操作数规则区分）。
 - 注意与重定位/ASLR 的配合：RVA + image_base 在运行时还原，不依赖静态 VA。
 

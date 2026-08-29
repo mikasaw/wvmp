@@ -47,6 +47,12 @@
 #     switch 8 路 + default + 边界, 翻译期读表静态展开比较链真虚拟化;
 #     负样本 opaque 间接 jmp 同 exe 内照旧 gate, 行为 byte-exact 兜底).
 #     Total: 30 samples × 5 seeds = 150 runs.
+#   - MIT-411 (G1): extend to wvmp_sse_memop_sample (SSE 尾扫包主样本: 双访存
+#     读改写 triple + comiss/comisd (0F 2F 系折叠 ucomis, MSVC 天然 comiss +
+#     MASM mem 源) + pd 位运算族 andpd/orpd/xorpd (66 0F 54/56/57 折叠 ps,
+#     零新 VmOp) + 负例 andnps gate) + wvmp_sse_memop_xmm_readback_sample
+#     (comiss/comisd flags + pd 位运算 ctx.xmm 读回影子样本).
+#     Total: 32 samples × 5 seeds = 160 runs.
 #   - MIT-306: REQUIRE_REAL=1 校验日志含 "已生成 N 个入口 stub" 防止 C1 gate
 #     兜底被误判 PASS（仅 byte-exact 不够, C1 gate 函数被跳过仍能输出相同
 #     stdout+rc）。与 multiseed_e2e_real.sh 配套使用。
@@ -114,6 +120,12 @@ samples=(
     # 翻译期读表静态展开比较链真虚拟化 (REQUIRE_REAL ≥1 stub); 同 exe 负
     # 样本 opaque 间接 jmp 照旧 gate, 行为 byte-exact 由双跑兜底。
     "build/passes/marker_scan/tests/wvmp_jmp_table_sample.exe"
+    # MIT-411 (G1): SSE 尾扫包主样本 + ctx.xmm/flags 读回影子样本 — 双访存
+    # 读改写 triple / comiss/comisd (折叠 ucomis) / andpd/orpd/xorpd (折叠 ps),
+    # 负例 andnps 同 exe 内照旧 gate (行为 byte-exact); REQUIRE_REAL 保证
+    # 新形态真虚拟化非 gate。
+    "build/passes/marker_scan/tests/wvmp_sse_memop_sample.exe"
+    "build/passes/marker_scan/tests/wvmp_sse_memop_xmm_readback_sample.exe"
 )
 
 # Seeds: 1 (small), 12345 (default), 99999 (large), 0xDEADBEEF (magic), 0xCAFEBABE (magic).

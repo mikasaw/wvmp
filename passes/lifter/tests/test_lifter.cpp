@@ -1679,4 +1679,81 @@ TEST(LifterPass, EmptyFunctionsLiftsNothing) {
     EXPECT_TRUE(ctx.diag.items().empty());
 }
 
+// ---------------- MIT-411 (G1-b/G1-c): comiss/comisd 折叠 + pd 位运算族折叠 ----
+
+TEST_F(LifterTranslate, ComissRegRegFoldsToUcomiss) {
+    // 0F 2F C1: comiss xmm0, xmm1 (有序单精度比较, MIT-411 折叠为 Ucomiss)
+    const wvmp::u8 b[] = {0x0F, 0x2F, 0xC1};
+    auto r = translate_bytes(x64, b, ir::Arch::X64);
+    ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r.insn.op, ir::Op::Ucomiss);
+    EXPECT_EQ(r.insn.size, ir::Size::S32);
+    EXPECT_TRUE(r.insn.updates_flags);  // 真写 VM flags 槽 (pitfall #79)
+    EXPECT_EQ(r.insn.dst.kind, ir::Operand::Kind::Reg);
+    EXPECT_EQ(r.insn.dst.reg, ir::Reg::Rax);  // 0..7 复用 = xmm0
+    EXPECT_EQ(r.insn.src.reg, ir::Reg::Rcx);  // = xmm1 (ir::Reg 按 x86 编号 0..7 = Rax,Rcx,Rdx,Rbx,...)
+}
+
+TEST_F(LifterTranslate, ComisMemSrcFoldsToUcomiss) {
+    // 0F 2F 05 00 00 00 00: comiss xmm0, dword ptr [rip] (mem 源, rip 全局)
+    const wvmp::u8 b[] = {0x0F, 0x2F, 0x05, 0x00, 0x00, 0x00, 0x00};
+    auto r = translate_bytes(x64, b, ir::Arch::X64);
+    ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r.insn.op, ir::Op::Ucomiss);
+    EXPECT_TRUE(r.insn.updates_flags);
+    ASSERT_EQ(r.insn.src.kind, ir::Operand::Kind::Mem);
+    EXPECT_EQ(r.insn.src.mem.base, ir::Reg::Rip);
+}
+
+TEST_F(LifterTranslate, ComisdRegRegFoldsToUcomisd) {
+    // 66 0F 2F C1: comisd xmm0, xmm1 (有序双精度比较 → Ucomisd)
+    const wvmp::u8 b[] = {0x66, 0x0F, 0x2F, 0xC1};
+    auto r = translate_bytes(x64, b, ir::Arch::X64);
+    ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r.insn.op, ir::Op::Ucomisd);
+    EXPECT_EQ(r.insn.size, ir::Size::S64);
+    EXPECT_TRUE(r.insn.updates_flags);
+    EXPECT_EQ(r.insn.dst.reg, ir::Reg::Rax);
+    EXPECT_EQ(r.insn.src.reg, ir::Reg::Rcx);
+}
+
+TEST_F(LifterTranslate, AndpdFoldsToAndps) {
+    // 66 0F 54 C1: andpd xmm0, xmm1 → 复用 ps VmOp (MIT-411 D1 零新 VmOp)
+    const wvmp::u8 b[] = {0x66, 0x0F, 0x54, 0xC1};
+    auto r = translate_bytes(x64, b, ir::Arch::X64);
+    ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r.insn.op, ir::Op::Andps);
+    EXPECT_EQ(r.insn.size, ir::Size::S64);
+    EXPECT_FALSE(r.insn.updates_flags);
+    EXPECT_EQ(r.insn.dst.reg, ir::Reg::Rax);
+    EXPECT_EQ(r.insn.src.reg, ir::Reg::Rcx);
+}
+
+TEST_F(LifterTranslate, OrpdFoldsToOrps) {
+    // 66 0F 56 C1: orpd xmm0, xmm1 → Orps
+    const wvmp::u8 b[] = {0x66, 0x0F, 0x56, 0xC1};
+    auto r = translate_bytes(x64, b, ir::Arch::X64);
+    ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r.insn.op, ir::Op::Orps);
+    EXPECT_EQ(r.insn.size, ir::Size::S64);
+}
+
+TEST_F(LifterTranslate, XorpdMemSrcFoldsToXorps) {
+    // 66 0F 57 05 00 00 00 00: xorpd xmm0, xmmword ptr [rip] → Xorps mem 源
+    const wvmp::u8 b[] = {0x66, 0x0F, 0x57, 0x05, 0x00, 0x00, 0x00, 0x00};
+    auto r = translate_bytes(x64, b, ir::Arch::X64);
+    ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r.insn.op, ir::Op::Xorps);
+    ASSERT_EQ(r.insn.src.kind, ir::Operand::Kind::Mem);
+    EXPECT_EQ(r.insn.src.mem.base, ir::Reg::Rip);
+}
+
+TEST_F(LifterTranslate, AndnpsStillUnsupported) {
+    // 0F 55 C1: andnps xmm0, xmm1 — 0F 55 系不在 MIT-411 范围 (派活单 §C D4,
+    // 留 412+) → unsupported → C1 gate 兜底 (负例断言照旧)
+    const wvmp::u8 b[] = {0x0F, 0x55, 0xC1};
+    auto r = translate_bytes(x64, b, ir::Arch::X64);
+    EXPECT_EQ(r.status, lifter::TranslateStatus::Unsupported);
+}
+
 } // namespace

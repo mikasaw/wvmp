@@ -691,3 +691,49 @@ target_compile_options(wvmp_jmp_table_sample PRIVATE
 target_link_options(wvmp_jmp_table_sample PRIVATE
     $<$<CXX_COMPILER_ID:MSVC>:/INCREMENTAL:NO>
 )
+
+# MIT-411 (G1): SSE 尾扫包主样本——双访存语义 + comiss/comisd + pd 位运算族。
+# 区域覆盖 (派活单 §A.2 三挂点, 编译器形态实测定形):
+#   - 双访存读改写 triple (movsd+addsd+movsd 全 rip, C++ g_d += 1.0 天然产;
+#     "dst=mem" 无 x86 编码, 见 sse_memop_sample_main.cpp 头注释);
+#   - MSVC /Od 天然 comiss (g_f < 常量 → movss+movss+comiss reg-reg+jbe);
+#   - MSVC 对 _mm_and_pd/_mm_or_pd/_mm_xor_pd 直出 andps/orps/xorps
+#     (pd/ps 互换无损的编译器证据);
+#   - MASM helper 直写: addsd xmm0,[rsp+40] 栈基址 mem 源 / comiss/comisd
+#     rip mem 源 + seta (flags 读回) / 真 66-prefix andpd/orpd/xorpd
+#     (REG-REG + rip mem 源) / 负例 andnps (0F 55 系留 412+, C1 gate)。
+# REQUIRE_REAL: main 区域 + helper 区域真虚拟化 (stub ≥1); 负例函数 gate
+# 由保护日志 Note 验证。
+enable_language(ASM_MASM)
+add_executable(wvmp_sse_memop_sample
+    sse_memop_sample_main.cpp
+    sse_memop_sample_asm.asm
+)
+target_link_libraries(wvmp_sse_memop_sample PRIVATE wvmp::sdk)
+target_compile_options(wvmp_sse_memop_sample PRIVATE
+    $<$<AND:$<CXX_COMPILER_ID:MSVC>,$<COMPILE_LANGUAGE:C,CXX>>:/Od;/Ob0;/utf-8>
+    $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-O0>
+)
+target_link_options(wvmp_sse_memop_sample PRIVATE
+    $<$<CXX_COMPILER_ID:MSVC>:/INCREMENTAL:NO>
+)
+
+# MIT-411 (G1): 影子样本——comiss/comisd 折叠 + pd 位运算族折叠 + 双访存
+# 形态的 ctx.xmm / VM-flags 运行时读回断言 (验收门 #79 纪律, 与主样本同
+# IR 配对、独立 exe)。区域由 MASM 直写 7 条探针 (comiss/comisd mem 源 +
+# seta flags 读回 / andpd/orpd/xorpd reg+mem / addsd 栈源 / 双访存 triple),
+# 区域外 8 槽 × 2×u64 全量位图案打印 + seta 结果: 槽位落点错 (写 GPR 区)、
+# 宽度截断、flags 空转 (pitfall #79) 均与 native run 逐字节不一致 → FAIL。
+enable_language(ASM_MASM)
+add_executable(wvmp_sse_memop_xmm_readback_sample
+    sse_memop_xmm_readback_sample_main.cpp
+    sse_memop_xmm_readback_sample_asm.asm
+)
+target_link_libraries(wvmp_sse_memop_xmm_readback_sample PRIVATE wvmp::sdk)
+target_compile_options(wvmp_sse_memop_xmm_readback_sample PRIVATE
+    $<$<AND:$<CXX_COMPILER_ID:MSVC>,$<COMPILE_LANGUAGE:C,CXX>>:/Od;/Ob0;/utf-8>
+    $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-O0>
+)
+target_link_options(wvmp_sse_memop_xmm_readback_sample PRIVATE
+    $<$<CXX_COMPILER_ID:MSVC>:/INCREMENTAL:NO>
+)
