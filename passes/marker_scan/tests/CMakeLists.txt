@@ -597,3 +597,37 @@ target_compile_options(wvmp_deepcall_div_sample PRIVATE
 target_link_options(wvmp_deepcall_div_sample PRIVATE
     $<$<CXX_COMPILER_ID:MSVC>:/INCREMENTAL:NO>
 )
+
+# MIT-407 (MIT-D2): ExitNative 正样本——越区跳转单向退出两类形态 (END-call
+# 等价退出 + 早返回 jcc 退出)。两函数须被虚拟化 (REQUIRE_REAL ≥1 stub) 且
+# packed 与 native stdout+rc 逐字节一致。/Od 保持标记结构确定（goto/return
+# 的越区目标在 /Od 下同样成型）。
+add_executable(wvmp_exitnative_pos_sample
+    wvmp_exitnative_pos_sample_main.cpp
+)
+target_link_libraries(wvmp_exitnative_pos_sample PRIVATE wvmp::sdk)
+target_compile_options(wvmp_exitnative_pos_sample PRIVATE
+    $<$<AND:$<CXX_COMPILER_ID:MSVC>,$<COMPILE_LANGUAGE:C,CXX>>:/Od;/Ob0;/utf-8>
+    $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-O0>
+)
+target_link_options(wvmp_exitnative_pos_sample PRIVATE
+    $<$<CXX_COMPILER_ID:MSVC>:/INCREMENTAL:NO>
+)
+
+# MIT-407 (MIT-D2): ExitNative 反例样本——回跳形态 (C, walker 检出→gate) +
+# 超界形态 (MASM, 跨 .pdata 界 jmp→gate)。两函数都不得虚拟化, gate 后
+# packed 与 native 逐字节一致。不进 REQUIRE_REAL multiseed（无 stub 属
+# 预期），由 e2e.sh + 保护日志 gate note 双通道验证。
+enable_language(ASM_MASM)
+add_executable(wvmp_exitnative_neg_sample
+    wvmp_exitnative_neg_sample_main.cpp
+    wv_exitnative_neg_sample_asm.asm
+)
+target_link_libraries(wvmp_exitnative_neg_sample PRIVATE wvmp::sdk)
+target_compile_options(wvmp_exitnative_neg_sample PRIVATE
+    $<$<AND:$<CXX_COMPILER_ID:MSVC>,$<COMPILE_LANGUAGE:C,CXX>>:/Od;/Ob0;/utf-8>
+    $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-O0>
+)
+target_link_options(wvmp_exitnative_neg_sample PRIVATE
+    $<$<CXX_COMPILER_ID:MSVC>:/INCREMENTAL:NO>
+)

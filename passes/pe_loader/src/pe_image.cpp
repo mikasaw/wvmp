@@ -123,17 +123,18 @@ PeImage parse_impl(std::span<const u8> image) {
     // x64 RUNTIME_FUNCTION：12B/条 = BeginAddress(4) + EndAddress(4) +
     // UnwindInfoAddress(4)，按 BeginAddress 升序。
     // 防御：end <= begin 或 begin 逆序视为不可信，标记 pdata_empty=true
-    // 回退；RVA 越界 / 节内无映射同理。
+    // 回退；条目 RVA 无节内映射 / 超出文件边界同理（rva_to_offset 已做
+    // 节映射 + 未初始化尾部防御）。
+    // 教训（v1 实测）：曾用 `pdata_rva < image.size()` 比较 RVA 与**文件**
+    // 大小做"文件边界防御"——RVA 空间与文件偏移空间不同构（.pdata 常在
+    // 文件末尾之后，实测 test_target.exe pdata RVA=0x10D000 > 文件 0xE5C00），
+    // 该防御恒为 0 → pdata_empty 恒 true → ExitNative 上界查询永远失败。
     if (pdata_rva != 0 && pdata_size >= 12) {
         const u64 entry_count = u64(pdata_size) / 12u;
-        // 文件边界防御：实际可读条目数取 min(声明数, 文件剩余/12)
-        const u64 avail = (pdata_rva < image.size()) ?
-                              (image.size() - pdata_rva) / 12u : 0;
-        const u64 safe_count = (avail < entry_count) ? avail : entry_count;
-        img.pdata.reserve(static_cast<size_t>(safe_count));
+        img.pdata.reserve(static_cast<size_t>(entry_count));
         bool ok = true;
         u32 prev_begin = 0;
-        for (u64 i = 0; i < safe_count; ++i) {
+        for (u64 i = 0; i < entry_count; ++i) {
             const u64 entry_rva = u64(pdata_rva) + i * 12u;
             const auto off = img.rva_to_offset(entry_rva);
             if (!off || u64(*off) + 12 > image.size()) {

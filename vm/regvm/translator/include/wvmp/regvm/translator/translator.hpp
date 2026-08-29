@@ -21,9 +21,10 @@ struct TranslateResult {
 // MIT-407: 区域外跳转 ExitNative 上界函数。
 //   输入: 区域 begin_rva（即 marker_begin 落点 RVA）
 //   输出: 该函数在 .pdata RUNTIME_FUNCTION 表里的 EndAddress；nullopt = 无
-//         .pdata 条目 / 解析失败 / 调用方未提供（→ 维持 gate）。
+//         .pdata 条目 / 解析失败 / 调用方未提供 / lifter 检出越区目标回跳
+//         （→ 维持 gate）。
 //   实现：pe_loader::PeImage::find_function_end_rva；调用方构造 lambda
-//   捕获 PeImage 引用传入。
+//   捕获 PeImage 引用传入，并叠加 lifter 的 exit_native_blocked 判定。
 using FunctionUpperBoundFn = std::function<std::optional<u64>(u64 /*begin_rva*/)>;
 
 // 纯函数：把一个函数区域的 IR 逐指令翻译为 regvm 字节码。

@@ -249,10 +249,11 @@ struct Translator {
     const std::unordered_map<u64, size_t>& block_of_addr;
     std::vector<std::string>& notes;
     const std::unordered_map<u64, u64>* next_ip_of_;   // insn.addr -> next_ip (=addr+len)
-    // MIT-407: 可选上界查询函数（捕获 PeImage 引用）。空指针 / 空 lambda = 不
-    // 启用 ExitNative（维持 gate）。设置后 translate_jump 在目标块缺失时会
-    // 额外检查是否落在 [end_rva, upper_bound_fn(begin_rva)) 内 → ExitNative。
-    const FunctionUpperBoundFn* upper_bound_of_ = nullptr;
+    // MIT-407: 可选上界查询函数（捕获 PeImage 引用）。空 lambda = 不启用
+    // ExitNative（维持 gate）。设置后 translate_jump 在目标块缺失时会额外
+    // 检查是否落在 [end_rva, upper_bound_fn(begin_rva)) 内 → ExitNative。
+    // 按值持有（v1 曾存指向调用方参数的指针，函数作用域内虽安全但脆弱）。
+    FunctionUpperBoundFn upper_bound_of_;
     u64 begin_rva_ = 0;   // 区域起始（用于 ExitNative 上界查询）
     u64 end_rva_ = 0;     // 区域结束（用于 ExitNative 目标判定）
 
@@ -529,48 +530,38 @@ struct Translator {
         const auto it = block_of_addr.find(static_cast<u64>(in.dst.imm));
         if (it == block_of_addr.end()) {
             // MIT-407: 越区跳转 ExitNative 候选检查。条件全部满足时 emit
-            //   VmOp::ExitNative (aux = target RVA, cond_or_size = ir::Cond)；
+            //   VmOp::ExitNative (aux = target RVA)；
             //   否则维持原 C1 gate（保守正确，行为与修复前逐字节一致）。
             //   1) target >= end_rva（确实越出本区域）
             //   2) upper_bound_fn 可用且 target < upper_bound_fn(begin_rva)
-            //      （落在同一函数 .pdata 真实边界内）
+            //      （落在同一函数 .pdata 真实边界内；lifter 检出回跳时
+            //       upper_bound_fn 返回 nullopt → 维持 gate）
             //   3) 间接 jmp / ret 目标不入此路（维持 gate；C 双向分段不在本单）
-            if (in.op == ir::Op::Jmp && upper_bound_of_ != nullptr && *upper_bound_of_) {
+            //   编码：无条件 (Jmp) 用 a_kind=Imm 标记（cond 字段仅 4 位无
+            //   sentinel 可用，0xFF 会在 encode 端被 validate_insn 拒绝——
+            //   v1 草案缺陷）；条件 (Jcc) 用 cond_or_size = ir::Cond 0..15。
+            if ((in.op == ir::Op::Jmp || in.op == ir::Op::Jcc) && upper_bound_of_) {
                 const u64 target = static_cast<u64>(in.dst.imm);
-                const auto upper = (*upper_bound_of_)(begin_rva_);
+                const auto upper = upper_bound_of_(begin_rva_);
                 if (target >= end_rva_ && upper.has_value() && target < *upper) {
                     if (fits_aux(static_cast<i64>(target))) {
-                        em.emit(VmOp::ExitNative, OpKind::None, 0, OpKind::None, 0,
-                                static_cast<u32>(target),
-                                0xFF /*无条件直退 sentinel*/);
+                        const bool uncond = (in.op == ir::Op::Jmp);
+                        em.emit(VmOp::ExitNative,
+                                uncond ? OpKind::Imm : OpKind::None, 0,
+                                OpKind::None, 0, static_cast<u32>(target),
+                                uncond ? 0 : static_cast<u8>(in.cond));
                         char note[128];
-                        std::snprintf(note, sizeof(note),
-                                      "exit-native @ 0x%" PRIX64 " -> 0x%" PRIX64
-                                      " (unconditional)",
-                                      in.addr, target);
-                        notes.emplace_back(note);
-                        return true;
-                    }
-                }
-            }
-            // Jcc 形式 (12/17 站点, triage §6.7): 同样查上界, 条件 cond 保留
-            // 给 handler 求值。维持 emit ExitNative(aux=target, cond=in.cond)，
-            // 不满足时 advance 继续 VM（pitfall #79 禁 decode+advance 空转的
-            // 延伸：写 slot + 条件 exit 链由 handler 处理）。
-            if (in.op == ir::Op::Jcc && upper_bound_of_ != nullptr && *upper_bound_of_) {
-                const u64 target = static_cast<u64>(in.dst.imm);
-                const auto upper = (*upper_bound_of_)(begin_rva_);
-                if (target >= end_rva_ && upper.has_value() && target < *upper) {
-                    if (fits_aux(static_cast<i64>(target))) {
-                        em.emit(VmOp::ExitNative, OpKind::None, 0, OpKind::None, 0,
-                                static_cast<u32>(target),
-                                static_cast<u8>(in.cond));
-                        char note[128];
-                        std::snprintf(note, sizeof(note),
-                                      "exit-native @ 0x%" PRIX64 " -> 0x%" PRIX64
-                                      " (cond=%u)",
-                                      in.addr, target,
-                                      static_cast<unsigned>(in.cond));
+                        if (uncond)
+                            std::snprintf(note, sizeof(note),
+                                          "exit-native @ 0x%" PRIX64 " -> 0x%" PRIX64
+                                          " (unconditional)",
+                                          in.addr, target);
+                        else
+                            std::snprintf(note, sizeof(note),
+                                          "exit-native @ 0x%" PRIX64 " -> 0x%" PRIX64
+                                          " (cond=%u)",
+                                          in.addr, target,
+                                          static_cast<unsigned>(in.cond));
                         notes.emplace_back(note);
                         return true;
                     }
@@ -1520,7 +1511,7 @@ TranslateResult translate_function(const ir::FunctionRegion& fn,
     // 是否 emit ExitNative。upper_bound_fn 为空时 upper_bound_of_ 留空,
     // translate_jump 走原 gate 路径（与单参数版完全一致）。
     if (upper_bound_fn) {
-        tr.upper_bound_of_ = &upper_bound_fn;
+        tr.upper_bound_of_ = std::move(upper_bound_fn);
         tr.begin_rva_ = fn.begin_rva;
         tr.end_rva_ = fn.end_rva;
     }

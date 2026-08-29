@@ -87,11 +87,42 @@ public:
             }
         }
         if (!skipped) {
-            // MIT-407 (partial): stub indirect jmp regression under
-            // investigation; fall back to direct jmp path (no
-            // ExitNative). Translator-side upper_bound plumbing
-            // preserved for follow-up, but disabled here.
-            result = translator::translate_function(fn);
+            // MIT-407: 越区跳转 ExitNative 上界接线。上界 = 该函数 .pdata
+            // RUNTIME_FUNCTION EndAddress；lifter 检出越区目标回跳本区
+            // （LiftMetadata.exit_native_blocked）或 .pdata 缺失时返回
+            // nullopt → translator 维持原 C1 gate（行为与修复前逐字节
+            // 一致）。v1 在此处禁用接线是 segfault 未修的暂时回退。
+            const wvmp::passes::PeImage* pe = ctx.find_slot<wvmp::passes::PeImage>(kPeImage);
+            translator::FunctionUpperBoundFn upper_bound_of =
+                [pe, &ctx](u64 begin_rva) -> std::optional<u64> {
+                if (pe == nullptr || pe->pdata_empty) return std::nullopt;
+                if (const auto* meta_list =
+                        ctx.find_slot<std::vector<wvmp::passes::lifter::LiftMetadata>>(
+                            wvmp::passes::lifter::kLiftedMetadata);
+                    meta_list != nullptr) {
+                    // 平行下标契约：meta_list 与 ctx.functions 按 begin_rva
+                    // 反查（find_metadata_by_begin_rva）。回跳检出 → 整函数
+                    // 禁用 ExitNative（gate 本就是函数粒度）。
+                    const auto* m =
+                        find_metadata_by_begin_rva(ctx, meta_list, begin_rva);
+                    if (m != nullptr && m->exit_native_blocked) return std::nullopt;
+                }
+                return pe->find_function_end_rva(begin_rva);
+            };
+            result = translator::translate_function(fn, std::move(upper_bound_of));
+            // MIT-407: exit-native 站点 diag note 不进 gate 通道——virtualize
+            // 对 kLastTranslateNotes 的**任一** note 即放弃该函数虚拟化
+            // （v1 把站点 note 塞进 notes 的隐患：启用后每个 ExitNative 函数
+            // 都会被误 gate）。按前缀过滤，经 ctx.diag 直报（note 级每站点）。
+            auto& notes = result.notes;
+            for (size_t i = 0; i < notes.size();) {
+                if (notes[i].rfind("exit-native @", 0) == 0) {
+                    ctx.diag.report(Severity::Note, name(), notes[i]);
+                    notes.erase(notes.begin() + i);
+                } else {
+                    ++i;
+                }
+            }
         }
         ctx.slot<std::vector<std::string>>(kLastTranslateNotes) = std::move(result.notes);
         return std::move(result.program);

@@ -112,6 +112,20 @@ static_assert(offsetof(VmContext, native_sp) == 0x120);
 static_assert(offsetof(VmContext, host_rsp) == 0x128);
 static_assert(offsetof(VmContext, base_save) == 0x130);
 
+// MIT-407: ExitNative 退出槽（区域外跳转单向退出到 native 的运行时通道）。
+// 槽地址 = native_sp - kExitSlotDepth，单一事实来源（MIT-B2 纪律：消费方
+// 不得各持第二份字面量，v1 的 stub_gen/asmgen 各写各的偏移正是 segfault
+// 根因之一）。三个消费点按各自 rsp 基准换算同一地址：
+//   stub 入口（rsp = ns - kStubPushBytes - kCtxSize）: mov [rsp - 0x80], <VA>
+//   stub HALT 段（rsp = ns）:                          jmp [rsp - 0x288]
+//   ExitNative handler（rsp = host_rsp = ns - 0x250）: mov [rsp - 0x38], <VA>
+// 0x80 的选择：a) 使 stub 入口访问恰落在 disp8 编码边界（-128 可编码，
+//   规避 keystone 大负 disp 截断坑）；b) 槽位落在 host_rsp 下方 0x38，
+//   低于 VM entry 8 push / call 返回地址 / stub ctx 区的一切栈活动。
+// 槽内容 = 目标 VA（image_base + RVA），禁止裸 RVA（v1 崩溃根因，见
+// MIT-407 报告 §1 cdb 证据：rip=裸 RVA）。
+inline constexpr u64 kExitSlotDepth = kCalleeSavedIdx.size() * 8 + kCtxSize + 0x80;
+
 // 生成结果。
 struct RuntimeGenResult {
     vm::RuntimeImage image;  // code = 完整解释器机器码；vm_entry_offset = 0

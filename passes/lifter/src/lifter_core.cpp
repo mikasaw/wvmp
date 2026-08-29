@@ -29,6 +29,83 @@ void append_unique(std::vector<u64>& v, u64 value) {
 
 } // namespace
 
+// MIT-407: 越区跳转目标回跳检出（声明处注释见 lifter_core.hpp）。
+// 必须在匿名 namespace 之外——lifter_pass.cpp 的 lambda 跨 TU 调用。
+bool back_jump_reaches_region(CapstoneSession& session, std::span<const u8> image,
+                              const PeSectionMap& pe, u64 target, u64 begin_rva, u64 end_rva) {
+    struct Node { u64 addr; u32 layer; };
+    std::vector<Node> queue{{target, 0}};
+    std::set<u64> visited;
+    size_t budget = 256;  // 防御：病态/自修改数据不炸穿
+    while (!queue.empty()) {
+        const Node n = queue.front();
+        queue.erase(queue.begin());
+        if (n.layer > 3) continue;
+        if (n.addr >= begin_rva && n.addr < end_rva) return true;  // 回跳本区
+        if (!visited.insert(n.addr).second) continue;
+        if (budget-- == 0) break;
+        const auto off = pe.rva_to_offset(n.addr);
+        if (!off || *off >= image.size()) continue;
+        const u8* p = image.data() + *off;
+        size_t left = image.size() - *off;
+        u64 addr = n.addr;
+        const cs_insn* ci = session.next(p, left, addr);
+        if (ci == nullptr) continue;  // 无效字节：死端
+        const u64 next = ci->address + ci->size;
+        // 分类优先走 translate_insn（与主循环同一判定，保证一致）；未分类
+        // 分支（loop/jrcxz 等白名单外形态）回退 capstone 组并按条件分支处理
+        // ——跟目标（有立即数时）+ fallthrough 两条边，保守方向（多检出）。
+        const TranslateResult tr = translate_insn(*ci, session.arch());
+        bool is_jmp = false, is_jcc = false, is_ret = false;
+        bool direct_imm = false;
+        u64 imm_target = 0;
+        if (tr.status == TranslateStatus::Ok) {
+            switch (tr.insn.op) {
+            case ir::Op::Jmp: is_jmp = true; break;
+            case ir::Op::Jcc: is_jcc = true; break;
+            case ir::Op::Ret: is_ret = true; break;
+            default: break;
+            }
+            if ((is_jmp || is_jcc) && tr.insn.dst.kind == ir::Operand::Kind::Imm) {
+                direct_imm = true;
+                imm_target = static_cast<u64>(tr.insn.dst.imm);
+            }
+        } else if (ci->detail != nullptr) {
+            const cs_detail* det = ci->detail;
+            bool grp_ret = false, grp_jump = false;
+            for (size_t g = 0; g < det->groups_count; ++g) {
+                if (det->groups[g] == X86_GRP_RET) grp_ret = true;
+                if (det->groups[g] == X86_GRP_JUMP) grp_jump = true;
+            }
+            if (grp_ret) {
+                is_ret = true;
+            } else if (grp_jump) {
+                if (det->x86.op_count > 0 && det->x86.operands[0].type == X86_OP_IMM) {
+                    direct_imm = true;
+                    imm_target = static_cast<u64>(det->x86.operands[0].imm);
+                }
+                is_jcc = true;
+            }
+        }
+        if (is_ret) continue;  // 无后继
+        if (is_jmp) {
+            if (direct_imm) queue.push_back({imm_target, n.layer + 1});
+            continue;  // 无条件 jmp 无 fallthrough
+        }
+        if (is_jcc) {
+            if (direct_imm) queue.push_back({imm_target, n.layer + 1});
+            queue.push_back({next, n.layer + 1});  // fallthrough
+            continue;
+        }
+        // 普通指令 / call / 未分类：顺序续行。call 目标不跟——triage 走子
+        // 为 jcc/jmp 边；跟 call 会把递归函数体（如 ackermann 自调）卷进
+        // 来造成假阳性，且"回跳进区域"的危险面由 jcc/jmp 边覆盖（call 目标
+        // 入区是另一类形态，不在本单 ExitNative 通道的判定面内）。
+        queue.push_back({next, n.layer});
+    }
+    return false;
+}
+
 void build_blocks(u64 begin_rva, u64 end_rva, std::span<const LiftedItem> items,
                   std::vector<ir::BasicBlock>& out) {
     out.clear();
@@ -114,7 +191,8 @@ void build_blocks(u64 begin_rva, u64 end_rva, std::span<const LiftedItem> items,
 
 u64 disassemble_and_lift(CapstoneSession& session, const u8* code, size_t size, u64 begin_rva,
                          u64 end_rva, std::string_view func_name, std::string_view pass_name,
-                         Diagnostics& diag, ir::FunctionRegion& fr, LiftMetadata& meta_out) {
+                         Diagnostics& diag, ir::FunctionRegion& fr, LiftMetadata& meta_out,
+                         const ExitNativeGuardFn& exit_guard) {
     std::vector<LiftedItem> items;
     items.reserve(size / 4 + 4);
 
@@ -154,6 +232,20 @@ u64 disassemble_and_lift(CapstoneSession& session, const u8* code, size_t size, 
             } else if (item.ctl == LiftedItem::Ctl::Jmp ||
                        item.ctl == LiftedItem::Ctl::Call) {
                 item.indirect = true; // jmp/call reg
+            }
+            // MIT-407: 越区跳转目标回跳检出——直接 jcc/jmp 目标 ≥ end_rva 且
+            // 可达集回跳本区时置 exit_native_blocked（下游 translator 上界
+            // 查询返回 nullopt → C1 gate）。仅首个检出点跑走子（置位后
+            // 后续目标无需再查），间接目标静态不可解不查。
+            if (!meta_out.exit_native_blocked && exit_guard &&
+                (item.ctl == LiftedItem::Ctl::Jcc || item.ctl == LiftedItem::Ctl::Jmp) &&
+                !item.indirect && item.target >= end_rva && exit_guard(item.target)) {
+                meta_out.exit_native_blocked = true;
+                char rva_buf[32];
+                std::snprintf(rva_buf, sizeof(rva_buf), "0x%" PRIX64, item.target);
+                diag.report(Severity::Note, pass_name,
+                            std::string(func_name) + " @rva " + rva_buf +
+                                ": 越区跳转目标可达集回跳本区，ExitNative 禁用（保守 gate）");
             }
         } else {
             const char* why = (tr.status == TranslateStatus::Todo) ? "（TODO：v1 暂不支持）" : "";

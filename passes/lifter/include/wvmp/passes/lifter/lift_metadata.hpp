@@ -24,6 +24,14 @@ struct LiftMetadata {
     // 每项 = (rva, size)；不重叠；按 RVA 升序追加；当前实现下函数区域内
     // 这些字节未进入 ir::FunctionRegion.basic_blocks[].insns。
     std::vector<std::pair<u64, u64>> skipped_ranges;
+
+    // MIT-407: 越区跳转目标回跳检出（triage §5 反例形态 d1_back）。
+    // 区域内任一直接 jcc/jmp 的越区目标（target >= end_rva），其 ≤3 层
+    // 静态可达集若落回 [begin_rva, end_rva)——区域字节将被 stub_link 覆写
+    // 为 E9+INT3，native 回跳进区域 = 执行 stub 代码 → 行为错/崩溃。
+    // 置位后 backend 的上界查询 lambda 返回 nullopt，整函数维持 C1 gate
+    // （gate 本就是按函数粒度，无需逐目标记录）。
+    bool exit_native_blocked = false;
 };
 
 // 跨 pass 通信槽 key（LifterPass 输出 / 下游 pass 输入）。

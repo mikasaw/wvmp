@@ -34,6 +34,9 @@
 #     0x600B 静态可核算) + wvmp_deepcall_div_sample (div/idiv 与深 call
 #     共存) — callgate callee 专用栈窗口 (MIT-E1) 预算边界覆盖.
 #     Total: 26 samples × 5 seeds = 130 runs.
+#   - MIT-407 (MIT-D2): extend to wvmp_exitnative_pos_sample (ExitNative
+#     越区单向退出两类形态: END-call 等价退出 + 早返回 jcc 退出).
+#     Total: 27 samples × 5 seeds = 135 runs.
 #   - MIT-306: REQUIRE_REAL=1 校验日志含 "已生成 N 个入口 stub" 防止 C1 gate
 #     兜底被误判 PASS（仅 byte-exact 不够, C1 gate 函数被跳过仍能输出相同
 #     stdout+rc）。与 multiseed_e2e_real.sh 配套使用。
@@ -85,9 +88,13 @@ samples=(
     "build/passes/marker_scan/tests/wvmp_rip_relative_sample.exe"
     "build/passes/marker_scan/tests/wvmp_rip_relative_simple_sample.exe"
     # MIT-406 (MIT-E1): 深 call 递归链 + div/深 call 组合样本 — callee 专用
-    # 栈窗口预算边界覆盖 (16 层 x 0x60B = 0x600B / 12 层 0x480B 树深)。
+    # 栈窗口预算边界覆盖 (32 层 x 0x60B = 0xC00B / 12 层 0x480B 树深, MIT-407 加深)。
     "build/passes/marker_scan/tests/wvmp_deepcall_sample.exe"
     "build/passes/marker_scan/tests/wvmp_deepcall_div_sample.exe"
+    # MIT-407 (MIT-D2): ExitNative 正样本 — END-call 等价退出 + 早返回 jcc
+    # 退出两类越区形态, 两函数须真虚拟化 (REQUIRE_REAL ≥1 stub)。
+    # 反例样本 (回跳/超界 → gate) 不进 REQUIRE_REAL 列表, 由 e2e.sh 单独验。
+    "build/passes/marker_scan/tests/wvmp_exitnative_pos_sample.exe"
 )
 
 # Seeds: 1 (small), 12345 (default), 99999 (large), 0xDEADBEEF (magic), 0xCAFEBABE (magic).

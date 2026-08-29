@@ -9,6 +9,7 @@
 #include "wvmp/framework/registry.hpp"
 #include "wvmp/passes/lifter/lift_metadata.hpp"
 
+#include <span>
 #include <string>
 
 namespace wvmp::passes {
@@ -74,8 +75,17 @@ void LifterPass::run(ProtectionContext& ctx) {
         }
         const auto [offset, len] = *range;
         lifter::CapstoneSession& session = (fr.arch == ir::Arch::X86) ? session_x86 : session_x64;
+        // MIT-407: 越区跳转目标回跳检出回调（ExitNative 上界判定的一环）——
+        // 捕获当前函数区域端点 + image 原始字节 + 本会话，从越区目标起走
+        // ≤3 层静态可达集，落回本区即判危险。结果经 LiftMetadata 传下游。
+        const lifter::ExitNativeGuardFn exit_guard =
+            [&session, image = std::span<const u8>(ctx.image), &pe, &fr](u64 target) {
+                return lifter::back_jump_reaches_region(session, image, pe, target,
+                                                        fr.begin_rva, fr.end_rva);
+            };
         lifter::disassemble_and_lift(session, ctx.image.data() + offset, len, fr.begin_rva,
-                                     fr.end_rva, fr.name, name(), ctx.diag, fr, meta);
+                                     fr.end_rva, fr.name, name(), ctx.diag, fr, meta,
+                                     exit_guard);
         metadata.push_back(std::move(meta));
         ++lifted;
     }

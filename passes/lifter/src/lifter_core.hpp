@@ -2,12 +2,14 @@
 #pragma once
 
 #include "capstone_session.hpp"
+#include "pe_map.hpp"
 
 #include "wvmp/common/types.hpp"
 #include "wvmp/framework/diagnostics.hpp"
 #include "wvmp/ir/region.hpp"
 #include "wvmp/passes/lifter/lift_metadata.hpp"
 
+#include <functional>
 #include <optional>
 #include <span>
 #include <string_view>
@@ -37,6 +39,20 @@ struct LiftedItem {
 void build_blocks(u64 begin_rva, u64 end_rva, std::span<const LiftedItem> items,
                   std::vector<ir::BasicBlock>& out);
 
+// MIT-407: 越区跳转目标回跳检出（triage §5 反例形态 d1_back 的静态检查）。
+// 从 target 起沿静态控制流边 BFS ≤3 层（jcc → {target, fallthrough}、
+// jmp → {target}、call/其他 → 顺序续行；间接 jmp 无静态目标为死端；
+// 分类失败按非分支处理，绝不虚造边），任何被到达的地址落入
+// [begin_rva, end_rva) 即判危险（区域将被 stub 覆写，native 回跳 = 执行
+// stub 代码）。返回值 true = 目标不可用 → 调用方置 exit_native_blocked。
+// 防御边界：每节点至多反汇编 1 条、总预算 256 条、层数 >3 终止。
+bool back_jump_reaches_region(CapstoneSession& session, std::span<const u8> image,
+                              const PeSectionMap& pe, u64 target, u64 begin_rva, u64 end_rva);
+
+// MIT-407: 越区跳转目标回跳检出回调（lifter_pass 构造，捕获 session/image/
+// pe_map；true = 目标可达集回跳本区 → 该函数禁用 ExitNative）。
+using ExitNativeGuardFn = std::function<bool(u64 target_rva)>;
+
 // 一站式入口：对 [code, code+size)（对应函数区域 RVA [base_rva, end_rva)）
 // 线性反汇编、逐条映射并填充 fr.blocks。capstone 会话由调用方按 arch
 // 打开并复用。
@@ -47,6 +63,7 @@ void build_blocks(u64 begin_rva, u64 end_rva, std::span<const LiftedItem> items,
 //   - 返回解码出的指令条数（含被跳过的指令）。
 u64 disassemble_and_lift(CapstoneSession& session, const u8* code, size_t size, u64 begin_rva,
                          u64 end_rva, std::string_view func_name, std::string_view pass_name,
-                         Diagnostics& diag, ir::FunctionRegion& fr, LiftMetadata& meta_out);
+                         Diagnostics& diag, ir::FunctionRegion& fr, LiftMetadata& meta_out,
+                         const ExitNativeGuardFn& exit_guard = {});
 
 } // namespace wvmp::passes::lifter

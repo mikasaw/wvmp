@@ -3,7 +3,7 @@
 // 背景: 既有 call_gate 样本 callee 全浅帧 (<=0x30B), callgate 的 native
 // callee 树与驻留同栈的 VmContext 只隔 ~0x1D8 预算, 从未被测过。wvmpTest
 // sha256 (调用树 ~0x250B) 在 MIT-404 合入后砸穿 ctx → packed 双跑红。
-// 本样本用静态可核算的 16 层递归链 (每层 0x60B, 总树深 0x600B >= 0x400B,
+// 本样本用静态可核算的 32 层递归链 (每层 0x60B, 总树深 0xC00B, MIT-407 加深——
 // 推导见 deepcall_sample_asm.asm 头注释) 复现预算边界:
 //   - 修复前: 递归写入物理落进 VmContext 槽区 → CallGate 返回后解释器
 //     状态毁坏 → packed 必崩 (0xC0000005 形态) — 验收 #8 反证;

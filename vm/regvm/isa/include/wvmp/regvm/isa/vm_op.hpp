@@ -443,11 +443,14 @@ enum class VmOp : u16 {
     // 单向退出：越过区域 END 但落在同一函数 .pdata 边界内的跳转目标时，
     // 翻译期发 ExitNative；运行时复用 stub HALT 写回链（rax/rcx/rdx/r8-r11
     // + xmm0-7 + add rsp/pop）→ 间接 jmp 到 aux 指定的 RVA，**不再回 VM**。
-    //   - aux = 目标 RVA（u32 零扩展；handler 写到 EXIT_SLOT）
-    //   - cond_or_size = ir::Cond (0..15) 走条件退出；0xFF = 无条件直退
-    //   - 12/17 站点为 jcc（triage §6.7），条件由 dispatch 解出 cond 后
-    //     复用 build_jcc 的 cond_eval 链；不满足则 advance 继续 VM
-    //   - 5/17 站点为 jmp（无条件），cond_or_size = 0xFF，handler 跳过链
+    //   - aux = 目标 RVA（u32 零扩展；handler 加 image_base 后写 EXIT_SLOT）
+    //   - 无条件直退: a_kind=Imm（handler 解 t_[3]==2 跳过条件链）。注意
+    //     cond_or_size 是 4 位字段（encode 端 validate_insn 拒绝 >15），
+    //     不存在 0xFF sentinel——v1 草案的 0xFF 设计启用即抛，已废弃。
+    //   - 条件退出: cond_or_size = ir::Cond (0..15) 走条件退出（12/17 站点，
+    //     triage §6.7），条件由 dispatch 解出 cond 后复用 build_jcc 的
+    //     cond_eval 链；不满足则 advance 继续 VM
+    //   - 5/17 站点为 jmp（无条件），a_kind=Imm + cond=0
     // 契约：
     //   - 出口 rsp == entry rsp（与 callgate 同一 native_sp 基准，本语料
     //     14 区域 0 push / 0 rsp 调整实测成立；若未来区域含未配平 push，
@@ -455,9 +458,10 @@ enum class VmOp : u16 {
     //   - EFLAGS 不回写：15 去重落点实测均先覆写 flags 再读，落点不消费
     //     flags；属本语料实测契约，非普适证明（§2.4 / §F.2 披露）
     //   - 间接 jmp / ret 目标维持 gate（C 双向分段不在本单）
-    // handler 写回链等价 stub_gen.cpp:99-118 HALT 段（一字不动复用）；
-    // stub 终态 `jmp rel32 resume_rva` 改为 `jmp [rsp+EXIT_SLOT]` 间接
-    // （slot 在 ctx 下方 -8 处；stub 入口预写 end_rva，handler 覆写 aux）。
+    // 运行时通道 = EXIT_SLOT（native_sp - kExitSlotDepth，runtime.hpp 单一
+    // 事实来源）：stub 入口预写 VA(resume_rva)，ExitNative handler 命中时
+    // 覆写 VA(aux)；stub HALT 终态 `jmp [rsp - kExitSlotDepth]` 间接跳出。
+    // 槽内容必须是绝对 VA（image_base + RVA），禁止裸 RVA（v1 segfault 根因）。
     // 派活单 §D 决策: ExitNative 必 append-only 在 Idiv 之后 (pitfall #34
     // additive enum append-only)；kVmOpMax+1=80 < 128 跳表 (asmgen.cpp
     // static_assert(kVmOpMax < kTableEntries))。
