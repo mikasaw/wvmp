@@ -61,6 +61,30 @@ void add_note(std::vector<std::string>& notes, u64 addr, std::string_view what) 
     notes.emplace_back(std::string(what) + buf);
 }
 
+// MIT-419 (G4): lock 族 src2 标记 — 与 lifter (x86_translate.cpp
+// translate_lock_op) 的枚举分域严格对账 (5..11; string family 0..4 不相干):
+//   5..8: Op::Mov 载体族 (xadd/bts/btr/btc — ir::Op 冻结契约不可增枚举,
+//         沿用 G3 串指令 "Op::Mov + src2=imm(family)" 载体先例)
+//   9..11: 本体 op 族 (ALU/Cmpxchg/Xchg — 标记仅声明"曾带 lock", 发 note 用)
+enum : int { kLockXadd = 5, kLockBts = 6, kLockBtr = 7, kLockBtc = 8,
+             kLockStripAlu = 9, kLockStripCmpxchg = 10, kLockStripXchg = 11 };
+[[nodiscard]] bool is_lock_marker(i64 v) {
+    return v >= kLockXadd && v <= kLockStripXchg;
+}
+// lock 标记只可能骑在下列 op 上 (lifter 约定) — **必须 op 限定**:
+// imul 3-op imm 形式也用 src2=imm 且立即数任意 (exitnative 样本实证
+// imul rax,[rsp+0x40],7 → src2=imm(7) 恰落在标记域, 无条件拦截会误伤)。
+[[nodiscard]] bool is_lock_carrier_op(ir::Op op) {
+    switch (op) {
+    case ir::Op::Mov: case ir::Op::Add: case ir::Op::Sub: case ir::Op::Adc:
+    case ir::Op::Sbb: case ir::Op::And: case ir::Op::Or: case ir::Op::Xor:
+    case ir::Op::Cmpxchg: case ir::Op::Xchg:
+        return true;
+    default:
+        return false;
+    }
+}
+
 // ==================== MIT-409 + MIT-413 (G2): 跳转表特化 ====================
 //
 // 识别模式 = 受限模板匹配（D1 决策，派活单 §A.2 实测模板 + G2 三参数
@@ -758,6 +782,16 @@ struct Translator {
             const auto it = next_ip_of_->find(current_rva);
             if (it != next_ip_of_->end()) next_ip = it->second;
         }
+        // MIT-419 (G4): lock 族挂点 — lifter 用 src2=imm(kLockXadd..kLockStripXchg)
+        // 标记 (与 string-op 的 src2=imm(0..4) 分域零碰撞)。统一在 run() 入口
+        // 拦截: 先发 lock-strip note (D1 边界披露, 413 纪律 — "lock-strip @"
+        // 前缀进 backend 过滤白名单, 不触发 gate), 再按族派发本体翻译。
+        // ⚠️ 必须 op 限定 (is_lock_carrier_op): imul 3-op imm 也用 src2=imm
+        // 且立即数任意 (exitnative 样本 imul ...,7 实证踩域, 见函数注释)。
+        if (in.src2.kind == ir::Operand::Kind::Imm && is_lock_marker(in.src2.imm) &&
+            is_lock_carrier_op(in.op)) {
+            ok = translate_lock_family(em, sc, in, current_rva, next_ip);
+        } else {
         switch (in.op) {
         case ir::Op::Mov: ok = translate_mov(em, sc, in); break;
         case ir::Op::Lea: ok = translate_lea(em, sc, in, current_rva, next_ip); break;
@@ -845,7 +879,11 @@ struct Translator {
             } else if (in.op == ir::Op::Bswap) {
                 ok = translate_bswap(em, in);
             } else if (in.op == ir::Op::Xchg) {
-                ok = translate_xchg(em, in);
+                // MIT-419 (G4): xchg dispatch — REG-REG 形式 emit 单条
+                // VmOp::Xchg; MEM 形式 (xchg [m], r — InterlockedExchange 真
+                // 产物, 裸 xchg 隐式锁) emit Load+Xchg+Store 三条拆条
+                // (translate_xchg 内部展开, xchg 对称拆条语义等价)。
+                ok = translate_xchg(em, sc, in, current_rva, next_ip);
             } else if (in.op == ir::Op::Setcc) {
                 // MIT-336: setcc dispatch — REG 形式 emit 单条 VmOp::Setcc,
                 // MEM 形式 emit Load+Setcc+Store 三条拆条 (translate_setcc 内部展开)。
@@ -869,6 +907,7 @@ struct Translator {
             }
             break;
         }
+        }  // else switch (lock 族挂点)
         if (ok)
             code.insert(code.end(), em.out.begin(), em.out.end());
     }
@@ -1021,6 +1060,123 @@ struct Translator {
                       "ptr += %u (D1: DF=1 输入行为不保)",
                       in.addr, fam_name, suffix, inc, inc);
         notes.emplace_back(note);
+        return true;
+    }
+
+    // ---- MIT-419 (G4): lock 前缀原子族 strip-and-execute ----
+    //
+    // lifter 编码约定 (x86_translate.cpp translate_lock_op 对账):
+    //   src2=imm(kLockXadd..kLockStripXchg, 5..11) 标记 (string family 0..4
+    //   分域零碰撞)。run() 入口已拦截 (先发 lock-strip note 再按族派发),
+    //   本函数 = 族派发本体:
+    //     - kLockStripAlu      (Op::Add/Sub/Adc/Sbb/And/Or/Xor + dst=Mem):
+    //        剥 F0 后与普通 mem-dst ALU 同折条 — emit_address + Load +
+    //        ALU + Store (本体通路既有, 零新 VmOp; D1 折条原子性边界披露)
+    //     - kLockStripCmpxchg  (Op::Cmpxchg + dst=Mem): 既有 mem 拆条
+    //        (Load + Cmpxchg + Store)
+    //     - kLockStripXchg     (Op::Xchg + dst=Mem): 本单新 mem 拆条
+    //        (Load + Xchg + Store, xchg 对称拆条语义等价)
+    //     - kLockXadd          (Op::Mov 载体 + dst=Mem + src=Reg): emit
+    //        VmOp::Xadd 一条 (a=地址槽, b=源寄存器槽) — handler 内 native
+    //        lock xadd [addr], reg 单指令直执行, **硬件原子性保真** (D1 折条
+    //        妥协不适用本指令)
+    //     - kLockBts/Btr/Btc  (Op::Mov 载体 + dst=Mem + src=Reg/Imm8): emit
+    //        VmOp::Bts/Btr/Btc 一条 (a=地址槽; b_kind=Reg 位号槽 或 Imm aux=
+    //        imm8) — handler 内 native lock bts [addr], reg 直执行
+    //   note 前缀 "lock-strip @" 与 backend 过滤白名单对账 (413 纪律:
+    //   regvm_backend.cpp 过滤白名单, 命中不触发 C1 gate)。
+    bool translate_lock_family(Emitter& em, Scratch& sc, const ir::Insn& in,
+                               u64 current_rva, u64 next_ip) {
+        const i64 m = in.src2.imm;
+        const char* fam = m == kLockXadd       ? "xadd"
+                          : m == kLockBts      ? "bts"
+                          : m == kLockBtr      ? "btr"
+                          : m == kLockBtc      ? "btc"
+                          : m == kLockStripAlu ? "alu"
+                          : m == kLockStripCmpxchg ? "cmpxchg"
+                          : m == kLockStripXchg ? "xchg"
+                                                : "?";
+        // D1 边界披露 (GAPS G4 节): strip-and-execute, 多线程并发原子性不
+        // 保证 (折条路径); MFENCE 全序不建模。xadd/bts 系单 VmOp 直执行
+        // native lock 指令, 硬件原子性由 lock 前缀保真 — 不在本边界内。
+        char note[192];
+        std::snprintf(note, sizeof(note),
+                      "lock-strip @ 0x%" PRIX64 ": %s (strip-and-execute, D1: "
+                      "多线程并发原子性不保证, MFENCE 全序不建模)",
+                      in.addr, fam);
+        notes.emplace_back(note);
+        switch (m) {
+        case kLockStripAlu:
+            if (!is_alu_binop(in.op) || in.dst.kind != ir::Operand::Kind::Mem)
+                return skip(in, "lock ALU 操作数形态未支持", nullptr);
+            return translate_alu_binop(em, sc, in, current_rva, next_ip);
+        case kLockStripCmpxchg:
+            return translate_cmpxchg(em, sc, in, current_rva, next_ip);
+        case kLockStripXchg:
+            return translate_xchg(em, sc, in, current_rva, next_ip);
+        case kLockXadd:
+            return translate_lock_xadd(em, sc, in, current_rva, next_ip);
+        case kLockBts:
+        case kLockBtr:
+        case kLockBtc:
+            return translate_lock_bit(em, sc, in, m, current_rva, next_ip);
+        default:
+            return skip(in, "lock family 标记非法，建议 gate", nullptr);
+        }
+    }
+
+    // xadd [m], r (InterlockedAdd 真产物): [m] = [m] + r; r = 旧 [m]。
+    // 单 VmOp::Xadd (a=地址槽, b=源寄存器槽), handler 内 native lock xadd
+    // [addr], reg 一条指令完成读改写 — 硬件原子性保真 (不落 D1 折条边界)。
+    // flags = add 语义, handler 走 zero5→native→setcc5→flags_tail。
+    // rip-relative 目标: emit_address 出 RVA, 追加 LeaRva (RVA + image_base
+    // → VA) 后 Xadd 按绝对 VA 访存 (与 LoadRva/StoreRva 同通道; 实测真产物:
+    // 64 位全局 Interlocked* 直出 lock xadd/cmpxchg [rip+disp] 形态)。
+    bool translate_lock_xadd(Emitter& em, Scratch& sc, const ir::Insn& in,
+                             u64 current_rva, u64 next_ip) {
+        if (in.dst.kind != ir::Operand::Kind::Mem ||
+            in.src.kind != ir::Operand::Kind::Reg)
+            return skip(in, "lock xadd 操作数形态未支持", nullptr);
+        u8 acc = 0;
+        if (!emit_address(em, sc, in.dst.mem, current_rva, next_ip, acc))
+            return skip(in, "lock xadd 地址形态未支持", &in.dst.mem);
+        if (in.dst.mem.base == ir::Reg::Rip) {
+            const u8 sz64 = isa::size_field(ir::Size::S64);
+            em.emit_rr(VmOp::LeaRva, acc, acc, sz64);  // RVA→VA (in-place)
+        }
+        em.emit(VmOp::Xadd, OpKind::Reg, acc, OpKind::Reg, isa::vm_reg_of(in.src.reg),
+                0, isa::size_field(in.size));
+        return true;
+    }
+
+    // bts/btr/btc [m], r/imm8 (InterlockedBitTest* 真产物): CF = bit[位号];
+    // [m] = 1/0/^1 (按族)。单 VmOp::Bts/Btr/Btc (a=地址槽; b_kind=Reg 位号
+    // 槽低 8 位 或 Imm aux=imm8)。handler 内 native lock bts [addr], reg
+    // 直执行 (imm 位号经 aux 装载进寄存器, reg 形式是超集语义一致)。
+    bool translate_lock_bit(Emitter& em, Scratch& sc, const ir::Insn& in, i64 marker,
+                            u64 current_rva, u64 next_ip) {
+        const VmOp vop = marker == kLockBts ? VmOp::Bts
+                         : marker == kLockBtr ? VmOp::Btr
+                                              : VmOp::Btc;
+        if (in.dst.kind != ir::Operand::Kind::Mem)
+            return skip(in, "lock bit 操作数形态未支持", nullptr);
+        u8 acc = 0;
+        if (!emit_address(em, sc, in.dst.mem, current_rva, next_ip, acc))
+            return skip(in, "lock bit 地址形态未支持", &in.dst.mem);
+        if (in.dst.mem.base == ir::Reg::Rip) {
+            const u8 sz64 = isa::size_field(ir::Size::S64);
+            em.emit_rr(VmOp::LeaRva, acc, acc, sz64);  // RVA→VA (in-place)
+        }
+        const u8 sz = isa::size_field(in.size);
+        if (in.src.kind == ir::Operand::Kind::Reg) {
+            em.emit(vop, OpKind::Reg, acc, OpKind::Reg, isa::vm_reg_of(in.src.reg),
+                    0, sz);
+        } else if (in.src.kind == ir::Operand::Kind::Imm) {
+            em.emit(vop, OpKind::Reg, acc, OpKind::Imm, 0,
+                    static_cast<u32>(in.src.imm), sz);
+        } else {
+            return skip(in, "lock bit src 操作数形态未支持", nullptr);
+        }
         return true;
     }
 
@@ -2089,29 +2245,54 @@ struct Translator {
         return true;
     }
 
-    // ---- MIT-334: xchg (寄存器交换) ----
+    // ---- MIT-334 + MIT-419 (G4): xchg (寄存器/内存交换) ----
     //
-    // xchg 是 2 操作数 (dst + src 都是寄存器, 派活单限定 REG-REG, MEM-REG
-    // 由 lifter 拒为 unsupported → C1 gate 兜底). emit VmOp::Xchg 一条:
-    //   a_kind=Reg reg_a=dst, b_kind=Reg reg_b=src, aux=0, cond_or_size=size
-    //   (S32 或 S64 由 REX.W 决定, lifter 已传过来).
-    //
-    // xchg 是对称操作 (Intel SDM: xchg a, b == xchg b, a), IR.dst/src 顺序
-    // 不影响语义, 翻译器按 IR 直产 a=dst, b=src.
+    // xchg 是 2 操作数对称操作 (Intel SDM: xchg a, b == xchg b, a),
+    // IR.dst/src 顺序不影响语义, 翻译器按 IR 直产 a=dst, b=src.
+    //   - REG-REG: emit VmOp::Xchg 一条 (a=dst, b=src, aux=0,
+    //     cond_or_size=size; S32/S64 由 REX.W 决定, lifter 已传过来).
+    //   - MEM-REG (MIT-419 放开): xchg [m], r — InterlockedExchange 的 MSVC
+    //     真产物是裸 `xchg [m], r` (87 /r 无 F0, xchg 访存隐式锁; probe
+    //     实证 2026-08-30), lock xchg [m], r 同享本通路 (lifter 剥 F0 + src2
+    //     标记发 lock-strip note)。拆条 (xchg 对称, 拆条语义等价):
+    //       emit_address → acc; Load tmp, [acc]; Xchg(tmp, s); Store [acc], tmp
+    //       语义: tmp=旧[m]; Xchg(tmp,s) → tmp=旧s, s=旧[m]; Store → [m]=旧s ✓
+    //       scratch 预算 = emit_address(1) + tmp(1) = 2, 在 6 预算内。
+    //     rip-relative 目标 (lock cmpxchg [rip+disp] 同族形态) 经
+    //     LoadRva/StoreRva 通道。
     //
     // handler 在 asmgen.cpp 的 build_xchg: 按 cond_or_size 分 S32/S64 emit
     // native xchg eax,ebx (S32) 或 xchg rax,rbx (S64). S32 路径用 dword
     // 读写 (上 32 位 slot 保留), S64 路径用 qword 读写 (full 64 互换).
     //
     // 不更新 flags (xchg 不影响 CF/OF/SF/ZF/PF).
-    bool translate_xchg(Emitter& em, const ir::Insn& in) {
+    bool translate_xchg(Emitter& em, Scratch& sc, const ir::Insn& in,
+                        u64 current_rva, u64 next_ip) {
         if (in.op != ir::Op::Xchg) return false;
-        if (in.dst.kind != ir::Operand::Kind::Reg) return false;
+        // src 必为寄存器 (xchg r/m, r 第二操作数必是 r)
         if (in.src.kind != ir::Operand::Kind::Reg) return false;
-        const u8 d = isa::vm_reg_of(in.dst.reg);
         const u8 s = isa::vm_reg_of(in.src.reg);
         const u8 sz = isa::size_field(in.size);
-        em.emit_rr(VmOp::Xchg, d, s, sz);
+
+        if (in.dst.kind == ir::Operand::Kind::Reg) {
+            const u8 d = isa::vm_reg_of(in.dst.reg);
+            em.emit_rr(VmOp::Xchg, d, s, sz);
+            return true;
+        }
+        if (in.dst.kind != ir::Operand::Kind::Mem)
+            return skip(in, "xchg 操作数形态未支持", nullptr);
+        // MEM: xchg [m], r — Load tmp + Xchg(tmp, s) + Store 三条拆条。
+        u8 acc = 0;
+        if (!emit_address(em, sc, in.dst.mem, current_rva, next_ip, acc))
+            return skip(in, "xchg 地址形态未支持", &in.dst.mem);
+        const u8 tmp = sc.take();
+        const isa::VmOp load_op =
+            (in.dst.mem.base == ir::Reg::Rip) ? isa::VmOp::LoadRva : isa::VmOp::Load;
+        em.emit_rr(load_op, tmp, acc, sz);  // Load tmp, [acc]
+        em.emit_rr(VmOp::Xchg, tmp, s, sz); // Xchg(tmp, s): tmp=旧s, s=旧[m]
+        const isa::VmOp store_op =
+            (in.dst.mem.base == ir::Reg::Rip) ? isa::VmOp::StoreRva : isa::VmOp::Store;
+        em.emit_rr(store_op, acc, tmp, sz); // Store [acc], tmp → [m] = 旧s
         return true;
     }
 

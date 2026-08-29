@@ -1219,4 +1219,180 @@ TEST(Translate, StringOpEmitsDfAssumptionNote) {
     EXPECT_EQ(d.insns.back().op, VmOp::Halt);
 }
 
+// ==================== MIT-419 (G4): lock 前缀原子族 ====================
+//
+// src2 标记分域 (与 lifter translate_lock_op 对账): 5..8 = Op::Mov 载体族
+// (xadd/bts/btr/btc), 9..11 = 本体 op 族 (alu/cmpxchg/xchg)。统一挂点在
+// run() 入口: 先发 lock-strip note ("lock-strip @" 前缀与 backend 过滤
+// 白名单对账, 413 纪律) 再按族派发。
+
+// 辅助: lock 载体族 IR (Op::Mov + dst=Mem + src + src2=imm(marker)).
+ir::Insn lock_carrier(i64 marker, ir::Operand d, ir::Operand s, ir::Size sz) {
+    ir::Insn i = I(ir::Op::Mov, sz);
+    i.dst = d;
+    i.src = s;
+    i.src2 = ir::Operand::imm_(marker);
+    i.updates_flags = true;
+    return i;
+}
+
+TEST(Translate, LockXaddEmitsSingleVmOpWithNote) {
+    // lock xadd [rax], ebx (InterlockedAdd 真产物): 单 VmOp::Xadd —
+    // a=地址槽 (emit_address 产出), b=源寄存器槽, handler 内 native
+    // lock xadd [addr], reg 单指令直执行 (硬件原子性保真)。
+    const ir::MemOperand mem{ir::Reg::Rax, ir::Reg::Flags, 0, 0};
+    std::vector<std::string> notes;
+    const Decoded d = one_insn_n(
+        lock_carrier(5, ir::Operand::mem_(mem), ir::Operand::reg_(ir::Reg::Rbx),
+                     ir::Size::S32),
+        &notes);
+    ASSERT_EQ(d.insns.size(), static_cast<size_t>(4));  // Mov+Xadd+Jmp+Halt
+    const u8 s18 = isa::kScratchFirst;
+    expect_is(d.insns[0], VmOp::Mov, OpKind::Reg, s18, OpKind::Reg, kRax, 0, kS64);
+    expect_is(d.insns[1], VmOp::Xadd, OpKind::Reg, s18, OpKind::Reg, kRbx, 0, kS32);
+    expect_is(d.insns[2], VmOp::Jmp, OpKind::None, 0, OpKind::None, 0, 1, kS64);
+    expect_is(d.insns[3], VmOp::Halt, OpKind::None, 0, OpKind::None, 0, 0, 0);
+    ASSERT_EQ(notes.size(), 1u);
+    EXPECT_NE(notes[0].find("lock-strip @ 0x401000"), std::string::npos);
+    EXPECT_NE(notes[0].find("xadd"), std::string::npos);
+    EXPECT_NE(notes[0].find("strip-and-execute"), std::string::npos);
+}
+
+TEST(Translate, LockXadd64RipTarget) {
+    // lock xadd qword ptr [rip+disp], rbx — rip 目标经 emit_address 出 RVA,
+    // 与 LoadRva/StoreRva 同通道 (Xadd handler 直接以 acc 槽值作地址 — RVA
+    // 需先 LeaRva 转 VA? 否: Xadd 访存的是**绝对 VA**, 与 Load/Store 同语义,
+    // 故翻译器对 rip 目标在 Xadd 前插入 LeaRva 把 RVA→VA)。
+    const ir::MemOperand mem{ir::Reg::Rip, ir::Reg::Flags, 0, 0x20};
+    std::vector<std::string> notes;
+    const Decoded d = one_insn_n(
+        lock_carrier(5, ir::Operand::mem_(mem), ir::Operand::reg_(ir::Reg::Rbx),
+                     ir::Size::S64),
+        &notes);
+    // Mov acc, (next_ip+disp) [next_ip = fn.end_rva = 0x3000] → LeaRva
+    // acc, acc → Xadd acc, rbx → Jmp → Halt = 5 条。
+    ASSERT_EQ(d.insns.size(), static_cast<size_t>(5));
+    const u8 s18 = isa::kScratchFirst;
+    expect_is(d.insns[0], VmOp::Mov, OpKind::Reg, s18, OpKind::Imm, 0, 0x3020, kS64);
+    expect_is(d.insns[1], VmOp::LeaRva, OpKind::Reg, s18, OpKind::Reg, s18, 0, kS64);
+    expect_is(d.insns[2], VmOp::Xadd, OpKind::Reg, s18, OpKind::Reg, kRbx, 0, kS64);
+    expect_is(d.insns[3], VmOp::Jmp, OpKind::None, 0, OpKind::None, 0, 1, kS64);
+    expect_is(d.insns[4], VmOp::Halt, OpKind::None, 0, OpKind::None, 0, 0, 0);
+}
+
+TEST(Translate, LockStripAluFoldsLikePlainAluMem) {
+    // lock add [rax], ebx — 剥 F0 后与普通 mem-dst ALU 同折条 (D1:
+    // strip-and-execute, 零新 VmOp): Mov acc,rax; Load s,[acc]; Add s,ebx;
+    // Store [acc],s。note 前缀 lock-strip @。
+    const ir::MemOperand mem{ir::Reg::Rax, ir::Reg::Flags, 0, 0};
+    ir::Insn i = I(ir::Op::Add, ir::Size::S32);
+    i.dst = ir::Operand::mem_(mem);
+    i.src = ir::Operand::reg_(ir::Reg::Rbx);
+    i.src2 = ir::Operand::imm_(9);  // kLockStripAlu
+    i.updates_flags = true;
+    std::vector<std::string> notes;
+    const Decoded d = one_insn_n(i, &notes);
+    ASSERT_EQ(d.insns.size(), static_cast<size_t>(6));  // Mov+Load+Add+Store+Jmp+Halt
+    const u8 s18 = isa::kScratchFirst;
+    expect_is(d.insns[0], VmOp::Mov, OpKind::Reg, s18, OpKind::Reg, kRax, 0, kS64);
+    expect_is(d.insns[1], VmOp::Load, OpKind::Reg, s18 + 1, OpKind::Reg, s18, 0, kS32);
+    expect_is(d.insns[2], VmOp::Add, OpKind::Reg, s18 + 1, OpKind::Reg, kRbx, 0, kS32);
+    expect_is(d.insns[3], VmOp::Store, OpKind::Reg, s18, OpKind::Reg, s18 + 1, 0, kS32);
+    expect_is(d.insns[4], VmOp::Jmp, OpKind::None, 0, OpKind::None, 0, 1, kS64);
+    expect_is(d.insns[5], VmOp::Halt, OpKind::None, 0, OpKind::None, 0, 0, 0);
+    ASSERT_EQ(notes.size(), 1u);
+    EXPECT_NE(notes[0].find("lock-strip @ 0x401000"), std::string::npos);
+    EXPECT_NE(notes[0].find("alu"), std::string::npos);
+}
+
+TEST(Translate, LockBtsImmEmitsSingleVmOp) {
+    // lock bts [rax], 5 (InterlockedBitTest* 真产物 imm8 形式): 单
+    // VmOp::Bts — a=地址槽, b_kind=Imm aux=5。
+    const ir::MemOperand mem{ir::Reg::Rax, ir::Reg::Flags, 0, 0};
+    std::vector<std::string> notes;
+    const Decoded d = one_insn_n(
+        lock_carrier(6, ir::Operand::mem_(mem), ir::Operand::imm_(5), ir::Size::S32),
+        &notes);
+    ASSERT_EQ(d.insns.size(), static_cast<size_t>(4));  // Mov+Bts+Jmp+Halt
+    const u8 s18 = isa::kScratchFirst;
+    expect_is(d.insns[0], VmOp::Mov, OpKind::Reg, s18, OpKind::Reg, kRax, 0, kS64);
+    expect_is(d.insns[1], VmOp::Bts, OpKind::Reg, s18, OpKind::Imm, 0, 5, kS32);
+    expect_is(d.insns[2], VmOp::Jmp, OpKind::None, 0, OpKind::None, 0, 1, kS64);
+    expect_is(d.insns[3], VmOp::Halt, OpKind::None, 0, OpKind::None, 0, 0, 0);
+    ASSERT_EQ(notes.size(), 1u);
+    EXPECT_NE(notes[0].find("lock-strip @ 0x401000"), std::string::npos);
+    EXPECT_NE(notes[0].find("bts"), std::string::npos);
+}
+
+TEST(Translate, LockBtcRegEmitsSingleVmOp) {
+    // lock btc [rax], ebx — reg 位号形式: b_kind=Reg reg_b=ebx。
+    const ir::MemOperand mem{ir::Reg::Rax, ir::Reg::Flags, 0, 0};
+    const Decoded d = one_insn_n(
+        lock_carrier(8, ir::Operand::mem_(mem), ir::Operand::reg_(ir::Reg::Rbx),
+                     ir::Size::S64));
+    const u8 s18 = isa::kScratchFirst;
+    expect_is(d.insns[1], VmOp::Btc, OpKind::Reg, s18, OpKind::Reg, kRbx, 0, kS64);
+}
+
+TEST(Translate, LockStripCmpxchgMemReusesFolding) {
+    // lock cmpxchg [rax], ebx — 既有 mem 拆条 (Load+Cmpxchg+Store) 复用
+    // (B.3: dst=Mem 覆盖实测, 零改动)。note 前缀 lock-strip @。
+    const ir::MemOperand mem{ir::Reg::Rax, ir::Reg::Flags, 0, 0};
+    ir::Insn i = I(ir::Op::Cmpxchg, ir::Size::S32);
+    i.dst = ir::Operand::mem_(mem);
+    i.src = ir::Operand::reg_(ir::Reg::Rbx);
+    i.src2 = ir::Operand::imm_(10);  // kLockStripCmpxchg
+    i.updates_flags = true;
+    std::vector<std::string> notes;
+    const Decoded d = one_insn_n(i, &notes);
+    ASSERT_EQ(d.insns.size(), static_cast<size_t>(6));  // Mov+Load+Cmpxchg+Store+Jmp+Halt
+    const u8 s18 = isa::kScratchFirst;
+    expect_is(d.insns[0], VmOp::Mov, OpKind::Reg, s18, OpKind::Reg, kRax, 0, kS64);
+    expect_is(d.insns[1], VmOp::Load, OpKind::Reg, s18 + 1, OpKind::Reg, s18, 0, kS32);
+    expect_is(d.insns[2], VmOp::Cmpxchg, OpKind::Reg, s18 + 1, OpKind::Reg, kRbx, 0, kS32);
+    expect_is(d.insns[3], VmOp::Store, OpKind::Reg, s18, OpKind::Reg, s18 + 1, 0, kS32);
+    ASSERT_EQ(notes.size(), 1u);
+    EXPECT_NE(notes[0].find("lock-strip @ 0x401000"), std::string::npos);
+    EXPECT_NE(notes[0].find("cmpxchg"), std::string::npos);
+}
+
+TEST(Translate, XchgMemFoldsWithoutNote) {
+    // 裸 xchg [rax], ebx (InterlockedExchange 真产物, 无 F0) — mem 折条
+    // Load+Xchg+Store; **无 lock-strip note** (无 lock 前缀, one_insn 断言
+    // notes 空)。xchg 对称, 拆条语义等价: tmp=旧[m]; Xchg(tmp,ebx) →
+    // tmp=旧ebx, ebx=旧[m]; Store → [m]=旧ebx。
+    const ir::MemOperand mem{ir::Reg::Rax, ir::Reg::Flags, 0, 0};
+    ir::Insn i = I(ir::Op::Xchg, ir::Size::S32);
+    i.dst = ir::Operand::mem_(mem);
+    i.src = ir::Operand::reg_(ir::Reg::Rbx);
+    const Decoded d = one_insn(i);  // one_insn 断言 r.notes.empty()
+    ASSERT_EQ(d.insns.size(), static_cast<size_t>(6));  // Mov+Load+Xchg+Store+Jmp+Halt
+    const u8 s18 = isa::kScratchFirst;
+    expect_is(d.insns[0], VmOp::Mov, OpKind::Reg, s18, OpKind::Reg, kRax, 0, kS64);
+    expect_is(d.insns[1], VmOp::Load, OpKind::Reg, s18 + 1, OpKind::Reg, s18, 0, kS32);
+    expect_is(d.insns[2], VmOp::Xchg, OpKind::Reg, s18 + 1, OpKind::Reg, kRbx, 0, kS32);
+    expect_is(d.insns[3], VmOp::Store, OpKind::Reg, s18, OpKind::Reg, s18 + 1, 0, kS32);
+    expect_is(d.insns[4], VmOp::Jmp, OpKind::None, 0, OpKind::None, 0, 1, kS64);
+    expect_is(d.insns[5], VmOp::Halt, OpKind::None, 0, OpKind::None, 0, 0, 0);
+}
+
+TEST(Translate, ImulThreeOpImmInLockMarkerRangeNotIntercepted) {
+    // 回归 (exitnative_pos_sample 实测踩域): imul 3-op imm 也用 src2=imm
+    // 且立即数任意 — `imul rax, rax, 7` 的 src2=imm(7) 恰落在 lock 标记域
+    // (kLockBtr=7)。lock 族拦截必须 op 限定 (is_lock_carrier_op), 否则
+    // imul 被误路由到 translate_lock_family → skip → 整函数 gate。
+    // 期望: 按 imul 3-op REG 路径翻译 (Mov scratch,7 + Imul), notes 空。
+    ir::Insn i = I(ir::Op::Imul, ir::Size::S64);
+    i.dst = ir::Operand::reg_(ir::Reg::Rax);
+    i.src = ir::Operand::reg_(ir::Reg::Rax);
+    i.src2 = ir::Operand::imm_(7);  // 恰在 lock 标记域 (5..11)
+    const Decoded d = one_insn(i);  // 断言 notes 空 (未被 lock 拦截)
+    ASSERT_EQ(d.insns.size(), static_cast<size_t>(4));  // Mov+Mov+Imul+Jmp+Halt
+    const u8 s18 = isa::kScratchFirst;
+    expect_is(d.insns[0], VmOp::Mov, OpKind::Reg, s18, OpKind::Imm, 0, 7, kS64);
+    expect_is(d.insns[1], VmOp::Imul, OpKind::Reg, kRax, OpKind::Reg, s18, 0, kS64);
+    expect_is(d.insns[2], VmOp::Jmp, OpKind::None, 0, OpKind::None, 0, 1, kS64);
+    expect_is(d.insns[3], VmOp::Halt, OpKind::None, 0, OpKind::None, 0, 0, 0);
+}
+
 } // namespace

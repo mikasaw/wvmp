@@ -823,3 +823,31 @@ target_compile_options(wvmp_x87_gate_sample PRIVATE
 target_link_options(wvmp_x87_gate_sample PRIVATE
     $<$<CXX_COMPILER_ID:MSVC>:/INCREMENTAL:NO>
 )
+
+# MIT-419 (G4): lock 前缀原子族端到端主样本——C++ Interlocked* intrinsic
+# 真产物 + MASM 直写全谱 (lock xadd 32/64、lock bts/btr imm8、lock btc
+# reg 位号、裸 xchg mem、lock cmpxchg rip-relative 目标 + cmpxchg 后 je
+# ZF 读回惯用法), 验证 F0 前缀闸白名单放行 + strip-and-execute 后真虚拟
+# 化、行为与原生逐字节一致 (D1 原子性边界披露 note)。负例 lock mov/lock
+# nop (ml64 A2068 拒汇编, db 直发) 区域 → capstone 拒解码 → C1 gate, 原生
+# #UD 禁入可执行路径, gate 证据 = protect 日志 (main 只取地址不调用)。
+# REQUIRE_REAL: 主函数 cpp_atomic_region + 7 个 MASM 正例真虚拟化 (stub ≥1)。
+# 编译档位 (probe 实证 2026-08-30): /Od 下 MSVC 把 Interlocked intrinsic
+# 编成 call 到编译器生成 helper (helper 内含 lock xadd/lock and/or/xor/
+# lock cmpxchg 单指令, 反汇编表见报告 §3) — C++ 区域覆盖 callgate→原生
+# helper 通路 (lock 指令经 callgate 原生执行, 语义断言照旧); /O1 才直发
+# 内联 rip-relative lock 形态, 但 /O1 与 Debug 全局 /RTC1 硬冲突
+# (cl D8016, /RTC1- 等全部无效) — 内联形态由 MASM 侧按 helper 字节逐条
+# 拼写入区域 VM 化 (helper 即编译器真产物, 字节一致)。
+add_executable(wvmp_atomic_ops_sample
+    wvmp_atomic_ops_sample_main.cpp
+    wvmp_atomic_ops_sample_asm.asm
+)
+target_link_libraries(wvmp_atomic_ops_sample PRIVATE wvmp::sdk)
+target_compile_options(wvmp_atomic_ops_sample PRIVATE
+    $<$<AND:$<CXX_COMPILER_ID:MSVC>,$<COMPILE_LANGUAGE:C,CXX>>:/Od;/Ob0;/utf-8>
+    $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-O0>
+)
+target_link_options(wvmp_atomic_ops_sample PRIVATE
+    $<$<CXX_COMPILER_ID:MSVC>:/INCREMENTAL:NO>
+)

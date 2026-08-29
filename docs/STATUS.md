@@ -16,6 +16,7 @@
 | **MIT-243 C1 保守拦截** | ✅ | （本批次） | 翻译器 skip notes 经扩展槽传回，virtualize gate 遇 note 放弃虚拟化，区域保持原生；既有 M2-4 E2E 路径仍绿（M2-4 真实闭环白名单路径 + gate 路径均演示） |
 | **MIT-415 G3 串指令族** | ✅ | （本批次） | rep/repnz {movs,stos,scas,cmps,lods} 前缀闸放行 + 翻译器微程序展开（零新 VmOp）；multiseed 34×5=170/170、wvmpTest 14/14、双跑 103/103；DF=0 假定 note 披露（D1） |
 | **MIT-418 G5r-R3 x87 永久 gate** | ✅ | （本批次） | x87 全族（D8-DF）文档化不保护：gate→原生执行 byte-identical；回归样本 `wvmp_x87_gate_sample`（五族 fld/fadd/fstp/fcomip/fsin + GP helper 真区）；multiseed 35×5=175/175、ctest 16/16；R1 蓝图/R2 捆绑/跳表扩容路线留档 GAPS x87 节 |
+| **MIT-419 G4 lock 前缀原子族** | ✅ | （本批次） | lock {add,adc,sub,sbb,and,or,xor}×mem-dst + cmpxchg/xchg/xadd + bts/btr/btc 白名单放行 strip-and-execute（ALU 族零新 VmOp 折条；Xadd/Bts/Btr/Btc 单 VmOp native lock 直执行原子性保真）；D1 多线程并发原子性边界显式登记 GAPS G4 节；回归样本 `wvmp_atomic_ops_sample`（C++ Interlocked* 真产物 + MASM 全谱 8 函数 + 11 lock-strip note + 2 负例 gate）；multiseed 37×5=185/185、ctest 16/16、双跑 byte-exact |
 | M3 插件池 | ⏳ 未开始 | — | T1~T9：mutate / 两档 crypt / anti_debug / integrity_crc / import_protect 等 |
 
 ## M2 交付明细

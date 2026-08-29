@@ -1220,11 +1220,188 @@ TEST_F(LifterTranslate, SkippedInstructions) {
     EXPECT_EQ(translate_bytes(x64, cpuid, ir::Arch::X64).status,
               lifter::TranslateStatus::Unsupported);
 
-    // F0 01 00: lock add [rax], eax —— 带前缀的 ALU v1 跳过
-    //（注：lock 加在寄存器目标上的编码非法，capstone 直接拒绝解码）
-    const wvmp::u8 lock[] = {0xF0, 0x01, 0x00};
-    EXPECT_EQ(translate_bytes(x64, lock, ir::Arch::X64).status,
+    // F0 FF 00: lock inc [rax] —— lock 族白名单外 (MSVC _InterlockedIncrement
+    // 真产物, 派活单族面外 → §F 残余登记, 照旧 gate)
+    const wvmp::u8 lock_inc[] = {0xF0, 0xFF, 0x00};
+    EXPECT_EQ(translate_bytes(x64, lock_inc, ir::Arch::X64).status,
               lifter::TranslateStatus::Unsupported);
+
+    // F0 F6 10: lock not byte ptr [rax] —— 不可锁助记符 (D2 砍面)
+    const wvmp::u8 lock_not[] = {0xF0, 0xF6, 0x10};
+    EXPECT_EQ(translate_bytes(x64, lock_not, ir::Arch::X64).status,
+              lifter::TranslateStatus::Unsupported);
+
+    // 66 F0 01 00: 66 (16 位操作数) + lock 组合前缀 —— D4 组合前缀面收窄拒
+    const wvmp::u8 lock66[] = {0x66, 0xF0, 0x01, 0x00};
+    EXPECT_EQ(translate_bytes(x64, lock66, ir::Arch::X64).status,
+              lifter::TranslateStatus::Unsupported);
+
+    // F0 67 01 00: 67 (32 位地址宽) + lock 组合前缀 —— D4 拒
+    const wvmp::u8 lock67[] = {0xF0, 0x67, 0x01, 0x00};
+    EXPECT_EQ(translate_bytes(x64, lock67, ir::Arch::X64).status,
+              lifter::TranslateStatus::Unsupported);
+
+    // F0 F3 A4: lock rep movsb —— capstone 吸收 F0 报 prefix[0]=F3 (串指令
+    // 三元组), 串闸字节级 F0 扫描专拒 (415 纪律, 本单继承; 本机实测该组合
+    // 原生即 #UD, 不可执行样本, 仅单测覆盖)
+    const wvmp::u8 lock_rep_movsb[] = {0xF0, 0xF3, 0xA4};
+    EXPECT_EQ(translate_bytes(x64, lock_rep_movsb, ir::Arch::X64).status,
+              lifter::TranslateStatus::Unsupported);
+}
+
+// MIT-419 (G4): capstone 对非法 lock 组合 (lock mov / lock nop) 直接拒解码
+// (无 detail 输出) — 上游 disassemble_and_lift 走 skipped_ranges → C1 gate。
+// 单测钉死该通道: decode_first 返回 nullptr 即 gate 机制本身。
+TEST_F(LifterTranslate, LockIllegalCombosUndecodable) {
+    // F0 89 18: lock mov [rax], ebx —— 不可锁助记符 (capstone 拒解码)
+    const wvmp::u8 lock_mov[] = {0xF0, 0x89, 0x18};
+    EXPECT_EQ(decode_first(x64, lock_mov), nullptr);
+
+    // F0 90: lock nop —— capstone 拒解码
+    const wvmp::u8 lock_nop[] = {0xF0, 0x90};
+    EXPECT_EQ(decode_first(x64, lock_nop), nullptr);
+}
+
+// MIT-419 (G4): lock 族白名单 — strip-and-execute 放行面全谱。
+// src2 标记分域 (与 x86_translate.cpp translate_lock_op / translator.cpp
+// is_lock_marker 对账): 5..8 = Op::Mov 载体族 (xadd/bts/btr/btc),
+// 9..11 = 本体 op 族 (alu/cmpxchg/xchg 声明"曾带 lock")。
+TEST_F(LifterTranslate, LockOpsLifted) {
+    // ① F0 01 00: lock add [rax], eax —— ALU 族 × mem-dst 剥 F0 放行,
+    //    Op::Add + dst=Mem + src=Reg + src2=imm(9) 标记
+    const wvmp::u8 lock_add[] = {0xF0, 0x01, 0x00};
+    auto r = translate_bytes(x64, lock_add, ir::Arch::X64);
+    ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r.insn.op, ir::Op::Add);
+    EXPECT_EQ(r.insn.size, ir::Size::S32);
+    EXPECT_TRUE(r.insn.updates_flags);
+    ASSERT_EQ(r.insn.dst.kind, ir::Operand::Kind::Mem);
+    ASSERT_EQ(r.insn.src.kind, ir::Operand::Kind::Reg);
+    EXPECT_EQ(r.insn.src.reg, ir::Reg::Rax);
+    ASSERT_EQ(r.insn.src2.kind, ir::Operand::Kind::Imm);
+    EXPECT_EQ(r.insn.src2.imm, 9);  // kLockStripAlu
+
+    // ② F0 48 01 00: lock add [rax], rax —— REX.W (S64) + Reg 源
+    const wvmp::u8 lock_add64[] = {0xF0, 0x48, 0x01, 0x00};
+    auto r2 = translate_bytes(x64, lock_add64, ir::Arch::X64);
+    ASSERT_EQ(r2.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r2.insn.op, ir::Op::Add);
+    EXPECT_EQ(r2.insn.size, ir::Size::S64);
+
+    // ③ F0 01 05 34 12 00 00: lock add [rip+0x1234], eax —— rip 目标
+    const wvmp::u8 lock_add_rip[] = {0xF0, 0x01, 0x05, 0x34, 0x12, 0x00, 0x00};
+    auto r3 = translate_bytes(x64, lock_add_rip, ir::Arch::X64);
+    ASSERT_EQ(r3.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r3.insn.op, ir::Op::Add);
+    ASSERT_EQ(r3.insn.dst.kind, ir::Operand::Kind::Mem);
+    EXPECT_EQ(r3.insn.dst.mem.base, ir::Reg::Rip);
+
+    // ④ F0 11 18: lock adc [rax], ebx —— ADC 族同样放行 (src2=9)
+    const wvmp::u8 lock_adc[] = {0xF0, 0x11, 0x18};
+    auto r4 = translate_bytes(x64, lock_adc, ir::Arch::X64);
+    ASSERT_EQ(r4.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r4.insn.op, ir::Op::Adc);
+    ASSERT_EQ(r4.insn.src2.kind, ir::Operand::Kind::Imm);
+    EXPECT_EQ(r4.insn.src2.imm, 9);
+
+    // ⑤ F0 0F B1 18: lock cmpxchg [rax], ebx —— dst=Mem + src2=imm(10)
+    const wvmp::u8 lock_cmpxchg[] = {0xF0, 0x0F, 0xB1, 0x18};
+    auto r5 = translate_bytes(x64, lock_cmpxchg, ir::Arch::X64);
+    ASSERT_EQ(r5.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r5.insn.op, ir::Op::Cmpxchg);
+    ASSERT_EQ(r5.insn.dst.kind, ir::Operand::Kind::Mem);
+    ASSERT_EQ(r5.insn.src2.kind, ir::Operand::Kind::Imm);
+    EXPECT_EQ(r5.insn.src2.imm, 10);  // kLockStripCmpxchg
+
+    // ⑥ F0 87 18: lock xchg [rax], ebx —— dst=Mem + src2=imm(11)
+    const wvmp::u8 lock_xchg[] = {0xF0, 0x87, 0x18};
+    auto r6 = translate_bytes(x64, lock_xchg, ir::Arch::X64);
+    ASSERT_EQ(r6.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r6.insn.op, ir::Op::Xchg);
+    ASSERT_EQ(r6.insn.dst.kind, ir::Operand::Kind::Mem);
+    ASSERT_EQ(r6.insn.src2.kind, ir::Operand::Kind::Imm);
+    EXPECT_EQ(r6.insn.src2.imm, 11);  // kLockStripXchg
+
+    // ⑦ 87 18: 裸 xchg [rax], ebx (InterlockedExchange 真产物, 无 F0 隐式锁)
+    //    —— 本体 Op::Xchg + dst=Mem, src2 恒空 (无 lock-strip note 面)
+    const wvmp::u8 xchg_mem[] = {0x87, 0x18};
+    auto r7 = translate_bytes(x64, xchg_mem, ir::Arch::X64);
+    ASSERT_EQ(r7.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r7.insn.op, ir::Op::Xchg);
+    EXPECT_EQ(r7.insn.size, ir::Size::S32);
+    ASSERT_EQ(r7.insn.dst.kind, ir::Operand::Kind::Mem);
+    ASSERT_EQ(r7.insn.src.kind, ir::Operand::Kind::Reg);
+    EXPECT_EQ(r7.insn.src2.kind, ir::Operand::Kind::None);
+
+    // ⑧ 48 87 18: 裸 xchg [rax], rbx —— REX.W S64
+    const wvmp::u8 xchg_mem64[] = {0x48, 0x87, 0x18};
+    auto r8 = translate_bytes(x64, xchg_mem64, ir::Arch::X64);
+    ASSERT_EQ(r8.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r8.insn.op, ir::Op::Xchg);
+    EXPECT_EQ(r8.insn.size, ir::Size::S64);
+
+    // ⑨ F0 0F C1 18: lock xadd [rax], ebx —— InterlockedAdd 真产物,
+    //    Op::Mov 载体 + dst=Mem + src=Reg + src2=imm(5) + flags=true
+    const wvmp::u8 lock_xadd[] = {0xF0, 0x0F, 0xC1, 0x18};
+    auto r9 = translate_bytes(x64, lock_xadd, ir::Arch::X64);
+    ASSERT_EQ(r9.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r9.insn.op, ir::Op::Mov);  // 载体 (src2 区分)
+    EXPECT_EQ(r9.insn.size, ir::Size::S32);
+    EXPECT_TRUE(r9.insn.updates_flags);  // xadd flags = add 语义
+    ASSERT_EQ(r9.insn.dst.kind, ir::Operand::Kind::Mem);
+    ASSERT_EQ(r9.insn.src.kind, ir::Operand::Kind::Reg);
+    EXPECT_EQ(r9.insn.src.reg, ir::Reg::Rbx);
+    ASSERT_EQ(r9.insn.src2.kind, ir::Operand::Kind::Imm);
+    EXPECT_EQ(r9.insn.src2.imm, 5);  // kLockXadd
+
+    // ⑩ F0 48 0F C1 18: lock xadd [rax], rbx —— REX.W S64
+    const wvmp::u8 lock_xadd64[] = {0xF0, 0x48, 0x0F, 0xC1, 0x18};
+    auto r10 = translate_bytes(x64, lock_xadd64, ir::Arch::X64);
+    ASSERT_EQ(r10.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r10.insn.size, ir::Size::S64);
+
+    // ⑪ F0 0F BA 28 05: lock bts [rax], 5 —— imm8 形式 (InterlockedBitTest*
+    //    真产物, D3) src2=imm(6)
+    const wvmp::u8 lock_bts_imm[] = {0xF0, 0x0F, 0xBA, 0x28, 0x05};
+    auto r11 = translate_bytes(x64, lock_bts_imm, ir::Arch::X64);
+    ASSERT_EQ(r11.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r11.insn.op, ir::Op::Mov);  // 载体
+    EXPECT_EQ(r11.insn.size, ir::Size::S32);
+    EXPECT_TRUE(r11.insn.updates_flags);  // bts 写 CF
+    ASSERT_EQ(r11.insn.dst.kind, ir::Operand::Kind::Mem);
+    ASSERT_EQ(r11.insn.src.kind, ir::Operand::Kind::Imm);
+    EXPECT_EQ(r11.insn.src.imm, 5);
+    ASSERT_EQ(r11.insn.src2.kind, ir::Operand::Kind::Imm);
+    EXPECT_EQ(r11.insn.src2.imm, 6);  // kLockBts
+
+    // ⑫ F0 0F AB 18: lock bts [rax], ebx —— reg 位号形式
+    const wvmp::u8 lock_bts_reg[] = {0xF0, 0x0F, 0xAB, 0x18};
+    auto r12 = translate_bytes(x64, lock_bts_reg, ir::Arch::X64);
+    ASSERT_EQ(r12.status, lifter::TranslateStatus::Ok);
+    ASSERT_EQ(r12.insn.src.kind, ir::Operand::Kind::Reg);
+    EXPECT_EQ(r12.insn.src.reg, ir::Reg::Rbx);
+    ASSERT_EQ(r12.insn.src2.kind, ir::Operand::Kind::Imm);
+    EXPECT_EQ(r12.insn.src2.imm, 6);
+
+    // ⑬ F0 0F B3 18: lock btr [rax], ebx / F0 0F BB 18: lock btc [rax], ebx
+    const wvmp::u8 lock_btr[] = {0xF0, 0x0F, 0xB3, 0x18};
+    auto r13 = translate_bytes(x64, lock_btr, ir::Arch::X64);
+    ASSERT_EQ(r13.status, lifter::TranslateStatus::Ok);
+    ASSERT_EQ(r13.insn.src2.kind, ir::Operand::Kind::Imm);
+    EXPECT_EQ(r13.insn.src2.imm, 7);  // kLockBtr
+    const wvmp::u8 lock_btc[] = {0xF0, 0x0F, 0xBB, 0x18};
+    auto r14 = translate_bytes(x64, lock_btc, ir::Arch::X64);
+    ASSERT_EQ(r14.status, lifter::TranslateStatus::Ok);
+    ASSERT_EQ(r14.insn.src2.kind, ir::Operand::Kind::Imm);
+    EXPECT_EQ(r14.insn.src2.imm, 8);  // kLockBtc
+
+    // ⑭ F0 48 0F B1 18: lock cmpxchg [rax], rbx —— REX.W S64 (64 位全局
+    //    InterlockedCompareExchange 真产物形态)
+    const wvmp::u8 lock_cmpxchg64[] = {0xF0, 0x48, 0x0F, 0xB1, 0x18};
+    auto r15 = translate_bytes(x64, lock_cmpxchg64, ir::Arch::X64);
+    ASSERT_EQ(r15.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r15.insn.size, ir::Size::S64);
+    EXPECT_EQ(r15.insn.op, ir::Op::Cmpxchg);
 }
 
 // MIT-249 follow-up (issue-09): TranslateResult.skipped_ranges 在 status != Ok

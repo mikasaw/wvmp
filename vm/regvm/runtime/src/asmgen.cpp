@@ -2249,8 +2249,122 @@ public:
                flags_tail(dispatch, false);
     }
 
-    // cc_name: ir::Cond (0..15) → Intel 语法 cmovcc 后缀字符串
-    // (与 cond_eval 的 cond 命名严格一致).
+    // MIT-419 (G4): Xadd — [addr] = [addr] + reg_b; reg_b = 旧 [addr]
+    // (InterlockedAdd 真产物 lock xadd [m], r 返回旧值语义)。
+    // a_kind=Reg reg_a=地址槽 (翻译器 emit_address), b_kind=Reg reg_b=源
+    // 寄存器槽, aux=0, cond_or_size=size (S8/S32/S64; S16 需 66 前缀 lifter
+    // 入口已拒, S16 块防御 no-op)。
+    //
+    // **单 VmOp 直执行 native lock xadd [addr], reg** — 一条指令完成读改写
+    // + 加锁, 硬件原子性保真 (D1 的 strip-and-execute 折条妥协不适用于本
+    // 指令; [addr] 是宿主进程真实内存, VM 与原生共享地址空间)。flags =
+    // add 语义 (CF/OF/SF/ZF/PF 全更新), zero5 → native → setcc5 →
+    // flags_tail (与 cmpxchg/ALU 同通路)。
+    //
+    // 寄存器安全 (对齐 build_cmpxchg): setcc5 clobber 集合 {T3,T4,T6,T7,T9};
+    // T0 (结果) / T1 (地址) 安全。写回 reg_b 槽前从 T8 重提 reg_b 位域
+    // (27..31) 到 T1 (T7 已被 setcc5 clobber; T1 地址已消费可复用)。
+    std::string build_xadd(u64 dispatch) const {
+        const std::string tag = "xadd" + std::to_string(seq());
+        const std::string tail_lbl = "ftail_" + tag;
+        std::array<std::string, 4> blocks;
+        for (int s = 0; s < 4; ++s) {
+            const std::string stag = tag + "_" + std::to_string(s);
+            std::string o;
+            if (s == 1) {  // S16 防御 no-op (66 前缀入口已拒)
+                o += "    jmp " + tail_lbl + "\n";
+                blocks[s] = o;
+                continue;
+            }
+            // 1) 地址 → T1 (reg_a 槽 = 翻译器 emit_address 产出的绝对 VA)
+            o += std::string("    mov ") + r64(t_[1]) + ", qword ptr [" + r64(ctx_) +
+                 " + " + r64(t_[4]) + "*8 + 0x10]\n";
+            // 2) 源寄存器值 → T0 (alias_read, 按宽度零扩展)
+            o += load_operand(s, 6, 7, 0, "b" + stag);
+            // 3) zero5 — 清 flag scratch (副作用宿主 CF/OF/SF/ZF/PF ← 0)
+            o += zero5();
+            // 4) native lock xadd [T1], T0 — T0 = 旧 [addr], [addr] = 旧+源。
+            //    lock 前缀保硬件原子性 (与原生 InterlockedAdd 同真值)。
+            o += std::string("    lock xadd ") + mptr(s) + " [" + r64(t_[1]) + "], " +
+                 rs(t_[0], s) + "\n";
+            // 5) setcc5 — 捕获 add 语义 flags (CF/OF/SF/ZF/PF)
+            o += setcc5();
+            // 6) 重提 reg_b (27..31) 到 T1, 写回 T0 (旧 [addr]) 到 reg_b 槽
+            //    (alias_write 保高位; S32 dword store 与 build_cmpxchg 同款)
+            o += std::string("    mov ") + r64(t_[1]) + ", " + r64(t_[8]) + "\n";
+            o += std::string("    shr ") + r64(t_[1]) + ", " + imm(27) + "\n";
+            o += std::string("    and ") + r64(t_[1]) + ", " + imm(31) + "\n";
+            o += writeback(s, 1);
+            o += "    jmp " + tail_lbl + "\n";
+            blocks[s] = o;
+        }
+        return decode_prelude() + size_chain(blocks, tag) + tail_lbl + ":\n" +
+               flags_tail(dispatch, false);
+    }
+
+    // MIT-419 (G4): Bts/Btr/Btc — CF = bit[位号] of [addr]; [addr] = 1/0/^1
+    // (按族) (InterlockedBitTest* 真产物 lock bts [m], imm8 高频, D3; reg
+    // 位号形式一并支持)。
+    // a_kind=Reg reg_a=地址槽, b_kind=Reg (reg_b=位号寄存器槽) 或
+    // Imm (aux=imm8 位号), cond_or_size=size (S32/S64; bts 无字节形式,
+    // S8/S16 块防御 no-op)。
+    //
+    // 位号装载: Imm 形态的 aux 是**运行时值** (T5), native bts r/m, imm8
+    // 要求静态立即数 — 统一走 reg 形态 (`bts [t1], t0`), 位号先按**全宽**
+    // 装进 T0 (Reg: 读 reg_b 槽; Imm: mov t0, t5), 再用 rs(t_[0], s) 取
+    // 与操作数同宽的名字 — keystone 0.9.2 实测只接受 `bts qword ptr [m],
+    // rbx` / `bts dword ptr [m], ebx` 全宽形式, `bts [m], bl` 字节形式
+    // 拒汇编 (KS_ERR_ASM_INVALIDOPERAND, 416 同族 ml64/ks 部分拒汇编坑
+    // 先例, probe 实测 2026-08-30)。CPU 对位号自动按操作数宽度掩码
+    // (64 位 &63, 32 位 &31), 与 imm8 形式语义一致 (imm8 亦被掩码)。
+    // flags: 仅 CF 有定义 (SDM: 其余未定义) — setcc5 捕 host CPU 真值,
+    // flags_tail 装配, 与原生执行同 CPU 行为 (undefined 位逐 CPU 一致)。
+    std::string build_bit_op(const char* native, u64 dispatch) const {
+        const std::string tag = std::string(native) + std::to_string(seq());
+        const std::string tail_lbl = "ftail_" + tag;
+        std::array<std::string, 4> blocks;
+        for (int s = 0; s < 4; ++s) {
+            const std::string stag = tag + "_" + std::to_string(s);
+            std::string o;
+            if (s == 0 || s == 1) {  // S8/S16 防御 no-op (bts 无字节形式)
+                o += "    jmp " + tail_lbl + "\n";
+                blocks[s] = o;
+                continue;
+            }
+            // 1) 地址 → T1 (reg_a 槽)
+            o += std::string("    mov ") + r64(t_[1]) + ", qword ptr [" + r64(ctx_) +
+                 " + " + r64(t_[4]) + "*8 + 0x10]\n";
+            // 2) 位号 → T0 (全宽: b_kind==1 读 reg_b 槽, 否则用 aux 的 T5;
+            //    取 rs(t_[0], s) 与操作数同宽 — keystone 拒字节形式)
+            o += std::string("    cmp ") + r64(t_[6]) + ", 1\n";
+            o += "    jne bimm_" + stag + "\n";
+            if (s == 3)
+                o += std::string("    mov ") + r64(t_[0]) + ", qword ptr [" + r64(ctx_) +
+                     " + " + r64(t_[7]) + "*8 + 0x10]\n";
+            else
+                o += std::string("    mov ") + rs(t_[0], 2) + ", dword ptr [" + r64(ctx_) +
+                     " + " + r64(t_[7]) + "*8 + 0x10]\n";
+            o += "    jmp bdone_" + stag + "\n";
+            o += "bimm_" + stag + ":\n";
+            o += std::string("    mov ") + rs(t_[0], s) + ", " + rs(t_[5], s) + "\n";
+            o += "bdone_" + stag + ":\n";
+            // 3) zero5 — 清 flag scratch
+            o += zero5();
+            // 4) native lock bts/btr/btc [T1], T0 — 单指令直执行 (硬件原子)
+            o += std::string("    lock ") + native + " " + mptr(s) + " [" + r64(t_[1]) +
+                 "], " + rs(t_[0], s) + "\n";
+            // 5) setcc5 — CF 有定义 (其余未定义位 = host CPU 真值, 与原生同)
+            o += setcc5();
+            o += "    jmp " + tail_lbl + "\n";
+            blocks[s] = o;
+        }
+        return decode_prelude() + size_chain(blocks, tag) + tail_lbl + ":\n" +
+               flags_tail(dispatch, false);
+    }
+
+    std::string build_bts(u64 dispatch) const { return build_bit_op("bts", dispatch); }
+    std::string build_btr(u64 dispatch) const { return build_bit_op("btr", dispatch); }
+    std::string build_btc(u64 dispatch) const { return build_bit_op("btc", dispatch); }
     static const char* cc_name(int cond) {
         switch (static_cast<ir::Cond>(cond)) {
             case ir::Cond::O:  return "o";
@@ -3107,6 +3221,13 @@ RuntimeGenResult generate_runtime(wvmp::Rng& rng) {
         {int(VmOp::Setcc), "setcc", &AsmGen::build_setcc},
         {int(VmOp::Cmovcc), "cmovcc", &AsmGen::build_cmovcc},
         {int(VmOp::Cmpxchg), "cmpxchg", &AsmGen::build_cmpxchg},
+        // MIT-419 (G4): lock 前缀原子族 — xadd (InterlockedAdd 真产物,
+        // native lock xadd [addr],reg 单指令直执行, 硬件原子性保真) +
+        // bts/btr/btc (InterlockedBitTest* 真产物, imm8/reg 双形式)。
+        {int(VmOp::Xadd), "xadd", &AsmGen::build_xadd},
+        {int(VmOp::Bts), "bts", &AsmGen::build_bts},
+        {int(VmOp::Btr), "btr", &AsmGen::build_btr},
+        {int(VmOp::Btc), "btc", &AsmGen::build_btc},
         {int(VmOp::Movsx), "movsx", &AsmGen::build_movsx},
         {int(VmOp::MovsxMem), "movsxmem", &AsmGen::build_movsx_mem},
         {int(VmOp::Popcnt), "popcnt", &AsmGen::build_popcnt},

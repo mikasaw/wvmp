@@ -746,17 +746,18 @@ TranslateResult translate_bswap(const cs_insn& ci, const cs_x86& x, ir::Arch arc
 // IR 仍按 IR.dst / IR.src 顺序编码 dst 和 src (语义等价).
 // size 由 REX.W 标志决定: x.rex bit 3 (REX.W) → S64, 否则 → S32.
 // updates_flags=false (xchg 不影响 CF/OF/SF/ZF/PF)。
-// MEM 形式 (xchg [reg], reg) 派活单限定不支持 (需 temp 寄存器, 复杂),
-// lifter 拒 MEM → 触发 C1 gate 兜底 (与原生行为一致).
+// MIT-419 (G4): MEM 形式 (xchg [reg], reg) 放开——InterlockedExchange 的
+// MSVC 真产物是**裸 xchg [m], r (87 /r, 无 F0; xchg 访存隐式锁)** (probe
+// 实证, 2026-08-30), 故无前缀 xchg mem 与 lock xchg mem 两形态都要支持。
+// 翻译器折 Load+Xchg+Store 三条 (xchg 对称, 拆条语义等价); 宽度限定
+// S32/S64 (S8/S16 xchg mem 形态 handler 防御 no-op, 拒收防静默错)。
 TranslateResult translate_xchg(const cs_insn& ci, const cs_x86& x, ir::Arch arch) {
     if (x.op_count != 2) return unsupported(ci.address, ci.size);
-    // xchg 是对称操作, 但 IR 仍按 dst/src 编码 (语义等价). 两个操作数都必须
-    // 是寄存器 (MEM-REG 派活单限定不支持, lifter 拒 → C1 gate 兜底)。
-    if (x.operands[0].type != X86_OP_REG) return unsupported(ci.address, ci.size);
+    // xchg 是对称操作, 但 IR 仍按 dst/src 编码 (语义等价). src 必为寄存器
+    // (xchg r/m, r 第二操作数必是 r); dst 可 REG 或 MEM。
     if (x.operands[1].type != X86_OP_REG) return unsupported(ci.address, ci.size);
-    auto d = map_reg(x.operands[0].reg);
     auto s = map_reg(x.operands[1].reg);
-    if (!d || !s) return unsupported(ci.address, ci.size);
+    if (!s) return unsupported(ci.address, ci.size);
 
     // REX.W 检测: x.rex bit 3 (REX.W) → S64, 否则 → S32.
     const bool rex_w = (x.rex & 0x08) != 0;
@@ -766,9 +767,27 @@ TranslateResult translate_xchg(const cs_insn& ci, const cs_x86& x, ir::Arch arch
     out.addr = ci.address;
     out.size = rex_w ? Size::S64 : Size::S32;
     out.updates_flags = false;
-    out.dst = Operand::reg_(*d);
     out.src = Operand::reg_(*s);
-    return ok(out);
+
+    if (x.operands[0].type == X86_OP_REG) {
+        auto d = map_reg(x.operands[0].reg);
+        if (!d) return unsupported(ci.address, ci.size);
+        out.dst = Operand::reg_(*d);
+        return ok(out);
+    }
+    if (x.operands[0].type == X86_OP_MEM) {
+        // MEM 形式: lifter 直接 emit Operand::mem_(...), 翻译器折
+        // Load + Xchg + Store 三条 (与 cmpxchg MEM 路径同结构)。
+        // S8/S16 拒收 (handler 防御 no-op, 放行 = 静默空转; S16 66 前缀入口
+        // 已拒, 此处 S8 (86 /r) 防御性收口)。
+        if (out.size != Size::S32 && out.size != Size::S64)
+            return unsupported(ci.address, ci.size);
+        auto m = mem_operand(x.operands[0].mem);
+        if (!m) return unsupported(ci.address, ci.size);
+        out.dst = *m;
+        return ok(out);
+    }
+    return unsupported(ci.address, ci.size);
 }
 
 // MIT-336 setcc r/m8 (0F 90+cc+rm, 16 variants): 条件设置字节。
@@ -1403,6 +1422,19 @@ TranslateResult translate_cmpxchg(const cs_insn& ci, const cs_x86& x, ir::Arch a
 
 enum : int { kStrMovs = 0, kStrStos = 1, kStrScas = 2, kStrCmps = 3, kStrLods = 4 };
 
+// MIT-419 (G4): lock 族 src2 标记 — 与 string family (0..4) 分域零碰撞。
+// 编码约定 (与 translator.cpp is_lock_marker 对账):
+//   - 5..8: Op::Mov 载体族 (xadd/bts/btr/btc 无 ir::Op 枚举 — 冻结契约不可增,
+//     沿用 G3 串指令 "Op::Mov + src2=imm(family)" 载体先例)
+//   - 9..11: 本体 op 族 (ALU/Cmpxchg/Xchg — op 字段已表达语义, 标记仅声明
+//     "曾带 lock 前缀", 供翻译器发 lock-strip note 且不影响本体折条)
+enum : int {
+    kLockXadd = 5, kLockBts = 6, kLockBtr = 7, kLockBtc = 8,
+    kLockStripAlu = 9, kLockStripCmpxchg = 10, kLockStripXchg = 11
+};
+constexpr int kLockMarkerMin = kLockXadd;
+constexpr int kLockMarkerMax = kLockStripXchg;
+
 // id → 串指令族 (nullopt = 非串指令)。MOVSD 双形态由调用方按操作数形状区分。
 std::optional<int> string_family_of(x86_insn id) {
     switch (id) {
@@ -1491,6 +1523,158 @@ TranslateResult translate_string_op(const cs_insn& ci, const cs_x86& x, ir::Arch
     default: return unsupported(ci.address, ci.size);        // 防御 (family 越界)
     }
     return ok(out);
+}
+
+// ==================== MIT-419 (G4): lock 前缀原子族 strip-and-execute ====================
+//
+// 挂点 = lifter 入口前缀闸 (translate_insn): F0 (lock) 前缀 v1 一律拒; 本单
+// 对白名单三元组开 F0 口 (D1: strip-and-execute, 原子性边界文档化于 GAPS)。
+//
+// 放行判定 (D4: 仅 F0 独前缀 (+REX) 放行, 组合前缀面收窄):
+//   - prefix[0]==0xF0 && prefix[1..3]==0 (无段覆盖/66/67) && bytes[0]==0xF0
+//     (字节级确认 — 415 纪律: capstone 对 `F0 F3 A4` 实证吸收 F0 只报 F3,
+//     白名单判据以字节流为准不轻信 prefix 字段; F0 恒为首前缀字节)
+//   - mnemonic × 形状白名单:
+//       add/adc/sub/sbb/and/or/xor × dst=Mem (src=Reg/Imm)  → 剥 F0 走
+//         translate_alu (本体通路已有, 零新 VmOp)
+//       cmpxchg × dst=Mem × src=Reg                         → translate_cmpxchg
+//       xchg   × dst=Mem × src=Reg                         → translate_xchg
+//         (InterlockedExchange 真产物是裸 xchg [m],r 无 F0 — translate_xchg
+//         MEM 形式本单放开, lock 版同享)
+//       xadd   × dst=Mem × src=Reg  (InterlockedAdd 真产物) → Op::Mov 载体 +
+//         src2=kLockXadd (新 VmOp::Xadd, handler 内 native lock xadd [addr],r
+//         单指令直执行 — 硬件原子性保真, D1 折条妥协不适用本指令)
+//       bts/btr/btc × dst=Mem × (src=Reg | src=Imm 0..255) (InterlockedBitTest*
+//         真产物 = imm8 形式, D3) → Op::Mov 载体 + src2=kLockBts/Btr/Btc
+//   - 其余 lock 组合 (reg-dst / lock inc/dec/not/neg / 不可锁助记符 /
+//     lock+rep 串=undefined / 66 16 位操作数 / 67 地址宽) 照旧拒 → C1 gate。
+//     lock inc/dec 是合法编码但不在派活单族面 (MSVC _InterlockedIncrement
+//     真产物, 频率实证于报告 §F — 残余登记, 未来单)。
+//
+// IR 编码 (ir::Insn 冻结契约, 零碰撞):
+//   - 本体 op 族: op 不变 + src2=imm(kLockStrip*) — 普通 alu/cmpxchg/xchg 的
+//     src2 恒空 (imul 的 src2 在 Op::Imul 上; 串指令载体 Op::Mov 的 src2 是
+//     family 0..4 — 分域 9..11 零碰撞)
+//   - xadd/bts/btr/btc: op=Op::Mov 载体 + src2=imm(5..8) + dst=Mem + src=Reg/
+//     Imm (普通 mov 的 dst 恒 Reg, mem-dst mov 走 Op::Store — 载体零碰撞)
+//   - size: 本体 op 走 data_size() (xadd S8/S32/S64; bts 系 S32/S64 — S16 66
+//     前缀入口已拒, S8 bts 编码不存在; 防御性拒 S8/S16)
+//   - updates_flags: xadd=true (add 语义 flags), bts 系=true (CF 有定义,
+//     SDM 其余未定义 — handler setcc5 捕 host CPU 真值, 与原生同 CPU 行为),
+//     本体 op 族沿用 translate_* 原值
+TranslateResult translate_lock_op(const cs_insn& ci, const cs_x86& x, ir::Arch arch) {
+    // D4: 仅 F0 独前缀 (+REX, REX 不入 prefix 数组) — 66/67/段覆盖/组合拒。
+    if (x.prefix[0] != 0xF0 || x.prefix[1] != 0 || x.prefix[2] != 0 || x.prefix[3] != 0)
+        return unsupported(ci.address, ci.size);
+    // 字节级确认 (415 纪律): capstone 对合法 lock 指令恒报 bytes[0]==0xF0;
+    // 防御性拒绝 F0 被吸收的形态 (如 F0 F3 xx → prefix[0]=F3 走串闸, 见下)。
+    if (ci.size == 0 || ci.bytes[0] != 0xF0)
+        return unsupported(ci.address, ci.size);
+
+    // 剥 F0 后复用本体 translate_*: cs_x86 是值类型 (operands 内联数组),
+    // 复制后清零 prefix[0] 即可按普通指令翻译。
+    cs_x86 x0 = x;
+    x0.prefix[0] = 0;
+
+    switch (ci.id) {
+    case X86_INS_ADD: case X86_INS_ADC: case X86_INS_SUB: case X86_INS_SBB:
+    case X86_INS_AND: case X86_INS_OR:  case X86_INS_XOR: {
+        // 白名单三元组: ALU 族 × mem-dst (reg-dst lock 是非法编码, capstone
+        // 对 `F0 01 C0` 等拒解码, 此处形状检查防御收口)。
+        if (x.op_count != 2 || x.operands[0].type != X86_OP_MEM)
+            return unsupported(ci.address, ci.size);
+        Op op = Op::Add;
+        switch (ci.id) {
+        case X86_INS_ADC: op = Op::Adc; break;
+        case X86_INS_SUB: op = Op::Sub; break;
+        case X86_INS_SBB: op = Op::Sbb; break;
+        case X86_INS_AND: op = Op::And; break;
+        case X86_INS_OR:  op = Op::Or;  break;
+        case X86_INS_XOR: op = Op::Xor; break;
+        default: break;
+        }
+        auto r = translate_alu(ci, x0, arch, op);
+        if (r.status != TranslateStatus::Ok) return r;
+        r.insn.src2 = Operand::imm_(kLockStripAlu);  // 标记"曾带 lock"→ 翻译器发 note
+        return ok(r.insn);
+    }
+    case X86_INS_CMPXCHG: {
+        // lock cmpxchg: 仅 mem-dst 合法 (lock 必须作用内存操作数)。
+        if (x.op_count != 2 || x.operands[0].type != X86_OP_MEM ||
+            x.operands[1].type != X86_OP_REG)
+            return unsupported(ci.address, ci.size);
+        auto r = translate_cmpxchg(ci, x0, arch);
+        if (r.status != TranslateStatus::Ok) return r;
+        r.insn.src2 = Operand::imm_(kLockStripCmpxchg);
+        return ok(r.insn);
+    }
+    case X86_INS_XCHG: {
+        if (x.op_count != 2 || x.operands[0].type != X86_OP_MEM ||
+            x.operands[1].type != X86_OP_REG)
+            return unsupported(ci.address, ci.size);
+        auto r = translate_xchg(ci, x0, arch);
+        if (r.status != TranslateStatus::Ok) return r;
+        r.insn.src2 = Operand::imm_(kLockStripXchg);
+        return ok(r.insn);
+    }
+    case X86_INS_XADD: {
+        // lock xadd [m], r — InterlockedAdd 真产物 (返回旧值语义)。
+        if (x.op_count != 2 || x.operands[0].type != X86_OP_MEM ||
+            x.operands[1].type != X86_OP_REG)
+            return unsupported(ci.address, ci.size);
+        auto d = to_operand(x.operands[0]);
+        auto s = to_operand(x.operands[1]);
+        if (!d || !s) return unsupported(ci.address, ci.size);
+        ir::Insn out;
+        out.op = Op::Mov;  // 载体 (src2=族标记区分, 见上)
+        out.addr = ci.address;
+        out.size = data_size(x.operands, x.op_count, arch);
+        if (out.size != ir::Size::S8 && out.size != ir::Size::S32 &&
+            out.size != ir::Size::S64)
+            return unsupported(ci.address, ci.size);  // S16 防御 (66 前缀入口已拒)
+        out.dst = *d;
+        out.src = *s;
+        out.src2 = Operand::imm_(kLockXadd);
+        out.updates_flags = true;  // xadd flags = add 语义 (CF/OF/SF/ZF/PF)
+        return ok(out);
+    }
+    case X86_INS_BTS: case X86_INS_BTR: case X86_INS_BTC: {
+        // lock bts/btr/btc [m], r/imm8 — InterlockedBitTest* 真产物 (imm8
+        // 形式高频, D3)。src=Imm 限定 0..255 (imm8 编码域)。
+        if (x.op_count != 2 || x.operands[0].type != X86_OP_MEM)
+            return unsupported(ci.address, ci.size);
+        auto d = to_operand(x.operands[0]);
+        if (!d) return unsupported(ci.address, ci.size);
+        ir::Insn out;
+        out.op = Op::Mov;  // 载体 (src2=族标记区分)
+        out.addr = ci.address;
+        out.size = data_size(x.operands, x.op_count, arch);
+        if (out.size != ir::Size::S32 && out.size != ir::Size::S64)
+            return unsupported(ci.address, ci.size);  // bts 无字节形式; S16 砍面
+        out.dst = *d;
+        if (x.operands[1].type == X86_OP_REG) {
+            auto s = map_reg(x.operands[1].reg);
+            if (!s) return unsupported(ci.address, ci.size);
+            out.src = Operand::reg_(*s);
+        } else if (x.operands[1].type == X86_OP_IMM) {
+            const i64 bit = x.operands[1].imm;
+            if (bit < 0 || bit > 255) return unsupported(ci.address, ci.size);
+            out.src = Operand::imm_(bit);
+        } else {
+            return unsupported(ci.address, ci.size);
+        }
+        out.src2 = Operand::imm_(ci.id == X86_INS_BTS   ? kLockBts
+                                 : ci.id == X86_INS_BTR ? kLockBtr
+                                                        : kLockBtc);
+        out.updates_flags = true;  // 仅 CF 有定义 (SDM), setcc5 捕 host CPU 真值
+        return ok(out);
+    }
+    default:
+        // lock mov/inc/dec/not/neg/rep 组合等白名单外 → 照旧 gate。
+        // (capstone 对 F0 89 18 lock mov / F0 90 lock nop 直接拒解码 → 无
+        // detail → 上游 skipped_ranges 通道; 到不了本函数的组合由形状检查拒)
+        return unsupported(ci.address, ci.size);
+    }
 }
 
 } // namespace
@@ -1624,9 +1808,15 @@ TranslateResult translate_insn(const cs_insn& ci, ir::Arch arch) {
     // (translate_string_op); 其余带前缀指令 (lock/rep 非串指令/rep x87
     // 逃逸类等) 照旧拒。无前缀串指令 (plain movsb) 不在白名单 — 落
     // switch default 照旧 gate (§B.7 残余披露)。
+    // MIT-419 (G4): 例外放行 F0 (lock) 白名单三元组 — add/adc/sub/sbb/and/
+    // or/xor × mem-dst + cmpxchg/xchg/xadd mem 形式 + bts/btr/btc mem 形式
+    // (translate_lock_op; D4 仅 F0 独前缀, strip-and-execute, 原子性边界见
+    // GAPS G4 节)。非白名单 lock 组合照旧拒。
     if (x.prefix[0] != 0 || x.prefix[1] != 0) {
         if (string_family_of(static_cast<x86_insn>(ci.id)).has_value())
             return translate_string_op(ci, x, arch);
+        if (x.prefix[0] == 0xF0)
+            return translate_lock_op(ci, x, arch);
         return unsupported(ci.address, ci.size);
     }
 

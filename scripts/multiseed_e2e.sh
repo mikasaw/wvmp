@@ -77,6 +77,14 @@
 #     全局校验冲突 (multiseed_e2e_real.sh), 需另行注册白名单机制。
 #     Total: 36 samples × 5 seeds = 180 runs.  (项目主链式合并 417+418:
 #     两单各自单边报 35/175, 合并态样本数组 = 36, 此为合并后权威口径。)
+#   - MIT-419 (G4): extend to wvmp_atomic_ops_sample (lock 前缀原子族主
+#     样本: C++ Interlocked* 真产物形态 lock xadd/lock and-or-xor imm/裸
+#     xchg mem/lock cmpxchg 直发内联入区 + MASM 全谱 lock xadd 32/64/bts/
+#     btr imm8/btc reg 位号/裸 xchg mem/lock cmpxchg rip 目标 + cmpxchg 后
+#     je ZF 读回; F0 白名单放行 strip-and-execute 真虚拟化, D1 原子性边界
+#     note 披露; 负例 lock mov/lock nop db 直发 → capstone 拒解码 → C1
+#     gate, 原生 #UD 禁入可执行路径, gate 证据 = protect 日志; REQUIRE_REAL
+#     8 函数真虚拟化)。单边新增 1 样本 → 37 × 5 = 185 runs。
 #   - MIT-306: REQUIRE_REAL=1 校验日志含 "已生成 N 个入口 stub" 防止 C1 gate
 #     兜底被误判 PASS（仅 byte-exact 不够, C1 gate 函数被跳过仍能输出相同
 #     stdout+rc）。与 multiseed_e2e_real.sh 配套使用。
@@ -169,6 +177,14 @@ samples=(
     # fld/fadd/fstp/fcomip/fsin 整函数保持原生 (零 stub, gate 证据);
     # 同 exe 纯 GP helper 真虚拟化 (REQUIRE_REAL ≥1 stub 满足源)。
     "build/passes/marker_scan/tests/wvmp_x87_gate_sample.exe"
+    # MIT-419 (G4): lock 前缀原子族主样本 — C++ Interlocked* 真产物形态
+    # (lock xadd / lock and-or-xor imm / 裸 xchg mem / lock cmpxchg 直发
+    # 内联入区) + MASM 全谱 (lock xadd 32/64 / lock bts/btr imm8 / lock
+    # btc reg 位号 / 裸 xchg mem / lock cmpxchg rip 目标 + cmpxchg 后 je
+    # ZF 读回), F0 白名单放行 strip-and-execute 真虚拟化 (REQUIRE_REAL
+    # 8 函数); 负例 lock mov/lock nop db 直发 → capstone 拒解码 → C1 gate
+    # (原生 #UD 禁入可执行路径, main 只取地址, gate 证据 = protect 日志)。
+    "build/passes/marker_scan/tests/wvmp_atomic_ops_sample.exe"
 )
 
 # Seeds: 1 (small), 12345 (default), 99999 (large), 0xDEADBEEF (magic), 0xCAFEBABE (magic).

@@ -501,9 +501,31 @@ enum class VmOp : u16 {
     //   不影响 EFLAGS; 不调 setcc5 也不走 flags_tail, 直接 advance。
     // 派活单 §D 决策: 2 op 必 append-only 在 Divsd 之后 (pitfall #34);
     // kVmOpMax+1=86 < 128 跳表余量充足。
-    XmmLoad, XmmStore };
+    XmmLoad, XmmStore,
 
-inline constexpr u16 kVmOpMax = static_cast<u16>(VmOp::XmmStore);  // MIT-408: 86
+    // —— MIT-419 (G4): lock 前缀原子族 strip-and-execute ——
+    // Xadd (Mem-Reg): [addr] = [addr] + reg_b; reg_b = 旧 [addr] (返回旧值
+    //   = InterlockedAdd 真产物, lock xadd [m], r)。**单 VmOp 直执行 native
+    //   lock xadd [addr], reg** — 一条指令完成读改写, 硬件原子性保真
+    //   (D1 的折条妥协不适用于本指令; xadd 不在 ALU mem-dst 折条面)。
+    //   a_kind=Reg reg_a=地址槽 (翻译器 emit_address 产出, 与 Load/Store
+    //   同通道), b_kind=Reg reg_b=源寄存器槽, aux=0, cond_or_size=size
+    //   (S8/S32/S64; S16 需 66 前缀 lifter 入口已拒, handler S16 块防御
+    //   no-op)。flags = add 语义 (CF/OF/SF/ZF/PF 全更新), zero5 → native
+    //   lock xadd → setcc5 → flags_tail (与 cmpxchg/ALU 同通路)。
+    //   handler 内 [addr] 访存是**真内存** (VM 与宿主同进程地址空间) —
+    //   多线程并发下硬件原子性由 lock 前缀保真, 不落 D1 折条边界。
+    Xadd,
+    // Bts / Btr / Btc (Mem-Reg/Imm): CF = bit[位号] of [addr]; [addr] =
+    //   1 / 0 / ^1 (按族)。= InterlockedBitTest* 真产物 (lock bts [m], imm8
+    //   高频, D3; reg 位号形式一并支持)。a_kind=Reg reg_a=地址槽,
+    //   b_kind=Reg (reg_b=位号寄存器槽, 低 8 位) 或 Imm (aux=imm8 位号),
+    //   cond_or_size=size (S32/S64; bts 无字节形式, S8/S16 块防御 no-op)。
+    //   flags: 仅 CF 有定义 (SDM: 其余未定义) — setcc5 捕 host CPU 真值,
+    //   flags_tail 装配, 与原生执行同 CPU 行为 (undefined 位逐 CPU 一致)。
+    Bts, Btr, Btc };
+
+inline constexpr u16 kVmOpMax = static_cast<u16>(VmOp::Btc);  // MIT-419: 90
 inline constexpr u16 kVmOpLimit = 1u << 14;  // 14 位编码空间上限
 
 constexpr const char* to_string(VmOp op) {
@@ -584,6 +606,11 @@ constexpr const char* to_string(VmOp op) {
         case VmOp::Divsd: return "divsd";
         case VmOp::XmmLoad: return "xmmload";
         case VmOp::XmmStore: return "xmmstore";
+        // MIT-419: lock 前缀原子族.
+        case VmOp::Xadd: return "xadd";
+        case VmOp::Bts: return "bts";
+        case VmOp::Btr: return "btr";
+        case VmOp::Btc: return "btc";
     }
     return "?";
 }
