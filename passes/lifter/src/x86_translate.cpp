@@ -1368,6 +1368,131 @@ TranslateResult translate_cmpxchg(const cs_insn& ci, const cs_x86& x, ir::Arch a
     return ok(out);
 }
 
+// ==================== MIT-415 (G3): rep/repnz 串指令微程序 VM 化 ====================
+//
+// 挂点 = lifter 入口前缀闸 (translate_insn :1494 起): 带前缀指令 v1 一律拒,
+// rep/F2/F3/66 前缀的串指令全部在 lifter 层被拒 → 本单从 lifter 放行开始
+// (派活单 §A.2 锚 1), 翻译器微程序展开 (D2), 零新 VmOp。
+//
+// 放行判定 = detail 级三元组白名单 (mnemonic + prefix + 宽度), 禁
+// "prefix[0]!=0 全放" (派活单 §B.1):
+//   - prefix[0] ∈ {F3 (rep/repe/repz), F2 (repne/repnz)} — vendored capstone
+//     x86.h 实证: prefix[0]=rep/repne/lock, prefix[1]=段覆盖, prefix[2]=66
+//     操作数宽, prefix[3]=67 地址宽 (probe 实测, 2026-08-29)
+//   - mnemonic ∈ 串指令族: MOVSB..MOVSQ / STOSB..STOSQ / SCASB..SCASQ /
+//     CMPSB..CMPSQ / LODSB..LODSQ。string movsd (A5) 与 SSE movsd (F2 0F 10)
+//     同 id=X86_INS_MOVSD (408 实证) — 由双 MEM 操作数形状区分 (408 规则,
+//     translate_sse_mov 的 (Mem,Mem) 拒绝面正是本面)
+//   - F3: 全族放行 (movs/stos/lods = count-only; scas/cmps = repe)
+//   - F2: 仅 scas/cmps (repne); F2+movs/stos/lods = Intel undefined → 照旧 gate
+//   - 66 (prefix[2], 16 位操作数) / 67 (prefix[3], 地址宽) / 段覆盖 (prefix[1])
+//     / lock (F0) → 照旧 gate (66 砍面披露于 §B.7 残余; 67 改变计数宽/指针
+//     语义; lock 对串指令 undefined)
+//   - 宽度 = 操作数 size ∈ {1,4,8} (S16 砍面); **REX.W 修正**: capstone 对
+//     `48 F3 A5` (ml64 `rep movsq` 规范编码) 实证解为 'rep movsd' dword
+//     (id=486, rex=0, op_size=4) — F3 先于 REX 的 `F3 48 A5` 才正确报 MOVSQ
+//     qword。Q 形 (movsq/stosq/scasq/cmpsq/lodsq) 一律按 "op_size==4 且字节
+//     流含 REX.W → S64" 修正 (串指令无 ModRM/立即数, 0x40..0x4F 字节必为
+//     REX, 与 popcnt/lzcnt REX 扫描同纪律, §A.3 先验实测)
+//
+// IR 编码 (ir::Insn 冻结契约, 零碰撞):
+//   op=Op::Mov + src2=imm(family 0..4) + cond (E=rep/repe, Ne=repne) +
+//   size=元素宽 (S8/S32/S64) + dst/src=语义寄存器形态 + updates_flags
+//   (scas/cmps=true)。普通 mov 的 src2 恒空; imul 的 src2 在 Op::Imul 上 —
+//   与翻译器 translate_string_op (translator.cpp) 对账的私有约定。
+
+enum : int { kStrMovs = 0, kStrStos = 1, kStrScas = 2, kStrCmps = 3, kStrLods = 4 };
+
+// id → 串指令族 (nullopt = 非串指令)。MOVSD 双形态由调用方按操作数形状区分。
+std::optional<int> string_family_of(x86_insn id) {
+    switch (id) {
+    case X86_INS_MOVSB: case X86_INS_MOVSW: case X86_INS_MOVSD: case X86_INS_MOVSQ:
+        return kStrMovs;
+    case X86_INS_STOSB: case X86_INS_STOSW: case X86_INS_STOSD: case X86_INS_STOSQ:
+        return kStrStos;
+    case X86_INS_SCASB: case X86_INS_SCASW: case X86_INS_SCASD: case X86_INS_SCASQ:
+        return kStrScas;
+    case X86_INS_CMPSB: case X86_INS_CMPSW: case X86_INS_CMPSD: case X86_INS_CMPSQ:
+        return kStrCmps;
+    case X86_INS_LODSB: case X86_INS_LODSW: case X86_INS_LODSD: case X86_INS_LODSQ:
+        return kStrLods;
+    default:
+        return std::nullopt;
+    }
+}
+
+// rep/repnz 串指令 → ir::Insn (编码约定见上)。形态不符一律 unsupported →
+// C1 gate 兜底 (保守底线零让步)。无前缀串指令 (plain movsb) 不走本函数 —
+// 前缀闸外, switch default 照旧 gate (§B.7 残余: 单发形态)。
+TranslateResult translate_string_op(const cs_insn& ci, const cs_x86& x, ir::Arch arch) {
+    // ① 前缀三元组: F3/F2 + 无段覆盖 (prefix[1]) + 无 66 (prefix[2]) + 无 67 (prefix[3])
+    const u8 p = x.prefix[0];
+    if ((p != 0xF3 && p != 0xF2) || x.prefix[1] != 0 || x.prefix[2] != 0 || x.prefix[3] != 0) {
+        return unsupported(ci.address, ci.size);
+    }
+    // ② lock 字节级检查: capstone 对 `F0 F3 A4` (lock rep movsb) 实证把 F0
+    // 吸收掉只报 prefix[0]=F3 — 必须字节扫描。串指令无 ModRM/立即数, 字节
+    // 流中任何 0xF0 必为 lock 前缀。
+    for (size_t i = 0; i < ci.size; ++i) {
+        if (ci.bytes[i] == 0xF0) return unsupported(ci.address, ci.size);
+    }
+    // ③ family × prefix 合法性 (F2 仅 scas/cmps)
+    const auto fam = string_family_of(static_cast<x86_insn>(ci.id));
+    if (!fam) return unsupported(ci.address, ci.size);
+    if (p == 0xF2 && *fam != kStrScas && *fam != kStrCmps) {
+        return unsupported(ci.address, ci.size);  // repne + movs/stos/lods = undefined
+    }
+    // ④ 操作数形状 (串指令无显式操作数变体, 形状固定; MOVSD 双形态判据)
+    if (x.op_count != 2) return unsupported(ci.address, ci.size);
+    const cs_x86_op& o0 = x.operands[0];
+    const cs_x86_op& o1 = x.operands[1];
+    const bool dst_mem = o0.type == X86_OP_MEM;
+    const bool src_mem = o1.type == X86_OP_MEM;
+    if (*fam == kStrMovs || *fam == kStrCmps) {
+        // movs/cmps: 双 MEM — 非双 MEM 的 MOVSD id 即 SSE movsd (408 双形态互斥)
+        if (!dst_mem || !src_mem) return unsupported(ci.address, ci.size);
+    } else if (*fam == kStrStos) {
+        // stos: [rdi] ← AL/EAX/RAX
+        if (!dst_mem || src_mem) return unsupported(ci.address, ci.size);
+    } else {
+        // scas/lods: AL/EAX/RAX ← [rdi]/[rsi]
+        if (dst_mem || !src_mem) return unsupported(ci.address, ci.size);
+    }
+    // ⑤ 宽度: op_size ∈ {1,4,8}; REX.W 修正 (Q 形 capstone 缺陷, 见上)
+    unsigned width = o0.size;
+    if (width == 4) {
+        for (size_t i = 0; i < ci.size; ++i) {
+            if (ci.bytes[i] >= 0x40 && ci.bytes[i] <= 0x4F && (ci.bytes[i] & 0x08)) {
+                width = 8;
+                break;
+            }
+        }
+    }
+    if (width != 1 && width != 4 && width != 8) {
+        return unsupported(ci.address, ci.size);  // S16 (66 F3 xx) 砍面 → §B.7
+    }
+    // ⑥ IR 编码 (family → 语义寄存器硬编码: 串指令寄存器由 ISA 固定, 无变体)
+    ir::Insn out;
+    out.op = Op::Mov;  // 载体 (src2=family 标记区分, 见上)
+    out.addr = ci.address;
+    out.size = width == 1 ? ir::Size::S8 : width == 4 ? ir::Size::S32 : ir::Size::S64;
+    out.cond = (p == 0xF2) ? ir::Cond::Ne : ir::Cond::E;  // repne / rep(repe)
+    out.updates_flags = (*fam == kStrScas || *fam == kStrCmps);
+    out.src2 = Operand::imm_(*fam);
+    const auto rsi_m = Operand::mem_(ir::MemOperand{ir::Reg::Rsi, ir::Reg::Flags, 0, 0});
+    const auto rdi_m = Operand::mem_(ir::MemOperand{ir::Reg::Rdi, ir::Reg::Flags, 0, 0});
+    const auto rax_r = Operand::reg_(ir::Reg::Rax);
+    switch (*fam) {
+    case kStrMovs: out.dst = rdi_m; out.src = rsi_m; break;  // [rdi] ← [rsi]
+    case kStrStos: out.dst = rdi_m; out.src = rax_r; break;  // [rdi] ← AL/EAX/RAX
+    case kStrScas: out.dst = rax_r; out.src = rdi_m; break;  // cmp AL/EAX/RAX, [rdi]
+    case kStrCmps: out.dst = rsi_m; out.src = rdi_m; break;  // cmp [rsi], [rdi]
+    case kStrLods: out.dst = rax_r; out.src = rsi_m; break;  // AL/EAX/RAX ← [rsi]
+    default: return unsupported(ci.address, ci.size);        // 防御 (family 越界)
+    }
+    return ok(out);
+}
+
 } // namespace
 
 std::optional<ir::Reg> map_reg(x86_reg r) {
@@ -1494,7 +1619,16 @@ TranslateResult translate_insn(const cs_insn& ci, ir::Arch arch) {
     // 带 lock/rep/repne 前缀（prefix[0]）的指令语义与普通形式不同，
     // 段覆盖前缀（prefix[1]，如 gs:[..] TLS 访问）无法在平坦内存模型下
     // 虚拟化——v1 一律跳过。
-    if (x.prefix[0] != 0 || x.prefix[1] != 0) return unsupported(ci.address, ci.size);
+    // MIT-415 (G3): 例外放行 rep/repnz 串指令族 (movs/stos/scas/cmps/lods)
+    // — 经 detail 级三元组白名单 (mnemonic+prefix+宽度) 判定
+    // (translate_string_op); 其余带前缀指令 (lock/rep 非串指令/rep x87
+    // 逃逸类等) 照旧拒。无前缀串指令 (plain movsb) 不在白名单 — 落
+    // switch default 照旧 gate (§B.7 残余披露)。
+    if (x.prefix[0] != 0 || x.prefix[1] != 0) {
+        if (string_family_of(static_cast<x86_insn>(ci.id)).has_value())
+            return translate_string_op(ci, x, arch);
+        return unsupported(ci.address, ci.size);
+    }
 
     switch (ci.id) {
     case X86_INS_MOV: return translate_mov(ci, x, arch);

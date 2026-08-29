@@ -59,6 +59,11 @@
 #     真虚拟化; 同 exe 3 负例 (无防御/目标出区/表项指向数据段) 照旧 gate,
 #     行为 byte-exact 由双跑兜底).
 #     Total: 33 samples × 5 seeds = 165 runs.
+#   - MIT-415 (G3): extend to wvmp_string_ops_sample (串指令族 rep
+#     movsb/movsq 非对齐/stosb/scasb/cmpsb/lodsb + flags 通路探针主样本,
+#     微程序展开真虚拟化; 同 exe 负例 rep nop (pause) 照旧 gate; lock rep
+#     movsb 负例本机 #UD 不可执行, 仅 lifter 单测覆盖).
+#     Total: 34 samples × 5 seeds = 170 runs.
 #   - MIT-306: REQUIRE_REAL=1 校验日志含 "已生成 N 个入口 stub" 防止 C1 gate
 #     兜底被误判 PASS（仅 byte-exact 不够, C1 gate 函数被跳过仍能输出相同
 #     stdout+rc）。与 multiseed_e2e_real.sh 配套使用。
@@ -137,6 +142,11 @@ samples=(
     # (REQUIRE_REAL ≥1 stub); 同 exe 3 负例 (无防御/目标出区/表项指向数据段)
     # 照旧 gate, 行为 byte-exact 由双跑兜底。
     "build/passes/marker_scan/tests/wvmp_jmp_table8_sample.exe"
+    # MIT-415 (G3): 串指令族主样本 — rep movsb/movsq 非对齐/stosb/scasb/
+    # cmpsb/lodsb 微程序展开真虚拟化 (REQUIRE_REAL ≥1 stub) + 区域内 flags
+    # 通路探针 (movs 保全 ZF 的 sete 读回); 同 exe 负例 rep nop (pause)
+    # 照旧 gate, 行为 byte-exact 由双跑兜底。
+    "build/passes/marker_scan/tests/wvmp_string_ops_sample.exe"
 )
 
 # Seeds: 1 (small), 12345 (default), 99999 (large), 0xDEADBEEF (magic), 0xCAFEBABE (magic).

@@ -875,9 +875,162 @@ struct Translator {
 
     // ---- 数据移动 ----
 
+    // MIT-415 (G3): rep/repnz 串指令微程序展开 (D2 授权选型: 零新 VmOp 零新
+    // handler, 全复用既有组合)。
+    //
+    // lifter 编码约定 (x86_translate.cpp translate_string_op 对账):
+    //   op=Op::Mov + src2=imm(family 0..4) + cond (E=rep/repe, Ne=repne) +
+    //   size=元素宽 (S8/S32/S64) + dst/src=语义寄存器形态。普通 mov 的 src2
+    //   恒空; imul 的 src2 在 Op::Imul 上 — 零碰撞。
+    //
+    // 展开结构 (固定循环体, D4: 禁按 rcx 值展开代码; 运行时 rcx 语义保留):
+    //   movs:    GetFlags s0; Cmp rcx,0; Jcc E→restore;
+    //            loop { Load t,[rsi]; Store [rdi],t; Add rsi,w; Add rdi,w;
+    //                   Sub rcx,1; Jcc Ne→loop } restore: SetFlags s0
+    //   stos:    同 movs 无 Load (Store [rdi],Rax); lods: 同 movs 无 Store
+    //            (Load Rax,[rsi])。movs/stos/lods 不写 flags (SDM) — 全路径
+    //            恢复原 flags (含 rcx==0 空转路径)。
+    //   scas/cmps (repe/repne): GetFlags s0; Cmp rcx,0; Jcc E→restore0;
+    //            loop { Load t,[rdi] (+t2,[rsi] cmps); Cmp acc,t; GetFlags s1;
+    //                   Jcc 早退→exit_adv (repne: ZF==1; repe: ZF==0);
+    //                   Add 指针; Sub rcx,1; Jcc Ne→loop }
+    //            SetFlags s1 (rcx==0 正常出口: flags=末次比较); Jmp→exit;
+    //            exit_adv: Add 指针; Sub rcx,1; SetFlags s1; Jmp→exit;
+    //            restore0: SetFlags s0 (rcx==0 预检出口: flags 原样 — 原生
+    //            零次比较 flags 不变); exit: (jmp_a/jmp_b 汇合)。
+    //   早退语义 (native 实测, E2E 对拍 + strlen `lea rax,[rdi-1]` 惯用法
+    //   同证): 终止迭代**同样**推进指针并减计数 — repne scasb 命中后 RDI
+    //   指向匹配元素**之后**、RCX 已含该次递减; SDM 的"条件不满足即停"
+    //   仅指不再重复, 不含指针/计数副作用回滚。故早退 Jcc 跳到共享的
+    //   exit_adv 块 (Add/Sub 与主路径重复, SetFlags s1 收尾 flags=末次比较)。
+    //
+    // 微程序内 Jcc/Jmp 的 aux 直接按 em.out 内位置差回填 (与 pending 块回填
+    // 同一语义: 条数差, 负值补码入 u32), 不经过块表 — 循环回边是单条 IR
+    // 指令的内部结构, 与区域块表/回跳 gate 链无交互 (B.2 实测项)。
+    //
+    // DF=0 假定 (D1 裁决, B.3): 微程序按 DF=0 (指针递增) 展开; VM flags 槽
+    // 无 DF 位 (kFlagsMask 冻结), 翻译期无法静态证 DF — note 级披露, 与
+    // backend 过滤白名单对账 (413 纪律): "string-op @" 前缀走 diag 通道,
+    // 不触发 C1 gate。
+    bool translate_string_op(Emitter& em, Scratch& sc, const ir::Insn& in) {
+        const i64 family = in.src2.imm;  // 0=movs 1=stos 2=scas 3=cmps 4=lods
+        if (family < 0 || family > 4)
+            return skip(in, "string-op family 标记非法，建议 gate", nullptr);
+        const bool repne = (in.cond == ir::Cond::Ne);
+        const u8 sz = isa::size_field(in.size);
+        const u8 sz64 = isa::size_field(ir::Size::S64);
+        const u8 rsi = isa::vm_reg_of(ir::Reg::Rsi);
+        const u8 rdi = isa::vm_reg_of(ir::Reg::Rdi);
+        const u8 rax = isa::vm_reg_of(ir::Reg::Rax);
+        const u8 rcx = isa::vm_reg_of(ir::Reg::Rcx);
+        const u8 inc = in.size == ir::Size::S64 ? 8u : in.size == ir::Size::S32 ? 4u : 1u;
+
+        // 预检: rcx==0 → 零次迭代 (movs/stos/lods: 不动内存; scas/cmps: 不比较)
+        const u8 s0 = sc.take();  // 原 flags 保存槽 (rcx==0 路径恢复)
+        em.emit(VmOp::GetFlags, OpKind::Reg, s0, OpKind::None, 0, 0, sz64);
+        em.emit_ri(VmOp::Cmp, rcx, 0, sz64);
+        const size_t jcc0 = em.out.size();
+        em.emit(VmOp::Jcc, OpKind::None, 0, OpKind::None, 0, 0,
+                static_cast<u8>(ir::Cond::E));
+        const size_t loop_pos = em.out.size();
+
+        const bool cmp_family = (family == 2 || family == 3);
+        u8 s1 = 0;            // scas/cmps: 末次比较 flags 保存槽
+        size_t jcc_early = 0; // scas/cmps: 早退出口 (repne: ZF==1 / repe: ZF==0)
+        if (family == 0) {            // movs: t = [rsi]; [rdi] = t
+            const u8 t1 = sc.take();
+            em.emit_rr(VmOp::Load, t1, rsi, sz);
+            em.emit_rr(VmOp::Store, rdi, t1, sz);
+            em.emit_ri(VmOp::Add, rsi, inc, sz64);
+            em.emit_ri(VmOp::Add, rdi, inc, sz64);
+        } else if (family == 1) {     // stos: [rdi] = AL/EAX/RAX
+            em.emit_rr(VmOp::Store, rdi, rax, sz);
+            em.emit_ri(VmOp::Add, rdi, inc, sz64);
+        } else if (family == 4) {     // lods: AL/EAX/RAX = [rsi]
+            em.emit_rr(VmOp::Load, rax, rsi, sz);
+            em.emit_ri(VmOp::Add, rsi, inc, sz64);
+        } else {                      // scas / cmps: 每迭代 Cmp 真写 flags
+            const u8 t1 = sc.take();
+            if (family == 2) {
+                em.emit_rr(VmOp::Load, t1, rdi, sz);      // t1 = [rdi]
+                em.emit_rr(VmOp::Cmp, rax, t1, sz);       // flags = acc - [rdi]
+            } else {
+                const u8 t2 = sc.take();
+                em.emit_rr(VmOp::Load, t1, rsi, sz);      // t1 = [rsi]
+                em.emit_rr(VmOp::Load, t2, rdi, sz);      // t2 = [rdi]
+                em.emit_rr(VmOp::Cmp, t1, t2, sz);        // flags = [rsi] - [rdi]
+            }
+            s1 = sc.take();
+            em.emit(VmOp::GetFlags, OpKind::Reg, s1, OpKind::None, 0, 0, sz64);
+            // 早退 (repne: ZF==1 命中; repe: ZF==0 失配) → 仍推进指针减计数 —
+            // **native 实测语义** (E2E 对拍: repne scasb 命中后 RDI 指向匹配
+            // 元素**之后**、RCX 已减, strlen `lea rax,[rdi-1]` 惯用法同证;
+            // SDM 的 "条件不满足即停" 不适用于终止迭代的指针/计数副作用)。
+            // 故早退目标跳到共享的 L_exit_adv (推进+减计数后 SetFlags s1)。
+            jcc_early = em.out.size();
+            em.emit(VmOp::Jcc, OpKind::None, 0, OpKind::None, 0, 0,
+                    repne ? static_cast<u8>(ir::Cond::E)
+                          : static_cast<u8>(ir::Cond::Ne));
+            em.emit_ri(VmOp::Add, rdi, inc, sz64);
+            if (family == 3) em.emit_ri(VmOp::Add, rsi, inc, sz64);
+        }
+
+        // 计数递减 (movs/stos/lods: flags 随后统一恢复; scas/cmps: 下一迭代
+        // Cmp 覆写, 出口 SetFlags s1 恢复末次比较 flags)
+        em.emit_ri(VmOp::Sub, rcx, 1, sz64);
+        const size_t jcc_back = em.out.size();
+        em.emit(VmOp::Jcc, OpKind::None, 0, OpKind::None, 0, 0,
+                static_cast<u8>(ir::Cond::Ne));
+        if (cmp_family) {
+            // rcx==0 正常出口: flags = 末次比较
+            em.emit(VmOp::SetFlags, OpKind::Reg, s1, OpKind::None, 0, 0, sz64);
+            const size_t jmp_a = em.out.size();
+            em.emit(VmOp::Jmp, OpKind::None, 0, OpKind::None, 0, 0, 0);
+            // 早退出口 (jcc_early 目标): 终止迭代同样推进指针减计数 (native
+            // 实测语义, 见上) — Add/Sub 与主路径重复, SetFlags s1 收尾。
+            const size_t exit_adv = em.out.size();
+            em.emit_ri(VmOp::Add, rdi, inc, sz64);
+            if (family == 3) em.emit_ri(VmOp::Add, rsi, inc, sz64);
+            em.emit_ri(VmOp::Sub, rcx, 1, sz64);
+            em.emit(VmOp::SetFlags, OpKind::Reg, s1, OpKind::None, 0, 0, sz64);
+            const size_t jmp_b = em.out.size();
+            em.emit(VmOp::Jmp, OpKind::None, 0, OpKind::None, 0, 0, 0);
+            const size_t restore0 = em.out.size();  // 预检出口 (jcc0 目标)
+            em.emit(VmOp::SetFlags, OpKind::Reg, s0, OpKind::None, 0, 0, sz64);
+            const size_t exit = em.out.size();      // jmp_a/jmp_b 目标
+            em.out[jcc0].aux = static_cast<u32>(static_cast<i32>(restore0 - jcc0));
+            em.out[jcc_early].aux = static_cast<u32>(static_cast<i32>(exit_adv - jcc_early));
+            em.out[jcc_back].aux = static_cast<u32>(static_cast<i32>(loop_pos - jcc_back));
+            em.out[jmp_a].aux = static_cast<u32>(static_cast<i32>(exit - jmp_a));
+            em.out[jmp_b].aux = static_cast<u32>(static_cast<i32>(exit - jmp_b));
+        } else {
+            const size_t restore0 = em.out.size();  // 预检出口 == 循环自然出口
+            em.emit(VmOp::SetFlags, OpKind::Reg, s0, OpKind::None, 0, 0, sz64);
+            em.out[jcc0].aux = static_cast<u32>(static_cast<i32>(restore0 - jcc0));
+            em.out[jcc_back].aux = static_cast<u32>(static_cast<i32>(loop_pos - jcc_back));
+        }
+
+        // DF=0 假定 note (B.3; 413 纪律: 前缀与 backend 过滤白名单对账 —
+        // 命中 note 走 diag 通道, 不触发 C1 gate)
+        const char* fam_name = family == 0 ? "movs" : family == 1 ? "stos"
+                             : family == 2 ? "scas" : family == 3 ? "cmps" : "lods";
+        const char suffix = inc == 1 ? 'b' : inc == 4 ? 'd' : 'q';
+        char note[192];
+        std::snprintf(note, sizeof(note),
+                      "string-op @ 0x%" PRIX64 ": rep %s%c (elem %uB) DF=0 assumption, "
+                      "ptr += %u (D1: DF=1 输入行为不保)",
+                      in.addr, fam_name, suffix, inc, inc);
+        notes.emplace_back(note);
+        return true;
+    }
+
     // mov 不接 mem 操作数（lifter 已将 mem-src 拆为 Load, mem-dst 拆为 Store），
     // 故不需要 next_ip 参数.
     bool translate_mov(Emitter& em, Scratch& sc, const ir::Insn& in) {
+        // MIT-415: rep 串指令经 Op::Mov + src2=imm(family) 编码 (lifter 约定)
+        // — 普通 mov 的 src2 恒空, 零碰撞。
+        if (in.src2.kind == ir::Operand::Kind::Imm)
+            return translate_string_op(em, sc, in);
         if (in.dst.kind != ir::Operand::Kind::Reg)
             return skip(in, "mov 操作数形态未支持",
                         in.dst.kind == ir::Operand::Kind::Mem ? &in.dst.mem : nullptr);

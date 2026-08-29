@@ -1025,4 +1025,198 @@ TEST(Translate, JumpTableOutOfRegionGates) {
             EXPECT_NE(v.cond_or_size, static_cast<u8>(ir::Cond::E));
 }
 
+// =============================================================================
+// MIT-415 (G3): rep/repnz 串指令微程序展开 (D2: 零新 VmOp)
+// =============================================================================
+// lifter 编码约定: Op::Mov + src2=imm(family 0..4) + cond (E=rep/repe,
+// Ne=repne) + size (元素宽) + dst/src 语义寄存器形态。展开 = 既有 VmOp
+// 组合微循环: 预检 rcx==0 → 循环体 → 计数递减回边; scas/cmps 带末次比较
+// flags 保存/恢复 + repne/repe 早退 (早退迭代不推进指针不减计数)。
+
+// 串指令 IR 构造 (与 lifter translate_string_op 的编码对账)。
+ir::Insn str_op(int family, ir::Size sz, ir::Cond c = ir::Cond::E) {
+    ir::Insn i = I(ir::Op::Mov, sz);
+    i.cond = c;
+    i.src2 = ir::Operand::imm_(family);
+    i.updates_flags = (family == 2 || family == 3);
+    const ir::MemOperand rsi_m{ir::Reg::Rsi, ir::Reg::Flags, 0, 0};
+    const ir::MemOperand rdi_m{ir::Reg::Rdi, ir::Reg::Flags, 0, 0};
+    switch (family) {
+    case 0: i.dst = ir::Operand::mem_(rdi_m); i.src = ir::Operand::mem_(rsi_m); break;  // movs
+    case 1: i.dst = ir::Operand::mem_(rdi_m); i.src = ir::Operand::reg_(ir::Reg::Rax); break;  // stos
+    case 2: i.dst = ir::Operand::reg_(ir::Reg::Rax); i.src = ir::Operand::mem_(rdi_m); break;  // scas
+    case 3: i.dst = ir::Operand::mem_(rsi_m); i.src = ir::Operand::mem_(rdi_m); break;  // cmps
+    case 4: i.dst = ir::Operand::reg_(ir::Reg::Rax); i.src = ir::Operand::mem_(rsi_m); break;  // lods
+    default: break;
+    }
+    return i;
+}
+
+// 单条指令函数产出（允许 notes — 串指令的 DF=0 披露 note 是预期产物）。
+Decoded one_insn_n(const ir::Insn& i, std::vector<std::string>* notes_out = nullptr) {
+    const auto r = wvmp::regvm::translator::translate_function(fn_of({blk(0x1000, {i})}));
+    if (notes_out != nullptr) *notes_out = r.notes;
+    EXPECT_EQ(r.program.entry_offset, 0u);
+    return decode_program(r.program);
+}
+
+// 相对跳转 aux 断言 (条数差; 负值补码)。
+void expect_rel(const VmInsn& v, i64 expect) {
+    EXPECT_EQ(static_cast<int>(v.aux), static_cast<int>(expect));
+}
+
+// Jcc/Jmp 的 aux 是回填的相对条数差 — 与 expect_is 的 aux==0 断言互斥,
+// 单独断言 (op + cond + rel 一并)。
+void expect_jcc(const VmInsn& v, ir::Cond c, i64 rel) {
+    EXPECT_EQ(v.op, VmOp::Jcc);
+    EXPECT_EQ(v.cond_or_size, static_cast<u8>(c));
+    expect_rel(v, rel);
+}
+void expect_jmp(const VmInsn& v, i64 rel) {
+    EXPECT_EQ(v.op, VmOp::Jmp);
+    expect_rel(v, rel);
+}
+
+TEST(Translate, StringMovsExpandsToMicroLoop) {
+    // rep movsb (family 0, S8): GetFlags s0; Cmp rcx,0; Jcc E→restore;
+    // loop{ Load t,[rsi]; Store [rdi],t; Add rsi,1; Add rdi,1; Sub rcx,1;
+    //       Jcc Ne→loop } restore: SetFlags s0 (+ 块尾 Jmp+1 + Halt)。
+    // 回边 aux = loop_pos - jcc_back (负); 预检 aux = restore0 - jcc0 (正)。
+    const Decoded d = one_insn_n(str_op(0, ir::Size::S8));
+    ASSERT_EQ(d.insns.size(), static_cast<size_t>(12));  // 10 + Jmp + Halt
+    const u8 s18 = isa::kScratchFirst;
+    const u8 s19 = isa::kScratchFirst + 1;
+    expect_is(d.insns[0], VmOp::GetFlags, OpKind::Reg, s18, OpKind::None, 0, 0, kS64);
+    expect_is(d.insns[1], VmOp::Cmp, OpKind::Reg, kRcx, OpKind::Imm, 0, 0, kS64);
+    expect_jcc(d.insns[2], ir::Cond::E, 7);  // 预检 → restore0 (idx 9)
+    expect_is(d.insns[3], VmOp::Load, OpKind::Reg, s19, OpKind::Reg, isa::vm_reg_of(ir::Reg::Rsi), 0,
+              static_cast<u8>(ir::Size::S8));
+    expect_is(d.insns[4], VmOp::Store, OpKind::Reg, isa::vm_reg_of(ir::Reg::Rdi), OpKind::Reg, s19, 0,
+              static_cast<u8>(ir::Size::S8));
+    expect_is(d.insns[5], VmOp::Add, OpKind::Reg, isa::vm_reg_of(ir::Reg::Rsi), OpKind::Imm, 0, 1, kS64);
+    expect_is(d.insns[6], VmOp::Add, OpKind::Reg, isa::vm_reg_of(ir::Reg::Rdi), OpKind::Imm, 0, 1, kS64);
+    expect_is(d.insns[7], VmOp::Sub, OpKind::Reg, kRcx, OpKind::Imm, 0, 1, kS64);
+    expect_jcc(d.insns[8], ir::Cond::Ne, -5);  // 回边 → loop_pos (idx 3)
+    expect_is(d.insns[9], VmOp::SetFlags, OpKind::Reg, s18, OpKind::None, 0, 0, kS64);
+    expect_jmp(d.insns[10], 1);                // fallthrough
+    expect_is(d.insns[11], VmOp::Halt, OpKind::None, 0, OpKind::None, 0, 0, 0);
+}
+
+TEST(Translate, StringMovsqUsesWidth8) {
+    // rep movsq (family 0, S64): 元素宽 8 — Load/Store S64, 指针步长 8。
+    const Decoded d = one_insn_n(str_op(0, ir::Size::S64));
+    ASSERT_EQ(d.insns.size(), static_cast<size_t>(12));
+    expect_is(d.insns[3], VmOp::Load, OpKind::Reg, isa::kScratchFirst + 1,
+              OpKind::Reg, isa::vm_reg_of(ir::Reg::Rsi), 0, kS64);
+    expect_is(d.insns[4], VmOp::Store, OpKind::Reg, isa::vm_reg_of(ir::Reg::Rdi),
+              OpKind::Reg, isa::kScratchFirst + 1, 0, kS64);
+    expect_is(d.insns[5], VmOp::Add, OpKind::Reg, isa::vm_reg_of(ir::Reg::Rsi),
+              OpKind::Imm, 0, 8, kS64);
+    expect_is(d.insns[6], VmOp::Add, OpKind::Reg, isa::vm_reg_of(ir::Reg::Rdi),
+              OpKind::Imm, 0, 8, kS64);
+}
+
+TEST(Translate, StringScasRepneEarlyExit) {
+    // repne scasb (family 2, S8, cond Ne): loop{ Load t,[rdi]; Cmp rax,t;
+    // GetFlags s1; Jcc E→exit_adv (早退: ZF==1); Add rdi,1; Sub rcx,1;
+    // Jcc Ne→loop } SetFlags s1; Jmp→exit; exit_adv: Add rdi,1; Sub rcx,1;
+    // SetFlags s1; Jmp→exit; restore0: SetFlags s0。
+    // 早退迭代同样推进指针减计数 (native 实测语义 — RDI 指向匹配元素之后,
+    // strlen `lea rax,[rdi-1]` 惯用法同证)。
+    const Decoded d = one_insn_n(str_op(2, ir::Size::S8, ir::Cond::Ne));
+    ASSERT_EQ(d.insns.size(), static_cast<size_t>(19));  // 17 + Jmp + Halt
+    const u8 s18 = isa::kScratchFirst;
+    const u8 s19 = isa::kScratchFirst + 1;
+    const u8 s20 = isa::kScratchFirst + 2;
+    expect_is(d.insns[0], VmOp::GetFlags, OpKind::Reg, s18, OpKind::None, 0, 0, kS64);
+    expect_is(d.insns[1], VmOp::Cmp, OpKind::Reg, kRcx, OpKind::Imm, 0, 0, kS64);
+    expect_jcc(d.insns[2], ir::Cond::E, 14);  // 预检 → restore0 (idx 16)
+    expect_is(d.insns[3], VmOp::Load, OpKind::Reg, s19, OpKind::Reg, isa::vm_reg_of(ir::Reg::Rdi), 0,
+              static_cast<u8>(ir::Size::S8));
+    expect_is(d.insns[4], VmOp::Cmp, OpKind::Reg, kRax, OpKind::Reg, s19, 0,
+              static_cast<u8>(ir::Size::S8));
+    expect_is(d.insns[5], VmOp::GetFlags, OpKind::Reg, s20, OpKind::None, 0, 0, kS64);
+    expect_jcc(d.insns[6], ir::Cond::E, 6);   // repne 早退: ZF==1 → exit_adv (idx 12)
+    expect_is(d.insns[7], VmOp::Add, OpKind::Reg, isa::vm_reg_of(ir::Reg::Rdi), OpKind::Imm, 0, 1, kS64);
+    expect_is(d.insns[8], VmOp::Sub, OpKind::Reg, kRcx, OpKind::Imm, 0, 1, kS64);
+    expect_jcc(d.insns[9], ir::Cond::Ne, -6); // 回边 → loop_pos (idx 3)
+    expect_is(d.insns[10], VmOp::SetFlags, OpKind::Reg, s20, OpKind::None, 0, 0, kS64);
+    expect_jmp(d.insns[11], 6);               // rcx==0 正常出口 → exit (idx 17)
+    expect_is(d.insns[12], VmOp::Add, OpKind::Reg, isa::vm_reg_of(ir::Reg::Rdi), OpKind::Imm, 0, 1, kS64);
+    expect_is(d.insns[13], VmOp::Sub, OpKind::Reg, kRcx, OpKind::Imm, 0, 1, kS64);
+    expect_is(d.insns[14], VmOp::SetFlags, OpKind::Reg, s20, OpKind::None, 0, 0, kS64);
+    expect_jmp(d.insns[15], 2);               // 早退出口 → exit (idx 17)
+    expect_is(d.insns[16], VmOp::SetFlags, OpKind::Reg, s18, OpKind::None, 0, 0, kS64);
+    expect_jmp(d.insns[17], 1);               // fallthrough
+    expect_is(d.insns[18], VmOp::Halt, OpKind::None, 0, OpKind::None, 0, 0, 0);
+}
+
+TEST(Translate, StringCmpsRepeStructure) {
+    // repe cmpsb (family 3, S8, cond E): loop{ Load t1,[rsi]; Load t2,[rdi];
+    // Cmp t1,t2; GetFlags s1; Jcc Ne→exit_adv (repe 早退: ZF==0); Add rdi,1;
+    // Add rsi,1; Sub rcx,1; Jcc Ne→loop } SetFlags s1; Jmp→exit;
+    // exit_adv: Add rdi,1; Add rsi,1; Sub rcx,1; SetFlags s1; Jmp→exit;
+    // restore0: SetFlags s0。scratch 4 槽 (s0/t1/t2/s1) 在预算内。
+    const Decoded d = one_insn_n(str_op(3, ir::Size::S8, ir::Cond::E));
+    ASSERT_EQ(d.insns.size(), static_cast<size_t>(22));  // 20 + Jmp + Halt
+    const u8 s18 = isa::kScratchFirst;
+    const u8 s19 = isa::kScratchFirst + 1;
+    const u8 s20 = isa::kScratchFirst + 2;
+    const u8 s21 = isa::kScratchFirst + 3;
+    expect_is(d.insns[3], VmOp::Load, OpKind::Reg, s19, OpKind::Reg, isa::vm_reg_of(ir::Reg::Rsi), 0,
+              static_cast<u8>(ir::Size::S8));
+    expect_is(d.insns[4], VmOp::Load, OpKind::Reg, s20, OpKind::Reg, isa::vm_reg_of(ir::Reg::Rdi), 0,
+              static_cast<u8>(ir::Size::S8));
+    expect_is(d.insns[5], VmOp::Cmp, OpKind::Reg, s19, OpKind::Reg, s20, 0,
+              static_cast<u8>(ir::Size::S8));
+    expect_is(d.insns[6], VmOp::GetFlags, OpKind::Reg, s21, OpKind::None, 0, 0, kS64);
+    expect_jcc(d.insns[7], ir::Cond::Ne, 7);  // repe 早退: ZF==0 → exit_adv (idx 14)
+    expect_is(d.insns[8], VmOp::Add, OpKind::Reg, isa::vm_reg_of(ir::Reg::Rdi), OpKind::Imm, 0, 1, kS64);
+    expect_is(d.insns[9], VmOp::Add, OpKind::Reg, isa::vm_reg_of(ir::Reg::Rsi), OpKind::Imm, 0, 1, kS64);
+    expect_is(d.insns[10], VmOp::Sub, OpKind::Reg, kRcx, OpKind::Imm, 0, 1, kS64);
+    expect_jcc(d.insns[11], ir::Cond::Ne, -8); // 回边 → loop_pos (idx 3)
+    expect_is(d.insns[12], VmOp::SetFlags, OpKind::Reg, s21, OpKind::None, 0, 0, kS64);
+    expect_jmp(d.insns[13], 7);                // rcx==0 正常出口 → exit (idx 20)
+    expect_is(d.insns[14], VmOp::Add, OpKind::Reg, isa::vm_reg_of(ir::Reg::Rdi), OpKind::Imm, 0, 1, kS64);
+    expect_is(d.insns[15], VmOp::Add, OpKind::Reg, isa::vm_reg_of(ir::Reg::Rsi), OpKind::Imm, 0, 1, kS64);
+    expect_is(d.insns[16], VmOp::Sub, OpKind::Reg, kRcx, OpKind::Imm, 0, 1, kS64);
+    expect_is(d.insns[17], VmOp::SetFlags, OpKind::Reg, s21, OpKind::None, 0, 0, kS64);
+    expect_jmp(d.insns[18], 2);                // 早退出口 → exit (idx 20)
+    expect_is(d.insns[19], VmOp::SetFlags, OpKind::Reg, s18, OpKind::None, 0, 0, kS64);
+}
+
+TEST(Translate, StringStosAndLodsSimpleLoops) {
+    // rep stosb (family 1): loop{ Store [rdi],Rax; Add rdi,1; Sub rcx,1; Jcc }
+    const Decoded d = one_insn_n(str_op(1, ir::Size::S8));
+    ASSERT_EQ(d.insns.size(), static_cast<size_t>(10));  // 8 + Jmp + Halt
+    expect_is(d.insns[3], VmOp::Store, OpKind::Reg, isa::vm_reg_of(ir::Reg::Rdi),
+              OpKind::Reg, kRax, 0, static_cast<u8>(ir::Size::S8));
+    expect_is(d.insns[4], VmOp::Add, OpKind::Reg, isa::vm_reg_of(ir::Reg::Rdi),
+              OpKind::Imm, 0, 1, kS64);
+    expect_is(d.insns[5], VmOp::Sub, OpKind::Reg, kRcx, OpKind::Imm, 0, 1, kS64);
+    expect_jcc(d.insns[6], ir::Cond::Ne, -3); // 回边 → loop_pos (idx 3)
+    expect_is(d.insns[7], VmOp::SetFlags, OpKind::Reg, isa::kScratchFirst,
+              OpKind::None, 0, 0, kS64);
+
+    // rep lodsb (family 4): loop{ Load Rax,[rsi]; Add rsi,1; Sub rcx,1; Jcc }
+    const Decoded e = one_insn_n(str_op(4, ir::Size::S8));
+    ASSERT_EQ(e.insns.size(), static_cast<size_t>(10));
+    expect_is(e.insns[3], VmOp::Load, OpKind::Reg, kRax, OpKind::Reg,
+              isa::vm_reg_of(ir::Reg::Rsi), 0, static_cast<u8>(ir::Size::S8));
+    expect_is(e.insns[4], VmOp::Add, OpKind::Reg, isa::vm_reg_of(ir::Reg::Rsi),
+              OpKind::Imm, 0, 1, kS64);
+}
+
+TEST(Translate, StringOpEmitsDfAssumptionNote) {
+    // B.3: DF=0 假定 note 级披露 — "string-op @" 前缀与 backend 过滤白名单
+    // 对账 (413 纪律): 命中 note 走 diag 通道不触发 C1 gate。
+    std::vector<std::string> notes;
+    const Decoded d = one_insn_n(str_op(0, ir::Size::S64), &notes);
+    ASSERT_EQ(notes.size(), 1u);
+    EXPECT_NE(notes[0].find("string-op @ 0x401000"), std::string::npos);
+    EXPECT_NE(notes[0].find("DF=0 assumption"), std::string::npos);
+    EXPECT_NE(notes[0].find("movsq"), std::string::npos);
+    EXPECT_EQ(d.insns.back().op, VmOp::Halt);
+}
+
 } // namespace

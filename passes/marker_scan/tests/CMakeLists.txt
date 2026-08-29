@@ -766,3 +766,24 @@ target_compile_options(wvmp_sse_memop_xmm_readback_sample PRIVATE
 target_link_options(wvmp_sse_memop_xmm_readback_sample PRIVATE
     $<$<CXX_COMPILER_ID:MSVC>:/INCREMENTAL:NO>
 )
+
+# MIT-415 (G3): 端到端主样本——区域内含 rep/repnz 串指令族 (movsb/movsq 非对齐/
+# stosb/scasb/cmpsb/lodsb + flags 通路探针), 验证前缀闸放行 + 翻译器微程序
+# 展开 (D2: 零新 VmOp) 后真虚拟化、行为与原生逐字节一致。MSVC x64 不支持
+# inline asm, /Od 的 memcpy/memset 走 call 不产 rep 串指令 (派活单 §A.3 先验),
+# 故全族字节由 string_ops_sample_asm.asm (MASM) 直接 emit。负例 pause 同
+# exe 内照旧 gate (行为 byte-exact 由双跑兜底); lock rep movsb 负例本机
+# #UD 不可执行, 仅在 lifter 单测覆盖 (披露于报告)。
+enable_language(ASM_MASM)
+add_executable(wvmp_string_ops_sample
+    string_ops_sample_main.cpp
+    string_ops_sample_asm.asm
+)
+target_link_libraries(wvmp_string_ops_sample PRIVATE wvmp::sdk)
+target_compile_options(wvmp_string_ops_sample PRIVATE
+    $<$<AND:$<CXX_COMPILER_ID:MSVC>,$<COMPILE_LANGUAGE:C,CXX>>:/Od;/Ob0;/utf-8>
+    $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-O0>
+)
+target_link_options(wvmp_string_ops_sample PRIVATE
+    $<$<CXX_COMPILER_ID:MSVC>:/INCREMENTAL:NO>
+)

@@ -130,8 +130,7 @@
   movsd/addsd/movsd 三连，逐条已支持。
 - **不支持面（越界即 C1 gate 兜底）**：andnps/andnpd（0F 55 系，留 412+）、
   AVX/x87/SSE2 整数族（movd/movdqa p 形式）、SSE mul 族
-  （mulss/mulps/mulpd）、string movsd（A5，capstone 与 SSE movsd 同 id，
-  由双 MEM 操作数规则区分）。
+  （mulss/mulps/mulpd）。（string movsd 双形态已由 MIT-415 收口，见下节。）
 - 注意与重定位/ASLR 的配合：RVA + image_base 在运行时还原，不依赖静态 VA。
 
 ## C5 x86 (32 位) 目标未支持 —— 显式硬拒绝（MIT-414 G7p2 收口）
@@ -189,6 +188,44 @@ rc=0 输出≈输入，用户以为受保护）与**产坏壳**（手造连续�
   .pdata → find_function_end_rva 退 nullopt → 保守 gate 兜底，行为差异非缺陷。
 - **CLI 无 arch 表达面**（triage §8 #7）：config 无 arch 字段、无 --help 子命令，
   32 位全支持需配置面扩口（P1 G7x-7）。
+
+## G3 串指令族 rep movs/stos/scas/cmps/lods（MIT-415 收口）
+
+**状态（2026-08-29，main 92928e0 后）：rep/repnz 串指令已入面**——lifter 前缀闸
+按 detail 级三元组白名单（mnemonic + prefix[0] F3/F2 + 宽度）放行；翻译器按
+D2 选型展开为既有 VmOp 组合微循环（零新 VmOp 零新 handler），运行时 rcx 值
+语义保留（禁按 rcx 展开代码）。multiseed 34 样本 × 5 = 170/170，wvmpTest
+14/14 满贯 + 双跑 103/103 保持。
+
+**支持面**：F3（rep/repe）{movs, stos, scas, cmps, lods} 全族 + F2（repne）
+{scas, cmps}，宽度 S8/S32/S64。string movsd（A5）与 SSE movsd（F2 0F 10）
+同 id=X86_INS_MOVSD，由双 MEM 操作数形状互斥区分（408 规则）。
+
+**残余（越界即 C1 gate 兜底，保持原生）**：
+- 16 位操作数（66 前缀，movsw/stosw/scasw/cmpsw/lodsw）——砍面披露，MSVC
+  不产，未来如需按同构展开（runtime S16 通路现成）；
+- 67 地址宽（ECX 计数 + 32 位指针语义）与段覆盖前缀；
+- lock 前缀（F0）——capstone 对 `F0 F3 A4` 吸收 F0 只报 F3，lifter 字节级
+  扫描拒；本机实测 lock rep movsb 原生即 #UD，无法作为可执行样本，负例
+  仅在 lifter 单测覆盖；
+- F2 + movs/stos/lods（Intel undefined）；
+- 无前缀单发形态（plain movsb 等）；
+- **DF=1 输入**（手写 asm 置 DF）：翻译期无法静态证 DF，微程序按 DF=0
+  （指针递增）展开，note 级 `string-op DF=0 assumption` 披露（D1 裁决，
+  不建 DF 位——kFlagsMask 冻结）；MSVC/主流编译器产物 DF 恒 0（cld ABI
+  惯例），实际行为=原生；
+- 重叠区域拷贝（rep movs 原生未定义，样本禁依赖）。
+
+**capstone REX.W 实证缺陷（Q 形必知）**：`48 F3 A5`（ml64 `rep movsq` 规范
+编码）被解为 `rep movsd` dword（id=MOVSD、rex=0、op_size=4）——F3 先于 REX
+的 `F3 48 A5` 才正确报 MOVSQ qword；movsq/stosq/scasq/cmpsq/lodsq 一律按
+"op_size==4 且字节流含 REX.W → S64" 修正（串指令无 ModRM/立即数，0x40..0x4F
+必为 REX，与 popcnt REX 扫描同纪律）。
+
+**早退语义实测（E2E 对拍）**：repne scasb/repe cmpsb 命中/失配终止时，
+RDI/RSI 指向比较元素**之后**、RCX 已含终止迭代的递减（strlen
+`lea rax,[rdi-1]` 惯用法同证）——展开的早退出口同样推进指针减计数，
+flags 恢复为末次比较值。
 
 ## 保护强度缺口（= M3 内容，非正确性问题）
 

@@ -1787,4 +1787,148 @@ TEST_F(LifterTranslate, AndnpsStillUnsupported) {
     EXPECT_EQ(r.status, lifter::TranslateStatus::Unsupported);
 }
 
+// =============================================================================
+// MIT-415 (G3): rep/repnz 串指令族 (movs/stos/scas/cmps/lods) 前缀闸放行
+// =============================================================================
+// 挂点 = 前缀闸 (x86_translate.cpp translate_insn :1494 起); 放行判定 =
+// detail 级三元组白名单 (mnemonic + prefix[0] F3/F2 + 宽度), 禁全放。
+// IR 编码: Op::Mov + src2=imm(family 0..4) + cond (E=rep/repe, Ne=repne) +
+// size=元素宽 (S8/S32/S64)。capstone 报法全部经 probe 实测 (2026-08-29,
+// vendored capstone x86.h: prefix[0]=rep/repne/lock, [1]=段覆盖, [2]=66,
+// [3]=67)。
+
+TEST_F(LifterTranslate, RepMovsbLifted) {
+    // F3 A4: rep movsb — 前缀闸放行 (B.1 三元组白名单命中)
+    const wvmp::u8 b[] = {0xF3, 0xA4};
+    auto r = translate_bytes(x64, b, ir::Arch::X64);
+    ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r.insn.op, ir::Op::Mov);          // 载体 (src2=family 标记区分)
+    EXPECT_EQ(r.insn.size, ir::Size::S8);
+    EXPECT_EQ(r.insn.cond, ir::Cond::E);        // F3 = rep
+    ASSERT_EQ(r.insn.src2.kind, ir::Operand::Kind::Imm);
+    EXPECT_EQ(r.insn.src2.imm, 0);              // family 0 = movs
+    EXPECT_FALSE(r.insn.updates_flags);         // movs 不写 flags (SDM)
+    ASSERT_EQ(r.insn.dst.kind, ir::Operand::Kind::Mem);
+    EXPECT_EQ(r.insn.dst.mem.base, ir::Reg::Rdi);
+    ASSERT_EQ(r.insn.src.kind, ir::Operand::Kind::Mem);
+    EXPECT_EQ(r.insn.src.mem.base, ir::Reg::Rsi);
+}
+
+TEST_F(LifterTranslate, RepMovsqRexWFixup) {
+    // 48 F3 A5: rep movsq — capstone 实证把 REX.W 丢弃解为 'rep movsd' dword
+    // (id=X86_INS_MOVSD, op_size=4); REX.W 字节扫描修正 → S64 (§A.3 先验
+    // 实测, 与 popcnt REX 扫描同纪律)。
+    const wvmp::u8 b[] = {0x48, 0xF3, 0xA5};
+    auto r = translate_bytes(x64, b, ir::Arch::X64);
+    ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r.insn.op, ir::Op::Mov);
+    EXPECT_EQ(r.insn.size, ir::Size::S64);      // REX.W 修正
+    EXPECT_EQ(r.insn.src2.imm, 0);
+    // F3 先于 REX 的等价编码 (F3 48 A5) capstone 正确报 MOVSQ qword — 两序
+    // 殊途同归
+    const wvmp::u8 b2[] = {0xF3, 0x48, 0xA5};
+    auto r2 = translate_bytes(x64, b2, ir::Arch::X64);
+    ASSERT_EQ(r2.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r2.insn.size, ir::Size::S64);
+}
+
+TEST_F(LifterTranslate, StringMovsdVsSseMovsdDualForm) {
+    // 双形态互斥 (D3 硬判据, 408 纪律): 同 id=X86_INS_MOVSD — F3 A5 双 MEM
+    // = string movsd; F2 0F 10 C1 REG-REG = SSE movsd。两形态互不误纳。
+    const wvmp::u8 str[] = {0xF3, 0xA5};        // rep movsd (string)
+    auto s = translate_bytes(x64, str, ir::Arch::X64);
+    ASSERT_EQ(s.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(s.insn.op, ir::Op::Mov);
+    EXPECT_EQ(s.insn.src2.imm, 0);              // string 族
+    EXPECT_EQ(s.insn.size, ir::Size::S32);
+
+    const wvmp::u8 sse[] = {0xF2, 0x0F, 0x10, 0xC1};  // movsd xmm0, xmm1
+    auto m = translate_bytes(x64, sse, ir::Arch::X64);
+    ASSERT_EQ(m.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(m.insn.op, ir::Op::Movss);        // SSE 路径 (MIT-408 (Movss,S64))
+    EXPECT_EQ(m.insn.size, ir::Size::S64);
+    EXPECT_NE(m.insn.src2.kind, ir::Operand::Kind::Imm);
+}
+
+TEST_F(LifterTranslate, RepStosAndRepneScasLifted) {
+    // F3 AA: rep stosb — family 1, dst=Mem{Rdi}, src=Reg{Rax}
+    const wvmp::u8 sb[] = {0xF3, 0xAA};
+    auto s = translate_bytes(x64, sb, ir::Arch::X64);
+    ASSERT_EQ(s.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(s.insn.op, ir::Op::Mov);
+    EXPECT_EQ(s.insn.src2.imm, 1);
+    EXPECT_EQ(s.insn.size, ir::Size::S8);
+    ASSERT_EQ(s.insn.dst.kind, ir::Operand::Kind::Mem);
+    EXPECT_EQ(s.insn.dst.mem.base, ir::Reg::Rdi);
+    ASSERT_EQ(s.insn.src.kind, ir::Operand::Kind::Reg);
+    EXPECT_EQ(s.insn.src.reg, ir::Reg::Rax);
+    // F2 AE: repne scasb — family 2, cond=Ne, updates_flags=true
+    const wvmp::u8 cb[] = {0xF2, 0xAE};
+    auto c = translate_bytes(x64, cb, ir::Arch::X64);
+    ASSERT_EQ(c.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(c.insn.op, ir::Op::Mov);
+    EXPECT_EQ(c.insn.src2.imm, 2);
+    EXPECT_EQ(c.insn.cond, ir::Cond::Ne);       // repne
+    EXPECT_TRUE(c.insn.updates_flags);          // scas 写 flags
+    ASSERT_EQ(c.insn.dst.kind, ir::Operand::Kind::Reg);
+    EXPECT_EQ(c.insn.dst.reg, ir::Reg::Rax);
+    ASSERT_EQ(c.insn.src.kind, ir::Operand::Kind::Mem);
+    EXPECT_EQ(c.insn.src.mem.base, ir::Reg::Rdi);
+}
+
+TEST_F(LifterTranslate, RepCmpsAndRepLodsLifted) {
+    // F3 A6: repe cmpsb — family 3, updates_flags=true
+    const wvmp::u8 mb[] = {0xF3, 0xA6};
+    auto m = translate_bytes(x64, mb, ir::Arch::X64);
+    ASSERT_EQ(m.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(m.insn.op, ir::Op::Mov);
+    EXPECT_EQ(m.insn.src2.imm, 3);
+    EXPECT_TRUE(m.insn.updates_flags);
+    ASSERT_EQ(m.insn.dst.kind, ir::Operand::Kind::Mem);
+    EXPECT_EQ(m.insn.dst.mem.base, ir::Reg::Rsi);
+    ASSERT_EQ(m.insn.src.kind, ir::Operand::Kind::Mem);
+    EXPECT_EQ(m.insn.src.mem.base, ir::Reg::Rdi);
+    // F3 AC: rep lodsb — family 4, dst=Reg{Rax}, src=Mem{Rsi}
+    const wvmp::u8 lb[] = {0xF3, 0xAC};
+    auto l = translate_bytes(x64, lb, ir::Arch::X64);
+    ASSERT_EQ(l.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(l.insn.op, ir::Op::Mov);
+    EXPECT_EQ(l.insn.src2.imm, 4);
+    EXPECT_FALSE(l.insn.updates_flags);
+    ASSERT_EQ(l.insn.dst.kind, ir::Operand::Kind::Reg);
+    EXPECT_EQ(l.insn.dst.reg, ir::Reg::Rax);
+    ASSERT_EQ(l.insn.src.kind, ir::Operand::Kind::Mem);
+    EXPECT_EQ(l.insn.src.mem.base, ir::Reg::Rsi);
+}
+
+TEST_F(LifterTranslate, RepStringOpNegativesStillGated) {
+    // 负例全谱 (B.1 白名单纪律 — 放行必须 detail 级, 禁 prefix[0]!=0 全放):
+    // rep 前缀非串指令 / lock rep / repne+movs (Intel undefined) / 16 位
+    // (66 砍面, §B.7) / 67 地址宽 / 段覆盖 / 无前缀单发 — 全部照旧 gate。
+    const wvmp::u8 pause[] = {0xF3, 0x90};          // rep nop = pause
+    EXPECT_EQ(translate_bytes(x64, pause, ir::Arch::X64).status,
+              lifter::TranslateStatus::Unsupported);
+    const wvmp::u8 lock_rep[] = {0xF0, 0xF3, 0xA4}; // lock rep movsb
+    EXPECT_EQ(translate_bytes(x64, lock_rep, ir::Arch::X64).status,
+              lifter::TranslateStatus::Unsupported);
+    const wvmp::u8 repne_movsb[] = {0xF2, 0xA4};    // repne movsb (undefined)
+    EXPECT_EQ(translate_bytes(x64, repne_movsb, ir::Arch::X64).status,
+              lifter::TranslateStatus::Unsupported);
+    const wvmp::u8 movsw[] = {0x66, 0xF3, 0xA5};    // 66 = 16 位 movsw → 砍面
+    EXPECT_EQ(translate_bytes(x64, movsw, ir::Arch::X64).status,
+              lifter::TranslateStatus::Unsupported);
+    const wvmp::u8 addr67[] = {0x67, 0xF3, 0xA4};   // 67 地址宽 (ECX 计数)
+    EXPECT_EQ(translate_bytes(x64, addr67, ir::Arch::X64).status,
+              lifter::TranslateStatus::Unsupported);
+    const wvmp::u8 segovr[] = {0x64, 0xF3, 0xA4};   // fs 段覆盖 + rep movsb
+    EXPECT_EQ(translate_bytes(x64, segovr, ir::Arch::X64).status,
+              lifter::TranslateStatus::Unsupported);
+    const wvmp::u8 plain[] = {0xA4};                // 无前缀 movsb (单发) → gate
+    EXPECT_EQ(translate_bytes(x64, plain, ir::Arch::X64).status,
+              lifter::TranslateStatus::Unsupported);
+    const wvmp::u8 plainq[] = {0x48, 0xA5};         // 无前缀 movsq → gate
+    EXPECT_EQ(translate_bytes(x64, plainq, ir::Arch::X64).status,
+              lifter::TranslateStatus::Unsupported);
+}
+
 } // namespace

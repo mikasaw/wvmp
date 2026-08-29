@@ -142,10 +142,14 @@ public:
             // 都会被误 gate）。按前缀过滤，经 ctx.diag 直报（note 级每站点）。
             // MIT-409: jump-table 命中 note 同通道过滤（命中即翻译成功，
             // note 只是 diag 证据，不能触发 gate）。
+            // MIT-415: string-op 命中 note 同通道过滤（微程序翻译成功, DF=0
+            // 假定是披露不是 gate 原因 — 413 纪律对账: 新 note 类型必须进
+            // 过滤白名单, 否则每个含串指令的函数被误 gate, 功能全灭）。
             auto& notes = result.notes;
             for (size_t i = 0; i < notes.size();) {
                 if (notes[i].rfind("exit-native @", 0) == 0 ||
-                    notes[i].rfind("jump-table @", 0) == 0) {
+                    notes[i].rfind("jump-table @", 0) == 0 ||
+                    notes[i].rfind("string-op @", 0) == 0) {
                     ctx.diag.report(Severity::Note, name(), notes[i]);
                     notes.erase(notes.begin() + i);
                 } else {
