@@ -940,20 +940,18 @@ TranslateResult translate_div_idiv(const cs_insn& ci, const cs_x86& x, ir::Arch 
 //     lifter 的 prefix[0] 检查直接拒绝, S16 不走此路径 (派活单限定不支持)
 //   - MEM 形式 (cmpxchg [reg], r) lifter 直接 emit Operand::mem_(...) 到 dst;
 //     翻译器折 Load + Cmpxchg + Store 三条拆条 (与 setcc MEM 路径同结构)
-// MIT-371: SSE 浮点加 addss/addps/addpd (REG-REG only, mod=11).
-// MSVC /Od 默认 codegen REG-REG (mod=11), MSVC x64 不支持 inline asm,
-// 高 level C++ 在 /Od 下用 <intrin.h> 的 _mm_add_ss/_mm_add_ps/_mm_add_pd
-// 内部函数直接 emit 真 SSE 字节（F3 0F 58 / 0F 58 / 66 0F 58）——
-// 无需 MASM helper 强制 codegen（与 MIT-349 popcnt MASM helper 强制 codegen
-// 路径不同, 沿用 MIT-353 lzcnt/tzcnt 的"MSVC /Od 直接 emit 真字节"路径）。
+// MIT-371: SSE 浮点加 addss/addps/addpd (+ MIT-408: addsd 经 (Addss,S64) 编码,
+// 字节 F2 0F 58, scalar double)。
+// MSVC /Od 默认 codegen REG-REG (mod=11); 对全局浮点/数组直接 emit MEM 形式
+// (addss/addsd xmm, [mem], 实测见 MIT-408 §A.1)。
 //   - addss xmm1, xmm2/m32  F3 0F 58 /r  (scalar single, 1 element)
 //   - addps xmm1, xmm2/m128 0F 58 /r     (packed single, 4 elements)
 //   - addpd xmm1, xmm2/m128 66 0F 58 /r  (packed double, 2 elements)
-//   - 2 操作数 (dst + src), 必都是 XMM 寄存器 (派活单限定不支持 MEM form,
-//     lifter 拒 MEM → C1 gate 兜底)。
-//   - size 字段: addss=ir::Size::S32 (scalar 单精度), addps/addpd=ir::Size::S64
+//   - addsd xmm1, xmm2/m64  F2 0F 58 /r  (scalar double, 1 element)
+//   - size 字段: addss=ir::Size::S32 (scalar 单精度), addsd=ir::Size::S64
+//     (scalar 双精度, 与 packed S64 tag 由 Op 区分), addps/addpd=ir::Size::S64
 //     (packed 128-bit; handler 用 movups 全 128-bit 读写)。size 不影响 codegen,
-//     仅作 addss/addps/addpd 的区分 tag（handler 也按 size 派发）。
+//     仅作形式区分 tag（handler 也按 size 派发）。
 //   - updates_flags=false (SSE 浮点加不影响 x86 EFLAGS; MXCSR rounding mode
 //     v1 不追踪)。
 //
@@ -965,12 +963,17 @@ TranslateResult translate_div_idiv(const cs_insn& ci, const cs_x86& x, ir::Arch 
 // 加 24 偏移映射到 VmContext.regs[24..31] (vm_op.hpp 保留槽位 v24..v31 沿用).
 // IR.dst/IR.src.kind 仍为 Kind::Reg, 但 reg 值 0..7 在 SSE Op 语义下
 // 复用为 xmm0..xmm7 (asmgen 看到 reg_a/reg_b 在 [24..31] 区间即按 xmm 处理).
+//
+// MIT-408 (C4b): MEM 形式放开。dst 必为 XMM 寄存器; src 为 XMM 寄存器或
+// 内存 (mem_operand 通用通道, :37)。dst=mem 的读写双访存形态不在首轮范围
+// (派活单 D3 可砍面) → unsupported → C1 gate 兜底。
 TranslateResult translate_sse_add(const cs_insn& ci, const cs_x86& x, ir::Arch arch, Op op,
                                   ir::Size sz) {
     if (x.op_count != 2) return unsupported(ci.address, ci.size);
-    // 两个操作数必都是 XMM 寄存器 (派活单限定不支持 MEM form).
+    // dst 必是 XMM 寄存器; src 是 XMM 寄存器或内存 (MIT-408: MEM form 放开).
     if (x.operands[0].type != X86_OP_REG) return unsupported(ci.address, ci.size);
-    if (x.operands[1].type != X86_OP_REG) return unsupported(ci.address, ci.size);
+    if (x.operands[1].type != X86_OP_REG && x.operands[1].type != X86_OP_MEM)
+        return unsupported(ci.address, ci.size);
     // 手动 XMM 编号映射（X86_REG_XMM0..XMM7 → 0..7），不调 to_operand/map_reg
     // (它们对 XMM* 返回 nullopt, 沿用 SEG/xmm 不可映射的现有约定).
     auto xmm_idx = [&](x86_reg r) -> std::optional<u8> {
@@ -983,8 +986,7 @@ TranslateResult translate_sse_add(const cs_insn& ci, const cs_x86& x, ir::Arch a
         }
     };
     auto di = xmm_idx(x.operands[0].reg);
-    auto si = xmm_idx(x.operands[1].reg);
-    if (!di || !si) return unsupported(ci.address, ci.size);
+    if (!di) return unsupported(ci.address, ci.size);
     // IR Insn.dst.reg / IR.src.reg 借用现有 ir::Reg 值 0..7 (Rax..Rdi), 翻译器
     // 层在 dispatch Addss/Addps/Addpd 时识别 "这是 SSE Op, 加 24 偏移 → v24..v31".
     // 用 static_cast 把 u8 xmm 索引写成 ir::Reg 枚举值（编译期已知 0..7 落在
@@ -996,27 +998,41 @@ TranslateResult translate_sse_add(const cs_insn& ci, const cs_x86& x, ir::Arch a
     out.size = sz;
     out.updates_flags = false;
     out.dst = ir::Operand::reg_(static_cast<ir::Reg>(*di));
-    out.src = ir::Operand::reg_(static_cast<ir::Reg>(*si));
+    if (x.operands[1].type == X86_OP_MEM) {
+        // 内存源: mem_operand 通用通道构造 IR (base/index/scale/disp 齐全),
+        // 翻译器折 XmmLoad(临时槽) + Add 两条 (MIT-408).
+        auto m = mem_operand(x.operands[1].mem);
+        if (!m) return unsupported(ci.address, ci.size);
+        out.src = *m;
+    } else {
+        auto si = xmm_idx(x.operands[1].reg);
+        if (!si) return unsupported(ci.address, ci.size);
+        out.src = ir::Operand::reg_(static_cast<ir::Reg>(*si));
+    }
     return ok(out);
 }
 
-// MIT-373: SSE 浮点减 subss/subps/subpd (REG-REG only, mod=11).
+// MIT-373: SSE 浮点减 subss/subps/subpd (+ MIT-408: subsd 经 (Subss,S64) 编码,
+// 字节 F2 0F 5C, scalar double)。
 // 与 translate_sse_add (MIT-371) 同构: XMM 寄存器编码借用 ir::Reg 值 0..7,
 // 翻译期加 24 偏移 → VmContext.regs[24..31] (XMM 编码设计见上方 MIT-371 注释块).
 //   - subss xmm1, xmm2/m32  F3 0F 5C /r  (scalar single, 1 element)
 //   - subps xmm1, xmm2/m128 0F 5C /r     (packed single, 4 elements)
 //   - subpd xmm1, xmm2/m128 66 0F 5C /r  (packed double, 2 elements)
-//   - size 字段: subss=ir::Size::S32 (scalar 单精度), subps/subpd=ir::Size::S64
-//     (packed 128-bit; handler 用 movups 全 128-bit 读写)。size 不影响 codegen,
-//     仅作 subss/subps/subpd 的区分 tag（handler 也按 size 派发）。
+//   - subsd xmm1, xmm2/m64  F2 0F 5C /r  (scalar double, 1 element)
+//   - size 字段: subss=ir::Size::S32 (scalar 单精度), subsd=ir::Size::S64
+//     (scalar 双精度), subps/subpd=ir::Size::S64 (packed 128-bit; handler
+//     用 movups 全 128-bit 读写)。size 不影响 codegen, 仅作形式区分 tag。
 //   - updates_flags=false (SSE 浮点减不影响 x86 EFLAGS; MXCSR rounding mode
 //     v1 不追踪)。
+// MIT-408 (C4b): MEM 形式放开。dst 必为 XMM 寄存器; src 为 XMM 寄存器或内存。
 TranslateResult translate_sse_sub(const cs_insn& ci, const cs_x86& x, ir::Arch arch, Op op,
                                   ir::Size sz) {
     if (x.op_count != 2) return unsupported(ci.address, ci.size);
-    // 两个操作数必都是 XMM 寄存器 (派活单限定不支持 MEM form).
+    // dst 必是 XMM 寄存器; src 是 XMM 寄存器或内存 (MIT-408: MEM form 放开).
     if (x.operands[0].type != X86_OP_REG) return unsupported(ci.address, ci.size);
-    if (x.operands[1].type != X86_OP_REG) return unsupported(ci.address, ci.size);
+    if (x.operands[1].type != X86_OP_REG && x.operands[1].type != X86_OP_MEM)
+        return unsupported(ci.address, ci.size);
     // 手动 XMM 编号映射（X86_REG_XMM0..XMM7 → 0..7），不调 to_operand/map_reg
     // (它们对 XMM* 返回 nullopt, 沿用 SEG/xmm 不可映射的现有约定).
     auto xmm_idx = [&](x86_reg r) -> std::optional<u8> {
@@ -1029,8 +1045,7 @@ TranslateResult translate_sse_sub(const cs_insn& ci, const cs_x86& x, ir::Arch a
         }
     };
     auto di = xmm_idx(x.operands[0].reg);
-    auto si = xmm_idx(x.operands[1].reg);
-    if (!di || !si) return unsupported(ci.address, ci.size);
+    if (!di) return unsupported(ci.address, ci.size);
     // IR Insn.dst.reg / IR.src.reg 借用现有 ir::Reg 值 0..7 (Rax..Rdi), 翻译器
     // 层在 dispatch Subss/Subps/Subpd 时识别 "这是 SSE Op, 加 24 偏移 → v24..v31".
     // 用 static_cast 把 u8 xmm 索引写成 ir::Reg 枚举值（编译期已知 0..7 落在
@@ -1042,31 +1057,44 @@ TranslateResult translate_sse_sub(const cs_insn& ci, const cs_x86& x, ir::Arch a
     out.size = sz;
     out.updates_flags = false;
     out.dst = ir::Operand::reg_(static_cast<ir::Reg>(*di));
-    out.src = ir::Operand::reg_(static_cast<ir::Reg>(*si));
+    if (x.operands[1].type == X86_OP_MEM) {
+        // 内存源: mem_operand 通用通道 (MIT-408), 翻译器折条.
+        auto m = mem_operand(x.operands[1].mem);
+        if (!m) return unsupported(ci.address, ci.size);
+        out.src = *m;
+    } else {
+        auto si = xmm_idx(x.operands[1].reg);
+        if (!si) return unsupported(ci.address, ci.size);
+        out.src = ir::Operand::reg_(static_cast<ir::Reg>(*si));
+    }
     return ok(out);
 }
 
-// MIT-374: SSE 浮点除 divss/divps/divpd (REG-REG only, mod=11).
+// MIT-374: SSE 浮点除 divss/divps/divpd (+ MIT-408: divsd 经 (Divss,S64) 编码,
+// 字节 F2 0F 5E, scalar double)。
 // 与 translate_sse_sub (MIT-373) / translate_sse_add (MIT-371) 同构: XMM 寄存器
 // 编码借用 ir::Reg 值 0..7, 翻译期加 24 偏移 → VmContext.regs[24..31]
 // (XMM 编码设计见上方 MIT-371 注释块).
 //   - divss xmm1, xmm2/m32  F3 0F 5E /r  (scalar single, 1 element)
 //   - divps xmm1, xmm2/m128 0F 5E /r     (packed single, 4 elements)
 //   - divpd xmm1, xmm2/m128 66 0F 5E /r  (packed double, 2 elements)
+//   - divsd xmm1, xmm2/m64  F2 0F 5E /r  (scalar double, 1 element)
 //   (capstone 5.0.7 实证: F30F5EC1/0F5EC1/660F5EC1 → divss/divps/divpd xmm0,xmm1)
-//   - size 字段: divss=ir::Size::S32 (scalar 单精度), divps/divpd=ir::Size::S64
-//     (packed 128-bit; handler 用 movups 全 128-bit 读写)。size 不影响 codegen,
-//     仅作 divss/divps/divpd 的区分 tag（handler 也按 size 派发）。
+//   - size 字段: divss=ir::Size::S32 (scalar 单精度), divsd=ir::Size::S64
+//     (scalar 双精度), divps/divpd=ir::Size::S64 (packed 128-bit; handler 用
+//     movups 全 128-bit 读写)。size 不影响 codegen, 仅作形式区分 tag。
 //   - 除零 / NaN / 非规格化语义: 由 handler 内的真 div* 指令在 native MXCSR
 //     下保真执行 (与未保护路径同一舍入模式), v1 不额外追踪。
 //   - updates_flags=false (SSE 浮点除不影响 x86 EFLAGS; MXCSR rounding mode
 //     v1 不追踪)。
+// MIT-408 (C4b): MEM 形式放开。dst 必为 XMM 寄存器; src 为 XMM 寄存器或内存。
 TranslateResult translate_sse_div(const cs_insn& ci, const cs_x86& x, ir::Arch arch, Op op,
                                   ir::Size sz) {
     if (x.op_count != 2) return unsupported(ci.address, ci.size);
-    // 两个操作数必都是 XMM 寄存器 (派活单限定不支持 MEM form).
+    // dst 必是 XMM 寄存器; src 是 XMM 寄存器或内存 (MIT-408: MEM form 放开).
     if (x.operands[0].type != X86_OP_REG) return unsupported(ci.address, ci.size);
-    if (x.operands[1].type != X86_OP_REG) return unsupported(ci.address, ci.size);
+    if (x.operands[1].type != X86_OP_REG && x.operands[1].type != X86_OP_MEM)
+        return unsupported(ci.address, ci.size);
     // 手动 XMM 编号映射（X86_REG_XMM0..XMM7 → 0..7），不调 to_operand/map_reg
     // (它们对 XMM* 返回 nullopt, 沿用 SEG/xmm 不可映射的现有约定).
     auto xmm_idx = [&](x86_reg r) -> std::optional<u8> {
@@ -1079,8 +1107,7 @@ TranslateResult translate_sse_div(const cs_insn& ci, const cs_x86& x, ir::Arch a
         }
     };
     auto di = xmm_idx(x.operands[0].reg);
-    auto si = xmm_idx(x.operands[1].reg);
-    if (!di || !si) return unsupported(ci.address, ci.size);
+    if (!di) return unsupported(ci.address, ci.size);
     // IR Insn.dst.reg / IR.src.reg 借用现有 ir::Reg 值 0..7 (Rax..Rdi), 翻译器
     // 层在 dispatch Divss/Divps/Divpd 时识别 "这是 SSE Op, 加 24 偏移 → v24..v31".
     // 用 static_cast 把 u8 xmm 索引写成 ir::Reg 枚举值（编译期已知 0..7 落在
@@ -1092,30 +1119,60 @@ TranslateResult translate_sse_div(const cs_insn& ci, const cs_x86& x, ir::Arch a
     out.size = sz;
     out.updates_flags = false;
     out.dst = ir::Operand::reg_(static_cast<ir::Reg>(*di));
-    out.src = ir::Operand::reg_(static_cast<ir::Reg>(*si));
+    if (x.operands[1].type == X86_OP_MEM) {
+        // 内存源: mem_operand 通用通道 (MIT-408), 翻译器折条.
+        auto m = mem_operand(x.operands[1].mem);
+        if (!m) return unsupported(ci.address, ci.size);
+        out.src = *m;
+    } else {
+        auto si = xmm_idx(x.operands[1].reg);
+        if (!si) return unsupported(ci.address, ci.size);
+        out.src = ir::Operand::reg_(static_cast<ir::Reg>(*si));
+    }
     return ok(out);
 }
 
-// MIT-375: SSE 浮点传送 (movss / movaps / movapd / movups / movupd, REG-REG load 方向 only).
+// MIT-375: SSE 浮点传送 (movss / movaps / movapd / movups / movupd,
+// + MIT-408: movsd 经 (Movss,S64) 编码, 字节 F2 0F 10/11)。
 // 与 translate_sse_div 同构: XMM 寄存器编码借用 ir::Reg 值 0..7, 翻译期加 24 偏移 →
 // VmContext.regs[24..31] (XMM 编码设计见 MIT-371 注释块).
 //   - movss  xmm1, xmm2       F3 0F 10 /r   (标量: **只搬低 32 位, 高 96 位保持不变**;
-//     清零语义只属于内存源形式 movss xmm,[m32], 本单不支持 —— 见 asmgen
-//     build_movss 注释里的本机实测真值表)
+//     内存源形式 movss xmm,[m32] 的**清零**语义由 XmmLoad handler 的 native
+//     movss 直产, SDM: 内存源清零高位)
+//   - movsd  xmm1, xmm2/m64   F2 0F 10 /r   (标量: 只搬低 64 位, 高位保持;
+//     内存源形式清零高位, 同 movss 语义)
 //   - movaps xmm1, xmm2/m128  0F 28 /r      (对齐, 全 128-bit 搬)
 //   - movapd xmm1, xmm2/m128  66 0F 28 /r   (对齐, 全 128-bit 搬)
 //   - movups xmm1, xmm2/m128  0F 10 /r      (未对齐, 全 128-bit 搬)
 //   - movupd xmm1, xmm2/m128  66 0F 10 /r   (未对齐, 全 128-bit 搬)
 // capstone 实证: load 方向 reg,reg 报 X86_INS_MOVSS/MOVAPS/MOVAPD/MOVUPS/MOVUPD;
-//   store 方向 / MEM 形式 lifter 拒 → C1 gate 兜底保持原生.
-//   - size 字段: Movss=ir::Size::S32, 其余 4 条=ir::Size::S64.
+//   store 方向 / MEM 形式 lifter 拒 → C1 gate 兜底保持原生 (MIT-375 限定,
+//   MIT-408 放开, 见下)。
+//   - size 字段: Movss=ir::Size::S32 (movss), Movss+S64=(movsd),
+//     其余 4 条=ir::Size::S64 (movaps/movapd/movups/movupd)。
 //   - updates_flags=false.
+//
+// MIT-408 (C4b): MEM 形式放开 (派活单 §A.3 读/写两类):
+//   - dst=Reg, src=Mem  (load 方向): movss/movsd/movaps/movapd/movups/movupd
+//     xmm, [mem] → 翻译器 emit_address + XmmLoad (宽度 aux=4/8/16)。
+//   - dst=Mem, src=Reg  (store 方向): movss/movsd/movaps/movapd/movups/movupd
+//     [mem], xmm → 翻译器 emit_address + XmmStore。
+//   - 双 MEM (string movsd A5 报 X86_INS_MOVSD 同 id, capstone 实证) 非法 →
+//     unsupported → C1 gate 兜底保持原生。
+//   - movaps/movapd 的 mem 形式运行时一律 movups 非对齐语义 (D2: PE 不保证
+//     全局 16B 对齐)。
 TranslateResult translate_sse_mov(const cs_insn& ci, const cs_x86& x, ir::Arch arch, Op op,
                                   ir::Size sz) {
     if (x.op_count != 2) return unsupported(ci.address, ci.size);
-    // 两个操作数必都是 XMM 寄存器 (派活单限定不支持 MEM form).
-    if (x.operands[0].type != X86_OP_REG) return unsupported(ci.address, ci.size);
-    if (x.operands[1].type != X86_OP_REG) return unsupported(ci.address, ci.size);
+    // 形式矩阵: (Reg,Reg) REG-REG / (Reg,Mem) load / (Mem,Reg) store;
+    // (Mem,Mem) string movsd → unsupported (C1 gate 兜底).
+    const bool dst_reg = x.operands[0].type == X86_OP_REG;
+    const bool dst_mem = x.operands[0].type == X86_OP_MEM;
+    const bool src_reg = x.operands[1].type == X86_OP_REG;
+    const bool src_mem = x.operands[1].type == X86_OP_MEM;
+    if (dst_mem && src_mem) return unsupported(ci.address, ci.size);  // string movsd
+    if (!dst_reg && !dst_mem) return unsupported(ci.address, ci.size);
+    if (!src_reg && !src_mem) return unsupported(ci.address, ci.size);
     // 手动 XMM 编号映射 (X86_REG_XMM0..XMM7 → 0..7).
     auto xmm_idx = [&](x86_reg r) -> std::optional<u8> {
         switch (r) {
@@ -1126,23 +1183,39 @@ TranslateResult translate_sse_mov(const cs_insn& ci, const cs_x86& x, ir::Arch a
         default: return std::nullopt;
         }
     };
-    auto di = xmm_idx(x.operands[0].reg);
-    auto si = xmm_idx(x.operands[1].reg);
-    if (!di || !si) return unsupported(ci.address, ci.size);
-    // IR Insn.dst.reg / IR.src.reg 借用 ir::Reg 值 0..7, 翻译器层在 dispatch
-    // Movss/Movaps/Movapd/Movups/Movupd 时识别 SSE Op, 加 24 偏移 → v24..v31.
     (void)arch;
     ir::Insn out;
     out.op = op;
     out.addr = ci.address;
     out.size = sz;
     out.updates_flags = false;
+    if (dst_mem) {
+        // store 方向: [mem], xmm (src 必为 XMM 寄存器)
+        auto m = mem_operand(x.operands[0].mem);
+        if (!m) return unsupported(ci.address, ci.size);
+        out.dst = *m;
+        auto si = xmm_idx(x.operands[1].reg);
+        if (!si) return unsupported(ci.address, ci.size);
+        out.src = ir::Operand::reg_(static_cast<ir::Reg>(*si));
+        return ok(out);
+    }
+    auto di = xmm_idx(x.operands[0].reg);
+    if (!di) return unsupported(ci.address, ci.size);
     out.dst = ir::Operand::reg_(static_cast<ir::Reg>(*di));
-    out.src = ir::Operand::reg_(static_cast<ir::Reg>(*si));
+    if (src_mem) {
+        // load 方向: xmm, [mem]
+        auto m = mem_operand(x.operands[1].mem);
+        if (!m) return unsupported(ci.address, ci.size);
+        out.src = *m;
+    } else {
+        auto si = xmm_idx(x.operands[1].reg);
+        if (!si) return unsupported(ci.address, ci.size);
+        out.src = ir::Operand::reg_(static_cast<ir::Reg>(*si));
+    }
     return ok(out);
 }
 
-// MIT-376: SSE 浮点位运算 xorps/orps/andps (REG-REG only, mod=11).
+// MIT-376: SSE 浮点位运算 xorps/orps/andps (+ MIT-408: MEM 形式放开)。
 // 与 translate_sse_div (MIT-374) 同构: XMM 寄存器编码借用 ir::Reg 值 0..7,
 // 翻译期加 24 偏移 → VmContext.regs[24..31] (XMM 编码设计见 MIT-371 注释块).
 //   - xorps xmm1, xmm2/m128  0F 57 /r   (bitwise xor, 全 128-bit 按位)
@@ -1153,12 +1226,14 @@ TranslateResult translate_sse_mov(const cs_insn& ci, const cs_x86& x, ir::Arch a
 //     size 不影响 codegen, 仅作形式区分 tag。
 //   - updates_flags=false (SSE 位运算不影响 x86 EFLAGS — 位运算不解释浮点值,
 //     不产 NaN/无序; 与 add/sub/div 同口径)。
+// MIT-408 (C4b): MEM 形式放开。dst 必为 XMM 寄存器; src 为 XMM 寄存器或内存。
 TranslateResult translate_sse_bitwise(const cs_insn& ci, const cs_x86& x, ir::Arch arch, Op op,
                                       ir::Size sz) {
     if (x.op_count != 2) return unsupported(ci.address, ci.size);
-    // 两个操作数必都是 XMM 寄存器 (派活单限定不支持 MEM form).
+    // dst 必是 XMM 寄存器; src 是 XMM 寄存器或内存 (MIT-408: MEM form 放开).
     if (x.operands[0].type != X86_OP_REG) return unsupported(ci.address, ci.size);
-    if (x.operands[1].type != X86_OP_REG) return unsupported(ci.address, ci.size);
+    if (x.operands[1].type != X86_OP_REG && x.operands[1].type != X86_OP_MEM)
+        return unsupported(ci.address, ci.size);
     // 手动 XMM 编号映射 (X86_REG_XMM0..XMM7 → 0..7), 不调 to_operand/map_reg.
     auto xmm_idx = [&](x86_reg r) -> std::optional<u8> {
         switch (r) {
@@ -1170,8 +1245,7 @@ TranslateResult translate_sse_bitwise(const cs_insn& ci, const cs_x86& x, ir::Ar
         }
     };
     auto di = xmm_idx(x.operands[0].reg);
-    auto si = xmm_idx(x.operands[1].reg);
-    if (!di || !si) return unsupported(ci.address, ci.size);
+    if (!di) return unsupported(ci.address, ci.size);
     (void)arch;
     ir::Insn out;
     out.op = op;
@@ -1179,11 +1253,21 @@ TranslateResult translate_sse_bitwise(const cs_insn& ci, const cs_x86& x, ir::Ar
     out.size = sz;
     out.updates_flags = false;
     out.dst = ir::Operand::reg_(static_cast<ir::Reg>(*di));
-    out.src = ir::Operand::reg_(static_cast<ir::Reg>(*si));
+    if (x.operands[1].type == X86_OP_MEM) {
+        // 内存源: mem_operand 通用通道 (MIT-408), 翻译器折条.
+        auto m = mem_operand(x.operands[1].mem);
+        if (!m) return unsupported(ci.address, ci.size);
+        out.src = *m;
+    } else {
+        auto si = xmm_idx(x.operands[1].reg);
+        if (!si) return unsupported(ci.address, ci.size);
+        out.src = ir::Operand::reg_(static_cast<ir::Reg>(*si));
+    }
     return ok(out);
 }
 
-// MIT-376: SSE 浮点比较 ucomiss/ucomisd (REG-REG only, mod=11).
+// MIT-376: SSE 浮点比较 ucomiss/ucomisd (+ MIT-408: MEM 形式放开, 派活单 D4
+// "ucomis src=mem 必做")。
 // 与 translate_sse_bitwise 同构, 关键差异: **updates_flags=true** —
 // ucomiss/ucomisd 比较后只写 EFLAGS (ZF/PF/CF), 不改 xmm 操作数; 翻译器
 // emit 单条 VmOp::Ucomiss/Ucomisd, 运行时 handler 走 ALU binop 同一条
@@ -1196,12 +1280,14 @@ TranslateResult translate_sse_bitwise(const cs_insn& ci, const cs_x86& x, ir::Ar
 //    F3 0F 2E 编码不存在; comiss/comisd = 0F 2F 系, 不在本单范围 → C1 gate)
 //   - NaN → unordered → ZF=PF=CF=1, 按 Intel SDM UCOMISD/UCOMISS 真值表
 //     (OF/SF/AF 清 0); 完整 x87 式语义细分不做 (D1.1 限定)。
+// MIT-408 (C4b): MEM 形式放开。dst 必为 XMM 寄存器; src 为 XMM 寄存器或内存。
 TranslateResult translate_ucomis(const cs_insn& ci, const cs_x86& x, ir::Arch arch, Op op,
                                  ir::Size sz) {
     if (x.op_count != 2) return unsupported(ci.address, ci.size);
-    // 两个操作数必都是 XMM 寄存器 (派活单限定不支持 MEM form).
+    // dst 必是 XMM 寄存器; src 是 XMM 寄存器或内存 (MIT-408: MEM form 放开).
     if (x.operands[0].type != X86_OP_REG) return unsupported(ci.address, ci.size);
-    if (x.operands[1].type != X86_OP_REG) return unsupported(ci.address, ci.size);
+    if (x.operands[1].type != X86_OP_REG && x.operands[1].type != X86_OP_MEM)
+        return unsupported(ci.address, ci.size);
     // 手动 XMM 编号映射 (X86_REG_XMM0..XMM7 → 0..7), 不调 to_operand/map_reg.
     auto xmm_idx = [&](x86_reg r) -> std::optional<u8> {
         switch (r) {
@@ -1213,8 +1299,7 @@ TranslateResult translate_ucomis(const cs_insn& ci, const cs_x86& x, ir::Arch ar
         }
     };
     auto di = xmm_idx(x.operands[0].reg);
-    auto si = xmm_idx(x.operands[1].reg);
-    if (!di || !si) return unsupported(ci.address, ci.size);
+    if (!di) return unsupported(ci.address, ci.size);
     (void)arch;
     ir::Insn out;
     out.op = op;
@@ -1222,7 +1307,16 @@ TranslateResult translate_ucomis(const cs_insn& ci, const cs_x86& x, ir::Arch ar
     out.size = sz;
     out.updates_flags = true;
     out.dst = ir::Operand::reg_(static_cast<ir::Reg>(*di));
-    out.src = ir::Operand::reg_(static_cast<ir::Reg>(*si));
+    if (x.operands[1].type == X86_OP_MEM) {
+        // 内存源: mem_operand 通用通道 (MIT-408), 翻译器折条.
+        auto m = mem_operand(x.operands[1].mem);
+        if (!m) return unsupported(ci.address, ci.size);
+        out.src = *m;
+    } else {
+        auto si = xmm_idx(x.operands[1].reg);
+        if (!si) return unsupported(ci.address, ci.size);
+        out.src = ir::Operand::reg_(static_cast<ir::Reg>(*si));
+    }
     return ok(out);
 }
 
@@ -1457,6 +1551,9 @@ TranslateResult translate_insn(const cs_insn& ci, ir::Arch arch) {
     case X86_INS_ADDSS: return translate_sse_add(ci, x, arch, Op::Addss, Size::S32);
     case X86_INS_ADDPS: return translate_sse_add(ci, x, arch, Op::Addps, Size::S64);
     case X86_INS_ADDPD: return translate_sse_add(ci, x, arch, Op::Addpd, Size::S64);
+    // MIT-408: addsd (F2 0F 58, scalar double) 经 (Addss,S64) 编码 —
+    // ir::Op 冻结不可增枚举, (op,size) 组合在旧 lifter 中从不产生, 无歧义.
+    case X86_INS_ADDSD: return translate_sse_add(ci, x, arch, Op::Addss, Size::S64);
     // MIT-373: SSE 浮点减 subss/subps/subpd (REG-REG only, mod=11).
     //   - subss xmm1, xmm2/m32  F3 0F 5C /r  (scalar single, size=S32)
     //   - subps xmm1, xmm2/m128 0F 5C /r     (packed single, size=S64)
@@ -1466,6 +1563,8 @@ TranslateResult translate_insn(const cs_insn& ci, ir::Arch arch) {
     case X86_INS_SUBSS: return translate_sse_sub(ci, x, arch, Op::Subss, Size::S32);
     case X86_INS_SUBPS: return translate_sse_sub(ci, x, arch, Op::Subps, Size::S64);
     case X86_INS_SUBPD: return translate_sse_sub(ci, x, arch, Op::Subpd, Size::S64);
+    // MIT-408: subsd (F2 0F 5C, scalar double) 经 (Subss,S64) 编码.
+    case X86_INS_SUBSD: return translate_sse_sub(ci, x, arch, Op::Subss, Size::S64);
     // MIT-374: SSE 浮点除 divss/divps/divpd (REG-REG only, mod=11).
     //   - divss xmm1, xmm2/m32  F3 0F 5E /r  (scalar single, size=S32)
     //   - divps xmm1, xmm2/m128 0F 5E /r     (packed single, size=S64)
@@ -1476,6 +1575,8 @@ TranslateResult translate_insn(const cs_insn& ci, ir::Arch arch) {
     case X86_INS_DIVSS: return translate_sse_div(ci, x, arch, Op::Divss, Size::S32);
     case X86_INS_DIVPS: return translate_sse_div(ci, x, arch, Op::Divps, Size::S64);
     case X86_INS_DIVPD: return translate_sse_div(ci, x, arch, Op::Divpd, Size::S64);
+    // MIT-408: divsd (F2 0F 5E, scalar double) 经 (Divss,S64) 编码.
+    case X86_INS_DIVSD: return translate_sse_div(ci, x, arch, Op::Divss, Size::S64);
     // MIT-375: SSE 浮点传送 movss/movaps/movapd/movups/movupd (REG-REG load only).
     //   - movss  F3 0F 10 /r (标量, 只搬低 32 位/高位保持) / movaps 0F 28 /r /
     //     movapd 66 0F 28 /r / movups 0F 10 /r / movupd 66 0F 10 /r
@@ -1485,6 +1586,11 @@ TranslateResult translate_insn(const cs_insn& ci, ir::Arch arch) {
     case X86_INS_MOVAPD: return translate_sse_mov(ci, x, arch, Op::Movapd, Size::S64);
     case X86_INS_MOVUPS: return translate_sse_mov(ci, x, arch, Op::Movups, Size::S64);
     case X86_INS_MOVUPD: return translate_sse_mov(ci, x, arch, Op::Movupd, Size::S64);
+    // MIT-408: movsd (F2 0F 10/11, scalar double, load/store 双向) 经
+    // (Movss,S64) 编码。capstone 把 string movsd (A5, mem,mem) 与 SSE movsd
+    // 报同一 X86_INS_MOVSD (实证 id=486) — 由 translate_sse_mov 的双 MEM
+    // 拒绝规则区分, string 形式落 C1 gate 兜底.
+    case X86_INS_MOVSD: return translate_sse_mov(ci, x, arch, Op::Movss, Size::S64);
     // MIT-376: SSE 浮点位运算 xorps/orps/andps (REG-REG only, mod=11).
     //   - xorps 0F 57 /r / orps 0F 56 /r / andps 0F 54 /r (全 128-bit 按位,
     //     size=S64)。updates_flags=false (位运算不影响 EFLAGS)。

@@ -211,6 +211,21 @@ u8 emit_load(Emitter& em, Scratch& sc, const ir::MemOperand& m, ir::Size size,
     return val;
 }
 
+// MIT-408: SSE mem 形式访存宽度 (SDM Vol.2 宽度语义): ss=4B / sd=8B /
+// ps,pd=16B 全量。ir::Op 冻结不可增枚举 → (op,Size::S64) 双语义:
+// (Movss/Addss/Subss/Divss,S64) = scalar double (sd) 8B; packed (ps/pd)
+// 恒 S64 = 16B; Ucomisd = 8B; 其余 S32 形式 = 4B。
+[[nodiscard]] u32 sse_mem_width(ir::Op op, ir::Size sz) {
+    if (sz == ir::Size::S32) return 4;
+    switch (op) {
+    case ir::Op::Movss: case ir::Op::Addss: case ir::Op::Subss: case ir::Op::Divss:
+    case ir::Op::Ucomiss: case ir::Op::Ucomisd:
+        return 8;  // (op,S64) = sd 标量双精度 / ucomisd
+    default:
+        return 16;  // ps/pd packed 全 128-bit
+    }
+}
+
 [[nodiscard]] bool is_alu_binop(ir::Op op) {
     switch (op) {
     case ir::Op::Add: case ir::Op::Sub: case ir::Op::Adc: case ir::Op::Sbb:
@@ -262,6 +277,23 @@ struct Translator {
             what = "rip-relative 未支持";
         add_note(notes, in.addr, what);
         return false;
+    }
+
+    // MIT-408: SSE mem 操作数 → 地址槽折条。emit_address 出 acc (rip 形式为
+    // RVA, 非 rip 为绝对 VA); rip 形式追加既有 LeaRva (RVA + image_base →
+    // VA, 与 LoadRva/StoreRva 同通道), 统一后 XmmLoad/XmmStore 按绝对 VA 访存。
+    // 返回 false = 非法 scale / 越界 RVA → caller skip → C1 gate 兜底.
+    [[nodiscard]] bool emit_sse_mem_addr(Emitter& em, Scratch& sc,
+                                         const ir::MemOperand& m,
+                                         u64 current_rva, u64 next_ip, u8& acc_out) {
+        u8 acc = 0;
+        if (!emit_address(em, sc, m, current_rva, next_ip, acc)) return false;
+        if (m.base == ir::Reg::Rip) {
+            const u8 sz64 = isa::size_field(ir::Size::S64);
+            em.emit_rr(VmOp::LeaRva, acc, acc, sz64);  // RVA→VA (in-place, 读先于写)
+        }
+        acc_out = acc;
+        return true;
     }
 
     void run(const ir::Insn& in) {
@@ -321,49 +353,36 @@ struct Translator {
                 ok = translate_tzcnt(em, in);
             } else if (in.op == ir::Op::Addss || in.op == ir::Op::Addps || in.op == ir::Op::Addpd) {
                 // MIT-371: SSE 浮点加 dispatch — REG-REG 形式 emit 单条
-                // VmOp::Addss/Addps/Addpd (handler 用 native addss/addps/addpd
-                // 完成浮点加; src 必是 XMM 派活单限定). IR.dst.reg/IR.src.reg
-                // 是 xmm0..xmm7 编号 (lifter 借用 ir::Reg 值 0..7), 翻译期
-                // 加 24 偏移映射到 VmContext.regs[24..31] 保留槽位.
-                ok = translate_sse_add(em, in);
+                // VmOp::Addss/Addps/Addpd; MEM 源 (MIT-408) emit
+                // LeaRva?+XmmLoad(临时双槽)+ALU 三条 (translate_sse_add
+                // 内部展开; (Addss,S64)=addsd → VmOp::Addsd)。
+                ok = translate_sse_add(em, sc, in, current_rva, next_ip);
             } else if (in.op == ir::Op::Subss || in.op == ir::Op::Subps || in.op == ir::Op::Subpd) {
-                // MIT-373: SSE 浮点减 dispatch — REG-REG 形式 emit 单条
-                // VmOp::Subss/Subps/Subpd (handler 用 native subss/subps/subpd
-                // 完成浮点减; src 必是 XMM 派活单限定). IR.dst.reg/IR.src.reg
-                // 是 xmm0..xmm7 编号 (lifter 借用 ir::Reg 值 0..7), 翻译期
-                // 加 24 偏移映射到 VmContext.regs[24..31] 保留槽位.
-                ok = translate_sse_sub(em, in);
+                // MIT-373: SSE 浮点减 dispatch — REG-REG emit 单条; MEM 源
+                // (MIT-408) 折条同 add; (Subss,S64)=subsd → VmOp::Subsd。
+                ok = translate_sse_sub(em, sc, in, current_rva, next_ip);
             } else if (in.op == ir::Op::Divss || in.op == ir::Op::Divps || in.op == ir::Op::Divpd) {
-                // MIT-374: SSE 浮点除 dispatch — REG-REG 形式 emit 单条
-                // VmOp::Divss/Divps/Divpd (handler 用 native divss/divps/divpd
-                // 完成浮点除; src 必是 XMM 派活单限定). IR.dst.reg/IR.src.reg
-                // 是 xmm0..xmm7 编号 (lifter 借用 ir::Reg 值 0..7), 翻译期
-                // 加 24 偏移映射到 VmContext.regs[24..31] 保留槽位.
-                ok = translate_sse_div(em, in);
+                // MIT-374: SSE 浮点除 dispatch — REG-REG emit 单条; MEM 源
+                // (MIT-408) 折条同 add; (Divss,S64)=divsd → VmOp::Divsd。
+                ok = translate_sse_div(em, sc, in, current_rva, next_ip);
             } else if (in.op == ir::Op::Movss || in.op == ir::Op::Movaps ||
                        in.op == ir::Op::Movapd || in.op == ir::Op::Movups ||
                        in.op == ir::Op::Movupd) {
                 // MIT-375: SSE 浮点传送 dispatch — REG-REG load 形式 emit 单条
-                // VmOp::Movss/Movaps/Movapd/Movups/Movupd (handler 用 movss/movups
-                // 在 ctx.xmm 槽间搬数据; 操作数必是 XMM 派活单限定). IR.dst.reg/
-                // IR.src.reg 是 xmm0..xmm7 编号 (lifter 借用 ir::Reg 值 0..7),
-                // 翻译期加 24 偏移映射到 VmContext.regs[24..31] 保留槽位.
-                ok = translate_sse_mov(em, in);
+                // VmOp::Movss/Movaps/Movapd/Movups/Movupd; MEM load/store
+                // (MIT-408) emit XmmLoad/XmmStore (translate_sse_mov 内部展开;
+                // (Movss,S64)=movsd → VmOp::Movsd)。IR.dst.reg/IR.src.reg
+                // 是 xmm0..xmm7 编号 (lifter 借用 ir::Reg 值 0..7), 翻译期
+                // 加 24 偏移映射到 VmContext.regs[24..31] 保留槽位.
+                ok = translate_sse_mov(em, sc, in, current_rva, next_ip);
             } else if (in.op == ir::Op::Xorps || in.op == ir::Op::Orps || in.op == ir::Op::Andps) {
                 // MIT-376: SSE 浮点位运算 dispatch — REG-REG 形式 emit 单条
-                // VmOp::Xorps/Orps/Andps (handler 沿用 MIT-375 build_xmm_transfer
-                // 四步模板, 中间行为 native xorps/orps/andps; 操作数必是 XMM
-                // 派活单限定). IR.dst.reg/IR.src.reg 是 xmm0..xmm7 编号 (lifter
-                // 借用 ir::Reg 值 0..7), 翻译期加 24 偏移映射到
-                // VmContext.regs[24..31] 保留槽位.
-                ok = translate_sse_bitwise(em, in);
+                // VmOp::Xorps/Orps/Andps; MEM 源 (MIT-408) 折条同 add。
+                ok = translate_sse_bitwise(em, sc, in, current_rva, next_ip);
             } else if (in.op == ir::Op::Ucomiss || in.op == ir::Op::Ucomisd) {
                 // MIT-376: SSE 浮点比较 dispatch — REG-REG 形式 emit 单条
-                // VmOp::Ucomiss/Ucomisd (handler 走 ALU binop 同一条 flags 通路
-                // zero5 → native ucomis* → setcc5 → flags_tail, 让区域内紧随的
-                // setcc/jcc 读到真比较结果; 派活单 §D D1.1, 禁止空转 pitfall #79).
-                // 操作数必是 XMM 派活单限定; xmm 槽映射同上.
-                ok = translate_ucomis(em, in);
+                // VmOp::Ucomiss/Ucomisd; MEM 源 (MIT-408, D4 必做) 折条同 add。
+                ok = translate_ucomis(em, sc, in, current_rva, next_ip);
             } else if (in.op == ir::Op::Cdq) {
                 // MIT-404: cdq/cqo dispatch — 零操作数 (隐式 rax→rdx 符号扩展),
                 // emit 单条 VmOp::Cdq, handler 按 size 选 native 99 / 48 99 直通。
@@ -1043,7 +1062,7 @@ struct Translator {
         return true;
     }
 
-    // ---- MIT-371: SSE 浮点加 addss/addps/addpd ----
+    // ---- MIT-371: SSE 浮点加 addss/addps/addpd (+ MIT-408: addsd) ----
     //
     // lifter 用 IR.dst.reg / IR.src.reg 借用 ir::Reg 值 0..7 (Rax..Rdi),
     // 翻译期加 24 偏移映射到 VmContext.regs[24..31] 保留槽位 (vm_op.hpp
@@ -1051,79 +1070,124 @@ struct Translator {
     // 字节码, 真正 xmm 物理寄存器寻址在 handler (asmgen.cpp) 用 movups +
     // native addss/addps/addpd 完成.
     //
-    // 编码: a_kind=Reg reg_a=xmm_slot, b_kind=Reg reg_b=xmm_slot, aux=0,
-    //       cond_or_size=ir::Size (S32=Addss scalar, S64=Addps/Addpd packed).
-    //       字节码布局与 popcnt/lzcnt/tzcnt 完全一致 (2 操作数 REG-REG).
-    bool translate_sse_add(Emitter& em, const ir::Insn& in) {
+    // MIT-408 (C4b) MEM 源形式: `addss/addsd xmm, [mem]` → emit_address
+    // (+ LeaRva 若 rip) → XmmLoad 把 [VA] 按宽度 (aux=4/8/16) 读进 **GP
+    // scratch 双槽** (v18..v23 两两, 16B 覆盖 vN+vN+1, 指令边界后即死,
+    // 不与 xmm 槽互踩) → ALU(xmm_dst_slot, gp_pair)。ALU handler 的 src
+    // 读取 (load_src_slot_into_xmm1) 按 reg<24 走 GP 双槽寻址。
+    // (Addss,S64) = addsd (ir::Op 冻结不可增枚举, (op,size) 组合旧 lifter
+    // 从不产生, 无歧义)。
+    //
+    // 编码: a_kind=Reg reg_a=xmm_slot, b_kind=Reg reg_b=xmm_slot (REG-REG)
+    //   或 gp_pair (MEM 源), aux=0 (REG-REG) / 4|8|16 (MEM 源, XmmLoad 宽度),
+    //       cond_or_size=ir::Size。
+    bool translate_sse_add(Emitter& em, Scratch& sc, const ir::Insn& in,
+                           u64 current_rva, u64 next_ip) {
         if (in.op != ir::Op::Addss && in.op != ir::Op::Addps && in.op != ir::Op::Addpd)
             return false;
-        if (in.dst.kind != ir::Operand::Kind::Reg ||
-            in.src.kind != ir::Operand::Kind::Reg)
+        if (in.dst.kind != ir::Operand::Kind::Reg)
             return skip(in, "SSE 浮点加 操作数形态未支持", nullptr);
-        // IR.dst.reg / IR.src.reg 在 lifter 借用 ir::Reg 值 0..7 代表 xmm0..7.
-        // static_cast<u8> 拿到原始 u8 索引, 加 24 偏移到 VmContext.regs[24..31].
-        const u8 xmm_dst_slot = static_cast<u8>(in.dst.reg) + 24u;
-        const u8 xmm_src_slot = static_cast<u8>(in.src.reg) + 24u;
-        VmOp vop = (in.op == ir::Op::Addss) ? VmOp::Addss :
+        VmOp vop = (in.op == ir::Op::Addss) ?
+                       (in.size == ir::Size::S32 ? VmOp::Addss : VmOp::Addsd) :
                    (in.op == ir::Op::Addps) ? VmOp::Addps : VmOp::Addpd;
+        const u8 xmm_dst_slot = static_cast<u8>(in.dst.reg) + 24u;
+        if (in.src.kind == ir::Operand::Kind::Mem) {
+            // MEM 源: XmmLoad(临时双槽) + ALU(xmm_dst, 临时双槽)。
+            // scratch 预算: emit_address ≤4 + 临时双槽 1 = ≤5, 在 6 预算内。
+            u8 acc = 0;
+            if (!emit_sse_mem_addr(em, sc, in.src.mem, current_rva, next_ip, acc))
+                return skip(in, "SSE 浮点加 地址形态未支持", &in.src.mem);
+            const u8 pair = sc.take();  // 占用 pair 与 pair+1 (16B GP 双槽)
+            em.emit(VmOp::XmmLoad, OpKind::Reg, pair, OpKind::Reg, acc,
+                    sse_mem_width(in.op, in.size), isa::size_field(ir::Size::S64));
+            em.emit_rr(vop, xmm_dst_slot, pair, isa::size_field(in.size));
+            return true;
+        }
+        if (in.src.kind != ir::Operand::Kind::Reg)
+            return skip(in, "SSE 浮点加 操作数形态未支持", nullptr);
+        const u8 xmm_src_slot = static_cast<u8>(in.src.reg) + 24u;
         em.emit_rr(vop, xmm_dst_slot, xmm_src_slot, isa::size_field(in.size));
         return true;
     }
 
-    // ---- MIT-373: SSE 浮点减 subss/subps/subpd ----
+    // ---- MIT-373: SSE 浮点减 subss/subps/subpd (+ MIT-408: subsd) ----
     //
-    // lifter 用 IR.dst.reg / IR.src.reg 借用 ir::Reg 值 0..7 (Rax..Rdi),
-    // 翻译期加 24 偏移映射到 VmContext.regs[24..31] 保留槽位 (vm_op.hpp
-    // 注释 v24..v31 保留, 这里用作 xmm0..xmm7 VM 槽). 翻译器只负责 emit
-    // 字节码, 真正 xmm 物理寄存器寻址在 handler (asmgen.cpp) 用 movups +
-    // native subss/subps/subpd 完成. 与 MIT-371 translate_sse_add 同构.
+    // 与 MIT-371 translate_sse_add 完全同构: lifter 用 IR.dst.reg / IR.src.reg
+    // 借用 ir::Reg 值 0..7 (Rax..Rdi), 翻译期加 24 偏移映射到
+    // VmContext.regs[24..31] 保留槽位 (这里用作 xmm0..xmm7 VM 槽). 翻译器只
+    // emit 字节码, 真正 xmm 物理寄存器寻址在 handler (asmgen.cpp) 用 movups +
+    // native subss/subps/subpd 完成. MEM 源折条同 translate_sse_add (MIT-408):
+    // XmmLoad(临时双槽) + ALU(xmm_dst, 临时双槽)。(Subss,S64) = subsd。
     //
-    // 编码: a_kind=Reg reg_a=xmm_slot, b_kind=Reg reg_b=xmm_slot, aux=0,
-    //       cond_or_size=ir::Size (S32=Subss scalar, S64=Subps/Subpd packed).
-    //       字节码布局与 popcnt/lzcnt/tzcnt 完全一致 (2 操作数 REG-REG).
-    bool translate_sse_sub(Emitter& em, const ir::Insn& in) {
+    // 编码: a_kind=Reg reg_a=xmm_slot, b_kind=Reg reg_b=xmm_slot (REG-REG)
+    //   或 gp_pair (MEM 源), aux=0 / 4|8|16 (XmmLoad 宽度), cond_or_size=size。
+    bool translate_sse_sub(Emitter& em, Scratch& sc, const ir::Insn& in,
+                           u64 current_rva, u64 next_ip) {
         if (in.op != ir::Op::Subss && in.op != ir::Op::Subps && in.op != ir::Op::Subpd)
             return false;
-        if (in.dst.kind != ir::Operand::Kind::Reg ||
-            in.src.kind != ir::Operand::Kind::Reg)
+        if (in.dst.kind != ir::Operand::Kind::Reg)
             return skip(in, "SSE 浮点减 操作数形态未支持", nullptr);
-        // IR.dst.reg / IR.src.reg 在 lifter 借用 ir::Reg 值 0..7 代表 xmm0..7.
-        // static_cast<u8> 拿到原始 u8 索引, 加 24 偏移到 VmContext.regs[24..31].
-        const u8 xmm_dst_slot = static_cast<u8>(in.dst.reg) + 24u;
-        const u8 xmm_src_slot = static_cast<u8>(in.src.reg) + 24u;
-        VmOp vop = (in.op == ir::Op::Subss) ? VmOp::Subss :
+        VmOp vop = (in.op == ir::Op::Subss) ?
+                       (in.size == ir::Size::S32 ? VmOp::Subss : VmOp::Subsd) :
                    (in.op == ir::Op::Subps) ? VmOp::Subps : VmOp::Subpd;
+        const u8 xmm_dst_slot = static_cast<u8>(in.dst.reg) + 24u;
+        if (in.src.kind == ir::Operand::Kind::Mem) {
+            u8 acc = 0;
+            if (!emit_sse_mem_addr(em, sc, in.src.mem, current_rva, next_ip, acc))
+                return skip(in, "SSE 浮点减 地址形态未支持", &in.src.mem);
+            const u8 pair = sc.take();
+            em.emit(VmOp::XmmLoad, OpKind::Reg, pair, OpKind::Reg, acc,
+                    sse_mem_width(in.op, in.size), isa::size_field(ir::Size::S64));
+            em.emit_rr(vop, xmm_dst_slot, pair, isa::size_field(in.size));
+            return true;
+        }
+        if (in.src.kind != ir::Operand::Kind::Reg)
+            return skip(in, "SSE 浮点减 操作数形态未支持", nullptr);
+        const u8 xmm_src_slot = static_cast<u8>(in.src.reg) + 24u;
         em.emit_rr(vop, xmm_dst_slot, xmm_src_slot, isa::size_field(in.size));
         return true;
     }
 
-    // ---- MIT-374: SSE 浮点除 divss/divps/divpd ----
+    // ---- MIT-374: SSE 浮点除 divss/divps/divpd (+ MIT-408: divsd) ----
     //
     // 与 MIT-373 translate_sse_sub 完全同构: lifter 用 IR.dst.reg / IR.src.reg
     // 借用 ir::Reg 值 0..7 (Rax..Rdi), 翻译期加 24 偏移映射到
     // VmContext.regs[24..31] 保留槽位 (这里用作 xmm0..xmm7 VM 槽). 翻译器只
     // emit 字节码, 真正 xmm 物理寄存器寻址在 handler (asmgen.cpp) 用 movups +
-    // native divss/divps/divpd 完成.
+    // native divss/divps/divpd 完成. MEM 源折条同 translate_sse_add (MIT-408):
+    // XmmLoad(临时双槽) + ALU(xmm_dst, 临时双槽)。(Divss,S64) = divsd。
     //
-    // 编码: a_kind=Reg reg_a=xmm_slot, b_kind=Reg reg_b=xmm_slot, aux=0,
-    //       cond_or_size=ir::Size (S32=Divss scalar, S64=Divps/Divpd packed).
-    bool translate_sse_div(Emitter& em, const ir::Insn& in) {
+    // 编码: a_kind=Reg reg_a=xmm_slot, b_kind=Reg reg_b=xmm_slot (REG-REG)
+    //   或 gp_pair (MEM 源), aux=0 / 4|8|16 (XmmLoad 宽度), cond_or_size=size。
+    bool translate_sse_div(Emitter& em, Scratch& sc, const ir::Insn& in,
+                           u64 current_rva, u64 next_ip) {
         if (in.op != ir::Op::Divss && in.op != ir::Op::Divps && in.op != ir::Op::Divpd)
             return false;
-        if (in.dst.kind != ir::Operand::Kind::Reg ||
-            in.src.kind != ir::Operand::Kind::Reg)
+        if (in.dst.kind != ir::Operand::Kind::Reg)
             return skip(in, "SSE 浮点除 操作数形态未支持", nullptr);
-        // IR.dst.reg / IR.src.reg 在 lifter 借用 ir::Reg 值 0..7 代表 xmm0..7.
-        // static_cast<u8> 拿到原始 u8 索引, 加 24 偏移到 VmContext.regs[24..31].
-        const u8 xmm_dst_slot = static_cast<u8>(in.dst.reg) + 24u;
-        const u8 xmm_src_slot = static_cast<u8>(in.src.reg) + 24u;
-        VmOp vop = (in.op == ir::Op::Divss) ? VmOp::Divss :
+        VmOp vop = (in.op == ir::Op::Divss) ?
+                       (in.size == ir::Size::S32 ? VmOp::Divss : VmOp::Divsd) :
                    (in.op == ir::Op::Divps) ? VmOp::Divps : VmOp::Divpd;
+        const u8 xmm_dst_slot = static_cast<u8>(in.dst.reg) + 24u;
+        if (in.src.kind == ir::Operand::Kind::Mem) {
+            u8 acc = 0;
+            if (!emit_sse_mem_addr(em, sc, in.src.mem, current_rva, next_ip, acc))
+                return skip(in, "SSE 浮点除 地址形态未支持", &in.src.mem);
+            const u8 pair = sc.take();
+            em.emit(VmOp::XmmLoad, OpKind::Reg, pair, OpKind::Reg, acc,
+                    sse_mem_width(in.op, in.size), isa::size_field(ir::Size::S64));
+            em.emit_rr(vop, xmm_dst_slot, pair, isa::size_field(in.size));
+            return true;
+        }
+        if (in.src.kind != ir::Operand::Kind::Reg)
+            return skip(in, "SSE 浮点除 操作数形态未支持", nullptr);
+        const u8 xmm_src_slot = static_cast<u8>(in.src.reg) + 24u;
         em.emit_rr(vop, xmm_dst_slot, xmm_src_slot, isa::size_field(in.size));
         return true;
     }
 
-    // ---- MIT-375: SSE 浮点传送 movss/movaps/movapd/movups/movupd ----
+    // ---- MIT-375: SSE 浮点传送 movss/movaps/movapd/movups/movupd
+    //      (+ MIT-408: movsd 经 (Movss,S64) 编码, load/store 双向) ----
     //
     // 与 MIT-371 translate_sse_add / MIT-373 translate_sse_sub 同构: lifter 用
     // IR.dst.reg / IR.src.reg 借用 ir::Reg 值 0..7 代表 xmm0..7, 翻译期加 24
@@ -1131,57 +1195,110 @@ struct Translator {
     // handler (vm/regvm/runtime/src/asmgen.cpp) 用 movss/movups 读写
     // VmContext.xmm[8] @ +0x140 完成.
     //
+    // MIT-408 (C4b) MEM 形式 (派活单 §A.3 读/写两类必做):
+    //   - load 方向 (dst=Reg, src=Mem):  emit_address (+ LeaRva 若 rip) →
+    //     XmmLoad(dst_xmm_slot, addr, width) — 无需临时槽, dst 即落点;
+    //     movss/movsd 内存源的清零语义由 XmmLoad handler 的 native
+    //     movss/movsd 直产 (SDM: 内存源清零高位)。
+    //   - store 方向 (dst=Mem, src=Reg):  emit_address (+ LeaRva 若 rip) →
+    //     XmmStore(addr, src_xmm_slot, width)。
+    //   - (Movss,S64) = movsd: REG-REG 走 VmOp::Movsd (F2 0F 10, 8B 搬,
+    //     高位保持); MEM 宽度 8B。
+    //
     // 防御: lifter 只产 0..7; 手写 IR / passthrough 路径兜底 >7 报错。
-    bool translate_sse_mov(Emitter& em, const ir::Insn& in) {
+    bool translate_sse_mov(Emitter& em, Scratch& sc, const ir::Insn& in,
+                           u64 current_rva, u64 next_ip) {
         if (in.op != ir::Op::Movss && in.op != ir::Op::Movaps && in.op != ir::Op::Movapd &&
             in.op != ir::Op::Movups && in.op != ir::Op::Movupd)
             return false;
-        if (in.dst.kind != ir::Operand::Kind::Reg ||
-            in.src.kind != ir::Operand::Kind::Reg)
+        const u8 sz = isa::size_field(in.size);
+        if (in.dst.kind == ir::Operand::Kind::Mem) {
+            // store 方向: [mem], xmm — src 必为 xmm REG.
+            if (in.src.kind != ir::Operand::Kind::Reg)
+                return skip(in, "SSE 浮点传送 操作数形态未支持", nullptr);  // 双 mem 非法
+            u8 acc = 0;
+            if (!emit_sse_mem_addr(em, sc, in.dst.mem, current_rva, next_ip, acc))
+                return skip(in, "SSE 浮点传送 地址形态未支持", &in.dst.mem);
+            const u8 xmm_idx_src = static_cast<u8>(in.src.reg);
+            if (xmm_idx_src > 7u)
+                return skip(in, "SSE 浮点传送 xmm 索引越界 (仅支持 xmm0..xmm7)", nullptr);
+            em.emit(VmOp::XmmStore, OpKind::Reg, acc, OpKind::Reg, xmm_idx_src + 24u,
+                    sse_mem_width(in.op, in.size), sz);
+            return true;
+        }
+        if (in.dst.kind != ir::Operand::Kind::Reg)
             return skip(in, "SSE 浮点传送 操作数形态未支持", nullptr);
         const u8 xmm_idx_dst = static_cast<u8>(in.dst.reg);
-        const u8 xmm_idx_src = static_cast<u8>(in.src.reg);
-        if (xmm_idx_dst > 7u || xmm_idx_src > 7u)
+        if (xmm_idx_dst > 7u)
             return skip(in, "SSE 浮点传送 xmm 索引越界 (仅支持 xmm0..xmm7)", nullptr);
-        const u8 xmm_dst_slot = static_cast<u8>(xmm_idx_dst + 24u);
-        const u8 xmm_src_slot = static_cast<u8>(xmm_idx_src + 24u);
-        VmOp vop = (in.op == ir::Op::Movss)  ? VmOp::Movss :
+        if (in.src.kind == ir::Operand::Kind::Mem) {
+            // load 方向: xmm, [mem] — XmmLoad(dst_slot, addr, width).
+            u8 acc = 0;
+            if (!emit_sse_mem_addr(em, sc, in.src.mem, current_rva, next_ip, acc))
+                return skip(in, "SSE 浮点传送 地址形态未支持", &in.src.mem);
+            em.emit(VmOp::XmmLoad, OpKind::Reg, xmm_idx_dst + 24u, OpKind::Reg, acc,
+                    sse_mem_width(in.op, in.size), sz);
+            return true;
+        }
+        if (in.src.kind != ir::Operand::Kind::Reg)
+            return skip(in, "SSE 浮点传送 操作数形态未支持", nullptr);
+        const u8 xmm_idx_src = static_cast<u8>(in.src.reg);
+        if (xmm_idx_src > 7u)
+            return skip(in, "SSE 浮点传送 xmm 索引越界 (仅支持 xmm0..xmm7)", nullptr);
+        VmOp vop = (in.op == ir::Op::Movss) ?
+                       (in.size == ir::Size::S32 ? VmOp::Movss : VmOp::Movsd) :
                    (in.op == ir::Op::Movaps) ? VmOp::Movaps :
                    (in.op == ir::Op::Movapd) ? VmOp::Movapd :
                    (in.op == ir::Op::Movups) ? VmOp::Movups : VmOp::Movupd;
-        em.emit_rr(vop, xmm_dst_slot, xmm_src_slot, isa::size_field(in.size));
+        em.emit_rr(vop, xmm_idx_dst + 24u, xmm_idx_src + 24u, sz);
         return true;
     }
 
-    // ---- MIT-376: SSE 浮点位运算 xorps/orps/andps ----
+    // ---- MIT-376: SSE 浮点位运算 xorps/orps/andps (+ MIT-408: MEM 源) ----
     //
     // 与 MIT-375 translate_sse_mov 同构: lifter 用 IR.dst.reg / IR.src.reg
     // 借用 ir::Reg 值 0..7 代表 xmm0..7, 翻译期加 24 偏移映射到
     // VmContext.regs[24..31] 保留槽位; 真正 128-bit 按位运算在 handler
     // (asmgen.cpp build_xorps/orps/andps) 沿用 build_xmm_transfer 四步模板
     // (读 dst 槽 → 读 src 槽 → native xorps/orps/andps → 写回 dst 槽)。
+    // MEM 源折条同 translate_sse_add (MIT-408): XmmLoad(临时双槽) + 位运算。
     //
-    // 编码: a_kind=Reg reg_a=xmm_slot, b_kind=Reg reg_b=xmm_slot, aux=0,
-    //       cond_or_size=ir::Size::S64 (128-bit 整体读写)。
-    bool translate_sse_bitwise(Emitter& em, const ir::Insn& in) {
+    // 编码: a_kind=Reg reg_a=xmm_slot, b_kind=Reg reg_b=xmm_slot (REG-REG)
+    //   或 gp_pair (MEM 源), aux=0 / 16 (XmmLoad 宽度, 全 128-bit 按位),
+    //       cond_or_size=ir::Size::S64。
+    bool translate_sse_bitwise(Emitter& em, Scratch& sc, const ir::Insn& in,
+                               u64 current_rva, u64 next_ip) {
         if (in.op != ir::Op::Xorps && in.op != ir::Op::Orps && in.op != ir::Op::Andps)
             return false;
-        if (in.dst.kind != ir::Operand::Kind::Reg ||
-            in.src.kind != ir::Operand::Kind::Reg)
+        if (in.dst.kind != ir::Operand::Kind::Reg)
             return skip(in, "SSE 浮点位运算 操作数形态未支持", nullptr);
         const u8 xmm_idx_dst = static_cast<u8>(in.dst.reg);
-        const u8 xmm_idx_src = static_cast<u8>(in.src.reg);
-        if (xmm_idx_dst > 7u || xmm_idx_src > 7u)
+        if (xmm_idx_dst > 7u)
             return skip(in, "SSE 浮点位运算 xmm 索引越界 (仅支持 xmm0..xmm7)", nullptr);
         const u8 xmm_dst_slot = static_cast<u8>(xmm_idx_dst + 24u);
-        const u8 xmm_src_slot = static_cast<u8>(xmm_idx_src + 24u);
         VmOp vop = (in.op == ir::Op::Xorps) ? VmOp::Xorps :
                    (in.op == ir::Op::Orps)  ? VmOp::Orps : VmOp::Andps;
+        if (in.src.kind == ir::Operand::Kind::Mem) {
+            u8 acc = 0;
+            if (!emit_sse_mem_addr(em, sc, in.src.mem, current_rva, next_ip, acc))
+                return skip(in, "SSE 浮点位运算 地址形态未支持", &in.src.mem);
+            const u8 pair = sc.take();
+            em.emit(VmOp::XmmLoad, OpKind::Reg, pair, OpKind::Reg, acc,
+                    sse_mem_width(in.op, in.size), isa::size_field(ir::Size::S64));
+            em.emit_rr(vop, xmm_dst_slot, pair, isa::size_field(in.size));
+            return true;
+        }
+        if (in.src.kind != ir::Operand::Kind::Reg)
+            return skip(in, "SSE 浮点位运算 操作数形态未支持", nullptr);
+        const u8 xmm_idx_src = static_cast<u8>(in.src.reg);
+        if (xmm_idx_src > 7u)
+            return skip(in, "SSE 浮点位运算 xmm 索引越界 (仅支持 xmm0..xmm7)", nullptr);
+        const u8 xmm_src_slot = static_cast<u8>(xmm_idx_src + 24u);
         em.emit_rr(vop, xmm_dst_slot, xmm_src_slot, isa::size_field(in.size));
         return true;
     }
 
-    // ---- MIT-376: SSE 浮点比较 ucomiss/ucomisd ----
+    // ---- MIT-376: SSE 浮点比较 ucomiss/ucomisd (+ MIT-408: MEM 源) ----
     //
     // 与 translate_sse_bitwise 同构, 关键差异: ucomis* **只写 EFLAGS (ZF/PF/CF),
     // 不改 xmm 操作数**。handler (asmgen.cpp build_ucomiss/build_ucomisd) 走
@@ -1189,23 +1306,38 @@ struct Translator {
     // flags_tail), 与 setcc/jcc handler 共享同一 flags_ 寄存器 (ctx+0x98,
     // 位布局 ZF/CF/OF/SF/PF=bit0..4) — 区域内紧随的 setcc/jcc 读到真比较
     // 结果 (派活单 §C 6 + §D D1.1, 禁止 decode+advance 空转, pitfall #79)。
+    // MEM 源折条同 translate_sse_add (MIT-408, 派活单 D4 "ucomis src=mem 必做"):
+    // XmmLoad(临时双槽) + Ucomis*(dst, 临时双槽)。
     //
-    // 编码: a_kind=Reg reg_a=xmm_slot, b_kind=Reg reg_b=xmm_slot, aux=0,
-    //       cond_or_size=ir::Size (S32=Ucomiss scalar single, S64=Ucomisd
-    //       scalar double)。
-    bool translate_ucomis(Emitter& em, const ir::Insn& in) {
+    // 编码: a_kind=Reg reg_a=xmm_slot, b_kind=Reg reg_b=xmm_slot (REG-REG)
+    //   或 gp_pair (MEM 源), aux=0 / 4|8 (XmmLoad 宽度), cond_or_size=size。
+    bool translate_ucomis(Emitter& em, Scratch& sc, const ir::Insn& in,
+                          u64 current_rva, u64 next_ip) {
         if (in.op != ir::Op::Ucomiss && in.op != ir::Op::Ucomisd)
             return false;
-        if (in.dst.kind != ir::Operand::Kind::Reg ||
-            in.src.kind != ir::Operand::Kind::Reg)
+        if (in.dst.kind != ir::Operand::Kind::Reg)
             return skip(in, "SSE 浮点比较 操作数形态未支持", nullptr);
         const u8 xmm_idx_dst = static_cast<u8>(in.dst.reg);
-        const u8 xmm_idx_src = static_cast<u8>(in.src.reg);
-        if (xmm_idx_dst > 7u || xmm_idx_src > 7u)
+        if (xmm_idx_dst > 7u)
             return skip(in, "SSE 浮点比较 xmm 索引越界 (仅支持 xmm0..xmm7)", nullptr);
         const u8 xmm_dst_slot = static_cast<u8>(xmm_idx_dst + 24u);
-        const u8 xmm_src_slot = static_cast<u8>(xmm_idx_src + 24u);
         VmOp vop = (in.op == ir::Op::Ucomiss) ? VmOp::Ucomiss : VmOp::Ucomisd;
+        if (in.src.kind == ir::Operand::Kind::Mem) {
+            u8 acc = 0;
+            if (!emit_sse_mem_addr(em, sc, in.src.mem, current_rva, next_ip, acc))
+                return skip(in, "SSE 浮点比较 地址形态未支持", &in.src.mem);
+            const u8 pair = sc.take();
+            em.emit(VmOp::XmmLoad, OpKind::Reg, pair, OpKind::Reg, acc,
+                    sse_mem_width(in.op, in.size), isa::size_field(ir::Size::S64));
+            em.emit_rr(vop, xmm_dst_slot, pair, isa::size_field(in.size));
+            return true;
+        }
+        if (in.src.kind != ir::Operand::Kind::Reg)
+            return skip(in, "SSE 浮点比较 操作数形态未支持", nullptr);
+        const u8 xmm_idx_src = static_cast<u8>(in.src.reg);
+        if (xmm_idx_src > 7u)
+            return skip(in, "SSE 浮点比较 xmm 索引越界 (仅支持 xmm0..xmm7)", nullptr);
+        const u8 xmm_src_slot = static_cast<u8>(xmm_idx_src + 24u);
         em.emit_rr(vop, xmm_dst_slot, xmm_src_slot, isa::size_field(in.size));
         return true;
     }

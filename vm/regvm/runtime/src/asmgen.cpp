@@ -1263,6 +1263,126 @@ public:
         return o;
     }
 
+    // MIT-408: 读 reg_b (T7) 指向的 128-bit 槽到物理 xmm1 — **双语义寻址**:
+    //   reg_b >= 24 → ctx.xmm 区 (0x140 + (reg-24)*16, 既有公式);
+    //   reg_b <  24 → GP scratch 双槽 (0x10 + reg*8, 16B 覆盖 vN+vN+1) —
+    //     XmmLoad 的临时槽编码 (ALU src=mem 形式的落点, 翻译器取 v18..v23
+    //     两两作 xmm 宽临时, 指令边界后即死, 不与 xmm 槽互踩)。
+    // 静态文本同时含两条公式: verifier 的常量闸按 xmm 公式计数 (sub 0x18/
+    // shl 4/add 0x140), GP 分支的 0x10 是寻址位移非立即数, 不稀释闸面。
+    // 硬约束: 24/4/0x140 一律经 imm() (pitfall #78)。
+    std::string load_src_slot_into_xmm1(const std::string& tag) const {
+        const std::string lbl_x = "srcx_" + tag;
+        const std::string lbl_d = "srcd_" + tag;
+        std::string o;
+        o += std::string("    cmp ") + r64(t_[7]) + ", " + imm(24) + "\n";
+        o += "    jae " + lbl_x + "\n";
+        // GP 双槽: 16B 直读 (0x10 为寻址位移)
+        o += std::string("    movups xmm1, [") + r64(ctx_) + " + " + r64(t_[7]) + "*8 + 0x10]\n";
+        o += "    jmp " + lbl_d + "\n";
+        o += lbl_x + ":\n";
+        // xmm 区: 0x140 + (reg-24)*16 (Keystone 不支持 (reg-24)*16, 拆步)
+        o += std::string("    mov ") + r64(t_[9]) + ", " + r64(t_[7]) + "\n";
+        o += std::string("    sub ") + r64(t_[9]) + ", " + imm(24) + "\n";
+        o += std::string("    shl ") + r64(t_[9]) + ", " + imm(4) + "\n";
+        o += std::string("    add ") + r64(t_[9]) + ", " + imm(kCtxXmmBase) + "\n";
+        o += std::string("    movups xmm1, [") + r64(ctx_) + " + " + r64(t_[9]) + "]\n";
+        o += lbl_d + ":\n";
+        return o;
+    }
+
+    // 槽位偏移公式 (既有 xmm 区专用, dst 写回路径沿用): T9 = 0x140+(reg-24)*16。
+    // 硬约束: 24/4/0x140 一律经 imm() (pitfall #78)。
+    std::string xmm_offset_into_t9_text(int reg_t) const {
+        std::string o;
+        o += std::string("    mov ") + r64(t_[9]) + ", " + r64(reg_t) + "\n";
+        o += std::string("    sub ") + r64(t_[9]) + ", " + imm(24) + "\n";
+        o += std::string("    shl ") + r64(t_[9]) + ", " + imm(4) + "\n";
+        o += std::string("    add ") + r64(t_[9]) + ", " + imm(kCtxXmmBase) + "\n";
+        return o;
+    }
+
+    // MIT-408 XmmLoad: 内存 → xmm/GP 槽。a_kind=Reg reg_a=目的槽 (>=24 xmm 区
+    // / <24 GP 双槽), b_kind=Reg reg_b=地址槽 (绝对 VA), aux=访存宽度 (4/8/16),
+    // cond_or_size=Size (S64 占位)。handler:
+    //   mov T1, [ctx + reg_b*8 + 0x10]   (取地址)
+    //   cmp T5, 4 → movss / 8 → movsd / else movups xmm0, [T1]   (宽度链,
+    //     内存源清零语义由 native movss/movsd 直产: SDM 内存源清零高位)
+    //   cmp T4, 24 → jae xmm 区: T9=0x140+(reg_a-24)*16; movups [ctx+T9], xmm0
+    //             → else GP 双槽: movups [ctx + reg_a*8 + 0x10], xmm0
+    //   advance。
+    std::string build_xmm_load(u64 dispatch) const {
+        const std::string tag = "xmmld" + std::to_string(seq());
+        const std::string lbl4 = "ld4_" + tag;
+        const std::string lbl8 = "ld8_" + tag;
+        const std::string lbl16 = "ld16_" + tag;
+        const std::string lblx = "ldx_" + tag;
+        const std::string lbld = "ldd_" + tag;
+        std::string o = decode_prelude();
+        // 地址 → T1
+        o += std::string("    mov ") + r64(t_[1]) + ", qword ptr [" + r64(ctx_) + " + " +
+             r64(t_[7]) + "*8 + 0x10]\n";
+        // 宽度链: aux ∈ {4, 8, 16} (翻译器恒发合法值; 16 为链尾顺延)
+        o += std::string("    cmp ") + r64(t_[5]) + ", " + imm(4) + "\n";
+        o += "    je " + lbl4 + "\n";
+        o += std::string("    cmp ") + r64(t_[5]) + ", " + imm(8) + "\n";
+        o += "    je " + lbl8 + "\n";
+        o += "    jmp " + lbl16 + "\n";
+        o += lbl4 + ":\n";
+        o += std::string("    movss xmm0, dword ptr [") + r64(t_[1]) + "]\n";
+        o += "    jmp " + lblx + "\n";
+        o += lbl8 + ":\n";
+        o += std::string("    movsd xmm0, qword ptr [") + r64(t_[1]) + "]\n";
+        o += "    jmp " + lblx + "\n";
+        o += lbl16 + ":\n";
+        o += std::string("    movups xmm0, xmmword ptr [") + r64(t_[1]) + "]\n";
+        // 目的槽: reg_a >= 24 → xmm 区 (双公式, 0x10 是寻址位移非立即数)
+        o += lblx + ":\n";
+        o += std::string("    cmp ") + r64(t_[4]) + ", " + imm(24) + "\n";
+        o += "    jae " + lbld + "\n";
+        o += std::string("    movups [") + r64(ctx_) + " + " + r64(t_[4]) + "*8 + 0x10], xmm0\n";
+        o += "    jmp " + std::string("done_") + tag + "\n";
+        o += lbld + ":\n";
+        o += xmm_offset_into_t9_text(t_[4]);
+        o += std::string("    movups [") + r64(ctx_) + " + " + r64(t_[9]) + "], xmm0\n";
+        o += "done_" + tag + ":\n";
+        o += advance(dispatch);
+        return o;
+    }
+
+    // MIT-408 XmmStore: xmm/GP 槽 → 内存。a_kind=Reg reg_a=地址槽 (绝对 VA),
+    // b_kind=Reg reg_b=源槽 (>=24 xmm 区 / <24 GP 双槽), aux=访存宽度。
+    // handler: 槽 128-bit 读进物理 xmm1 (双语义寻址) → 宽度链
+    //   movss/movsd/movups [addr], xmm1 → advance。
+    std::string build_xmm_store(u64 dispatch) const {
+        const std::string tag = "xmmst" + std::to_string(seq());
+        const std::string lbl4 = "st4_" + tag;
+        const std::string lbl8 = "st8_" + tag;
+        const std::string lbl16 = "st16_" + tag;
+        std::string o = decode_prelude();
+        // 地址 → T1; 源槽 128-bit → xmm1
+        o += std::string("    mov ") + r64(t_[1]) + ", qword ptr [" + r64(ctx_) + " + " +
+             r64(t_[4]) + "*8 + 0x10]\n";
+        o += load_src_slot_into_xmm1(tag);
+        // 宽度链 (按 xmm1 落盘, 低宽度截断)
+        o += std::string("    cmp ") + r64(t_[5]) + ", " + imm(4) + "\n";
+        o += "    je " + lbl4 + "\n";
+        o += std::string("    cmp ") + r64(t_[5]) + ", " + imm(8) + "\n";
+        o += "    je " + lbl8 + "\n";
+        o += "    jmp " + lbl16 + "\n";
+        o += lbl4 + ":\n";
+        o += std::string("    movss dword ptr [") + r64(t_[1]) + "], xmm1\n";
+        o += "    jmp " + std::string("done_") + tag + "\n";
+        o += lbl8 + ":\n";
+        o += std::string("    movsd qword ptr [") + r64(t_[1]) + "], xmm1\n";
+        o += "    jmp " + std::string("done_") + tag + "\n";
+        o += lbl16 + ":\n";
+        o += std::string("    movups xmmword ptr [") + r64(t_[1]) + "], xmm1\n";
+        o += "done_" + tag + ":\n";
+        o += advance(dispatch);
+        return o;
+    }
+
     // MIT-371 Addss: scalar single-precision FP add (xmm1 = xmm1 + xmm2)。
     //   字节结构: F3 0F 58 /r (3 字节 REG-REG, mod=11)。
     //   编码: reg_a=xmm_dst_slot (24..31, translator 从 IR 0..7 加 24 偏移),
@@ -1284,8 +1404,7 @@ public:
         };
         emit_xmm_offset_into_t9(t_[4]);  // T9 = dst 偏移
         o += std::string("    movups xmm0, [") + r64(ctx_) + " + " + r64(t_[9]) + "]\n";
-        emit_xmm_offset_into_t9(t_[7]);  // T9 = src 偏移
-        o += std::string("    movups xmm1, [") + r64(ctx_) + " + " + r64(t_[9]) + "]\n";
+        o += load_src_slot_into_xmm1(tag);  // src: xmm 区或 GP 双槽 (MIT-408)
         o += "    addss xmm0, xmm1\n";
         emit_xmm_offset_into_t9(t_[4]);  // 重算 dst 偏移写回
         o += std::string("    movups [") + r64(ctx_) + " + " + r64(t_[9]) + "], xmm0\n";
@@ -1309,8 +1428,7 @@ public:
         };
         emit_xmm_offset_into_t9(t_[4]);
         o += std::string("    movups xmm0, [") + r64(ctx_) + " + " + r64(t_[9]) + "]\n";
-        emit_xmm_offset_into_t9(t_[7]);
-        o += std::string("    movups xmm1, [") + r64(ctx_) + " + " + r64(t_[9]) + "]\n";
+        o += load_src_slot_into_xmm1(tag);  // src: xmm 区或 GP 双槽 (MIT-408)
         o += "    addps xmm0, xmm1\n";
         emit_xmm_offset_into_t9(t_[4]);
         o += std::string("    movups [") + r64(ctx_) + " + " + r64(t_[9]) + "], xmm0\n";
@@ -1334,8 +1452,7 @@ public:
         };
         emit_xmm_offset_into_t9(t_[4]);
         o += std::string("    movups xmm0, [") + r64(ctx_) + " + " + r64(t_[9]) + "]\n";
-        emit_xmm_offset_into_t9(t_[7]);
-        o += std::string("    movups xmm1, [") + r64(ctx_) + " + " + r64(t_[9]) + "]\n";
+        o += load_src_slot_into_xmm1(tag);  // src: xmm 区或 GP 双槽 (MIT-408)
         o += "    addpd xmm0, xmm1\n";
         emit_xmm_offset_into_t9(t_[4]);
         o += std::string("    movups [") + r64(ctx_) + " + " + r64(t_[9]) + "], xmm0\n";
@@ -1365,8 +1482,7 @@ public:
         };
         emit_xmm_offset_into_t9(t_[4]);  // T9 = dst 偏移
         o += std::string("    movups xmm0, [") + r64(ctx_) + " + " + r64(t_[9]) + "]\n";
-        emit_xmm_offset_into_t9(t_[7]);  // T9 = src 偏移
-        o += std::string("    movups xmm1, [") + r64(ctx_) + " + " + r64(t_[9]) + "]\n";
+        o += load_src_slot_into_xmm1(tag);  // src: xmm 区或 GP 双槽 (MIT-408)
         o += "    subss xmm0, xmm1\n";
         emit_xmm_offset_into_t9(t_[4]);  // 重算 dst 偏移写回
         o += std::string("    movups [") + r64(ctx_) + " + " + r64(t_[9]) + "], xmm0\n";
@@ -1390,8 +1506,7 @@ public:
         };
         emit_xmm_offset_into_t9(t_[4]);
         o += std::string("    movups xmm0, [") + r64(ctx_) + " + " + r64(t_[9]) + "]\n";
-        emit_xmm_offset_into_t9(t_[7]);
-        o += std::string("    movups xmm1, [") + r64(ctx_) + " + " + r64(t_[9]) + "]\n";
+        o += load_src_slot_into_xmm1(tag);  // src: xmm 区或 GP 双槽 (MIT-408)
         o += "    subps xmm0, xmm1\n";
         emit_xmm_offset_into_t9(t_[4]);
         o += std::string("    movups [") + r64(ctx_) + " + " + r64(t_[9]) + "], xmm0\n";
@@ -1415,8 +1530,7 @@ public:
         };
         emit_xmm_offset_into_t9(t_[4]);
         o += std::string("    movups xmm0, [") + r64(ctx_) + " + " + r64(t_[9]) + "]\n";
-        emit_xmm_offset_into_t9(t_[7]);
-        o += std::string("    movups xmm1, [") + r64(ctx_) + " + " + r64(t_[9]) + "]\n";
+        o += load_src_slot_into_xmm1(tag);  // src: xmm 区或 GP 双槽 (MIT-408)
         o += "    subpd xmm0, xmm1\n";
         emit_xmm_offset_into_t9(t_[4]);
         o += std::string("    movups [") + r64(ctx_) + " + " + r64(t_[9]) + "], xmm0\n";
@@ -1448,8 +1562,7 @@ public:
         };
         emit_xmm_offset_into_t9(t_[4]);  // T9 = dst 偏移
         o += std::string("    movups xmm0, [") + r64(ctx_) + " + " + r64(t_[9]) + "]\n";
-        emit_xmm_offset_into_t9(t_[7]);  // T9 = src 偏移
-        o += std::string("    movups xmm1, [") + r64(ctx_) + " + " + r64(t_[9]) + "]\n";
+        o += load_src_slot_into_xmm1(tag);  // src: xmm 区或 GP 双槽 (MIT-408)
         o += "    divss xmm0, xmm1\n";
         emit_xmm_offset_into_t9(t_[4]);  // 重算 dst 偏移写回
         o += std::string("    movups [") + r64(ctx_) + " + " + r64(t_[9]) + "], xmm0\n";
@@ -1473,8 +1586,7 @@ public:
         };
         emit_xmm_offset_into_t9(t_[4]);
         o += std::string("    movups xmm0, [") + r64(ctx_) + " + " + r64(t_[9]) + "]\n";
-        emit_xmm_offset_into_t9(t_[7]);
-        o += std::string("    movups xmm1, [") + r64(ctx_) + " + " + r64(t_[9]) + "]\n";
+        o += load_src_slot_into_xmm1(tag);  // src: xmm 区或 GP 双槽 (MIT-408)
         o += "    divps xmm0, xmm1\n";
         emit_xmm_offset_into_t9(t_[4]);
         o += std::string("    movups [") + r64(ctx_) + " + " + r64(t_[9]) + "], xmm0\n";
@@ -1498,8 +1610,7 @@ public:
         };
         emit_xmm_offset_into_t9(t_[4]);
         o += std::string("    movups xmm0, [") + r64(ctx_) + " + " + r64(t_[9]) + "]\n";
-        emit_xmm_offset_into_t9(t_[7]);
-        o += std::string("    movups xmm1, [") + r64(ctx_) + " + " + r64(t_[9]) + "]\n";
+        o += load_src_slot_into_xmm1(tag);  // src: xmm 区或 GP 双槽 (MIT-408)
         o += "    divpd xmm0, xmm1\n";
         emit_xmm_offset_into_t9(t_[4]);
         o += std::string("    movups [") + r64(ctx_) + " + " + r64(t_[9]) + "], xmm0\n";
@@ -1509,7 +1620,75 @@ public:
     }
 
 
-    // ---- MIT-375: SSE 浮点传送 movss / movaps / movapd / movups / movupd ----
+    // ---- MIT-408: SSE scalar-double 族 addsd/subsd/divsd ----
+    //
+    // 与 ss/ps/pd 三族同构 (读 dst 槽 → 读 src 槽 → native sd 指令 → 写回
+    // dst 槽 → advance), 仅 native 助记符不同 (F2 0F 58/5C/5E, 低 64 位
+    // 标量运算, 高 64 位保持 — movups 全 128-bit 读写自然保高位)。src 读
+    // 走 load_src_slot_into_xmm1 双语义 (MIT-408: MEM 源经 GP 双槽)。
+    // 不影响 EFLAGS; 不调 setcc5/flags_tail, 直接 advance。
+    std::string build_addsd(u64 dispatch) const {
+        const std::string tag = "addsd" + std::to_string(seq());
+        std::string o = decode_prelude();
+        auto emit_xmm_offset_into_t9 = [&](int reg_t) {
+            o += std::string("    mov ") + r64(t_[9]) + ", " + r64(reg_t) + "\n";
+            o += std::string("    sub ") + r64(t_[9]) + ", " + imm(24) + "\n";
+            o += std::string("    shl ") + r64(t_[9]) + ", " + imm(4) + "\n";
+            o += std::string("    add ") + r64(t_[9]) + ", " + imm(kCtxXmmBase) + "\n";
+        };
+        emit_xmm_offset_into_t9(t_[4]);  // T9 = dst 偏移
+        o += std::string("    movups xmm0, [") + r64(ctx_) + " + " + r64(t_[9]) + "]\n";
+        o += load_src_slot_into_xmm1(tag);  // src: xmm 区或 GP 双槽 (MIT-408)
+        o += "    addsd xmm0, xmm1\n";
+        emit_xmm_offset_into_t9(t_[4]);  // 重算 dst 偏移写回
+        o += std::string("    movups [") + r64(ctx_) + " + " + r64(t_[9]) + "], xmm0\n";
+        o += advance(dispatch);
+        (void)tag;
+        return o;
+    }
+
+    // MIT-408 Subsd: 同 build_addsd, native "subsd" (F2 0F 5C)。
+    std::string build_subsd(u64 dispatch) const {
+        const std::string tag = "subsd" + std::to_string(seq());
+        std::string o = decode_prelude();
+        auto emit_xmm_offset_into_t9 = [&](int reg_t) {
+            o += std::string("    mov ") + r64(t_[9]) + ", " + r64(reg_t) + "\n";
+            o += std::string("    sub ") + r64(t_[9]) + ", " + imm(24) + "\n";
+            o += std::string("    shl ") + r64(t_[9]) + ", " + imm(4) + "\n";
+            o += std::string("    add ") + r64(t_[9]) + ", " + imm(kCtxXmmBase) + "\n";
+        };
+        emit_xmm_offset_into_t9(t_[4]);  // T9 = dst 偏移
+        o += std::string("    movups xmm0, [") + r64(ctx_) + " + " + r64(t_[9]) + "]\n";
+        o += load_src_slot_into_xmm1(tag);  // src: xmm 区或 GP 双槽 (MIT-408)
+        o += "    subsd xmm0, xmm1\n";
+        emit_xmm_offset_into_t9(t_[4]);  // 重算 dst 偏移写回
+        o += std::string("    movups [") + r64(ctx_) + " + " + r64(t_[9]) + "], xmm0\n";
+        o += advance(dispatch);
+        (void)tag;
+        return o;
+    }
+
+    // MIT-408 Divsd: 同 build_addsd, native "divsd" (F2 0F 5E)。
+    std::string build_divsd(u64 dispatch) const {
+        const std::string tag = "divsd" + std::to_string(seq());
+        std::string o = decode_prelude();
+        auto emit_xmm_offset_into_t9 = [&](int reg_t) {
+            o += std::string("    mov ") + r64(t_[9]) + ", " + r64(reg_t) + "\n";
+            o += std::string("    sub ") + r64(t_[9]) + ", " + imm(24) + "\n";
+            o += std::string("    shl ") + r64(t_[9]) + ", " + imm(4) + "\n";
+            o += std::string("    add ") + r64(t_[9]) + ", " + imm(kCtxXmmBase) + "\n";
+        };
+        emit_xmm_offset_into_t9(t_[4]);  // T9 = dst 偏移
+        o += std::string("    movups xmm0, [") + r64(ctx_) + " + " + r64(t_[9]) + "]\n";
+        o += load_src_slot_into_xmm1(tag);  // src: xmm 区或 GP 双槽 (MIT-408)
+        o += "    divsd xmm0, xmm1\n";
+        emit_xmm_offset_into_t9(t_[4]);  // 重算 dst 偏移写回
+        o += std::string("    movups [") + r64(ctx_) + " + " + r64(t_[9]) + "], xmm0\n";
+        o += advance(dispatch);
+        (void)tag;
+        return o;
+    }
+    //      (+ MIT-408: movsd 经 (Movss,S64) 编码 = VmOp::Movsd) ----
     //
     // 五条共用模板 (hotfix v6 重建, 独立成员函数): 读 dst 槽 -> 读 src 槽 ->
     // 就地执行被虚拟化的那条 native 指令 -> 写回 dst 槽 -> advance。
@@ -1518,8 +1697,15 @@ public:
     // 保持不变), 对 aps/apd/ups/upd 是无害统一模板。
     // 硬约束: 槽位偏移公式的 24/4/0x140 一律经 imm(), 禁止裸多位数字
     // (pitfall #78: Keystone Intel 语法裸数字按 16 进制解析)。
-    std::string build_xmm_transfer(u64 dispatch, const char* native_mn) const {
+    //
+    // MIT-408 (C4b): xorps/orps/andps (位运算) 的 MEM 源折条把 src 槽编码为
+    // GP 双槽 (reg < 24, XmmLoad 落点) → dual_src=true 时 src 读走
+    // load_src_slot_into_xmm1 双语义寻址; mov 族 (reg-reg 或 XmmLoad 直落
+    // xmm 槽) 保持既有 xmm 区单公式 (dual_src=false, 文本与修复前逐字节一致)。
+    std::string build_xmm_transfer(u64 dispatch, const char* native_mn,
+                                   bool dual_src = false) const {
         std::string o = decode_prelude();
+        const std::string tag = std::string(native_mn) + std::to_string(seq());
         auto emit_xmm_offset_into_t9 = [&](int reg_t) {
             o += std::string("    mov ") + r64(t_[9]) + ", " + r64(reg_t) + "\n";
             o += std::string("    sub ") + r64(t_[9]) + ", " + imm(24) + "\n";
@@ -1528,8 +1714,12 @@ public:
         };
         emit_xmm_offset_into_t9(t_[4]);  // T9 = dst 槽偏移
         o += std::string("    movups xmm0, [") + r64(ctx_) + " + " + r64(t_[9]) + "]\n";
-        emit_xmm_offset_into_t9(t_[7]);  // T9 = src 槽偏移
-        o += std::string("    movups xmm1, [") + r64(ctx_) + " + " + r64(t_[9]) + "]\n";
+        if (dual_src) {
+            o += load_src_slot_into_xmm1(tag);  // src: xmm 区或 GP 双槽
+        } else {
+            emit_xmm_offset_into_t9(t_[7]);  // T9 = src 槽偏移
+            o += std::string("    movups xmm1, [") + r64(ctx_) + " + " + r64(t_[9]) + "]\n";
+        }
         o += std::string("    ") + native_mn + " xmm0, xmm1\n";
         emit_xmm_offset_into_t9(t_[4]);  // 重算 dst 偏移写回
         o += std::string("    movups [") + r64(ctx_) + " + " + r64(t_[9]) + "], xmm0\n";
@@ -1544,6 +1734,9 @@ public:
     std::string build_movapd(u64 d) const { return build_xmm_transfer(d, "movapd"); }
     std::string build_movups(u64 d) const { return build_xmm_transfer(d, "movups"); }
     std::string build_movupd(u64 d) const { return build_xmm_transfer(d, "movupd"); }
+    // MIT-408: movsd (F2 0F 10, scalar double) — 8B 搬, 高 64 位保持不变
+    // (寄存器形式; 内存源清零语义由 XmmLoad 的 native movsd 直产)。
+    std::string build_movsd(u64 d)  const { return build_xmm_transfer(d, "movsd"); }
 
     // ---- MIT-376: SSE 浮点位运算 xorps / orps / andps ----
     //
@@ -1554,9 +1747,9 @@ public:
     // 族同为"无 flags 尾巴"路径。
     // 硬约束: 槽位偏移公式的 24/4/0x140 一律经 imm(), 禁止裸多位数字
     // (pitfall #78)。
-    std::string build_xorps(u64 d) const { return build_xmm_transfer(d, "xorps"); }
-    std::string build_orps(u64 d)  const { return build_xmm_transfer(d, "orps"); }
-    std::string build_andps(u64 d) const { return build_xmm_transfer(d, "andps"); }
+    std::string build_xorps(u64 d) const { return build_xmm_transfer(d, "xorps", /*dual_src=*/true); }
+    std::string build_orps(u64 d)  const { return build_xmm_transfer(d, "orps", /*dual_src=*/true); }
+    std::string build_andps(u64 d) const { return build_xmm_transfer(d, "andps", /*dual_src=*/true); }
 
     // ---- MIT-376: SSE 浮点比较 ucomiss / ucomisd ----
     //
@@ -1580,6 +1773,7 @@ public:
     // ucomisd ↔ S64 tag), 不像 ALU binop 按 cond_or_size 四路展开。
     std::string build_ucomis_flags(u64 dispatch, const char* native_mn) const {
         std::string o = decode_prelude();
+        const std::string tag = std::string(native_mn) + std::to_string(seq());
         auto emit_xmm_offset_into_t9 = [&](int reg_t) {
             o += std::string("    mov ") + r64(t_[9]) + ", " + r64(reg_t) + "\n";
             o += std::string("    sub ") + r64(t_[9]) + ", " + imm(24) + "\n";
@@ -1588,8 +1782,7 @@ public:
         };
         emit_xmm_offset_into_t9(t_[4]);  // T9 = dst 槽偏移 (reg_a = 24..31)
         o += std::string("    movups xmm0, [") + r64(ctx_) + " + " + r64(t_[9]) + "]\n";
-        emit_xmm_offset_into_t9(t_[7]);  // T9 = src 槽偏移 (reg_b = 24..31)
-        o += std::string("    movups xmm1, [") + r64(ctx_) + " + " + r64(t_[9]) + "]\n";
+        o += load_src_slot_into_xmm1(tag);  // src: xmm 区或 GP 双槽 (MIT-408)
         o += zero5();                    // 清 flag scratch (T3/T4/T6/T7/T9)
         o += std::string("    ") + native_mn + " xmm0, xmm1\n";
         o += setcc5();                   // T3=CF T4=OF(=0) T6=ZF T7=SF(=0) T9=PF
@@ -2952,6 +3145,16 @@ RuntimeGenResult generate_runtime(wvmp::Rng& rng) {
         {int(VmOp::SetFlags), "setflags", &AsmGen::build_setflags},
         {int(VmOp::CallGate), "callgate", &AsmGen::build_callgate},
         {int(VmOp::ExitNative), "exitnative", &AsmGen::build_exitnative},
+        // MIT-408: SSE scalar-double 族 (addsd/subsd/divsd/movsd, REG-REG,
+        // 与 ss/ps/pd 同模板; MOVSD 是 F2 0F 10 传送, build_movsd 走
+        // build_xmm_transfer) + mem 形式原语 XmmLoad/XmmStore (宽度经 aux,
+        // 双语义槽寻址, 一律 movups 非对齐语义 D2)。
+        {int(VmOp::Movsd), "movsd", &AsmGen::build_movsd},
+        {int(VmOp::Addsd), "addsd", &AsmGen::build_addsd},
+        {int(VmOp::Subsd), "subsd", &AsmGen::build_subsd},
+        {int(VmOp::Divsd), "divsd", &AsmGen::build_divsd},
+        {int(VmOp::XmmLoad), "xmmload", &AsmGen::build_xmm_load},
+        {int(VmOp::XmmStore), "xmmstore", &AsmGen::build_xmm_store},
     };
     rng.shuffle(handlers.begin(), handlers.end());   // 码序随机
 

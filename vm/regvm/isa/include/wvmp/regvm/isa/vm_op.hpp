@@ -465,9 +465,45 @@ enum class VmOp : u16 {
     // 派活单 §D 决策: ExitNative 必 append-only 在 Idiv 之后 (pitfall #34
     // additive enum append-only)；kVmOpMax+1=80 < 128 跳表 (asmgen.cpp
     // static_assert(kVmOpMax < kTableEntries))。
-    ExitNative };
+    ExitNative,
 
-inline constexpr u16 kVmOpMax = static_cast<u16>(VmOp::ExitNative);
+    // —— MIT-408 SSE scalar-double (sd) 族: addsd/subsd/divsd/movsd ——
+    // 与 ss/ps/pd 三族同构的 REG-REG 形式。IR 编码借用既有 ir::Op +
+    // Size::S64 双语义 ((Addss,S64)=addsd, (Subss,S64)=subsd, (Divss,S64)=
+    // divsd, (Movss,S64)=movsd)——ir::Op 是冻结契约不可增枚举, (op,size)
+    // 组合在旧 lifter 中从不产生 (addss 恒 S32), 无歧义。字节结构:
+    //   - movsd xmm1, xmm2   F2 0F 10 /r  (标量 double, **只搬低 64 位,
+    //     高 64 位保持不变**——与 movss 同语义, 内存源形式的清零语义由
+    //     XmmLoad handler 的 native movsd 直产)
+    //   - addsd xmm1, xmm2   F2 0F 58 /r  (scalar double 加, 低 64 位)
+    //   - subsd xmm1, xmm2   F2 0F 5C /r  /  divsd xmm1, xmm2  F2 0F 5E /r
+    //   cond_or_size=ir::Size::S64 (scalar double 8B 占位, 与 packed S64
+    //   tag 由 opcode 区分)。不影响 EFLAGS; updates_flags=false。
+    // 派活单 §D 决策: 4 op 必 append-only 在 ExitNative 之后 (pitfall #34)。
+    Movsd, Addsd, Subsd, Divsd,
+
+    // —— MIT-408 SSE mem 形式原语: XmmLoad / XmmStore ——
+    // xmm 槽 ↔ [VA] 访存 (movss=4B / movsd=8B / movups=16B, 宽度经 aux)。
+    // 运行时一律 movups 非对齐语义 (D2: PE 不保证全局 16B 对齐, 用对齐版
+    // 指令=埋 #GP 雷; movaps/movapd 的 mem 形式同样走本通路)。
+    //   XmmLoad:  a_kind=Reg reg_a=目的槽, b_kind=Reg reg_b=地址槽, aux=宽度。
+    //     reg_a >= 24 = ctx.xmm 区 (0x140+(reg-24)*16); reg_a < 24 = GP
+    //     scratch 双槽 (0x10+reg*8, 16B 覆盖 vN+vN+1)——ALU src=mem 形式
+    //     的临时槽编码 (MIT-408 设计: 不动 VmContext 布局, 借用 v18..v23
+    //     两两作 xmm 宽临时, 指令边界后即死)。native 指令的 movss/movsd
+    //     **清零语义**由 movss/movsd xmm0,[mem] 直产 (SDM: 内存源清零
+    //     高位), movups 全 128-bit。
+    //   XmmStore:  a_kind=Reg reg_a=地址槽, b_kind=Reg reg_b=源槽 (同上
+    //     双语义), aux=宽度。写 [VA] 前先把槽 128-bit 读进 xmm0 (movups),
+    //     再按宽度 movss/movsd/movups [addr], xmm0 落盘 (低宽度截断)。
+    //   rip-relative: 翻译器先 emit_address (RVA) + 既有 LeaRva (RVA→VA),
+    //     再走本对原语——不加 LoadRva/StoreRva 变体, 复用既有通道。
+    //   不影响 EFLAGS; 不调 setcc5 也不走 flags_tail, 直接 advance。
+    // 派活单 §D 决策: 2 op 必 append-only 在 Divsd 之后 (pitfall #34);
+    // kVmOpMax+1=86 < 128 跳表余量充足。
+    XmmLoad, XmmStore };
+
+inline constexpr u16 kVmOpMax = static_cast<u16>(VmOp::XmmStore);  // MIT-408: 86
 inline constexpr u16 kVmOpLimit = 1u << 14;  // 14 位编码空间上限
 
 constexpr const char* to_string(VmOp op) {
@@ -541,6 +577,13 @@ constexpr const char* to_string(VmOp op) {
         case VmOp::Idiv: return "idiv";
         // MIT-407: 区域外跳转单向退出到 native.
         case VmOp::ExitNative: return "exitnative";
+        // MIT-408: SSE scalar-double 族 + mem 形式原语.
+        case VmOp::Movsd: return "movsd";
+        case VmOp::Addsd: return "addsd";
+        case VmOp::Subsd: return "subsd";
+        case VmOp::Divsd: return "divsd";
+        case VmOp::XmmLoad: return "xmmload";
+        case VmOp::XmmStore: return "xmmstore";
     }
     return "?";
 }
