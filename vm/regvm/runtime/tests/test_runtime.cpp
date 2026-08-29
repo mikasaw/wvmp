@@ -1136,6 +1136,91 @@ TEST(Interpreter, CallgateCtxAlwaysCalleeSaved) {
     EXPECT_EQ(ok, total) << "callgate dump 校验失败 " << (total - ok) << "/" << total;
 }
 
+// MIT-417 (P0): callgate FP 参数/返回值通路 — 生成码含 4+1 movups 序列断言
+// + 时机。修复前 build_callgate 只搬 RCX/RDX/R8/R9 整数参数、只回写 RAX,
+// 区域内带 double/float 参数的 native 调用 FP 参数断链 → 静默错乱 (g5r_p0)。
+// 修复后 callgate 段必须含:
+//   (a) 4 条 `movups xmmN, [<ctx_> + 0x140 + 16*N]` (N=0..3, FP 入参槽),
+//       且全部出现在 `call` (step 6) **之前** (参数就位时序);
+//   (b) 1 条 `movups [<ctx_> + 0x140], xmm0` (标量 FP 返回值捕获), 且出现在
+//       `call` **之后** (step 10.5, pop ctx 之后)。
+// 跨多 seed 验证 (ctx_ 随机化下序列与时机恒成立)。偏移从 kCtxXmmBase
+// 派生 (与 asmgen 同源, 禁字面量第二份拷贝)。
+TEST(Interpreter, CallGateFpArgReturnWiring) {
+    auto extract_callgate = [](const std::string& dump) -> std::string {
+        const std::string marker = "handler callgate @ +";
+        const auto pos = dump.find(marker);
+        if (pos == std::string::npos) return {};
+        const auto end_marker = dump.find("; ---- handler", pos + marker.size());
+        const auto end = (end_marker != std::string::npos) ? end_marker : dump.size();
+        return dump.substr(pos, end - pos);
+    };
+    // 偏移从 kCtxXmmBase 派生 (与 asmgen 同源, 禁字面量第二份拷贝)。
+    const auto hex = [](u64 v) {
+        char b[24];
+        std::snprintf(b, sizeof(b), "0x%llX", static_cast<unsigned long long>(v));
+        return std::string(b);
+    };
+    const std::array<const char*, 8> kCalleeSavedNames = {
+        "rbx", "rbp", "rsi", "rdi", "r12", "r13", "r14", "r15"
+    };
+    const std::array<const char*, 4> kOffsets = {"0xD0", "0xD8", "0xE0", "0xE8"};
+    const std::string call_marker = "    call ";
+
+    int total = 0;
+    for (u64 seed : {1ull, 2ull, 3ull, 5ull, 10ull, 12345ull, 99999ull, 0xDEADBEEFull,
+                     0xCAFEBABEull, 0xC0FFEEull, 0xABCDEFull, 0xBABEF00Dull,
+                     0xFEEDFACEull, 4ull, 6ull, 7ull, 8ull, 100ull,
+                     1000ull, 10000ull}) {
+        wvmp::Rng rng(seed);
+        const auto result = rt::generate_runtime(rng);
+        const std::string cg = extract_callgate(result.asm_dump);
+        ASSERT_FALSE(cg.empty()) << "seed=" << seed << " 缺 callgate handler 段";
+
+        // 找出 callgate 段实际作为 ctx_ 使用的寄存器名 (任一 callee-saved
+        // + 0xD0..0xE8, 与 AsmGenCtxAlwaysCalleeSaved 同法)。
+        std::string ctx_reg;
+        for (const auto* name : kCalleeSavedNames) {
+            for (const auto* off : kOffsets) {
+                if (cg.find(std::string("[") + name + " + " + off + "]")
+                    != std::string::npos) {
+                    ctx_reg = name;
+                    break;
+                }
+            }
+            if (!ctx_reg.empty()) break;
+        }
+        ASSERT_FALSE(ctx_reg.empty()) << "seed=" << seed << " 未找到 ctx_ 寄存器名";
+
+        // (a) 4 条 FP 入参 movups (xmm0..3 ← ctx.xmm[0..3]), 且全部位于
+        //     `call` (step 6) 之前 —— 参数就位时序。
+        const auto call_pos = cg.find(call_marker);
+        ASSERT_NE(call_pos, std::string::npos) << "seed=" << seed << " callgate 段缺 call";
+        for (int n = 0; n < 4; ++n) {
+            const std::string pat = std::string("    movups xmm") + std::to_string(n) +
+                                    ", [" + ctx_reg + " + " +
+                                    hex(rt::kCtxXmmBase + 16 * n) + "]";
+            const auto pos = cg.find(pat);
+            ASSERT_NE(pos, std::string::npos)
+                << "seed=" << seed << " callgate 段缺 FP 入参搬运: " << pat;
+            EXPECT_LT(pos, call_pos)
+                << "seed=" << seed << " FP 入参 movups 必须位于 call 之前: " << pat;
+        }
+
+        // (b) 1 条 FP 返回值捕获 (ctx.xmm[0] ← xmm0), 位于 `call` 之后
+        //     (step 10.5, pop ctx 之后)。
+        const std::string ret_pat = std::string("    movups [") + ctx_reg + " + " +
+                                    hex(rt::kCtxXmmBase) + "], xmm0";
+        const auto ret_pos = cg.find(ret_pat);
+        ASSERT_NE(ret_pos, std::string::npos)
+            << "seed=" << seed << " callgate 段缺 FP 返回值捕获: " << ret_pat;
+        EXPECT_GT(ret_pos, call_pos)
+            << "seed=" << seed << " FP 返回值捕获必须位于 call 之后: " << ret_pat;
+        ++total;
+    }
+    EXPECT_EQ(total, 20) << "FP 入参/返回通路断言未覆盖全 seed";
+}
+
 TEST(Interpreter, AsmDumpStructure) {
     wvmp::Rng rng(0xABCDEF);
     const auto result = rt::generate_runtime(rng);

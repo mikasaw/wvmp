@@ -64,6 +64,11 @@
 #     微程序展开真虚拟化; 同 exe 负例 rep nop (pause) 照旧 gate; lock rep
 #     movsb 负例本机 #UD 不可执行, 仅 lifter 单测覆盖).
 #     Total: 34 samples × 5 seeds = 170 runs.
+#   - MIT-417 (P0): extend to wvmp_fp_callgate_sample (CallGate FP 参数/返回
+#     值通路修复主样本: 区域内 3 次 callgate 全 FP 参数形态 — double×4
+#     (xmm0..3 全槽) + float×2 入参, 返回值参与后续 VM 运算 (addsd/addss),
+#     g5r_p0 等价构造的回归盲区消灭样本; REQUIRE_REAL 主函数真虚拟化).
+#     Total: 35 samples × 5 seeds = 175 runs.
 #   - MIT-306: REQUIRE_REAL=1 校验日志含 "已生成 N 个入口 stub" 防止 C1 gate
 #     兜底被误判 PASS（仅 byte-exact 不够, C1 gate 函数被跳过仍能输出相同
 #     stdout+rc）。与 multiseed_e2e_real.sh 配套使用。
@@ -147,6 +152,11 @@ samples=(
     # 通路探针 (movs 保全 ZF 的 sete 读回); 同 exe 负例 rep nop (pause)
     # 照旧 gate, 行为 byte-exact 由双跑兜底。
     "build/passes/marker_scan/tests/wvmp_string_ops_sample.exe"
+    # MIT-417 (P0): CallGate FP 参数/返回值通路主样本 — 区域内 3 次 callgate
+    # 全 FP 参数形态 (double×4 xmm0..3 全槽 + float×2), 返回值参与 VM 内
+    # addsd/addss 运算后落全局 + 经函数返回; g5r_p0 等价构造 (修复前静默
+    # 错乱), REQUIRE_REAL 保证真虚拟化非 gate。
+    "build/passes/marker_scan/tests/wvmp_fp_callgate_sample.exe"
 )
 
 # Seeds: 1 (small), 12345 (default), 99999 (large), 0xDEADBEEF (magic), 0xCAFEBABE (magic).

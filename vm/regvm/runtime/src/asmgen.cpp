@@ -1240,6 +1240,23 @@ public:
         o += std::string("    mov rdx, qword ptr [") + r64(ctx_) + " + 0xD8]\n";
         o += std::string("    mov r8,  qword ptr [") + r64(ctx_) + " + 0xE0]\n";
         o += std::string("    mov r9,  qword ptr [") + r64(ctx_) + " + 0xE8]\n";
+        // 5.5) MIT-417 (P0): Win64 FP 参数槽 xmm0..3 ← ctx.xmm[0..3]。
+        // 此前 step 0/5 只搬整数参数 (rcx/rdx/r8/r9), 区域内对带
+        // double/float 参数的 native 调用 FP 参数断链 → 静默错乱零告警
+        // (g5r_p0: native fp_sum=15.00 → packed fp_sum=3.00; G5r triage
+        // §6.1)。全 16B movups 对 float/double/packed 全安全: Win64 ABI
+        // 规定 FP 参数高位 undefined, 全宽搬运与原生行为精确一致 (ctx.xmm
+        // 槽由 408 Movss S32/Movsd S64 通路正确维护, 低部有效即可)。
+        // movaps 禁用 (406 movaps 对齐 #GP 先例; ctx.xmm 区 16B 对齐但
+        // 物理侧无保证)。xmm base 经 kCtxXmmBase + 16*N 编译期派生, 禁
+        // 字面量第二份拷贝 (B2/E1 纪律)。
+        // 时序安全 (B.2 实测): 全部 handler 的物理 xmm0..3 均为指令内
+        // 临时 (读 ctx → 算 → 写 ctx → advance), 指令边界无活值; 此处
+        // 无条件覆写不破坏任何跨指令状态 (审读见 MIT-417 报告)。
+        for (int n = 0; n < 4; ++n) {
+            o += std::string("    movups xmm") + std::to_string(n) + ", [" +
+                 r64(ctx_) + " + " + imm(kCtxXmmBase + 16 * n) + "]\n";
+        }
         // 6) 调 native（目标 VA 在 t_[0]，参数已就位）
         o += std::string("    call ") + r64(t_[0]) + "\n";
         // 7) rsp 回到 host stack 上 push ctx 处（host_rsp - 8）。窗口 +
@@ -1258,6 +1275,15 @@ public:
         o += std::string("    mov ") + r64(base_) + ", qword ptr [" + r64(ctx_) + " + 0x130]\n";
         // 10) RAX (callee 返回值) 写回 regs[v0]
         o += std::string("    mov qword ptr [") + r64(ctx_) + " + 0x10], rax\n";
+        // 10.5) MIT-417 (P0): callee 标量 FP 返回值 xmm0 → ctx.xmm[0]。
+        // Win64 标量 FP 返回恒 xmm0 单槽, 无需 xmm1 (__vectorcall 多槽
+        // 返回不在 v1 面, GAPS C3 登记)。全 16B movups 捕获 callee 实际
+        // xmm0 全宽 — 后续 movsd/movss 低部读取与 addps 等全宽读取均与
+        // 原生残留语义一致 (未修复时 ctx.xmm[0] 保持 call 前旧值, 区域内
+        // 用返回值的 SSE 运算全部错值)。必须位于 step 8 pop ctx 之后
+        // (r64(ctx_) 已恢复)。
+        o += std::string("    movups [") + r64(ctx_) + " + " +
+             imm(kCtxXmmBase) + "], xmm0\n";
         // 11) advance（PC += 1; jmp dispatch）
         o += advance(dispatch);
         return o;

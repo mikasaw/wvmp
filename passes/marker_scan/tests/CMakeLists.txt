@@ -787,3 +787,19 @@ target_compile_options(wvmp_string_ops_sample PRIVATE
 target_link_options(wvmp_string_ops_sample PRIVATE
     $<$<CXX_COMPILER_ID:MSVC>:/INCREMENTAL:NO>
 )
+
+# MIT-417 (P0): 端到端正路径样本——区域内调用带 double/float 参数的 native
+# callee (3 次 callgate: 4 槽 double + 2 槽 float), 验证 CallGate FP 参数/
+# 返回值通路 (xmm0..3 入参 + xmm0 返回) 修复后真虚拟化、行为与原生逐字节
+# 一致 (G5r triage §6.1: 修复前 FP 参数断链 → 静默错乱零告警)。返回值参与
+# 后续 VM 运算 (addsd/addss), 四个可观察输出各对应一条故障通路。
+# REQUIRE_REAL: 主函数 fp_callgate_vm 真虚拟化 (stub ≥1)。
+add_executable(wvmp_fp_callgate_sample fp_callgate_sample_main.cpp)
+target_link_libraries(wvmp_fp_callgate_sample PRIVATE wvmp::sdk)
+target_compile_options(wvmp_fp_callgate_sample PRIVATE
+    $<$<AND:$<CXX_COMPILER_ID:MSVC>,$<COMPILE_LANGUAGE:C,CXX>>:/Od;/Ob0;/utf-8>
+    $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-O0>
+)
+target_link_options(wvmp_fp_callgate_sample PRIVATE
+    $<$<CXX_COMPILER_ID:MSVC>:/INCREMENTAL:NO>
+)

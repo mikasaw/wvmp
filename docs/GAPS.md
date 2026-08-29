@@ -95,12 +95,33 @@
 
 **验收**：每个新 op 的真执行电池用例绿；含 sar/adc/sbb 循环的 E2E 样本 PASS。
 
-## C3 区域内 call 不支持
+## C3 区域内 call 支持（callgate；整数 + FP 参数/返回值，MIT-417 起）
 
-- 翻译器直接 skip（translator.cpp:216-218，注释"建议 gate"）；runtime 同样落 Halt。
-- 真实函数几乎必然调用其他函数/API。M2-4 样本是刻意避开调用的。
-- 短期随 C1 的保守拦截兜底；长期需要 call gate（VM 内切原生 → 原生返回后
-  re-enter）或 VM 间调用协议。依赖 C1 的分段基础设施。
+**现状（MIT-417 改写，旧文 "翻译器直接 skip" 为 pre-M2-9 遗留，作废）**
+
+- 区域内直接 call（E8 disp32）已由 M2-9 起经 callgate 支持：翻译器 emit
+  `VmOp::CallGate`（目标 RVA 存 aux），运行时 handler 切 rsp 到 caller 原始
+  frame（MIT-B2 栈回退链 + MIT-406 callee 专用 4KB 窗口 + 运行时 16 对齐，
+  深树如 sha256 54-call 实测通过），调 native callee 后回解释器继续 dispatch。
+- **整数参数通路**（M2-9 起）：regs[1/2/8/9]（VM 的 rcx/rdx/r8/r9）→ reserved
+  槽 +0xD0..0xE8 → 物理 rcx/rdx/r8/r9，RAX 返回值写回 regs[v0]。
+- **FP 参数/返回值通路**（MIT-417 P0，2026-08-30 起）：call 前 4 条
+  `movups xmmN, [ctx.xmm + 16*N]`（N=0..3，全 16B 搬运，Win64 FP 参数槽），
+  call 后 1 条 `movups [ctx.xmm], xmm0` 捕获标量 FP 返回值（xmm base 经
+  kCtxXmmBase 编译期派生）。修复前 FP 参数断链 = **静默坏壳首例**（G5r
+  triage §6.1 / MIT-416 登记：区域内带 double/float 参数的 native 调用
+  虚拟化后错值零告警，如 g5r_p0 fp_sum=15.00→3.00；对 x87 路线的意义：
+  区域内调 CRT 数学函数 sin/pow 等必经此通路，是本缺陷的前置依赖）。
+- **残余面（登记，非 v1）**：
+  1. `__vectorcall` 多 xmm 返回 / 128 位结构返回不在 v1 面（Win64 标量 FP
+     返回恒 xmm0 单槽，无需 xmm1）；
+  2. 可变参 FP（printf 类）：variadic FP 参数按 ABI 需 caller 侧 `al` 计数
+     xmm 使用数，VM 通路未实测（MIT-417 D4 决策：不预设，进样本或披露，
+     当前未进样本——区域内 printf 拉入格式化字符串寻址等形态，留后续实测）；
+  3. callee 返回 double 但调用点按 float 读（类型错配）= 上游翻译缺陷，
+     出现即披露（MIT-417 §F.3）。
+- 其他形态：间接 call（O3 优化产物）、跨 stub 递归调用（callee 也是标记
+  函数）不在 v1 支持面，遇之由 C1 gate 兜底。
 
 ## C4 rip-relative 内存操作数不支持（GP 已 done；SSE mem 由 MIT-408 收口）
 
