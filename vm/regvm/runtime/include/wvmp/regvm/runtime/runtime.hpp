@@ -84,11 +84,25 @@ struct VmContext {
 };
 #pragma warning(pop)
 // MIT-371: VmContext 大小从 0x138 扩到 0x1C0（加 0x80 = xmm[8] 128B）。
-// 实际 sizeof 由编译器保证与 offset 一致, 加 8 字节栈对齐余量 = 0x1C8 (见
-// stub_gen.cpp 的 kCtxSize)。
+// 实际 sizeof 由编译器保证与 offset 一致。
 static_assert(sizeof(VmContext) >= 0x1C0, "VmContext must include xmm[8] (128B)");
 inline constexpr u64 kCtxXmmBase = 0x140;  // VmContext.xmm[0] RVA 偏移 = 0x140
 static_assert(offsetof(VmContext, xmm) == 0x140, "xmm must be 16-aligned at 0x140");
+
+// MIT-B2: kCtxSize 单一事实来源——stub 的 `sub rsp` 上下文区大小。
+// 此前定义在 stub_gen.cpp（匿名 namespace），asmgen.cpp 的 callgate step 7
+// 栈回退常量另持一份硬编码 0x1A8：MIT-371 把 0x140→0x1C8 时未跟随，push/pop
+// ctx 槽错开 0x88 → pop 读到 stub VmContext 帧内宿主 RBP(=0) → ctx_=0 →
+// callgate 样本全线 0xC0000005（MIT-393 四路互证）。两处消费方（stub_gen /
+// asmgen）现都从本头取用，改 VmContext 布局时全部自动跟随。
+// 派生式 = 上取 16 对齐 + 8，不变量：
+//   1) >= sizeof(VmContext)——栈上槽区必须装下整个 struct；
+//   2) ≡ 8 (mod 16)——stub 入口 rsp ≡ 8 (mod 16)，8 push 不变，sub 完须
+//      16 对齐（ctx 槽被 movups 全 16B 访问、`call rt_entry` 走 Win64 ABI
+//      都要求）。sizeof(VmContext) 的布局由上方 offsetof static_assert 钉死。
+inline constexpr u64 kCtxSize = ((sizeof(VmContext) + 15) & ~u64(15)) + 8;
+static_assert(kCtxSize >= sizeof(VmContext), "kCtxSize must cover VmContext");
+static_assert(kCtxSize % 16 == 8, "kCtxSize must keep stub rsp 16-aligned after sub");
 static_assert(offsetof(VmContext, bytecode) == 0x00);
 static_assert(offsetof(VmContext, pc) == 0x08);
 static_assert(offsetof(VmContext, regs) == 0x10);

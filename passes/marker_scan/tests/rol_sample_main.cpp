@@ -1,6 +1,13 @@
 // MIT-247: 端到端正路径样本——区域内含 rol/ror（白名单内），验证 C2-Rol/Ror
 // 修复后翻译成功、运行时走真实 Rol/Ror handler、行为与原生逐字节一致。
 //
+// MIT-B2 哨兵（D2.2，勿改主体逻辑）: 实测 VS 18 Insiders (v145) /MDd 下
+// _rotl64 / _rotr64 **未内联**成 rol/ror 指令，而是落成 CRT call
+// （ucrtbased!_rotl64）——区域因此含 call，保护时走 callgate 路径。本样本
+// 由此成为 callgate 的活体回归样本（MIT-393/MIT-B2 修复验证即依赖此路径）。
+// 换编译器版本可能"意外内联"使 callgate 覆盖静默流失——若发现本样本不再
+// 命中 callgate，先查工具链再查 VM 侧。
+//
 // 设计要点：
 //   - MSVC `_rotl64` / `_rotr64` 内部函数在 /Od 下 codegen 为真 `rol` / `ror`
 //     指令（/Od 不做 shl+shr 模式合并——那是 /O1 /O2 才发生的优化）。这是

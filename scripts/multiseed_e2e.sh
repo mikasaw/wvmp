@@ -31,7 +31,17 @@
 set -u
 
 repo="$(cd "$(dirname "$0")/.." && pwd)"
-cli="$repo/build/vs/cli/Debug/wvmp_cli.exe"
+
+# CLI 双探测（MIT-B2 B.3）：Ninja 现行布局优先，缺则回退旧 VS 布局，
+# 都缺则明确报错退出——消灭"镜像目录 hack"（mkdir build/vs/cli/Debug && cp）。
+if [[ -f "$repo/build/cli/wvmp_cli.exe" ]]; then
+    cli="$repo/build/cli/wvmp_cli.exe"
+elif [[ -f "$repo/build/vs/cli/Debug/wvmp_cli.exe" ]]; then
+    cli="$repo/build/vs/cli/Debug/wvmp_cli.exe"
+else
+    echo "[multiseed] ERROR: wvmp_cli.exe 未找到（探测过 build/cli/ 与 build/vs/cli/Debug/），请先跑 scripts\\build.bat" >&2
+    exit 2
+fi
 
 # MIT-306: REQUIRE_REAL 强校验. 设 1 时除 byte-exact 外, 还需 CLI 日志含
 # "已生成 N 个入口 stub" 标记（stub_link 在 virtualize 至少产生 1 个

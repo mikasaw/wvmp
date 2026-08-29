@@ -1,5 +1,7 @@
 #include "stub_gen.hpp"
 
+#include "wvmp/regvm/runtime/runtime.hpp"
+
 #include <keystone/keystone.h>
 
 #include <cstdio>
@@ -23,14 +25,20 @@ constexpr u64 kCtxRsp = 0x30;       // regs[4]
 constexpr u64 kCtxScratch = 0x110;
 constexpr u64 kCtxNativeSp = 0x120; // M2-9 call gate: caller 原始 frame 基址
 // MIT-371: XMM VM 槽位。VmContext.xmm[8] @ 0x140（8 槽 16B = 128B）= xmm0..xmm7。
-// VmContext 总大小 = 0x1C0 (基址 0x138 + xmm[8] 128B + 自然对齐) → kCtxSize
-// = 0x1C8 (= 0x1C0 + 8B 16-字节栈对齐余量)。这些常量与 runtime.hpp 的 VmContext
-// 布局强耦合 (offsetof 校验), 改 VmContext 时**必须**同步更新 kCtxSize/kCtxXmmBase。
-constexpr u64 kCtxXmmBase = 0x140;
-constexpr u64 kCtxSize = 0x1C8;
+// MIT-B2: kCtxSize/kCtxXmmBase 的单一事实来源移至 runtime.hpp（kCtxSize 由
+// sizeof(VmContext) 上取 16 对齐 + 8 派生）——本文件与 asmgen.cpp（callgate
+// step 7 栈回退）都是消费方，禁止再各持硬编码副本（MIT-371 漂移根因）。
+using wvmp::regvm::runtime::kCtxSize;
+using wvmp::regvm::runtime::kCtxXmmBase;
 
 // 占位 disp32（回填目标 = blob 指令流）：选罕见值便于汇编后定位。
 constexpr u32 kBlobDispDummy = 0xDEAD'0001;
+
+// stub 序言 push 的 callee-saved 全量字节数。与 runtime.hpp 的 kCalleeSavedIdx
+// 是同一 8 寄存器集合（rbx/rbp/rdi/rsi/r12-r15），由集合大小结构化导出——
+// 若 push 行增删，此值自动跟随（MIT-B2: 0x208 = 8*push + kCtxSize 曾整体
+// 硬编码，属 kCtxSize 漂移同族缺陷，一并派生）。
+constexpr u64 kStubPushBytes = wvmp::regvm::runtime::kCalleeSavedIdx.size() * 8;
 
 std::string build_stub_asm(u64 rt_entry_rva, u64 resume_rva, u64 image_base) {
     std::string o;
@@ -59,11 +67,11 @@ std::string build_stub_asm(u64 rt_entry_rva, u64 resume_rva, u64 image_base) {
         }
     }
     // v4 = 原始 rsp（区域代码按原函数帧的 rsp 相对寻址）：当前 rsp 比原始值
-    // 低 8*push(0x40) + kCtxSize(0x1C8) = 0x208，用 lea 还原。rax 的原值已在
+    // 低 kStubPushBytes(0x40) + kCtxSize(0x1C8) = 0x208，用 lea 还原。rax 的原值已在
     // slot0 保存，可复用。同一份原始 rsp 同时写到 native_sp（M2-9 call gate
     // 需要稳定的 caller frame 基址——v4 会被 VM 自身 push/pop 改写，native_sp
     // 跨指令不变，供 callgate handler 把 rsp 切回 caller frame 跑 native）。
-    o += "lea rax, [rsp + 0x208]\n";
+    o += "lea rax, [rsp + " + hex(kStubPushBytes + kCtxSize) + "]\n";
     o += "mov [rsp + " + hex(kCtxRsp) + "], rax\n";
     o += "mov [rsp + " + hex(kCtxNativeSp) + "], rax\n";
     // image_base（PE optional header 的 ImageBase 字段）→ scratch_mem 槽：

@@ -2,6 +2,14 @@
 // bswap 修复后: 翻译成功、运行时走真 Bswap handler、行为与原生逐字节一致
 // （保护 → 运行 → stdout+退出码比对）。
 //
+// MIT-B2 哨兵（D2.2，勿改主体逻辑）: 实测 VS 18 Insiders (v145) /MDd 下
+// _byteswap_ulong / _byteswap_uint64 **未内联**成 bswap 指令，而是落成
+// CRT call（ucrtbased!_byteswap_ulong / _byteswap_uint64）——区域因此含
+// call，保护时走 callgate 路径。本样本由此成为 callgate 的活体回归样本
+// （MIT-393/MIT-B2 修复验证即依赖此路径）。换编译器版本可能"意外内联"
+// 使 callgate 覆盖静默流失——若发现本样本不再命中 callgate，先查工具链
+// 再查 VM 侧。
+//
 // 设计要点 (沿用 cl_shift / imul / rol 模式):
 //   - bswap 测试 32-bit 和 64-bit 两种 size（分别对应无 REX.W 与有 REX.W）；
 //   - 用 _byteswap_ulong / _byteswap_uint64 强制 MSVC /Od 下 codegen 为真

@@ -211,6 +211,40 @@ std::string hex(u64 v) {
 }
 
 // ---------------------------------------------------------------------------
+// M2-9 callgate 栈回退常量（MIT-B2）——从 kCtxSize 编译期派生，禁止硬编码。
+//
+// 栈算术（native_sp = 进入 stub 时刻的 rsp；host_rsp = 解释器执行期 rsp）：
+//   host_rsp = native_sp - (kCalleeSavedPushBytes + kCtxSize + kCallRetBytes
+//              + kCalleeSavedPushBytes)
+//     stub: 8 push(callee-saved 全量) + sub rsp,kCtxSize；`call rt_entry`
+//     压返回地址；入口块再 8 push（base_ + rest 7，见 build_entry）。
+//   callgate step 3 push ctx 槽 = host_rsp - kCtxPushBytes
+//   step 4/6 后 rsp = native_sp - kWinShadowBytes
+//   step 7 sub 后必须回到 push ctx 槽：
+//     kCallgateSpRollback = kCalleeSavedPushBytes + kCtxSize + kCallRetBytes
+//                           + kCalleeSavedPushBytes + kCtxPushBytes
+//                           - kWinShadowBytes
+//     = kCtxSize + 0x68 （kCtxSize=0x1C8 → 0x230；0x140 时代 → 0x1A8 ✓）
+//
+// MIT-371 把 kCtxSize 0x140→0x1C8 时本处曾硬编码 0x1A8 未跟随：push/pop ctx
+// 槽错开 0x88，pop 读到 stub VmContext 帧内宿主 RBP(=0) → ctx_=0 → 下一指令
+// 寻址 0xC0000005（MIT-393 四路互证，5 坏样本崩点 .wvmp+0x37C0）。常量改由
+// kCtxSize（runtime.hpp，sizeof(VmContext) 派生）自动跟随，同类漂移断根。
+// ---------------------------------------------------------------------------
+constexpr u64 kCalleeSavedPushBytes = kCalleeSavedIdx.size() * 8;  // 0x40
+constexpr u64 kCallRetBytes   = 0x8;   // stub `call rt_entry` 的返回地址
+constexpr u64 kCtxPushBytes   = 0x8;   // callgate step 3 push ctx
+constexpr u64 kWinShadowBytes = 0x28;  // step 4: 32B shadow + 8B 对齐
+constexpr u64 kCallgateSpRollback = kCalleeSavedPushBytes + kCtxSize +
+                                    kCallRetBytes + kCalleeSavedPushBytes +
+                                    kCtxPushBytes - kWinShadowBytes;
+// 回落后 rsp = push ctx 槽：host_rsp - 8。host_rsp ≡ 8 (mod 16)（stub 入口
+// rsp ≡ 8，两次 8 push 与 call ret 均不动 16 余数）→ 槽 ≡ 0 (mod 16)，
+// 故回退量本身必 ≡ 0 (mod 16)——公式错位在此当场炸编译期。
+static_assert(kCallgateSpRollback % 16 == 0,
+              "callgate step7 rollback must land on the 16-aligned push-ctx slot");
+
+// ---------------------------------------------------------------------------
 // 生成器主体。
 // ---------------------------------------------------------------------------
 class AsmGen {
@@ -228,11 +262,11 @@ public:
         ctx_ = kCalleeSavedIdx[rng_.uniform(0u, u64(kCalleeSavedIdx.size()) - 1u)];
 
         // base_ 也必须 callee-saved：vm_entry push base_ + push 7 rest(跳过 base_)
-        // = 8 个 push, host_rsp = native_sp - 0x1C8. 若 base_ 是 caller-saved
-        // (如 rax), 它不在 rest 数组里, push 数变成 9, host_rsp = native_sp
-        // - 0x1D0. callgate step 7 `sub rsp, 0x1A8` 按 0x1C8 算, 实际需 0x1A0
-        // (少 8 字节), pop ctx_ 时读错地址, ctx_ 被破坏 → 跨 native call
-        // 后寻址 VmContext 读到垃圾 → segfault.
+        // = 8 个 push, host_rsp = native_sp - 0x250（= kCtxSize + 0x88, 见文件头
+        // kCallgateSpRollback 推导）. 若 base_ 是 caller-saved (如 rax), 它不在
+        // rest 数组里, push 数变成 9, host_rsp 再低 8 字节. callgate step 7 的
+        // 回退量按 8 push 口径派生, pop ctx_ 时读错地址, ctx_ 被破坏 → 跨
+        // native call 后寻址 VmContext 读到垃圾 → segfault.
         int base_idx = ctx_;
         while (base_idx == ctx_) {
             base_idx = kCalleeSavedIdx[rng_.uniform(0u, u64(kCalleeSavedIdx.size()) - 1u)];
@@ -976,13 +1010,17 @@ public:
     //      切 rsp 前预留 32 字节 Win64 阴影 + 8 字节对齐垫（40），使 call 前
     //      rsp 16 对齐（callee 进入看到 8 mod 16，符合 Win64）。
     //
-    // 栈回退算术（host_rsp = native_sp - 0x1C8 = 解释器执行期 rsp）：
-    //   stub 8 push + sub 0x140 + call 返回 8 + entry 8 push = 0x1C8
-    //   push ctx → rsp = host_rsp - 8 = native_sp - 0x1D0
+    // 栈回退算术（host_rsp = native_sp - 0x250 = 解释器执行期 rsp；常量由
+    // 文件头 kCallgateSpRollback 从 kCtxSize 编译期派生，MIT-B2）：
+    //   stub 8 push + sub kCtxSize + call 返回 8 + entry 8 push = 0x250
+    //   push ctx → rsp = host_rsp - 8 = native_sp - 0x258
     //   mov rsp, native_sp - 0x28
     //   call/ret → rsp = native_sp - 0x28
-    //   sub rsp, 0x1A8 → rsp = host_rsp - 8
+    //   sub rsp, kCallgateSpRollback(0x230) → rsp = host_rsp - 8
     //   pop ctx → rsp = host_rsp
+    // MIT-371 把 kCtxSize 0x140→0x1C8 时此处曾硬编码 0x1A8（0x140 时代值）
+    // 未跟随：push/pop ctx 槽错开 0x88，pop 读到 stub 帧内宿主 RBP(=0) →
+    // ctx_=0 → callgate 样本全线 0xC0000005（MIT-393）。
     //
     // Win64 ABI：callee 允许 clobber rcx/rdx/r8/r9。callgate 必须**保证
     // call 之前**它们持有调用参数——但 VM 翻译器把 mov/load 结果写到
@@ -1038,8 +1076,9 @@ public:
         o += std::string("    mov r9,  qword ptr [") + r64(ctx_) + " + 0xE8]\n";
         // 6) 调 native（目标 VA 在 t_[0]，参数已就位）
         o += std::string("    call ") + r64(t_[0]) + "\n";
-        // 7) rsp 回到 host stack 上 push ctx 处（native_sp - 0x1D0）
-        o += "    sub rsp, 0x1A8\n";
+        // 7) rsp 回到 host stack 上 push ctx 处（host_rsp - 8）；回退量从
+        //    kCtxSize 编译期派生（MIT-B2），kCtxSize 再变时自动跟随
+        o += "    sub rsp, " + imm(kCallgateSpRollback) + "\n";
         // 8) pop 回 ctx_
         o += std::string("    pop ") + r64(ctx_) + "\n";
         // 9) 从 VmContext 恢复 pc/flags/base
@@ -1070,7 +1109,7 @@ public:
             o += std::string("    mov ") + r64(t_[9]) + ", " + r64(reg_t) + "\n";
             o += std::string("    sub ") + r64(t_[9]) + ", " + imm(24) + "\n";
             o += std::string("    shl ") + r64(t_[9]) + ", " + imm(4) + "\n";
-            o += std::string("    add ") + r64(t_[9]) + ", " + imm(0x140) + "\n";
+            o += std::string("    add ") + r64(t_[9]) + ", " + imm(kCtxXmmBase) + "\n";
         };
         emit_xmm_offset_into_t9(t_[4]);  // T9 = dst 偏移
         o += std::string("    movups xmm0, [") + r64(ctx_) + " + " + r64(t_[9]) + "]\n";
@@ -1095,7 +1134,7 @@ public:
             o += std::string("    mov ") + r64(t_[9]) + ", " + r64(reg_t) + "\n";
             o += std::string("    sub ") + r64(t_[9]) + ", " + imm(24) + "\n";
             o += std::string("    shl ") + r64(t_[9]) + ", " + imm(4) + "\n";
-            o += std::string("    add ") + r64(t_[9]) + ", " + imm(0x140) + "\n";
+            o += std::string("    add ") + r64(t_[9]) + ", " + imm(kCtxXmmBase) + "\n";
         };
         emit_xmm_offset_into_t9(t_[4]);
         o += std::string("    movups xmm0, [") + r64(ctx_) + " + " + r64(t_[9]) + "]\n";
@@ -1120,7 +1159,7 @@ public:
             o += std::string("    mov ") + r64(t_[9]) + ", " + r64(reg_t) + "\n";
             o += std::string("    sub ") + r64(t_[9]) + ", " + imm(24) + "\n";
             o += std::string("    shl ") + r64(t_[9]) + ", " + imm(4) + "\n";
-            o += std::string("    add ") + r64(t_[9]) + ", " + imm(0x140) + "\n";
+            o += std::string("    add ") + r64(t_[9]) + ", " + imm(kCtxXmmBase) + "\n";
         };
         emit_xmm_offset_into_t9(t_[4]);
         o += std::string("    movups xmm0, [") + r64(ctx_) + " + " + r64(t_[9]) + "]\n";
@@ -1151,7 +1190,7 @@ public:
             o += std::string("    mov ") + r64(t_[9]) + ", " + r64(reg_t) + "\n";
             o += std::string("    sub ") + r64(t_[9]) + ", " + imm(24) + "\n";
             o += std::string("    shl ") + r64(t_[9]) + ", " + imm(4) + "\n";
-            o += std::string("    add ") + r64(t_[9]) + ", " + imm(0x140) + "\n";
+            o += std::string("    add ") + r64(t_[9]) + ", " + imm(kCtxXmmBase) + "\n";
         };
         emit_xmm_offset_into_t9(t_[4]);  // T9 = dst 偏移
         o += std::string("    movups xmm0, [") + r64(ctx_) + " + " + r64(t_[9]) + "]\n";
@@ -1176,7 +1215,7 @@ public:
             o += std::string("    mov ") + r64(t_[9]) + ", " + r64(reg_t) + "\n";
             o += std::string("    sub ") + r64(t_[9]) + ", " + imm(24) + "\n";
             o += std::string("    shl ") + r64(t_[9]) + ", " + imm(4) + "\n";
-            o += std::string("    add ") + r64(t_[9]) + ", " + imm(0x140) + "\n";
+            o += std::string("    add ") + r64(t_[9]) + ", " + imm(kCtxXmmBase) + "\n";
         };
         emit_xmm_offset_into_t9(t_[4]);
         o += std::string("    movups xmm0, [") + r64(ctx_) + " + " + r64(t_[9]) + "]\n";
@@ -1201,7 +1240,7 @@ public:
             o += std::string("    mov ") + r64(t_[9]) + ", " + r64(reg_t) + "\n";
             o += std::string("    sub ") + r64(t_[9]) + ", " + imm(24) + "\n";
             o += std::string("    shl ") + r64(t_[9]) + ", " + imm(4) + "\n";
-            o += std::string("    add ") + r64(t_[9]) + ", " + imm(0x140) + "\n";
+            o += std::string("    add ") + r64(t_[9]) + ", " + imm(kCtxXmmBase) + "\n";
         };
         emit_xmm_offset_into_t9(t_[4]);
         o += std::string("    movups xmm0, [") + r64(ctx_) + " + " + r64(t_[9]) + "]\n";
@@ -1234,7 +1273,7 @@ public:
             o += std::string("    mov ") + r64(t_[9]) + ", " + r64(reg_t) + "\n";
             o += std::string("    sub ") + r64(t_[9]) + ", " + imm(24) + "\n";
             o += std::string("    shl ") + r64(t_[9]) + ", " + imm(4) + "\n";
-            o += std::string("    add ") + r64(t_[9]) + ", " + imm(0x140) + "\n";
+            o += std::string("    add ") + r64(t_[9]) + ", " + imm(kCtxXmmBase) + "\n";
         };
         emit_xmm_offset_into_t9(t_[4]);  // T9 = dst 偏移
         o += std::string("    movups xmm0, [") + r64(ctx_) + " + " + r64(t_[9]) + "]\n";
@@ -1259,7 +1298,7 @@ public:
             o += std::string("    mov ") + r64(t_[9]) + ", " + r64(reg_t) + "\n";
             o += std::string("    sub ") + r64(t_[9]) + ", " + imm(24) + "\n";
             o += std::string("    shl ") + r64(t_[9]) + ", " + imm(4) + "\n";
-            o += std::string("    add ") + r64(t_[9]) + ", " + imm(0x140) + "\n";
+            o += std::string("    add ") + r64(t_[9]) + ", " + imm(kCtxXmmBase) + "\n";
         };
         emit_xmm_offset_into_t9(t_[4]);
         o += std::string("    movups xmm0, [") + r64(ctx_) + " + " + r64(t_[9]) + "]\n";
@@ -1284,7 +1323,7 @@ public:
             o += std::string("    mov ") + r64(t_[9]) + ", " + r64(reg_t) + "\n";
             o += std::string("    sub ") + r64(t_[9]) + ", " + imm(24) + "\n";
             o += std::string("    shl ") + r64(t_[9]) + ", " + imm(4) + "\n";
-            o += std::string("    add ") + r64(t_[9]) + ", " + imm(0x140) + "\n";
+            o += std::string("    add ") + r64(t_[9]) + ", " + imm(kCtxXmmBase) + "\n";
         };
         emit_xmm_offset_into_t9(t_[4]);
         o += std::string("    movups xmm0, [") + r64(ctx_) + " + " + r64(t_[9]) + "]\n";
@@ -1314,7 +1353,7 @@ public:
             o += std::string("    mov ") + r64(t_[9]) + ", " + r64(reg_t) + "\n";
             o += std::string("    sub ") + r64(t_[9]) + ", " + imm(24) + "\n";
             o += std::string("    shl ") + r64(t_[9]) + ", " + imm(4) + "\n";
-            o += std::string("    add ") + r64(t_[9]) + ", " + imm(0x140) + "\n";
+            o += std::string("    add ") + r64(t_[9]) + ", " + imm(kCtxXmmBase) + "\n";
         };
         emit_xmm_offset_into_t9(t_[4]);  // T9 = dst 槽偏移
         o += std::string("    movups xmm0, [") + r64(ctx_) + " + " + r64(t_[9]) + "]\n";
@@ -1374,7 +1413,7 @@ public:
             o += std::string("    mov ") + r64(t_[9]) + ", " + r64(reg_t) + "\n";
             o += std::string("    sub ") + r64(t_[9]) + ", " + imm(24) + "\n";
             o += std::string("    shl ") + r64(t_[9]) + ", " + imm(4) + "\n";
-            o += std::string("    add ") + r64(t_[9]) + ", " + imm(0x140) + "\n";
+            o += std::string("    add ") + r64(t_[9]) + ", " + imm(kCtxXmmBase) + "\n";
         };
         emit_xmm_offset_into_t9(t_[4]);  // T9 = dst 槽偏移 (reg_a = 24..31)
         o += std::string("    movups xmm0, [") + r64(ctx_) + " + " + r64(t_[9]) + "]\n";
