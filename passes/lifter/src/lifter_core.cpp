@@ -3,6 +3,8 @@
 #include "x86_translate.hpp"
 
 #include <algorithm>
+#include <cinttypes>
+#include <cstdio>
 #include <map>
 #include <set>
 #include <string>
@@ -155,8 +157,10 @@ u64 disassemble_and_lift(CapstoneSession& session, const u8* code, size_t size, 
             }
         } else {
             const char* why = (tr.status == TranslateStatus::Todo) ? "（TODO：v1 暂不支持）" : "";
+            char rva_buf[32];
+            std::snprintf(rva_buf, sizeof(rva_buf), "0x%" PRIX64, item.addr);
             diag.report(Severity::Note, pass_name,
-                        std::string(func_name) + " @rva 0x" + std::to_string(item.addr) +
+                        std::string(func_name) + " @rva " + rva_buf +
                             ": 未支持指令 '" + ci->mnemonic + "' " + why + "，已跳过");
             // MIT-249 follow-up (issue-09): 累积跳过的字节范围, 供下游
             // C1 gate 识别 IR 缺字节。translator 看到该函数有 skipped_range

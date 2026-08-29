@@ -1487,7 +1487,7 @@ TEST(LifterBlocks, UnsupportedInsnRecordedButNotFatal) {
     EXPECT_EQ(diag.items()[0].pass, "lifter");
     EXPECT_NE(diag.items()[0].message.find("cpuidy"), std::string::npos);
     EXPECT_NE(diag.items()[0].message.find("cpuid"), std::string::npos);
-    EXPECT_NE(diag.items()[0].message.find("4097"), std::string::npos); // 0x1001 的十进制
+    EXPECT_NE(diag.items()[0].message.find("0x1001"), std::string::npos); // MIT-407 hex log fix (was "4097" = decimal bug)
     EXPECT_FALSE(diag.has_errors());
 
     // MIT-249 follow-up (issue-09): cpuid (0F A2, 2 字节) 被跳过, 应在

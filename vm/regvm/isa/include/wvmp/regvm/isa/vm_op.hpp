@@ -437,9 +437,33 @@ enum class VmOp : u16 {
     // Idiv (单操作数): 有符号除, 余数截断向零 (Intel 语义, D3.1)。其余与
     //   Div 完全同构 (native idiv, F7 /7); 负被除数经 cqo/cdq 符号扩展进
     //   Rdx 槽后 native idiv 直接处理, 无需额外逻辑。
-    Idiv };
+    Idiv,
 
-inline constexpr u16 kVmOpMax = static_cast<u16>(VmOp::Idiv);
+    // —— MIT-407 ExitNative（区域外跳转单向退出到 native）——
+    // 单向退出：越过区域 END 但落在同一函数 .pdata 边界内的跳转目标时，
+    // 翻译期发 ExitNative；运行时复用 stub HALT 写回链（rax/rcx/rdx/r8-r11
+    // + xmm0-7 + add rsp/pop）→ 间接 jmp 到 aux 指定的 RVA，**不再回 VM**。
+    //   - aux = 目标 RVA（u32 零扩展；handler 写到 EXIT_SLOT）
+    //   - cond_or_size = ir::Cond (0..15) 走条件退出；0xFF = 无条件直退
+    //   - 12/17 站点为 jcc（triage §6.7），条件由 dispatch 解出 cond 后
+    //     复用 build_jcc 的 cond_eval 链；不满足则 advance 继续 VM
+    //   - 5/17 站点为 jmp（无条件），cond_or_size = 0xFF，handler 跳过链
+    // 契约：
+    //   - 出口 rsp == entry rsp（与 callgate 同一 native_sp 基准，本语料
+    //     14 区域 0 push / 0 rsp 调整实测成立；若未来区域含未配平 push，
+    //     现行 HALT 链同样会按 entry rsp 恢复，属既有潜在约束）
+    //   - EFLAGS 不回写：15 去重落点实测均先覆写 flags 再读，落点不消费
+    //     flags；属本语料实测契约，非普适证明（§2.4 / §F.2 披露）
+    //   - 间接 jmp / ret 目标维持 gate（C 双向分段不在本单）
+    // handler 写回链等价 stub_gen.cpp:99-118 HALT 段（一字不动复用）；
+    // stub 终态 `jmp rel32 resume_rva` 改为 `jmp [rsp+EXIT_SLOT]` 间接
+    // （slot 在 ctx 下方 -8 处；stub 入口预写 end_rva，handler 覆写 aux）。
+    // 派活单 §D 决策: ExitNative 必 append-only 在 Idiv 之后 (pitfall #34
+    // additive enum append-only)；kVmOpMax+1=80 < 128 跳表 (asmgen.cpp
+    // static_assert(kVmOpMax < kTableEntries))。
+    ExitNative };
+
+inline constexpr u16 kVmOpMax = static_cast<u16>(VmOp::ExitNative);
 inline constexpr u16 kVmOpLimit = 1u << 14;  // 14 位编码空间上限
 
 constexpr const char* to_string(VmOp op) {
@@ -511,6 +535,8 @@ constexpr const char* to_string(VmOp op) {
         case VmOp::Cdq: return "cdq";
         case VmOp::Div: return "div";
         case VmOp::Idiv: return "idiv";
+        // MIT-407: 区域外跳转单向退出到 native.
+        case VmOp::ExitNative: return "exitnative";
     }
     return "?";
 }

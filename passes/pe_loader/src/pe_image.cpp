@@ -2,6 +2,7 @@
 
 #include "wvmp/common/bytes.hpp"
 
+#include <algorithm>
 #include <cstdio>
 #include <limits>
 
@@ -23,6 +24,9 @@ std::string hex16(u16 v) {
     std::snprintf(buf, sizeof(buf), "0x%04X", v);
     return std::string(buf);
 }
+
+// MIT-407: 按 BeginAddress 二分查 .pdata 的实现在 PeImage::find_function_end_rva
+// 内联方法（详见头文件注释）；本文件不再保留额外静态包装。
 
 PeImage parse_impl(std::span<const u8> image) {
     if (image.size() < 0x40) throw PeParseError("文件太小，容纳不下 DOS 头");
@@ -73,6 +77,29 @@ PeImage parse_impl(std::span<const u8> image) {
     img.section_alignment = r.read_u32();
     img.file_alignment = r.read_u32();
 
+    // —— MIT-407: 暂存 DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION] (index=3)
+    // 解析 .pdata RUNTIME_FUNCTION 表所需的元数据。实际 .pdata 读取推迟到
+    // 节表解析之后（rva_to_offset 依赖 sections 完成）；此处仅记下 RVA/Size。
+    //
+    // PE32+ / PE32 的 OptionalHeader 字节布局到 DataDirectory 起点：
+    //   PE32+: ...| SizeOfHeapCommit(8)| LoaderFlags(4)| NumRvaSizes(4)| DataDir[0]
+    //   PE32 : ...| SizeOfHeapCommit(4)| LoaderFlags(4)| NumRvaSizes(4)| DataDir[0]
+    // 从 file_alignment 之后 (PE32+ 0x28 / PE32 0x24) 跳到 DataDirectory 起
+    // 点：0x70-0x28=0x48 (PE32+) / 0x60-0x24=0x3C (PE32)。
+    // DataDirectory[3] (EXCEPTION) 起点偏移 = 3*8 = 0x18。
+    u32 pdata_rva = 0, pdata_size = 0;
+    {
+        const u64 skip_to_dir = img.is_pe32_plus ? 0x48u : 0x3Cu;
+        if (u64(r.off) + skip_to_dir > image.size())
+            throw PeParseError("OptionalHeader 越界（DataDirectory 前）");
+        r.skip(skip_to_dir);
+        if (u64(r.off) + 0x18 + 8 > image.size())
+            throw PeParseError("OptionalHeader 越界（DataDirectory[3]）");
+        r.skip(0x18);
+        pdata_rva = r.read_u32();
+        pdata_size = r.read_u32();
+    }
+
     // —— 节表：每项 40 字节，位于 NT 头 + 24 + SizeOfOptionalHeader ——
     r.off = u64(pe_off) + 24 + opt_size;
     img.sections.reserve(img.num_sections);
@@ -91,10 +118,71 @@ PeImage parse_impl(std::span<const u8> image) {
         s.characteristics = r.read_u32();
         img.sections.push_back(std::move(s));
     }
+
+    // —— MIT-407: 解析 .pdata RUNTIME_FUNCTION 表（节表已就位）——
+    // x64 RUNTIME_FUNCTION：12B/条 = BeginAddress(4) + EndAddress(4) +
+    // UnwindInfoAddress(4)，按 BeginAddress 升序。
+    // 防御：end <= begin 或 begin 逆序视为不可信，标记 pdata_empty=true
+    // 回退；RVA 越界 / 节内无映射同理。
+    if (pdata_rva != 0 && pdata_size >= 12) {
+        const u64 entry_count = u64(pdata_size) / 12u;
+        // 文件边界防御：实际可读条目数取 min(声明数, 文件剩余/12)
+        const u64 avail = (pdata_rva < image.size()) ?
+                              (image.size() - pdata_rva) / 12u : 0;
+        const u64 safe_count = (avail < entry_count) ? avail : entry_count;
+        img.pdata.reserve(static_cast<size_t>(safe_count));
+        bool ok = true;
+        u32 prev_begin = 0;
+        for (u64 i = 0; i < safe_count; ++i) {
+            const u64 entry_rva = u64(pdata_rva) + i * 12u;
+            const auto off = img.rva_to_offset(entry_rva);
+            if (!off || u64(*off) + 12 > image.size()) {
+                ok = false;
+                break;
+            }
+            // ByteReader 无构造函数，按字段直填（避免 init-list 与设计意图混淆）
+            ByteReader er;
+            er.p = image.data() + *off;
+            er.n = image.size() - *off;
+            er.off = 0;
+            PeImage::RuntimeFunction rf;
+            rf.begin_rva = er.read_u32();
+            rf.end_rva = er.read_u32();
+            rf.unwind_info_rva = er.read_u32();
+            if (rf.end_rva <= rf.begin_rva) { ok = false; break; }
+            if (!img.pdata.empty() && rf.begin_rva < prev_begin) {
+                // 乱序：MSVC 按序排放；stripped / 自改工具可能乱序——保守回退
+                ok = false;
+                break;
+            }
+            prev_begin = rf.begin_rva;
+            img.pdata.push_back(rf);
+        }
+        img.pdata_empty = !ok || img.pdata.empty();
+    }
+
     return img;
 }
 
 } // namespace
+
+std::optional<u64> PeImage::find_function_end_rva(u64 begin_rva) const {
+    if (pdata_empty || pdata.empty()) return std::nullopt;
+    // 二分: 找 BeginAddress <= begin_rva 的最大条目, 验证 begin_rva < EndAddress
+    size_t lo = 0, hi = pdata.size();
+    while (lo < hi) {
+        const size_t mid = lo + (hi - lo) / 2;
+        if (static_cast<u64>(pdata[mid].begin_rva) <= begin_rva) lo = mid + 1;
+        else hi = mid;
+    }
+    if (lo == 0) return std::nullopt;
+    const auto& cand = pdata[lo - 1];
+    if (static_cast<u64>(cand.begin_rva) <= begin_rva &&
+        begin_rva < static_cast<u64>(cand.end_rva)) {
+        return static_cast<u64>(cand.end_rva);
+    }
+    return std::nullopt;
+}
 
 u64 PeImage::headers_raw_size() const {
     u64 hs = std::numeric_limits<u64>::max();

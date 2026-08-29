@@ -7,6 +7,8 @@ target_include_directories(wvmp_regvm_backend PUBLIC
     # MIT-249 follow-up (issue-09): backend 检查 lifter 跳过的字节范围
     # (LiftMetadata), 需可见 lifter header。
     ${CMAKE_SOURCE_DIR}/passes/lifter/include
+    # MIT-407: translate_function 上界查询 lambda 捕获 PeImage 引用.
+    ${CMAKE_SOURCE_DIR}/passes/pe_loader/include
 )
 # OBJECT 直链各组件对象（OBJECT-as-SOURCES 不传播 usage requirements 的
 # 老问题对编译期 include 路径同样成立，故显式列出全部依赖）。
@@ -17,6 +19,10 @@ target_link_libraries(wvmp_regvm_backend PUBLIC
     wvmp::vm
     wvmp::ir
     wvmp::common
+    # MIT-407: translate_function 上界查询 lambda 调用 PeImage 方法, 需可
+    # 见 PeImage 符号 (find_function_end_rva)。OBJECT-as-SOURCES 不传播,
+    # 显式列。
+    wvmp_pass_pe_loader
 )
 wvmp_target_warnings(wvmp_regvm_backend)
 

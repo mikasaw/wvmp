@@ -2,6 +2,8 @@
 #include "wvmp/ir/region.hpp"
 #include "wvmp/vm/backend.hpp"
 
+#include <functional>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -16,9 +18,17 @@ struct TranslateResult {
     std::vector<std::string> notes;
 };
 
+// MIT-407: 区域外跳转 ExitNative 上界函数。
+//   输入: 区域 begin_rva（即 marker_begin 落点 RVA）
+//   输出: 该函数在 .pdata RUNTIME_FUNCTION 表里的 EndAddress；nullopt = 无
+//         .pdata 条目 / 解析失败 / 调用方未提供（→ 维持 gate）。
+//   实现：pe_loader::PeImage::find_function_end_rva；调用方构造 lambda
+//   捕获 PeImage 引用传入。
+using FunctionUpperBoundFn = std::function<std::optional<u64>(u64 /*begin_rva*/)>;
+
 // 纯函数：把一个函数区域的 IR 逐指令翻译为 regvm 字节码。
 //   - 无跨指令分析、无状态残留；同输入同输出。
-//   - 遇到 v1 未支持的形态（call [mem] / 间接 call / 目标块缺失等）
+//   - 遇到 v1 未支持形态（call [mem] / 间接 call / 目标块缺失等）
 //     不抛异常：跳过该指令并写入 notes，交由上层 gate 回退。
 //
 // ============================ 翻译约定（与 runtime/isa 对齐） ============================
@@ -84,7 +94,18 @@ struct TranslateResult {
 // 直接 call (dst = Imm) emit VmOp::CallGate（aux = target RVA, cond_or_size
 // = arg_count, v1 固定 0）；间接 call / call [mem] 跳过并记 note 触发
 // C1 gate（保持原生）。完整 ABI 透传 / 递归 / 浮点参数留给后续 issue。
+//
+// MIT-407: 越区跳转 ExitNative（当 upper_bound_fn 非空且 target ∈
+// [end_rva, upper_bound_fn(begin_rva)) 时 emit VmOp::ExitNative, aux =
+// target RVA, cond_or_size = ir::Cond；不满足 → 维持原 gate）。
 // =====================================================================================
+
+// 单参数版：保持原签名向后兼容（无 .pdata 上界 → 维持 gate 行为）。
 [[nodiscard]] TranslateResult translate_function(const ir::FunctionRegion& fn);
+
+// 双参数版：传 .pdata 上界查询函数；virtualize pass 构造捕获 PeImage 引用
+// 的 lambda 传入。upper_bound_fn 为空 lambda 时与单参数版行为一致。
+[[nodiscard]] TranslateResult translate_function(const ir::FunctionRegion& fn,
+                                                 FunctionUpperBoundFn upper_bound_fn);
 
 } // namespace wvmp::regvm::translator

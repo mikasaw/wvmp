@@ -70,6 +70,7 @@
 #include <map>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace wvmp::regvm::runtime {
@@ -1009,6 +1010,108 @@ public:
             o += std::string("    pop ") + r64(base_) + "\n";
         }
         o += "    ret\n";
+        return o;
+    }
+
+    // MIT-407: ExitNative 写回链 — 复用 stub_gen.cpp Halt 段语义（rax/rcx/rdx/
+    // r8-r11 + xmm0-7 + add rsp, kCtxSize + pop callee-saved）+ 间接 jmp 到
+    // EXIT_SLOT（位于 [rsp - kExitSlotFinalOff]，stub 入口预写 resume_rva，
+    // handler 已覆写 aux 目标 RVA）。与 build_callgate step 4-8 互不影响
+    // （callgate 写回 regs[1/2/8/9] 是 caller-saved 透传快照到 reserved 槽，
+    // 本 handler 是宿主寄存器终态写回，作用域不同）。
+    //
+    // kExitSlotFinalOff = kCtxSize + 8*8 + 0x50（MIT-B2 纪律：kCtxSize 编译期
+    // 派生，禁止第二份字面量）。本文件不依赖 stub_gen.cpp 的常量以保持编译
+    // 边界；二者必须一致（见 stub_gen.cpp kExitSlotFinalOff 注释 — 0x50 在
+    // runtime 8 callee-saved push 槽 + callgate push ctx 槽下方，避让所有
+    // runtime 栈活动, 防 Halt pop rbp/rbx 把 slot 当 callee-saved 值读出）。
+    // rsp 直接写：handler 内 rsp = 宿主栈, 落点固定（add kCtxSize + 8 pop
+    // 序列后 rsp = entry rsp）。
+    std::string build_exitnative_writeback_and_jmp() const {
+        const u64 kExitSlotFinalOff = kCtxSize + 8 * 8 + 0x80;
+        std::string o;
+        // 写回 caller-saved 整数寄存器：rax/rcx/rdx/r8-r11（与 stub_gen.cpp
+        // HALT 段对齐: regs[0/1/2/8/9/10/11] @ ctx+0x10+i*8）。
+        for (const auto& [slot_off, reg_name] : std::vector<std::pair<int, const char*>>{
+                 {0, "rax"}, {1 * 8, "rcx"}, {2 * 8, "rdx"},
+                 {8 * 8, "r8"}, {9 * 8, "r9"}, {10 * 8, "r10"}, {11 * 8, "r11"}}) {
+            o += std::string("    mov ") + reg_name + ", qword ptr [" + r64(ctx_) +
+                 " + " + imm(u64(0x10 + slot_off)) + "]\n";
+        }
+        // 写回 xmm0..xmm7（MIT-371 SSE 槽位 @ ctx+0x140）。
+        for (int i = 0; i < 8; ++i) {
+            o += std::string("    movups xmm") + std::to_string(i) + ", [" + r64(ctx_) +
+                 " + " + imm(kCtxXmmBase + u64(i) * 16) + "]\n";
+        }
+        // add rsp, kCtxSize（ctx 区让出）
+        o += std::string("    add rsp, ") + imm(kCtxSize) + "\n";
+        // 弹 8 个 callee-saved（r15/r14/r13/r12/rsi/rdi/rbp/rbx 顺序，base_
+        // 最后弹 — 与 build_halt 一致）。
+        const char* rest[] = {"r15", "r14", "r13", "r12", "rsi", "rdi", "rbp", "rbx"};
+        for (const char* r : rest) {
+            if (std::string_view(r) == std::string_view(kPhys[base_].r64)) continue;
+            o += std::string("    pop ") + r + "\n";
+        }
+        o += std::string("    pop ") + r64(base_) + "\n";
+        // 间接 jmp EXIT_SLOT（slot = [rsp - kExitSlotFinalOff]，rsp 此时 =
+        // entry rsp，因为 add kCtxSize 把 ctx 区让出后 + 8 pop 复原了 8 push）。
+        o += std::string("    jmp qword ptr [rsp - ") + imm(kExitSlotFinalOff) + "]\n";
+        return o;
+    }
+
+    // MIT-407: ExitNative 主 handler。
+    //   - aux = 目标 RVA（u32，零扩展入 t_[5]）
+    //   - cond_or_size = 0xFF → 无条件直退
+    //                  = 0..15 (ir::Cond) → 条件退出（不满足 advance）
+    //   - 写回链复用 build_halt 的 pop 序 + 加 rax/rcx/rdx/r8-r11 + xmm0-7
+    //   - EXIT_SLOT = [rsp - 16]（handler rsp 视角）/ [rsp - 0x218]（终态）
+    std::string build_exitnative(u64 dispatch) const {
+        const std::string tag = "exitn" + std::to_string(seq());
+        const std::string test_lbl = "exitn_test_" + tag;
+        const std::string fall_lbl = "exitn_fall_" + tag;
+        constexpr u8 kUnconditionalSentinel = 0xFF;
+
+        std::string o = decode_prelude();   // t_[5]=aux, t_[2]=cond_or_size
+
+        // 0) 总是把 aux (t_[5]) 写到 EXIT_SLOT — 条件退出仅在 taken 时
+        //    jmp 槽位, 写早代价低; 无条件路径直接覆写。M2 Halt 路径 stub
+        //    入口预写 resume_rva 到同槽, 此处无条件覆写为 aux。
+        //    注意: [rsp - 8] 是 callgate push ctx 槽 (MIT-249), 会被覆写;
+        //    [rsp - 0x10..0x48] 是 runtime vm_entry 8 callee-saved push 槽
+        //    (asmgen.cpp vm_entry), Halt pop 会读这些地址作 callee-saved
+        //    值。用 [rsp - 0x50] 避让所有 runtime 栈活动 (callgate + 8 push)。
+        o += std::string("    mov qword ptr [rsp - 0x50], ") + r64(t_[5]) + "\n";
+
+        // 1) 无条件直退: cond_or_size == 0xFF → 写回 + 间接 jmp
+        //    条件退出: cond_or_size 0..15 → 走条件链
+        o += std::string("    cmp ") + r64(t_[2]) + ", " +
+             imm(kUnconditionalSentinel) + "\n";
+        o += "    je " + fall_lbl + "\n";  // 0xFF → 走 fall_lbl 处的直退
+        // 条件退出链 (cond_or_size 0..15): 仿 build_jcc 链式 cond_perm_[15] 分派
+        for (int i = 0; i < 15; ++i) {
+            const int c = cond_perm_[i];
+            o += std::string("    cmp ") + r64(t_[2]) + ", " + imm(c) + "\n";
+            o += "    je cc" + std::to_string(c) + "_" + tag + "\n";
+        }
+        o += "cc" + std::to_string(cond_perm_[15]) + "_" + tag + ":\n" +
+               cond_eval(cond_perm_[15]) + "    jmp " + test_lbl + "\n";
+        for (int i = 0; i < 15; ++i) {
+            const int c = cond_perm_[i];
+            o += "cc" + std::to_string(c) + "_" + tag + ":\n";
+            o += cond_eval(c);
+            o += "    jmp " + test_lbl + "\n";
+        }
+        o += test_lbl + ":\n";
+        // 条件求值: t_[0] = 0 (false) 或 1 (true)。test t_[0], t_[0];
+        // jz 跳 advance (条件不满足, 继续 VM)
+        o += std::string("    test ") + r64(t_[0]) + ", " + r64(t_[0]) + "\n";
+        o += "    jz " + std::string("cc_advance_") + tag + "\n";
+        // 条件满足: 写回 + jmp slot (走 fall_lbl 的直退复用)
+        o += build_exitnative_writeback_and_jmp();
+        o += std::string("cc_advance_") + tag + ":\n";
+        o += advance(dispatch);  // 条件不满足 → 继续 VM
+        o += fall_lbl + ":\n";
+        o += build_exitnative_writeback_and_jmp();  // 无条件直退
         return o;
     }
 
@@ -2862,6 +2965,10 @@ RuntimeGenResult generate_runtime(wvmp::Rng& rng) {
         {int(VmOp::GetFlags), "getflags", &AsmGen::build_getflags},
         {int(VmOp::SetFlags), "setflags", &AsmGen::build_setflags},
         {int(VmOp::CallGate), "callgate", &AsmGen::build_callgate},
+        // MIT-407: 区域外跳转单向退出到 native（.pdata 上界内）。
+        // DEBUG: temporarily disabled — stub indirect jmp regression
+        // under investigation. Re-enable when fixed.
+        // {int(VmOp::ExitNative), "exitnative", &AsmGen::build_exitnative},
     };
     rng.shuffle(handlers.begin(), handlers.end());   // 码序随机
 

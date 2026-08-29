@@ -13,6 +13,7 @@ target_link_libraries(wvmp_regvm_backend_tests PRIVATE
     $<TARGET_OBJECTS:wvmp_regvm_translator>
     $<TARGET_OBJECTS:wvmp_regvm_runtime>
     $<TARGET_OBJECTS:wvmp_regvm_isa>
+    $<TARGET_OBJECTS:wvmp_pass_pe_loader>
     wvmp::vm
     wvmp::ir
     wvmp::common

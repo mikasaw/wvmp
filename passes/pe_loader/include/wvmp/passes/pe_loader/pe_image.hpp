@@ -45,6 +45,28 @@ struct PeImage {
     u32 nt_headers_offset = 0;  // DOS 头 e_lfanew
     std::vector<SectionInfo> sections;
 
+    // —— MIT-407: .pdata (IMAGE_DIRECTORY_ENTRY_EXCEPTION) 解析 ——
+    // x64 RUNTIME_FUNCTION 表：12B/条 = BeginAddress(4) + EndAddress(4) +
+    // UnwindInfoAddress(4)，按 BeginAddress 升序。越区跳转 ExitNative 上界
+    // 算法 = RUNTIME_FUNCTION.EndAddress（triage §3 三候选实测 17/17 完胜）。
+    // 无 .pdata / 无 DataDirectory[3] / 解析失败时 pdata_empty = true，
+    // 调用方须回退 next-marker-begin / section-end 兜底，行为与修复前逐
+    // 字节一致（保守 gate）。
+    struct RuntimeFunction {
+        u32 begin_rva = 0;       // 函数起始 RVA（含）
+        u32 end_rva = 0;         // 函数结束 RVA（不含）
+        u32 unwind_info_rva = 0; // UNWIND_INFO RVA（仅诊断，本单不消费）
+    };
+    std::vector<RuntimeFunction> pdata;
+    bool pdata_empty = true;    // true = 未解析到或解析失败 → 回退链
+
+    // 给定 begin_rva 查 .pdata 找到包含它的函数 EndAddress（含 begin_rva
+    // 自身的 exact 命中优先；fallback = BeginAddress ≤ begin_rva < EndAddress
+    // 的最长前缀）。找不到返回 std::nullopt（调用方决定 gate 还是回退）。
+    // .pdata 按 BeginAddress 升序，二分 O(log N)；triage 实测 test_target.exe
+    // .pdata 1805 条 0x549C B，二分毫秒级。
+    std::optional<u64> find_function_end_rva(u64 begin_rva) const;
+
     // RVA → 文件偏移。文件头区间（首个含原始数据的节的 PointerToRawData
     // 之前，头在文件中线性铺开，RVA==偏移）直接返回；否则按节表已初始化
     // 区间映射；未映射（节间隙 / 未初始化尾部 / 越界）返回 nullopt。

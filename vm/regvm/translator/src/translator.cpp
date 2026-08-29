@@ -249,6 +249,12 @@ struct Translator {
     const std::unordered_map<u64, size_t>& block_of_addr;
     std::vector<std::string>& notes;
     const std::unordered_map<u64, u64>* next_ip_of_;   // insn.addr -> next_ip (=addr+len)
+    // MIT-407: 可选上界查询函数（捕获 PeImage 引用）。空指针 / 空 lambda = 不
+    // 启用 ExitNative（维持 gate）。设置后 translate_jump 在目标块缺失时会
+    // 额外检查是否落在 [end_rva, upper_bound_fn(begin_rva)) 内 → ExitNative。
+    const FunctionUpperBoundFn* upper_bound_of_ = nullptr;
+    u64 begin_rva_ = 0;   // 区域起始（用于 ExitNative 上界查询）
+    u64 end_rva_ = 0;     // 区域结束（用于 ExitNative 目标判定）
 
     bool skip(const ir::Insn& in, std::string_view what, const ir::MemOperand* rip) {
         if (rip && rip->base == ir::Reg::Rip)
@@ -521,8 +527,57 @@ struct Translator {
         if (in.dst.kind != ir::Operand::Kind::Imm)
             return skip(in, "跳转目标非立即数，未支持", nullptr);
         const auto it = block_of_addr.find(static_cast<u64>(in.dst.imm));
-        if (it == block_of_addr.end())
+        if (it == block_of_addr.end()) {
+            // MIT-407: 越区跳转 ExitNative 候选检查。条件全部满足时 emit
+            //   VmOp::ExitNative (aux = target RVA, cond_or_size = ir::Cond)；
+            //   否则维持原 C1 gate（保守正确，行为与修复前逐字节一致）。
+            //   1) target >= end_rva（确实越出本区域）
+            //   2) upper_bound_fn 可用且 target < upper_bound_fn(begin_rva)
+            //      （落在同一函数 .pdata 真实边界内）
+            //   3) 间接 jmp / ret 目标不入此路（维持 gate；C 双向分段不在本单）
+            if (in.op == ir::Op::Jmp && upper_bound_of_ != nullptr && *upper_bound_of_) {
+                const u64 target = static_cast<u64>(in.dst.imm);
+                const auto upper = (*upper_bound_of_)(begin_rva_);
+                if (target >= end_rva_ && upper.has_value() && target < *upper) {
+                    if (fits_aux(static_cast<i64>(target))) {
+                        em.emit(VmOp::ExitNative, OpKind::None, 0, OpKind::None, 0,
+                                static_cast<u32>(target),
+                                0xFF /*无条件直退 sentinel*/);
+                        char note[128];
+                        std::snprintf(note, sizeof(note),
+                                      "exit-native @ 0x%" PRIX64 " -> 0x%" PRIX64
+                                      " (unconditional)",
+                                      in.addr, target);
+                        notes.emplace_back(note);
+                        return true;
+                    }
+                }
+            }
+            // Jcc 形式 (12/17 站点, triage §6.7): 同样查上界, 条件 cond 保留
+            // 给 handler 求值。维持 emit ExitNative(aux=target, cond=in.cond)，
+            // 不满足时 advance 继续 VM（pitfall #79 禁 decode+advance 空转的
+            // 延伸：写 slot + 条件 exit 链由 handler 处理）。
+            if (in.op == ir::Op::Jcc && upper_bound_of_ != nullptr && *upper_bound_of_) {
+                const u64 target = static_cast<u64>(in.dst.imm);
+                const auto upper = (*upper_bound_of_)(begin_rva_);
+                if (target >= end_rva_ && upper.has_value() && target < *upper) {
+                    if (fits_aux(static_cast<i64>(target))) {
+                        em.emit(VmOp::ExitNative, OpKind::None, 0, OpKind::None, 0,
+                                static_cast<u32>(target),
+                                static_cast<u8>(in.cond));
+                        char note[128];
+                        std::snprintf(note, sizeof(note),
+                                      "exit-native @ 0x%" PRIX64 " -> 0x%" PRIX64
+                                      " (cond=%u)",
+                                      in.addr, target,
+                                      static_cast<unsigned>(in.cond));
+                        notes.emplace_back(note);
+                        return true;
+                    }
+                }
+            }
             return skip(in, "跳转目标块未找到（区域外/未 lift）", nullptr);
+        }
         if (in.op == ir::Op::Jcc)
             em.emit(VmOp::Jcc, OpKind::None, 0, OpKind::None, 0, 0,
                     static_cast<u8>(in.cond)); // cond_or_size = ir::Cond
@@ -1421,6 +1476,13 @@ struct Translator {
 } // namespace
 
 TranslateResult translate_function(const ir::FunctionRegion& fn) {
+    // 无 .pdata 上界 → 维持原行为。FunctionUpperBoundFn 默认构造为 nullptr
+    // 调用，等价于"无上界"，translate_jump 走原 C1 gate 路径。
+    return translate_function(fn, FunctionUpperBoundFn{});
+}
+
+TranslateResult translate_function(const ir::FunctionRegion& fn,
+                                 FunctionUpperBoundFn upper_bound_fn) {
     TranslateResult result;
 
     // 地址 -> 块下标（块按向量顺序即布局顺序排放）。
@@ -1454,6 +1516,14 @@ TranslateResult translate_function(const ir::FunctionRegion& fn) {
     std::vector<PendingJump> pending;
     std::vector<size_t> block_start(fn.blocks.size());
     Translator tr{code, pending, block_of_addr, result.notes, &next_ip_of};
+    // MIT-407: 把上界查询与区域端点写入 Translator, translate_jump 据此判定
+    // 是否 emit ExitNative。upper_bound_fn 为空时 upper_bound_of_ 留空,
+    // translate_jump 走原 gate 路径（与单参数版完全一致）。
+    if (upper_bound_fn) {
+        tr.upper_bound_of_ = &upper_bound_fn;
+        tr.begin_rva_ = fn.begin_rva;
+        tr.end_rva_ = fn.end_rva;
+    }
     const u8 sz64 = isa::size_field(ir::Size::S64);
 
     for (size_t bi = 0; bi < fn.blocks.size(); ++bi) {

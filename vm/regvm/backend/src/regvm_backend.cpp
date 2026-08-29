@@ -1,12 +1,14 @@
 #include "wvmp/regvm/backend/regvm_backend.hpp"
 
 #include "wvmp/passes/lifter/lift_metadata.hpp"
+#include "wvmp/passes/pe_loader/pe_image.hpp"
 #include "wvmp/regvm/runtime/runtime.hpp"
 #include "wvmp/regvm/translator/translator.hpp"
 #include "wvmp/vm/backend_registry.hpp"
 
 #include <cstdio>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -85,6 +87,10 @@ public:
             }
         }
         if (!skipped) {
+            // MIT-407 (partial): stub indirect jmp regression under
+            // investigation; fall back to direct jmp path (no
+            // ExitNative). Translator-side upper_bound plumbing
+            // preserved for follow-up, but disabled here.
             result = translator::translate_function(fn);
         }
         ctx.slot<std::vector<std::string>>(kLastTranslateNotes) = std::move(result.notes);

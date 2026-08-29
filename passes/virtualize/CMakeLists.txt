@@ -18,6 +18,10 @@ target_link_libraries(wvmp_pass_virtualize INTERFACE
     wvmp_regvm_translator
     wvmp_regvm_runtime
     wvmp_regvm_backend
+    # MIT-407: regvm_backend 编译期经 lambda 引用 PeImage::find_function_end_rva
+    # (OBJECT-as-SOURCES 不传播, 显式 INTERFACE 列, 保证 cli/测试链接时不
+    # 出现 unresolved external)。
+    wvmp_pass_pe_loader
 )
 wvmp_target_warnings(wvmp_pass_virtualize)
 

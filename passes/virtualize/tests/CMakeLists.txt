@@ -7,6 +7,9 @@ target_link_libraries(wvmp_virtualize_tests PRIVATE
     wvmp_regvm_isa
     wvmp_regvm_translator
     wvmp_regvm_runtime
+    # MIT-407: regvm_backend 编译期调用 PeImage::find_function_end_rva
+    # (Pass wvmp_pass_pe_loader 提供). OBJECT 链不可靠, 显式列。
+    wvmp_pass_pe_loader
     wvmp::framework
     wvmp::ir
     wvmp::common
