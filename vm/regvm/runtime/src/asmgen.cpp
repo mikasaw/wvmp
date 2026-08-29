@@ -245,6 +245,51 @@ static_assert(kCallgateSpRollback % 16 == 0,
               "callgate step7 rollback must land on the 16-aligned push-ctx slot");
 
 // ---------------------------------------------------------------------------
+// MIT-406 (MIT-E1): callgate callee 专用栈窗口。
+//
+// 预算推导: 修复前 callee 树从 native_sp-0x28 向下生长, 到 VmContext 顶
+// (native_sp-0x208) 只有 0x1D8 预算 (0x208 - 0x28 - 8ret)。wvmpTest sha256
+// 调用树 sha256_K→frac_cbrt_prime→wvpow13→pow/floor 实测栈深 ~0x250B, 砸穿
+// ctx → VM 状态毁坏 → packed.exe 0xC0000005 (MIT-404 合入暴露, 非引入)。
+// 实测最深树 0x250 → 0x1000 ≈ 6.5x 余量 + CRT 深链防御; 单调用树 > 4KB
+// 时症状从"砸穿 ctx"变为"砸穿窗口下 guard page"——明确崩溃非静默。
+//
+// 窗口位置: host_rsp (= native_sp-0x250) 以下当前无任何消费者 (entry 的
+// 8 push 在 host_rsp 之上; dispatch 纯跳表无递归; handler 仅 callgate 动
+// rsp) —— 干净窗口。step 4 把 rsp 切到 native_sp-kWinShadowBytes-窗口,
+// callee 树在窗口内生长, 与 ctx / stub 8 push 保存区零重叠。
+// 16 对齐: 窗口是 16 的倍数, 切换前后 call 前 rsp 的 16 余数不变 (Win64
+// call 站位语义与 0x28 基线完全一致)。
+// ---------------------------------------------------------------------------
+constexpr u64 kCallgateCalleeWindow = 0x1000;  // 4KB callee 专用窗口
+static_assert(kCallgateCalleeWindow % 16 == 0,
+              "callee window must be 16-aligned to keep the call-site rsp residue unchanged");
+
+// step 7 回退量 (MIT-406): 窗口 + 运行时对齐使 call/ret 后 rsp 相对
+// native_sp 的偏移含逐 stub 变化的对齐余数 (见 step 4 and 掩码), 常量
+// 回退不再可解——改为从 ctx+0x120 (native_sp, stub_gen 一次性写入, 跨
+// call 稳定) 重基数再减常量:
+//   kPushCtxDepth = native_sp 到 push ctx 槽的距离
+//                 = kWinShadowBytes + kCallgateSpRollback (0x28 + 0x230)
+//                 = 2*kCalleeSavedPushBytes + kCtxSize + kCallRetBytes
+//                   + kCtxPushBytes = 0x258
+// 不变量: pop ctx 落在 push ctx 槽 (host_rsp - 8), host_rsp = ns-0x250 恒成立。
+constexpr u64 kPushCtxDepth = kWinShadowBytes + kCallgateSpRollback;
+// 注意: push ctx 槽 (= ns - kPushCtxDepth) 的 16 余数随 ns 变化 (ns ≡ 8
+// mod 16 只是"区域函数序言为偶数个 push + N≡0"时的隐含假设, 非不变量);
+// step 7 从 ctx+0x120 (ns) 重基数后再减本常量, 对任意余数都精确落槽,
+// 不依赖该假设。槽本身的读写 (push/pop ctx) 也无对齐要求。
+
+// step 4 对齐移位 (MIT-406): call 前 rsp 必须 16 对齐 (Win64: callee 入口
+// 看 rsp ≡ 8 mod 16)。原 0x28 垫只做了相对 native_sp 的对齐, 而 ns 自身
+// 余数随区域函数序言深度变化 (wvmpTest sha256 区域 ns ≡ 0 mod 16 → callee
+// 入口 ≡ 0 → CRT 浮点 helper 的 movaps [rsp+..] #GP → 0xC0000005, cdb
+// 实证 packed+0xd389 movaps 崩点)。此处把 call 站位动态归一到 16 对齐:
+// 实现为 shr/shl 各 4 位 (丢低 4 位余数)。不用 and r,0xFFFFFFF0 —— keystone
+// 拒绝 >INT32_MAX 的 and 立即数 (errno 512 实证), shr/shl 小立即数无此限。
+constexpr u64 kCallgateAlignShift = 4;  // 2^4 = 16 对齐
+
+// ---------------------------------------------------------------------------
 // 生成器主体。
 // ---------------------------------------------------------------------------
 class AsmGen {
@@ -1011,13 +1056,29 @@ public:
     //      rsp 16 对齐（callee 进入看到 8 mod 16，符合 Win64）。
     //
     // 栈回退算术（host_rsp = native_sp - 0x250 = 解释器执行期 rsp；常量由
-    // 文件头 kCallgateSpRollback 从 kCtxSize 编译期派生，MIT-B2）：
+    // 文件头从 kCtxSize 编译期派生，MIT-B2；MIT-406 加 callee 窗口后重推）：
     //   stub 8 push + sub kCtxSize + call 返回 8 + entry 8 push = 0x250
     //   push ctx → rsp = host_rsp - 8 = native_sp - 0x258
-    //   mov rsp, native_sp - 0x28
-    //   call/ret → rsp = native_sp - 0x28
-    //   sub rsp, kCallgateSpRollback(0x230) → rsp = host_rsp - 8
-    //   pop ctx → rsp = host_rsp
+    //   t1 = native_sp - kWinShadowBytes - kCallgateCalleeWindow
+    //      = native_sp - 0x1028          ← callee 专用窗口 (MIT-406)
+    //   t1 &= ~15                        ← 运行时对齐 (MIT-406 缺陷二)
+    //   mov rsp, t1
+    //   mov qword ptr [t1], 0            ← 窗口底探针写 (防御性)
+    //   call/ret → rsp = t1 (对齐后, 距 ns 含 0..15B 对齐余数)
+    //   mov rsp, [ctx + 0x120]           ← native_sp 重基数 (跨 call 稳定)
+    //   sub rsp, kPushCtxDepth(0x258)    → rsp = native_sp - 0x258 = host_rsp - 8
+    //   pop ctx → rsp = host_rsp         (不变量保持)
+    // 缺陷一 (窗口): 修复前 call 站位 native_sp-0x28 距 ctx 顶仅 0x1D8
+    // 预算, 深树砸穿 ctx (wvmpTest sha256 调用树 ~0x250B, MIT-404 暴露)。
+    // 缺陷二 (对齐): 原 0x28 垫只相对 ns 对齐, ns 余数随区域函数序言变
+    // 化; sha256 树内 CRT 浮点 helper 的 movaps [rsp+..] 对 8 mod 16 的
+    // callee 入口 rsp 直接 #GP (cdb 实证 packed+0xd389 崩点)。两缺陷正交,
+    // 单修一不转绿——本单双修。
+    //
+    // 契约（MIT-406 §B.5）: 区域 VM 栈 (v4 = regs[4], VM Push/Pop 按
+    // [v4+disp] 绝对寻址) 与 native 窗口互斥——v4 以 native_sp 为基准,
+    // 区域栈向下越界属未配平 push 的潜在约束 (MIT-405 §2.4, 已知边界,
+    // 本单不修); native 窗口在 host_rsp 下方独立生长, 两者互不重叠。
     // MIT-371 把 kCtxSize 0x140→0x1C8 时此处曾硬编码 0x1A8（0x140 时代值）
     // 未跟随：push/pop ctx 槽错开 0x88，pop 读到 stub 帧内宿主 RBP(=0) →
     // ctx_=0 → callgate 样本全线 0xC0000005（MIT-393）。
@@ -1060,11 +1121,27 @@ public:
         o += std::string("    mov qword ptr [") + r64(ctx_) + " + 0x130], " + r64(base_) + "\n";
         // 3) push ctx 到 host stack
         o += std::string("    push ") + r64(ctx_) + "\n";
-        // 4) 切 rsp → native_sp - 40（32 shadow + 8 对齐）
+        // 4) 切 rsp → native_sp - 0x28 - kCallgateCalleeWindow（32 shadow
+        //    + 8 对齐 + callee 专用窗口, MIT-406）。立即数经 imm() 从常量
+        //    派生, 禁字面量第二份拷贝 (MIT-B2 纪律)。
         o += std::string("    mov ") + r64(t_[1]) + ", qword ptr [" + r64(ctx_) +
              " + 0x120]\n";
-        o += std::string("    sub ") + r64(t_[1]) + ", 0x28\n";
+        o += std::string("    sub ") + r64(t_[1]) + ", " +
+             imm(kWinShadowBytes + kCallgateCalleeWindow) + "\n";
+        // 运行时对齐 (MIT-406 缺陷二): ns 自身余数随区域函数序言深度变化,
+        // 0x28 垫只能相对对齐 — 此处把 call 站位归一到 16 对齐, 保证
+        // callee 入口 rsp ≡ 8 (mod 16) 恒成立 (Win64 ABI, movaps 栈槽)。
+        o += std::string("    shr ") + r64(t_[1]) + ", " +
+             imm(kCallgateAlignShift) + "\n";
+        o += std::string("    shl ") + r64(t_[1]) + ", " +
+             imm(kCallgateAlignShift) + "\n";
         o += std::string("    mov rsp, ") + r64(t_[1]) + "\n";
+        // 探针写 (MIT-406 §B.2 / D3.1): 窗口底一次触碰, 防御性——本跳幅
+        // (自 push ctx 槽 ns-0x258 至 ns-0x1028 共 0xDD0) < 1 页, Win64
+        // guard page 自动扩栈本应覆盖 (栈探测规则: 触碰点距已提交区不超
+        // 一页即自动生长); 显式探针消除边界条件。窗口若调大过一页, 此写
+        // 从防御升级为必需。
+        o += std::string("    mov qword ptr [") + r64(t_[1]) + "], 0\n";
         // 5) 把 reserved slots 抬到物理 rcx/rdx/r8/r9。
         // 关键：必须用 r64(ctx_) 而非硬编码 "r14" —— ctx_ 由 AsmGen::roll()
         // 从 14 GPR 池随机洗牌 (pool[0]) 选出，当前 seed=12345 下恰好是
@@ -1076,9 +1153,14 @@ public:
         o += std::string("    mov r9,  qword ptr [") + r64(ctx_) + " + 0xE8]\n";
         // 6) 调 native（目标 VA 在 t_[0]，参数已就位）
         o += std::string("    call ") + r64(t_[0]) + "\n";
-        // 7) rsp 回到 host stack 上 push ctx 处（host_rsp - 8）；回退量从
-        //    kCtxSize 编译期派生（MIT-B2），kCtxSize 再变时自动跟随
-        o += "    sub rsp, " + imm(kCallgateSpRollback) + "\n";
+        // 7) rsp 回到 host stack 上 push ctx 处（host_rsp - 8）。窗口 +
+        //    运行时对齐使 call/ret 后 rsp 相对 ns 的偏移含逐 stub 余数,
+        //    常量回退不可解 — 从 ctx+0x120 (native_sp, stub_gen 一次性
+        //    写入, 跨 call 稳定; ctx_ 抽自 callee-saved 池, 跨 call 存活)
+        //    重基数, 再减常量 kPushCtxDepth (kCtxSize 编译期派生链,
+        //    MIT-B2 纪律, kCtxSize 再变时自动跟随)。
+        o += std::string("    mov rsp, qword ptr [") + r64(ctx_) + " + 0x120]\n";
+        o += "    sub rsp, " + imm(kPushCtxDepth) + "\n";
         // 8) pop 回 ctx_
         o += std::string("    pop ") + r64(ctx_) + "\n";
         // 9) 从 VmContext 恢复 pc/flags/base

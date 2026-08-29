@@ -30,6 +30,10 @@
 #     wvmp_rip_relative_simple_sample (MIT-248 C4 读/写路径首次 multiseed
 #     覆盖; 若 FAIL 如实报告, StorRva 缺口属 C4 后续单).
 #     Total: 24 samples × 5 seeds = 120 runs.
+#   - MIT-406: extend to wvmp_deepcall_sample (16 层 MASM 递归链, 树深
+#     0x600B 静态可核算) + wvmp_deepcall_div_sample (div/idiv 与深 call
+#     共存) — callgate callee 专用栈窗口 (MIT-E1) 预算边界覆盖.
+#     Total: 26 samples × 5 seeds = 130 runs.
 #   - MIT-306: REQUIRE_REAL=1 校验日志含 "已生成 N 个入口 stub" 防止 C1 gate
 #     兜底被误判 PASS（仅 byte-exact 不够, C1 gate 函数被跳过仍能输出相同
 #     stdout+rc）。与 multiseed_e2e_real.sh 配套使用。
@@ -80,6 +84,10 @@ samples=(
     "build/passes/marker_scan/tests/wvmp_div_flags_readback_sample.exe"
     "build/passes/marker_scan/tests/wvmp_rip_relative_sample.exe"
     "build/passes/marker_scan/tests/wvmp_rip_relative_simple_sample.exe"
+    # MIT-406 (MIT-E1): 深 call 递归链 + div/深 call 组合样本 — callee 专用
+    # 栈窗口预算边界覆盖 (16 层 x 0x60B = 0x600B / 12 层 0x480B 树深)。
+    "build/passes/marker_scan/tests/wvmp_deepcall_sample.exe"
+    "build/passes/marker_scan/tests/wvmp_deepcall_div_sample.exe"
 )
 
 # Seeds: 1 (small), 12345 (default), 99999 (large), 0xDEADBEEF (magic), 0xCAFEBABE (magic).

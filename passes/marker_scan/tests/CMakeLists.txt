@@ -560,3 +560,40 @@ target_compile_options(wvmp_div_flags_readback_sample PRIVATE
 target_link_options(wvmp_div_flags_readback_sample PRIVATE
     $<$<CXX_COMPILER_ID:MSVC>:/INCREMENTAL:NO>
 )
+
+# MIT-406 (MIT-E1): 深 call 递归链样本——callgate callee 专用栈窗口的预算
+# 边界覆盖。deep_recurse 16 层 x 0x60B = 0x600B 静态可核算树深 (>=0x400B,
+# 派活单 §B.6), 旧 0x1D8 预算下修复前必砸穿 VmContext (反证, 验收 #8),
+# 修复后树在 host_rsp 下方 0x1000 窗口内生长。递归本体 MASM 直写 (帧深
+# 静态可控, C++ /Od 帧布局不可核算), 标记区域在 deepcall_entry (asm)。
+enable_language(ASM_MASM)
+add_executable(wvmp_deepcall_sample
+    deepcall_sample_main.cpp
+    deepcall_sample_asm.asm
+)
+target_link_libraries(wvmp_deepcall_sample PRIVATE wvmp::sdk)
+# COMPILE_LANGUAGE 限定 C/C++: C++ 选项传给 MASM 会 A4018, 同 MIT-389 块。
+target_compile_options(wvmp_deepcall_sample PRIVATE
+    $<$<AND:$<CXX_COMPILER_ID:MSVC>,$<COMPILE_LANGUAGE:C,CXX>>:/Od;/Ob0;/utf-8>
+    $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-O0>
+)
+target_link_options(wvmp_deepcall_sample PRIVATE
+    $<$<CXX_COMPILER_ID:MSVC>:/INCREMENTAL:NO>
+)
+
+# MIT-406 (MIT-E1): 组合形态样本——区域内 div/idiv (MIT-404 商余双槽路径)
+# 与深 call (0x480B 树深) 共存, 验证窗口切换与除法防护互不干扰 (派活单
+# §B.7 / §C D4.1)。递归本体复用 deepcall_sample_asm.asm。
+enable_language(ASM_MASM)
+add_executable(wvmp_deepcall_div_sample
+    deepcall_div_sample_main.cpp
+    deepcall_sample_asm.asm
+)
+target_link_libraries(wvmp_deepcall_div_sample PRIVATE wvmp::sdk)
+target_compile_options(wvmp_deepcall_div_sample PRIVATE
+    $<$<AND:$<CXX_COMPILER_ID:MSVC>,$<COMPILE_LANGUAGE:C,CXX>>:/Od;/Ob0;/utf-8>
+    $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-O0>
+)
+target_link_options(wvmp_deepcall_div_sample PRIVATE
+    $<$<CXX_COMPILER_ID:MSVC>:/INCREMENTAL:NO>
+)
