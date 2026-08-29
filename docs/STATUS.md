@@ -96,9 +96,10 @@ C3 区域内 call、C4 rip-relative、C5 x86 扫描不可用。
 - lifter：cl 变体移位、rol/ror v1 跳过（`x86_translate.cpp` 记 TODO）。
 - call / rip-relative 走 gate 回退路径（native 执行）——gate 本身未实现，见 GAPS C3/C4。
 - flags 跨指令污染：待 M3 活跃性分析消除。
-- marker_scan：仅 x64（GAPS C5）；O2 尾调用编成 E9 jmp（不产生 E8）不覆盖；
-  函数名解析 TODO(P7-names)。
-- x86 目标整体对齐仍在 backlog（当前主攻 x64）。
+- marker_scan：x86 锚点未支持（GAPS C5；32 位输入已在 pe_loader 显式硬拒绝，
+  MIT-414）；O2 尾调用编成 E9 jmp（不产生 E8）不覆盖；函数名解析 TODO(P7-names)。
+- x86 目标整体对齐在 P1 backlog（G7x-1..8）；当前支持目标 = **x64 PE**（32 位
+  输入显式拒绝，MIT-414）。
 
 ## 测试补强方向（按优先级）
 

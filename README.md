@@ -1,9 +1,14 @@
 # WVmp
 
-WVmp 是一个完全插件化的 PE x86/x64 虚拟机保护壳（参考 VMProtect/VMPilot 的自研实现）。
+WVmp 是一个完全插件化的 PE 虚拟机保护壳（参考 VMProtect/VMPilot 的自研实现）。
+**当前支持目标 = x64 PE（Machine 0x8664）**：32 位（x86 0x014C）输入会被
+显式硬拒绝（ERROR diag + 非零退出，不产出保护壳），见 docs/GAPS.md C5
+与 docs/STATUS.md。
 
-A fully pluginized PE x86/x64 virtual-machine protector (self-researched,
-VMProtect/VMPilot-inspired).
+A fully pluginized PE virtual-machine protector (self-researched,
+VMProtect/VMPilot-inspired). **Supported target: x64 PE (Machine 0x8664)**
+— 32-bit (x86 0x014C) inputs are explicitly rejected (ERROR + non-zero exit,
+no output), see docs/GAPS.md C5.
 
 ## 构建（Windows / MSVC / Ninja，需 VS 18 Insiders）
 

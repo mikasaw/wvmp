@@ -133,8 +133,19 @@ void roundtrip_system_pe(const fs::path& src, u16 machine, bool pe32_plus, const
     ProtectionContext ctx;
     ctx.input_path = copy;
     ctx.output_path = out;
-    wvmp::passes::PeLoaderPass loader;
-    loader.run(ctx);
+    ctx.image = read_file(copy);
+    // MIT-414 (G7p2 B.2): x86 输入在 PeLoaderPass 层显式硬 gate（不产保护壳）。
+    // 本测试意图是验证 pe_writer 对 PE32 镜像"不追加节时逐字节往返保持"，
+    // 与 gate 语义不冲突——x86 分支绕过 pass 层、直接以 parse 级接口（解析
+    // 本身双架构无害）产出模型；pass 层 gate 行为由 test_pe_loader 的
+    // RejectsX86InputWithHardError 覆盖。
+    if (machine == kMachineX86) {
+        ctx.slot<wvmp::passes::PeImage>(wvmp::passes::kImageMeta) =
+            wvmp::passes::parse_pe_image(ctx.image);
+    } else {
+        wvmp::passes::PeLoaderPass loader;
+        loader.run(ctx);
+    }
     const wvmp::passes::PeImage* meta =
         ctx.find_slot<wvmp::passes::PeImage>(wvmp::passes::kImageMeta);
     ASSERT_NE(meta, nullptr);

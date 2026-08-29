@@ -113,12 +113,36 @@ TEST(AddSections, MultipleSectionsSequential) {
     EXPECT_EQ(parse_pe_image(img).num_sections, 3);
 }
 
-TEST(AddSections, RequestedRvaHonoredWhenFree) {
+// MIT-414 (G7p2 B.4)：追加节与前一节对齐端连续（无 VA 空洞）时按请求落位。
+// 既有 .text 端 0x1100 → 对齐端 0x2000，请求 0x2000 即连续。
+TEST(AddSections, RequestedRvaContiguousHonored) {
     std::vector<u8> img = build_minimal_pe();
-    const auto placed = add_sections(img, {make_section(".far", 0x10, 0x9000)}, kSecAlign, kFileAlign);
+    const auto placed = add_sections(img, {make_section(".wvmp", 0x10, 0x2000)}, kSecAlign, kFileAlign);
     ASSERT_EQ(placed.size(), static_cast<size_t>(1));
-    EXPECT_EQ(placed[0].rva, 0x9000u);
-    EXPECT_EQ(parse_pe_image(img).sections[1].virtual_addr, 0x9000u);
+    EXPECT_EQ(placed[0].rva, 0x2000u);
+    EXPECT_EQ(parse_pe_image(img).sections[1].virtual_addr, 0x2000u);
+}
+
+// MIT-414 (G7p2 B.4)：VA 空洞（请求 RVA 落在前一节对齐端之后）必须显式失败。
+// Windows 加载器拒绝带空洞的节布局（triage §3.3 实测：既有节端 0x5000 时
+// .wvmp 落 0x5000 可加载、0x6000 起全拒 WinError 193）。旧行为是"空洞也
+// 照落"（本测试原名 RequestedRvaHonoredWhenFree）——正是产坏壳的帮凶。
+TEST(AddSections, RequestedRvaGapThrowsAndLeavesImageIntact) {
+    std::vector<u8> img = build_minimal_pe();
+    const std::vector<u8> before = img;
+    EXPECT_THROW((void)add_sections(img, {make_section(".far", 0x10, 0x9000)}, kSecAlign, kFileAlign),
+                 std::runtime_error);
+    EXPECT_EQ(img, before); // 校验先行：失败零修改
+}
+
+// MIT-414 (G7p2 B.4)：多请求之间同样不得留空洞——auto 请求顺序延伸对齐端，
+// 后续 requested_rva 必须接其对齐端。请求 0x4000 在 auto(.a@0x2000→端 0x3000)
+// 之后留下 0x3000..0x4000 空洞 → 拒绝。
+TEST(AddSections, RequestedRvaGapAfterAutoRequestThrows) {
+    std::vector<u8> img = build_minimal_pe();
+    EXPECT_THROW((void)add_sections(img, {make_section(".a", 0x10), make_section(".b", 0x10, 0x4000)},
+                                    kSecAlign, kFileAlign),
+                 std::runtime_error);
 }
 
 TEST(AddSections, RequestedRvaConflictThrowsAndLeavesImageIntact) {

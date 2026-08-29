@@ -122,12 +122,61 @@
   由双 MEM 操作数规则区分）。
 - 注意与重定位/ASLR 的配合：RVA + image_base 在运行时还原，不依赖静态 VA。
 
-## C5 x86 目标实际不可用
+## C5 x86 (32 位) 目标未支持 —— 显式硬拒绝（MIT-414 G7p2 收口）
 
-- marker_scan 仅支持 x64：magic 在 x86 上被拆成两条 imm32，不连续
-  （marker_scan_pass.cpp:172 TODO(P7-x86)）。
-- ISA/lifter 层有 X86 枚举与部分支持，但扫描这一环断了，双架构承诺
-  目前只在底层兑现。作为 M3 后的独立里程碑排期。
+**状态（2026-08-29）：32 位输入显式硬失败，不再静默。** `machine==0x014C`
+的输入在 pe_loader 解析完成后输出 ERROR diag
+`"32 位目标 (x86) 未支持 (GAPS C5); 不产出保护壳"` 并抛错（CLI 非零退出）。
+消灭两态：**静默无操作**（SDK magic 被拆成两条 imm32、锚点不连续时旧行为
+rc=0 输出≈输入，用户以为受保护）与**产坏壳**（手造连续锚点时 x64 管道在
+32 位 PE 上覆写 .text，加载器 WinError 193）。完整证据链：
+`.multica/mit-G7r-triage.md`（项目主亲验复现）。
+
+**GAPS C5 旧主张逐条审计（triage §1 裁定：1 条成立，3 条过时/归因不完整）**
+
+1. ✅ **真缺口（实证成立）**：marker_scan 锚点 x86 不连续——SDK magic 在 x86
+   上拆成两条 imm32（`c7 45 f8 57 56 4d 50` / `c7 45 fc 42 45 47 31`，
+   marker32.exe 反汇编实证），8 字节 needle 不连续
+   （marker_scan_pass.cpp TODO(P7-x86)）。
+2. ⚠️ **过时（程度低估）**：lifter 不是"部分支持"而是真参数化——双 Capstone
+   会话（lifter_pass.cpp:54-77，capstone_session.cpp CS_MODE_32/64 分支）、
+   x86_translate.cpp pointer_size S32/S64 分叉、EAX..EDI/EIP→Rax..Rip map、
+   movsxd 显式拒 x86。
+3. ⚠️ **过时（归因不完整）**：真实断层除扫描外还有两大块——asmgen.cpp:85 与
+   stub_gen.cpp:155 硬编码 `KS_MODE_64` + Win64 ABI（14 物理寄存器池 /
+   cdecl 变体 / 无 REX 等价物），pe_loader 双架构解析本身已就位。
+   x86 全量对齐 = **P1 backlog**（G7x-1..8 拆分，asmgen 为唯一 XL 排期锚，
+   依赖图见 triage §4）。
+4. ⚠️ **部分过时**："不可用"的一部分根因是 pe_loader PE32 解析 bug（BaseOfData
+   漏读，三字段错位 4B，见下）——非纯设计缺口，MIT-414 已修复并单测固化。
+
+**MIT-414 附带修复的正确性缺口（独立于 x86 支持本身）**
+
+- **pe_loader PE32 分支 BaseOfData 漏读**（pe_image.cpp）：修复前
+  image_base=BaseOfData / section_alignment=ImageBase / file_alignment=
+  SectionAlignment 三字段错位 4B；section_alignment 误读为 0x400000 →
+  stub_link 把 `.wvmp` RVA 对齐到 0x400000 → 加载器节 VA 连续性拒绝
+  （WinError 193）。修复 + `test_pe_loader` PE32 fixture 逐字段断言
+  （image_base=0x400000 / section_alignment=0x1000 / file_alignment=0x200）。
+- **section_builder 节 VA 连续性防御**：追加节（requested_rva）必须与前一节
+  对齐端连续（对齐后 start == prev end），空洞显式失败非静默——Windows
+  加载器实测拒绝空洞布局（既有节端 0x5000 时 .wvmp 落 0x5000 可加载、
+  0x6000 起全拒，triage §3.3 变异体二分）。
+
+**16-bit 目标：不可行（登记）**——PE 格式只接受 Machine 白名单
+0x014C/0x8664（pe_image.cpp），16 位 NE/LE 文件过不了 PE 签名检查；保护壳
+生态无 16 位 PE 现实需求（triage §4）。
+
+**观察清单（triage §8 新耦合转录）**
+
+- **CRT 初始化区 E8 误归属**（triage §8 #4）：32 位 CRT 初始化近距调用密集，
+  kStubWindow=64 窗口内 E8 目标落入锚点前 ≤64B 的概率高于 x64（craft32 实测
+  2 个误归属 begin）。规则内设计行为，低危（只产生多余 warning + 潜在空区域）；
+  未来归属规则可加"目标与锚点间无可执行指令"类强校验或降窗口。
+- **ExitNative .pdata 依赖在 x86 天然失效**（triage §8 #6）：x86 通常无
+  .pdata → find_function_end_rva 退 nullopt → 保守 gate 兜底，行为差异非缺陷。
+- **CLI 无 arch 表达面**（triage §8 #7）：config 无 arch 字段、无 --help 子命令，
+  32 位全支持需配置面扩口（P1 G7x-7）。
 
 ## 保护强度缺口（= M3 内容，非正确性问题）
 
@@ -150,5 +199,6 @@
    SSE mem 已收口（MIT-408）**；剩余面 = `add/sub [mem],xmm` 双访存形态
    （C4c，D3 砍面）
 4. C3 call gate（工作量最大，依赖 C1 分段）→ 解锁真实函数
-5. C5 x86 对齐（独立里程碑）
+5. C5 x86：**安全拒绝面已收口（MIT-414：PE32 bug 修复 + 显式硬 gate + 文档）**；
+   全量对齐 = P1 backlog（G7x-1..8，asmgen 为排期锚）
 6. 与 M3 插件池并行推进不冲突（不同代码面）

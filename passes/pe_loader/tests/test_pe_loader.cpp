@@ -40,7 +40,9 @@ void put32(std::vector<u8>& v, size_t o, u32 x) {
 
 // 手工拼最小合法 PE：DOS 头(0x00) + NT 头(0x40) + 节表 + ".text" 原始数据。
 // 布局：[0x000,0x200) 头部 | [0x200,0x400) .text（VA 0x1000，VS=SR=0x200）。
-// image_base 默认 0x400000；PE32+ 8B 字段写入, PE32 4B 字段写入。
+// image_base 默认 0x400000；PE32+ 8B 字段写入, PE32 按真实布局写入——
+// BaseOfData @opt+24、ImageBase @opt+28（MIT-414：漏读 BaseOfData 是
+// pe_loader PE32 分支三字段错位的根因，fixture 必须按真实布局构造）。
 std::vector<u8> build_minimal_pe(bool pe32_plus, u16 machine, u64 image_base = 0x400000ull) {
     const u16 opt_size = pe32_plus ? 240 : 224; // PE32+ 240 / PE32 224
     const size_t nt = 0x40;
@@ -56,15 +58,17 @@ std::vector<u8> build_minimal_pe(bool pe32_plus, u16 machine, u64 image_base = 0
     put16(img, nt + 4, machine);    // Machine
     put16(img, nt + 6, 1);          // NumberOfSections
     put16(img, nt + 20, opt_size);  // SizeOfOptionalHeader
-    // OptionalHeader（EntryPoint @16 / ImageBase @24 (PE32+) / @24 (PE32) /
-    // SectionAlignment @32 / FileAlignment @36, 两种格式对齐到 @32）
+    // OptionalHeader（EntryPoint @16 / BaseOfData @24 (PE32) / ImageBase
+    // @28 (PE32) 或 @24 (PE32+) / SectionAlignment @32 / FileAlignment @36,
+    // 两种格式对齐到 @32）
     put16(img, opt + 0, pe32_plus ? 0x20B : 0x10B);
     put32(img, opt + 16, 0x1234);  // AddressOfEntryPoint
     put32(img, opt + 20, 0x1000);  // BaseOfCode
     if (pe32_plus) {
         for (int i = 0; i < 8; ++i) img[opt + 24 + i] = u8(image_base >> (8 * i));
     } else {
-        put32(img, opt + 24, u32(image_base));
+        put32(img, opt + 24, 0x2000);       // BaseOfData（PE32 独占字段）
+        put32(img, opt + 28, u32(image_base));
     }
     put32(img, opt + 32, 0x1000);  // SectionAlignment
     put32(img, opt + 36, 0x200);   // FileAlignment
@@ -139,6 +143,26 @@ TEST(PeImageParse, MinimalX86) {
     EXPECT_EQ(img.image_base, 0x400000u);  // PE32 4B ImageBase
     EXPECT_EQ(img.num_sections, u16(1));
     EXPECT_EQ(img.sections[0].name, ".text");
+}
+
+// MIT-414 (G7p2 B.1) 回归：PE32 分支必须跳过 BaseOfData 再读 ImageBase。
+// 修复前 pe_image.cpp 漏读 BaseOfData → image_base=0x2000(BaseOfData)、
+// section_alignment=0x400000(ImageBase)、file_alignment=0x1000(SectionAlignment)
+// 三字段错位 4B；triage §3.3 实测后果链：stub_link 把 .wvmp 对齐到 0x400000
+// → 加载器节 VA 连续性拒绝（WinError 193）。hello32/craft32 直读对照见
+// MIT-414 报告（真实字段 BaseOfData=0x2000/ImageBase=0x400000/
+// SectionAlignment=0x1000/FileAlignment=0x200，与此 fixture 同构）。
+TEST(PeImageParse, Pe32OptionalHeaderFieldLayout) {
+    const auto bytes = build_minimal_pe(false, kMachineX86, 0x400000u);
+    const wvmp::passes::PeImage img = wvmp::passes::parse_pe_image(bytes);
+
+    EXPECT_FALSE(img.is_pe32_plus);
+    EXPECT_EQ(img.machine, kMachineX86);
+    EXPECT_EQ(img.entry_point_rva, 0x1234u);
+    EXPECT_EQ(img.image_base, 0x400000u);      // opt+28 的 ImageBase（非 opt+24 的 BaseOfData）
+    EXPECT_EQ(img.section_alignment, 0x1000u); // 修复前误读为 0x400000
+    EXPECT_EQ(img.file_alignment, 0x200u);     // 修复前误读为 0x1000
+    EXPECT_EQ(img.num_sections, u16(1));
 }
 
 // —— rva_to_offset 边界 ————————————————————————————————————————————
@@ -241,6 +265,25 @@ TEST(PeLoaderPass, LoadsFileIntoImageAndSlot) {
     EXPECT_TRUE(meta->is_pe32_plus);
     EXPECT_EQ(meta->machine, kMachineX64);
     EXPECT_EQ(meta->num_sections, u16(1));
+}
+
+// MIT-414 (G7p2 B.2)：x86 输入在 pass 层硬失败（ERROR diag + 抛错）——
+// 解析本身完成（修复后字段正确、无害），但绝不进入下游产壳流程，消灭
+// "静默无操作"与"产 WinError 193 坏壳"两态。
+TEST(PeLoaderPass, RejectsX86InputWithHardError) {
+    ProtectionContext ctx;
+    ctx.input_path = write_temp("x86_target.exe", build_minimal_pe(false, kMachineX86));
+    wvmp::passes::PeLoaderPass pass;
+
+    EXPECT_THROW(pass.run(ctx), std::runtime_error);
+    EXPECT_TRUE(ctx.diag.has_errors());
+    EXPECT_FALSE(ctx.has_slot(wvmp::passes::kImageMeta)); // 模型不落槽：下游无从继续
+    bool saw_gate = false;
+    for (const auto& d : ctx.diag.items())
+        if (d.severity == wvmp::Severity::Error &&
+            d.message.find("32 位目标 (x86) 未支持 (GAPS C5)") != std::string::npos)
+            saw_gate = true;
+    EXPECT_TRUE(saw_gate);
 }
 
 TEST(PeLoaderPass, MissingInputFileFails) {

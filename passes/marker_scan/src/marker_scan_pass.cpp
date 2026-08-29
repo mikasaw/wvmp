@@ -25,6 +25,11 @@ struct RawRange {
     size_t lo = 0, hi = 0;
 };
 
+// IMAGE_FILE_MACHINE_I386（x86）。x86 全量支持在 P1 backlog，此处仅用于把
+// fr.arch 从 PeImage.machine 推导出来（MIT-414 G7p2 B.3，为未来 P1 铺路；
+// x64 路径恒 X64，零行为变化）。
+constexpr u16 kMachineX86 = 0x014C;
+
 u16 rd16(const u8* p) {
     return static_cast<u16>(static_cast<u16>(p[0]) | (static_cast<u16>(p[1]) << 8));
 }
@@ -170,7 +175,10 @@ void MarkerScanPass::run(ProtectionContext& ctx) {
         // TODO(P7-names): 从 begin 调用点的 lea/rcx 引用解析字符串名；v1 用地址。
         fr.name = "(marker@0x" + hex_off(r.begin_off) + ")";
         // TODO(P7-x86): x86 目标上 magic 会拆成两条 imm32（不连续），v1 仅 x64。
-        fr.arch = ir::Arch::X64;
+        // MIT-414 (G7p2 B.3): arch 从 PeImage.machine 推导（P1 x86 铺路）；
+        // x64 路径恒 X64；PeImage 缺失（泳道单测直接构造 context）沿用 X64。
+        fr.arch = (pe != nullptr && pe->machine == kMachineX86) ? ir::Arch::X86
+                                                                : ir::Arch::X64;
         fr.begin_rva = to_rva(r.begin_off, "begin", fr.name);
         fr.end_rva = to_rva(r.end_off, "end", fr.name);
         ctx.functions.push_back(std::move(fr));

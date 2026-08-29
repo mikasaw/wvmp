@@ -67,11 +67,18 @@ PeImage parse_impl(std::span<const u8> image) {
     img.entry_point_rva = r.read_u32();
     if (img.is_pe32_plus) {
         // PE32+：BaseOfCode（4B）+ ImageBase（8B）= 12B；PE32：BaseOfCode（4B）+
-        // ImageBase（4B）= 8B. 共同起点 = 紧跟 entry_point_rva 之后.
+        // BaseOfData（4B）+ ImageBase（4B）= 12B. 共同起点 = 紧跟 entry_point_rva 之后.
         r.skip(4);                  // BaseOfCode
         img.image_base = r.read_u64();
     } else {
-        r.skip(4);                  // BaseOfCode
+        // MIT-414 (G7p2 B.1): PE32 真实布局 = BaseOfCode(4B) + BaseOfData(4B) +
+        // ImageBase(4B)。漏读 BaseOfData 会让 image_base/section_alignment/
+        // file_alignment 三字段整体错位 4B（image_base=BaseOfData、
+        // section_alignment=ImageBase、file_alignment=SectionAlignment）——triage
+        // §3.3 实测后果链：section_alignment 误读为 ImageBase(0x400000) →
+        // stub_link 把 .wvmp RVA 对齐到 0x400000 → 加载器节 VA 连续性拒绝
+        // (WinError 193)。BaseOfData 无下游消费（D2 决策不扩公共面），显式跳过。
+        r.skip(8);                  // BaseOfCode + BaseOfData
         img.image_base = r.read_u32();
     }
     img.section_alignment = r.read_u32();

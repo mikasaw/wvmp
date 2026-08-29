@@ -11,6 +11,13 @@
 #include <utility>
 
 namespace wvmp::passes {
+namespace {
+
+// IMAGE_FILE_MACHINE_I386（x86 32 位目标）。解析层白名单仍接受（解析本身
+// 无害，诊断信息可读），门在 pass 层落下。
+constexpr u16 kMachineX86 = 0x014C;
+
+} // namespace
 
 std::span<const std::string_view> PeLoaderPass::provides_keys() const {
     static constexpr std::string_view kProvides[] = {kImage, kPeImage};
@@ -43,6 +50,18 @@ void PeLoaderPass::run(ProtectionContext& ctx) {
     // 2) 解析 PE 结构（MZ / e_lfanew / PE 签名 / Machine / 可选头 / 节表）。
     try {
         PeImage img = parse_pe_image(ctx.image);
+        // 2.5) MIT-414 (G7p2 B.2): x86 (machine=0x014C) 显式 gate —— 硬失败
+        // 语义（派活单 D1：非零退出 + ERROR diag，不做"尽力而为静默透传"）。
+        // 解析本身双架构无害（gate 在解析后，§F #2）；但继续跑下游只会两态：
+        // SDK magic 不连续 → 静默无操作（用户以为受保护）；手造连续锚点 →
+        // x64 管道（asmgen/stub_gen 硬编码 KS_MODE_64 + Win64 ABI）在 32 位
+        // PE 上覆写 .text 产出 WinError 193 坏壳（triage §3.2/§3.3 实测）。
+        // x86 全量对齐 = P1 backlog（G7x-1..8），本单只收安全拒绝面。
+        if (img.machine == kMachineX86) {
+            ctx.diag.report(Severity::Error, name(),
+                            "32 位目标 (x86) 未支持 (GAPS C5); 不产出保护壳");
+            throw std::runtime_error(std::string(name()) + ": 32 位目标 (x86) 未支持");
+        }
         // 3) 解析模型入扩展槽，供下游 pass（marker_scan/lifter/pe_writer）使用。
         ctx.slot<PeImage>(kImageMeta) = std::move(img);
     } catch (const PeParseError& e) {

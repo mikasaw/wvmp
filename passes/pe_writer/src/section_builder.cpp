@@ -89,6 +89,14 @@ std::vector<SectionPlacement> add_sections(std::vector<u8>& image,
     max_raw_end = std::max<u64>(max_raw_end, align_up(image.size(), file_alignment));
 
     // —— 全部校验先行 ——
+    // MIT-414 (G7p2 B.4): 追加节必须与前一节 VA 连续（对齐后 start == prev
+    // end）。Windows 加载器拒绝带空洞的节布局（triage §3.3 实测：craft32 既有
+    // 节末端 0x5000，.wvmp 落 0x5000 可加载、0x6000 起全拒 WinError 193——
+    // pe_loader PE32 bug 把 section_alignment 误读为 0x400000 正是踩此）。
+    // run_end 顺序跟踪：既有节虚拟最大端对齐值起，逐请求延伸（auto 请求按
+    // 落位规则 = 顺序对齐延伸）；有既有节时 requested_rva 必须 == run_end，
+    // 空洞（begin > run_end）与重叠（begin < run_end）一律显式失败。
+    u64 run_end = align_up(max_va_end, section_alignment);
     for (const auto& req : requests) {
         if (req.name.size() > 8) fail("section name '" + req.name + "' longer than 8 bytes");
         if (req.data.empty()) fail("section '" + req.name + "' has no data");
@@ -101,7 +109,15 @@ std::vector<SectionPlacement> add_sections(std::vector<u8>& image,
                 if (begin < ee && eb < end)
                     fail("requested RVA 0x" + std::to_string(req.requested_rva) + " overlaps existing section");
             }
+            if (max_va_end != 0 && begin != run_end)
+                fail("requested RVA 0x" + std::to_string(req.requested_rva) +
+                     " not contiguous with previous section end 0x" +
+                     std::to_string(run_end) +
+                     " (section VA gap; Windows loader rejects such images)");
+            run_end = end;
             max_va_end = std::max(max_va_end, end);
+        } else {
+            run_end = align_up(run_end + req.data.size(), section_alignment);
         }
     }
 
