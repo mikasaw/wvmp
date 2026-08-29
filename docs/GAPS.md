@@ -38,6 +38,20 @@
 - 新增正路径样本 `wvmp_whitelist_sample`（区域内纯 Mov/Add，无 loop/jcc/
   rip-relative），虚拟化正确生成 stub、行为在 VM 内执行、与原生逐字节一致。
 
+**MIT-409 收口：MSVC 跳转表特化（`jmp reg` 间接跳转）**
+- 翻译期预扫描四件套模板（`lea <b>,[rip+T]` → `mov <ix>,[<b>+<idx>*4+off]`
+  (u32) → `add <t>,<b>` → `jmp <t>`，t==ix）+ 前块尾部防御 `cmp <idx>,K-1;
+  ja <越区>` 取表长 K（严禁靠"扫到非法值"推导）；命中后读 K 项 u32 delta，
+  目标 RVA = lea 目标 RVA + delta；全部目标 ∈ 区域且为已 lift 指令地址才
+  展开为比较链（`Mov s,rva_i; LeaRva s,s; Cmp t,s; Jcc eq → 块_i` ×K，
+  零新 VmOp，预算 ≤32）；任一环节不符 → 照旧 gate（保守底线零让步）。
+- 残余间接跳转形态（留未来单，越界即 C1 gate 兜底）：
+  - `jmp [mem]` 内存间接形态（clang/GCC `jmp [tbl+idx*8]` 平台表）
+  - 8B 绝对表（非 4B delta 表）形态
+  - 不可枚举 `jmp reg`（函数指针全局尾跳、运行时计算目标——MIT-409 负
+    样本 wv_opaque_jmp_masm 实证照旧 gate 且行为一致）
+  - 非 MSVC 编译器/其他防御形态（无 `cmp K-1; ja` 或非 `ja` 条件）
+
 **已知遗留 / 范围外**
 - SDK 桩函数去参清理（`marker_begin/end()` 不再带 `const char* name`）：
   因带参版本在每次 E8 调用点之前会生成 `lea rcx,[rip+name]`，该 lea 是

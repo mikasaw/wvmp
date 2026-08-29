@@ -1524,15 +1524,23 @@ TEST(LifterBlocks, CallTargetAndReturnPointAreLeaders) {
     ASSERT_TRUE(diag.items().empty());
 
     // leader：0（起点）、9（call 目标）、5（返回点）。9 之后单独成块。
-    ASSERT_EQ(fr.blocks.size(), 3u);
+    // MIT-409: ret 后的死代码（nop 填充）不再丢弃——可 lift 的死代码成块
+    // （MSVC 跳转表 case body 只经表可达，翻译器跳转表特化需要这些指令
+    // 存在；int3 等不可 lift 字节走 skipped_ranges 通道，不会成为 item）。
+    // 死块语义不变：前块以无条件 jmp/ret 终结，VM 永不落入，仅表链可达。
+    ASSERT_EQ(fr.blocks.size(), 4u);
     EXPECT_EQ(fr.blocks[0].addr, 0u);  // call：块末是 call → succ = fallthrough
     EXPECT_EQ(fr.blocks[0].succs, (std::vector<wvmp::u64>{5}));
     EXPECT_EQ(fr.blocks[0].insns.size(), 1u);
     EXPECT_EQ(fr.blocks[1].addr, 5u);  // xor + ret
     EXPECT_TRUE(fr.blocks[1].succs.empty());
     EXPECT_EQ(fr.blocks[1].preds, (std::vector<wvmp::u64>{0}));
-    EXPECT_EQ(fr.blocks[2].addr, 9u);  // call 目标块
-    EXPECT_TRUE(fr.blocks[2].preds.empty()); // call 不产生 CFG 边（目标块仅被识别为 leader）
+    EXPECT_EQ(fr.blocks[2].addr, 8u);  // 死代码块（nop，仅表/未知目标可达）
+    EXPECT_EQ(fr.blocks[2].insns.size(), 1u);
+    EXPECT_EQ(fr.blocks[3].addr, 9u);  // call 目标块
+    // call 不产生 CFG 边（目标块仅被识别为 leader）；pred 唯一来源 = 死
+    // 代码块 @8 的 fallthrough 边（死块若被未知跳转目标进入, 顺序落入 9）。
+    EXPECT_EQ(fr.blocks[3].preds, (std::vector<wvmp::u64>{8}));
 }
 
 // ---------------- PE 映射 + 端到端 run() ----------------

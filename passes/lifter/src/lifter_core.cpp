@@ -153,7 +153,19 @@ void build_blocks(u64 begin_rva, u64 end_rva, std::span<const LiftedItem> items,
             current = out.size() - 1;
             placement.push_back(nullptr);
         } else if (prev_terminated) {
-            continue; // 死代码
+            // MIT-409: 死代码不再一律丢弃——MSVC 跳转表 case body 只经表可达,
+            // 线性扫描已 lift 但被死代码规则丢弃; 翻译器跳转表特化 (预扫描 +
+            // 目标块切分) 需要这些指令存在。不可 lift 的字节 (int3 填充等)
+            // 根本不会成为 item (translate_insn 失败走 skipped_ranges 通道),
+            // 此处只放行成功 lift 的指令, 天然免疫填充垃圾。新起一块; 后续
+            // 指令并入, 直至下个 leader。死块前块以无条件 jmp/ret 终结,
+            // VM 永不落入, 仅跳转表链可达——语义不变, 仅字节码多死块。
+            ir::BasicBlock bb;
+            bb.addr = it.addr;
+            out.push_back(std::move(bb));
+            block_index[it.addr] = out.size() - 1;
+            current = out.size() - 1;
+            placement.push_back(nullptr);
         }
         if (it.insn) out[current].insns.push_back(*it.insn);
         placement[current] = &it;

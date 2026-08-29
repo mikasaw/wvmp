@@ -65,12 +65,14 @@ void add_note(std::vector<std::string>& notes, u64 addr, std::string_view what) 
 //
 // 识别模式 = 受限四件套模板（D1 决策，派活单 §A.2 实测模板），翻译期预扫描：
 //   块尾 `jmp <t>`（Reg 间接跳转，C1 gate 挂点）前溯 5 条：
-//     [-5] mov <idx>, [mem]             idx 载入（链接防御 cmp 的桥）
-//     [-4] lea <b>, [rip+T]             b = 表基址（运行时 VA = image_base+lea_tgt）
-//     [-3] mov <ix>, [<b>+<idx>*4+off]  u32 表项读入（要求 t==ix，四件套语义：
-//                                         add 只改 dst，表值必须已在 jmp 目标寄存器）
-//     [-2] add <t>, <b>                 delta + 基址 → 目标 VA
-//     [-1] jmp <t>
+//     mov <idx>, [mem]             idx 载入（链接防御 cmp 的桥）
+//     lea <b>, [rip+T]             b = 表基址（运行时 VA = image_base+lea_tgt）
+//     mov <ix>, [<b>+<idx>*4+off]  u32 表项读入（要求 t==ix，四件套语义：
+//                                     add 只改 dst，表值必须已在 jmp 目标寄存器）
+//     add <t>, <b>                 delta + 基址 → 目标 VA
+//     jmp <t>
+//   其中 lea 与 idx 载入可互换（实测两种 MSVC codegen：r06 载入在前、
+//   jmp_table_sample lea 在前）。
 //   前一块尾部防御（表长 K 唯一合法来源，D1 锁死"严禁靠扫非法值推导"）：
 //     cmp <idx>, K-1 ; ja <越区>（cond=A，被比较值经 idx 链接 = 表索引）
 //   表长 K = cmp 立即数 + 1；命中后从 PE 镜像读 K 项 u32 delta，
@@ -104,8 +106,23 @@ std::optional<JumpTableHandle> try_match_jump_table(
         return std::nullopt;
     const ir::Insn& add = ins[ins.size() - 2];
     const ir::Insn& ld = ins[ins.size() - 3];
-    const ir::Insn& lea = ins[ins.size() - 4];
-    const ir::Insn& il = ins[ins.size() - 5];
+    const ir::Insn& p1 = ins[ins.size() - 4];
+    const ir::Insn& p2 = ins[ins.size() - 5];
+    // lea 与 idx 载入可互换（实测两种 MSVC codegen：r06 = 载入在前；
+    // jmp_table_sample = lea 在前）——MIT-409 实测修正（派活单 §E #33）。
+    const ir::Insn* lea_p = nullptr;
+    const ir::Insn* il_p = nullptr;
+    if (p1.op == ir::Op::Lea && p2.op == ir::Op::Load) {
+        lea_p = &p1;
+        il_p = &p2;
+    } else if (p2.op == ir::Op::Lea && p1.op == ir::Op::Load) {
+        lea_p = &p2;
+        il_p = &p1;
+    } else {
+        return std::nullopt;
+    }
+    const ir::Insn& lea = *lea_p;
+    const ir::Insn& il = *il_p;
 
     // 1) add <t>, <b>（S64，Reg/Reg——目标 VA 的 64 位拼装）
     if (add.op != ir::Op::Add || add.size != ir::Size::S64 ||

@@ -42,7 +42,11 @@
 #     rip 全局与非 rip 数组下标 + 栈基址 + D2 对齐/非对齐) +
 #     wvmp_sse_rip_xmm_readback_sample (XmmLoad/XmmStore/ALU-mem 折条的
 #     ctx.xmm 读回影子样本).
-#     Total: 28 samples × 5 seeds = 140 runs.
+#     Total: 29 samples × 5 seeds = 145 runs.
+#   - MIT-409 (MIT-A6): extend to wvmp_jmp_table_sample (MSVC 跳转表正样本:
+#     switch 8 路 + default + 边界, 翻译期读表静态展开比较链真虚拟化;
+#     负样本 opaque 间接 jmp 同 exe 内照旧 gate, 行为 byte-exact 兜底).
+#     Total: 30 samples × 5 seeds = 150 runs.
 #   - MIT-306: REQUIRE_REAL=1 校验日志含 "已生成 N 个入口 stub" 防止 C1 gate
 #     兜底被误判 PASS（仅 byte-exact 不够, C1 gate 函数被跳过仍能输出相同
 #     stdout+rc）。与 multiseed_e2e_real.sh 配套使用。
@@ -106,6 +110,10 @@ samples=(
     # 对齐与 非对齐), REQUIRE_REAL 保证真虚拟化非 gate。
     "build/passes/marker_scan/tests/wvmp_sse_rip_sample.exe"
     "build/passes/marker_scan/tests/wvmp_sse_rip_xmm_readback_sample.exe"
+    # MIT-409 (MIT-A6): MSVC 跳转表正样本 — switch 8 路 + default + 边界,
+    # 翻译期读表静态展开比较链真虚拟化 (REQUIRE_REAL ≥1 stub); 同 exe 负
+    # 样本 opaque 间接 jmp 照旧 gate, 行为 byte-exact 由双跑兜底。
+    "build/passes/marker_scan/tests/wvmp_jmp_table_sample.exe"
 )
 
 # Seeds: 1 (small), 12345 (default), 99999 (large), 0xDEADBEEF (magic), 0xCAFEBABE (magic).

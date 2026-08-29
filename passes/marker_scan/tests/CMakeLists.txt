@@ -670,3 +670,24 @@ target_compile_options(wvmp_exitnative_neg_sample PRIVATE
 target_link_options(wvmp_exitnative_neg_sample PRIVATE
     $<$<CXX_COMPILER_ID:MSVC>:/INCREMENTAL:NO>
 )
+
+# MIT-409 (MIT-A6): 跳转表样本——正/负双形态单 exe。正样本 wv_switch8:
+# switch 8 路 + default + 边界 (idx 越界走 default), MSVC 稠密 case 恒产
+# 四件套跳转表, 翻译期读表静态展开 (比较链, 零新 VmOp) → 真虚拟化
+# (REQUIRE_REAL ≥1 stub)。负样本 wv_opaque_jmp_masm (MASM): 区域含
+# `mov rax,[g_fp]; jmp rax` opaque 间接跳转 → 照旧 C1 gate, packed 与
+# native 逐字节一致。jump-table 命中证据 = 保护日志 "jump-table @ ..."
+# note; 负样本 gate = 保护日志 "间接 jmp 未支持" note。
+enable_language(ASM_MASM)
+add_executable(wvmp_jmp_table_sample
+    jmp_table_sample_main.cpp
+    jmp_table_sample_asm.asm
+)
+target_link_libraries(wvmp_jmp_table_sample PRIVATE wvmp::sdk)
+target_compile_options(wvmp_jmp_table_sample PRIVATE
+    $<$<AND:$<CXX_COMPILER_ID:MSVC>,$<COMPILE_LANGUAGE:C,CXX>>:/Od;/Ob0;/utf-8>
+    $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-O0>
+)
+target_link_options(wvmp_jmp_table_sample PRIVATE
+    $<$<CXX_COMPILER_ID:MSVC>:/INCREMENTAL:NO>
+)
