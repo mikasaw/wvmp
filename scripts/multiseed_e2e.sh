@@ -68,7 +68,15 @@
 #     值通路修复主样本: 区域内 3 次 callgate 全 FP 参数形态 — double×4
 #     (xmm0..3 全槽) + float×2 入参, 返回值参与后续 VM 运算 (addsd/addss),
 #     g5r_p0 等价构造的回归盲区消灭样本; REQUIRE_REAL 主函数真虚拟化).
-#     Total: 35 samples × 5 seeds = 175 runs.
+#   - MIT-418 (G5r-R3): extend to wvmp_x87_gate_sample (x87 永久 gate 回归
+#     样本: 标记区域内 x87 五族 fld/fadd/fstp/fcomip/fsin → lifter 未支持 →
+#     C1 gate 整函数保持原生零 stub, byte-identical; 同 exe 1 个纯 GP
+#     helper 真虚拟化区满足 REQUIRE_REAL). ⚠️ B.5 登记: 本样本的 helper
+#     真区是 REQUIRE_REAL ≥1 stub 断言的结构性依赖, **禁止后人删掉 helper
+#     区把它改成纯 gate-only 样本**——gate-only 形态会与 REQUIRE_REAL=1
+#     全局校验冲突 (multiseed_e2e_real.sh), 需另行注册白名单机制。
+#     Total: 36 samples × 5 seeds = 180 runs.  (项目主链式合并 417+418:
+#     两单各自单边报 35/175, 合并态样本数组 = 36, 此为合并后权威口径。)
 #   - MIT-306: REQUIRE_REAL=1 校验日志含 "已生成 N 个入口 stub" 防止 C1 gate
 #     兜底被误判 PASS（仅 byte-exact 不够, C1 gate 函数被跳过仍能输出相同
 #     stdout+rc）。与 multiseed_e2e_real.sh 配套使用。
@@ -157,6 +165,10 @@ samples=(
     # addsd/addss 运算后落全局 + 经函数返回; g5r_p0 等价构造 (修复前静默
     # 错乱), REQUIRE_REAL 保证真虚拟化非 gate。
     "build/passes/marker_scan/tests/wvmp_fp_callgate_sample.exe"
+    # MIT-418 (G5r-R3): x87 永久 gate 回归样本 — 区域内 x87 五族
+    # fld/fadd/fstp/fcomip/fsin 整函数保持原生 (零 stub, gate 证据);
+    # 同 exe 纯 GP helper 真虚拟化 (REQUIRE_REAL ≥1 stub 满足源)。
+    "build/passes/marker_scan/tests/wvmp_x87_gate_sample.exe"
 )
 
 # Seeds: 1 (small), 12345 (default), 99999 (large), 0xDEADBEEF (magic), 0xCAFEBABE (magic).

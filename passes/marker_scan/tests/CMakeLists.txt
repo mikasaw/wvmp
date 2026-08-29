@@ -803,3 +803,23 @@ target_compile_options(wvmp_fp_callgate_sample PRIVATE
 target_link_options(wvmp_fp_callgate_sample PRIVATE
     $<$<CXX_COMPILER_ID:MSVC>:/INCREMENTAL:NO>
 )
+
+# MIT-418 (G5r-R3): x87 永久 gate 回归样本——区域内 x87 五族 (fld/fadd/fstp/
+# fcomip/fsin) 各 ≥1 条入标记区, lifter 未支持 → C1 gate 整函数保持原生
+# (**零 stub**, byte-identical); 同 exe 1 个纯 GP helper 真虚拟化区
+# (REQUIRE_REAL ≥1 stub 满足源, stub 总数 1 = 仅 helper 虚拟化钉死 gate
+# 证据)。MSVC x64 不产 x87 (long double=double), x87 字节由
+# x87_gate_sample_asm.asm (MASM) 直写——416 §A 裁定 MASM 是唯一可靠构造路。
+# (enable_language(ASM_MASM) 已由 MIT-415 样本段启用, 此处不重复。)
+add_executable(wvmp_x87_gate_sample
+    x87_gate_sample_main.cpp
+    x87_gate_sample_asm.asm
+)
+target_link_libraries(wvmp_x87_gate_sample PRIVATE wvmp::sdk)
+target_compile_options(wvmp_x87_gate_sample PRIVATE
+    $<$<AND:$<CXX_COMPILER_ID:MSVC>,$<COMPILE_LANGUAGE:C,CXX>>:/Od;/Ob0;/utf-8>
+    $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-O0>
+)
+target_link_options(wvmp_x87_gate_sample PRIVATE
+    $<$<CXX_COMPILER_ID:MSVC>:/INCREMENTAL:NO>
+)

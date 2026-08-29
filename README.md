@@ -3,12 +3,17 @@
 WVmp 是一个完全插件化的 PE 虚拟机保护壳（参考 VMProtect/VMPilot 的自研实现）。
 **当前支持目标 = x64 PE（Machine 0x8664）**：32 位（x86 0x014C）输入会被
 显式硬拒绝（ERROR diag + 非零退出，不产出保护壳），见 docs/GAPS.md C5
-与 docs/STATUS.md。
+与 docs/STATUS.md。**浮点支持面：SSE 浮点族真虚拟化；x87 全族（D8-DF）
+永久 gate（文档化不保护）**——标记区域含 x87 指令时整函数保持原生执行，
+输出 byte-identical，见 docs/GAPS.md x87 节（MIT-418 R3 裁决）。
 
 A fully pluginized PE virtual-machine protector (self-researched,
 VMProtect/VMPilot-inspired). **Supported target: x64 PE (Machine 0x8664)**
 — 32-bit (x86 0x014C) inputs are explicitly rejected (ERROR + non-zero exit,
-no output), see docs/GAPS.md C5.
+no output), see docs/GAPS.md C5. **Floating point: SSE families are truly
+virtualized; the whole x87 family (D8-DF) is permanently gated**
+(document-only non-protection, MIT-418 R3): a marked region containing x87
+stays fully native, byte-identical output — see docs/GAPS.md x87 section.
 
 ## 构建（Windows / MSVC / Ninja，需 VS 18 Insiders）
 
@@ -54,7 +59,10 @@ lifter → virtualize → stub_link → pe_writer`). 输出统一到
 
 ### 派活单限定不支持 (verify_real_world.sh 会作为 pitfall 实证记录, 不算回归)
 
-- SSE / AVX / x87 FPU / lock prefix / rep prefix
+- SSE / AVX / lock prefix / rep prefix（rep 串指令族已真虚拟化，MIT-415；
+  SSE 浮点族已真虚拟化，MIT-371~376/408/411——清单为 v1 派活单原始口径）
+- **x87 FPU：永久 gate（MIT-418 R3 裁决）**——区域含 x87 → 整函数保持原生，
+  byte-identical，属文档化承诺面而非 pitfall 回归
 - MFC / WTL / Qt GUI 框架 / DirectX / OpenGL
 - syscall / sysenter
 - DLL imports (派活单限定 EXE)

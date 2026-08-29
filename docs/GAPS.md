@@ -150,9 +150,57 @@
   内存只可能是源（ml64 A2000 + capstone 实证），真实"读→算→写回"语义 =
   movsd/addsd/movsd 三连，逐条已支持。
 - **不支持面（越界即 C1 gate 兜底）**：andnps/andnpd（0F 55 系，留 412+）、
-  AVX/x87/SSE2 整数族（movd/movdqa p 形式）、SSE mul 族
-  （mulss/mulps/mulpd）。（string movsd 双形态已由 MIT-415 收口，见下节。）
+  AVX/SSE2 整数族（movd/movdqa p 形式）、SSE mul 族
+  （mulss/mulps/mulpd）。（string movsd 双形态已由 MIT-415 收口，见 G3 节；
+  x87 已拆出独立小节，见下节 "x87 (永久 gate, R3 裁决)"——不是简单"不支持
+  兜底"，而是有独立频率数据与行为承诺的裁决面。）
 - 注意与重定位/ASLR 的配合：RVA + image_base 在运行时还原，不依赖静态 VA。
+
+## x87 (永久 gate, R3 裁决) —— 文档化不保护
+
+**状态（2026-08-30，MIT-416/G5r triage 实测 + MIT-418/R3 收口）：x87 全族
+（D8-DF）入标记区 → lifter "未支持指令" note → C1 gate 整函数保持原生 →
+输出 byte-identical，不产坏壳。行为承诺 = 永久 gate（文档化不保护），
+回归样本 `wvmp_x87_gate_sample`（区域内五族 fld/fadd/fstp/fcomip/fsin 各
+≥1 条 + 同 exe 纯 GP helper 真虚拟化区）钉死该行为（multiseed 35 样本 × 5
+= 175/175）。**
+
+**全族清单（8 组，416 §1 表，真实出现频率 = 实测样本命中密度）**：
+
+| # | 家族 | 指令 | 真实世界频率 |
+|---|---|---|---|
+| 1 | 数据传输 | fld/fst/fstp/fild/fist/fistp/fbld/fbstp/fld1/fldz/fldpi/fldl2e/fldl2t/fldlg2/fldln2 | 高 |
+| 2 | 算术 | fadd/fsub/fmul/fdiv(±r,±p)/fi*/fabs/fchs/fsqrt/frndint/fprem/fprem1/fscale/fxtract | 高 |
+| 3 | 超越 | fsin/fcos/fsincos/fptan/fpatan/f2xm1/fyl2x/fyl2xp1 | 中（仅 CRT/运行时实现） |
+| 4 | 比较 | fcom/fcomp/fcompp/fucom*/fcomi/fcomip/fucomi/fucomip/ftst/fxam | 中 |
+| 5 | 条件移动 | fcmovb/be/e/nb/nbe/ne/nu/u（8） | 低–中 |
+| 6 | 状态控制 | fldcw/fnstcw/fnstsw/fstsw/fclex/fnclex/finit/fninit/fldenv/fnstenv/fnsave/frstor/fnop | 中 |
+| 7 | 常数加载 | fld1/fldz/fldpi/fldl2e/fldl2t/fldlg2/fldln2 | 中 |
+| 8 | 杂项/栈管理 | ffree/fincstp/fdecstp/fxch/fnop | 低–中 |
+
+**频率数据摘要（416 实测，26 真实二进制 + 30 探针，方法/样本集/反例见
+`.multica/mit-G5r-triage.md` §1/§2）**：x64 MSVC 世界 x87 ≈ 0（0.0000–
+0.0032%，全伪影点检）；mingw x64 0.0006–2.12%（msys runtime/CRT 类库）；
+32 位世界 0.01–0.88%（OS 运行时/CRT 集中）；x64 上唯一合法入口 = 手写 asm。
+v145 MSVC x86 默认 /arch:SSE2（cl /help 实测），显式 /arch:IA32 才涌出
+（2.17–11.45%）。x64 长期保持原生零成本，受保护函数含 x87 时整函数不保护
+（性能零影响，安全面收缩）。
+
+**路线记录（防未来考古困惑）**：
+- **R1（全量 x87 排波）不排波**——x64 频率 ≈ 0 支撑不足；蓝图（L0–L4 分级 +
+  ST 栈模型成本量化）留档 `.multica/mit-G5r-triage.md` §4/§5，若未来 G7 x86
+  P1 立项且走 IA32，IA32 浮点档口重开、蓝图直接生效；
+- **R2（32 位目标捆绑）随 G7 P1 立项时评估**，不单独投；
+- **跳表 128→256 扩容** = G7/x87 未来前置（kTableEntries=128；kVmOpMax=86
+  即 87 项已用，fa08d50/MIT-408 后实测 vm_op.hpp:506；x87 全族 ~80 新 VmOp
+  会把 128 撑爆，拆单蓝图预埋，见 triage §6 #2）；
+- **callgate FP 参数/返回值修复** = x87 任何路线的前置依赖（P0，独立派单
+  MIT-417，当前 SSE 世界即中招，见 triage §6 #1）；
+- 16-bit 目标不可行（交叉引用 C5 节，PE 格式白名单只收 0x014C/0x8664）。
+
+**裁决边界（D2）**：本面是"文档化不保护"承诺，**不是实现级支持面**——
+若未来实测发现 x87 某条（如前缀组合）绕过 gate 进了 VM 产出坏壳，属 P0
+级新洞，立即上报，不归本面兜底。
 
 ## C5 x86 (32 位) 目标未支持 —— 显式硬拒绝（MIT-414 G7p2 收口）
 
@@ -197,7 +245,9 @@ rc=0 输出≈输入，用户以为受保护）与**产坏壳**（手造连续�
 
 **16-bit 目标：不可行（登记）**——PE 格式只接受 Machine 白名单
 0x014C/0x8664（pe_image.cpp），16 位 NE/LE 文件过不了 PE 签名检查；保护壳
-生态无 16 位 PE 现实需求（triage §4）。
+生态无 16 位 PE 现实需求（triage §4）。x87 面交叉引用：16 位 x87 形态
+（x87 数学协处理器 / 16 位栈拓扑）随 16 位目标整体不可行，见 x87 节路线
+记录。
 
 **观察清单（triage §8 新耦合转录）**
 
