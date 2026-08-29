@@ -49,6 +49,12 @@ __m128 g_ps2 = {10.0f, 20.0f, 30.0f, 40.0f};
 // 访存 — 证明 XmmLoad 16B 宽度对非对齐地址无差异 (D2)。
 float g_f4[8] = {0.5f, 1.5f, 2.5f, 3.5f, 4.5f, 5.5f, 6.5f, 7.5f};
 
+// 额外 double 标量 (subsd/divsd mem 源) 与 __m128d 全局 (movaps + addpd
+// mem; 实测 MSVC /Od 对 _mm_add_pd 直出 movaps+addpd+movaps)。
+double g_e = 8.0;
+__m128d g_pd = {1.5, 2.5};
+__m128d g_pd2 = {10.0, 20.0};
+
 int main() {
     int cmp_r = 0;
 
@@ -69,10 +75,15 @@ int main() {
     g_ps = _mm_loadu_ps(g_f4 + 2);    // {2.5,3.5,4.5,5.5}
     // 7) ucomisd mem + jp/jne (D4: 全局浮点判等高频形态; g_d == 2.5 成立)
     if (g_d == 2.5) cmp_r = 1;
+    // 8) subsd/divsd mem 源 (scalar double 减/除, 同 addsd 折条)
+    g_e -= 1.0;          // g_e = 8.0 - 1.0 = 7.0
+    g_e /= 2.0;          // g_e = 7.0 / 2.0 = 3.5
+    // 9) __m128d packed 加 (movaps read + addpd read + movaps write)
+    g_pd = _mm_add_pd(g_pd, g_pd2);   // {11.5, 22.5}
     WVMP_END(main);
 
     // 期望值: g_d=2.5 g_f=1.5 g_arr=[1,4.5,2.5,4] g_align=[12.5,20,30,40]
-    //          g_ps=[2.5,3.5,4.5,5.5] cmp_r=1
+    //          g_ps=[2.5,3.5,4.5,5.5] cmp_r=1 g_e=3.5 g_pd=[11.5,22.5]
     std::printf("g_d=%g g_f=%g\n", g_d, static_cast<double>(g_f));
     std::printf("g_arr=[%g,%g,%g,%g]\n", g_arr[0], g_arr[1], g_arr[2], g_arr[3]);
     std::printf("g_align=[%g,%g,%g,%g]\n", g_align[0], g_align[1], g_align[2], g_align[3]);
@@ -81,6 +92,7 @@ int main() {
                 static_cast<double>(g_ps.m128_f32[1]),
                 static_cast<double>(g_ps.m128_f32[2]),
                 static_cast<double>(g_ps.m128_f32[3]));
-    std::printf("cmp_r=%d\n", cmp_r);
+    std::printf("cmp_r=%d g_e=%g\n", cmp_r, g_e);
+    std::printf("g_pd=[%g,%g]\n", g_pd.m128d_f64[0], g_pd.m128d_f64[1]);
     return 0;
 }
