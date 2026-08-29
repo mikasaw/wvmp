@@ -34,9 +34,12 @@ Input artifacts (both from ONE protect run of a real sample, same seed):
                             --out-bin on first extraction).
 
 Checks every handler named in the SSE set:
-  addss addps addpd subss subps subpd
+  addss addps addpd subss subps subpd divss divps divpd
+  xorps orps andps addsd subsd divsd movsd
 (extend the set when new SSE/VMX/AVX ops land; unlisted handlers that emit
  xmm FP arithmetic are flagged as unregistered = forced review.)
+Plus the MIT-408 mem-form primitives xmmload/xmmstore (check_mem_handler:
+ memory-operand FP load/store + width chain + dual xmm/GP slot addressing).
 
 Exit codes: 0 all checks passed; 1 at least one handler failed; 2 tooling error.
 
@@ -76,9 +79,27 @@ except ImportError:
 # their flags path is asserted by the sse_bwcmpss_flags_readback shadow
 # sample instead (dispatch sheet §D D2.1).  They are listed in
 # FP_MNEMONIC_RE, so they still surface as "unregistered" WARNING for review.
+# MIT-408: addsd/subsd/divsd/movsd added (SSE scalar-double family, same
+# four-step template as addss -- identical prologue constants, native
+# mnemonic swapped).  xmmload/xmmstore deliberately NOT registered here:
+# they are the mem-form primitives (memory-operand FP instruction, width
+# chain from aux, dual xmm/GP-slot addressing) -- checked by the separate
+# check_mem_handler gate (MEM_HANDLERS below) with a dedicated shape.
 SSE_HANDLERS = {"addss", "addps", "addpd", "subss", "subps", "subpd",
                 "divss", "divps", "divpd",
-                "xorps", "orps", "andps"}
+                "xorps", "orps", "andps",
+                "addsd", "subsd", "divsd", "movsd"}
+
+# MIT-408: mem-form primitives (XmmLoad / XmmStore).  Expected shape:
+#   - memory-operand FP instruction present (movss/movsd/movups with a
+#     [reg] memory operand -- width chain from aux: cmp <aux>, 0x4 / 0x8,
+#     16 is the chain-tail fallthrough);
+#   - >= 1 xmm slot-offset prologue (sub 0x18 / shl 4 / add 0x140: the
+#     xmm-area branch of the dual slot addressing) + pc advance add 1;
+#   - >= 1 movups touching ctx (slot read/write via ctx reg);
+#   - no other immediate-bearing sub/shl/add (0x10 appears only as a
+#     memory displacement, which is not an instruction immediate).
+MEM_HANDLERS = {"xmmload", "xmmstore"}
 
 # Expected xmm slot-offset prologue constants (asmgen emit_xmm_offset_into_t9):
 #   xmm slot offset = kCtxXmmBase(0x140) + (reg - 24) * 16
@@ -88,9 +109,16 @@ EXPECTED_SHL_IMMS = {0x4}
 EXPECTED_ADD_IMMS = {0x140, 1}  # 0x140 = xmm base; 1 = pc advance
 MIN_PROLOGUE_COUNT = 3          # dst load / src load / dst store
 MIN_MOVUPS_COUNT = 3
+# MIT-408: mem-form handlers have exactly ONE xmm-area branch per slot access
+# (xmmload: dst store; xmmstore: src read) -- prologue constants appear once.
+MEM_MIN_PROLOGUE_COUNT = 1
+# Width chain constants (aux = 4/8/16 bytes; 16 = chain-tail fallthrough, so
+# only 4 and 8 appear as explicit cmp immediates).
+MEM_WIDTH_CMP_IMMS = {4, 8}
 
 FP_MNEMONIC_RE = re.compile(
-    r"^(addss|addps|addpd|subss|subps|subpd|mulss|mulps|mulpd|divss|divps|divpd|"
+    r"^(addss|addps|addpd|addsd|subss|subps|subpd|subsd|mulss|mulps|mulpd|"
+    r"divss|divps|divpd|divsd|"
     r"movss|movps|movsd|movapd|movaps|movups|movupd|xorps|orps|andps|andpd|"
     r"comiss|ucomiss|comisd|ucomisd)$"
 )
@@ -241,6 +269,115 @@ def check_sse_handler(name: str, code: bytes, base_va: int, md) -> tuple[bool, l
     return ok, lines
 
 
+def check_mem_handler(name: str, code: bytes, base_va: int, md) -> tuple[bool, list[str]]:
+    """Return (ok, evidence lines) for one MIT-408 mem-form primitive (xmmload/xmmstore).
+
+    Shape asserted (see MEM_HANDLERS comment):
+      1. >= 1 memory-operand FP load/store (movss/movsd/movups with a [reg]
+         operand) -- the width chain (aux 4/8, 16 = chain-tail);
+      2. >= 1 xmm slot-offset prologue (sub 0x18 / shl 4 / add 0x140) -- the
+         xmm-area branch of the dual slot addressing, and add 1 (pc advance);
+      3. >= 1 movups touching ctx (slot read/write);
+      4. no other immediate-bearing sub/shl/add (0x10 appears only as a
+         memory displacement, not an instruction immediate -- the MIT-371
+         bug shape `sub r, 0x24` still FAILs);
+      5. >= 1 cmp with width-chain immediate 4 or 8 (aux width dispatch).
+    """
+    lines: list[str] = []
+    ok = True
+
+    fp_mem_hits: list[str] = []
+    sub_imms: list[tuple[str, int]] = []
+    shl_imms: list[tuple[str, int]] = []
+    add_imms: list[tuple[str, int]] = []
+    cmp_imms: list[tuple[str, int]] = []
+    movups_ctx = 0
+
+    for ins in md.disasm(code, base_va):
+        ops = ins.op_str
+        if ins.mnemonic in ("sub", "shl", "add", "cmp"):
+            reg = gpr_name(ins, 0)
+            if reg is not None and ins.operands[1].type == capstone.x86.X86_OP_IMM:
+                immv = parse_imm(str(ins.operands[1].imm))
+                if ins.mnemonic == "sub":
+                    sub_imms.append((reg, immv))
+                elif ins.mnemonic == "shl":
+                    shl_imms.append((reg, immv))
+                elif ins.mnemonic == "cmp":
+                    cmp_imms.append((reg, immv))
+                else:
+                    add_imms.append((reg, immv))
+        if ins.mnemonic == "movups" and "xmm" in ops:
+            movups_ctx += 1
+        if FP_MNEMONIC_RE.match(ins.mnemonic) and any(
+            o.type == capstone.x86.X86_OP_MEM for o in ins.operands
+        ):
+            fp_mem_hits.append(f"{ins.mnemonic} {ops}")
+
+    if not fp_mem_hits:
+        ok = False
+        lines.append("    FAIL: no memory-operand FP instruction (movss/movsd/movups [..])")
+    else:
+        lines.append(f"    ok: memory-operand FP: {fp_mem_hits[0]}")
+
+    bad_sub = [(r, v) for (r, v) in sub_imms if v not in EXPECTED_SUB_IMMS]
+    bad_shl = [(r, v) for (r, v) in shl_imms if v not in EXPECTED_SHL_IMMS]
+    bad_add = [(r, v) for (r, v) in add_imms if v not in EXPECTED_ADD_IMMS]
+    if bad_sub or bad_shl or bad_add:
+        ok = False
+        lines.append(
+            "    FAIL: immediates outside expected sets "
+            f"sub{{{sorted(hex(v) for v in EXPECTED_SUB_IMMS)}}} "
+            f"shl{{{sorted(hex(v) for v in EXPECTED_SHL_IMMS)}}} "
+            f"add{{{sorted(hex(v) for v in EXPECTED_ADD_IMMS)}}}: "
+            + ", ".join(f"sub {r},{hex(v)}" for r, v in bad_sub)
+            + ", ".join(f"shl {r},{hex(v)}" for r, v in bad_shl)
+            + ", ".join(f"add {r},{hex(v)}" for r, v in bad_add)
+        )
+    else:
+        lines.append(
+            "    ok: sub/shl/add immediates = "
+            + ", ".join(f"sub {r},{hex(v)}" for r, v in sub_imms)
+            + ", ".join(f"shl {r},{hex(v)}" for r, v in shl_imms)
+            + ", ".join(f"add {r},{hex(v)}" for r, v in add_imms)
+        )
+
+    n_sub = sum(1 for (_, v) in sub_imms if v in EXPECTED_SUB_IMMS)
+    n_shl = sum(1 for (_, v) in shl_imms if v in EXPECTED_SHL_IMMS)
+    n_add140 = sum(1 for (_, v) in add_imms if v == 0x140)
+    n_add1 = sum(1 for (_, v) in add_imms if v == 1)
+    if min(n_sub, n_shl, n_add140) < MEM_MIN_PROLOGUE_COUNT or n_add1 < 1:
+        ok = False
+        lines.append(
+            f"    FAIL: prologue counts sub 0x18 x{n_sub} shl 4 x{n_shl} "
+            f"add 0x140 x{n_add140} add 1 x{n_add1} "
+            f"(need >= {MEM_MIN_PROLOGUE_COUNT} and >= 1)"
+        )
+    else:
+        lines.append(
+            f"    ok: prologue counts sub 0x18 x{n_sub} shl 4 x{n_shl} "
+            f"add 0x140 x{n_add140} add 1 x{n_add1}"
+        )
+
+    width_cmps = [(r, v) for (r, v) in cmp_imms if v in MEM_WIDTH_CMP_IMMS]
+    if not width_cmps:
+        ok = False
+        lines.append(
+            f"    FAIL: no width-chain cmp with imm in "
+            f"{sorted(MEM_WIDTH_CMP_IMMS)} (aux width dispatch missing)"
+        )
+    else:
+        lines.append(f"    ok: width-chain cmp = " + ", ".join(f"{r},{v}" for r, v in width_cmps))
+
+    if movups_ctx < 1:
+        ok = False
+        lines.append("    FAIL: no movups touching ctx (slot read/write missing)")
+    else:
+        lines.append(f"    ok: movups ctx count = {movups_ctx}")
+
+    return ok, lines
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[1])
     ap.add_argument("--asm", required=True, help="WVMP_RUNTIME_DUMP text file")
@@ -305,6 +442,14 @@ def main() -> int:
             ok, lines = check_sse_handler(name, code, off, md)
             verdict = "PASS" if ok else "FAIL"
             print(f"  [{verdict}] handler {name} @ +{hex(off)} ({len(code)} bytes)")
+            for ln in lines:
+                print(ln)
+            (passed if ok else failed).append(name)
+            all_ok = all_ok and ok
+        elif name in MEM_HANDLERS:
+            ok, lines = check_mem_handler(name, code, off, md)
+            verdict = "PASS" if ok else "FAIL"
+            print(f"  [{verdict}] handler {name} @ +{hex(off)} ({len(code)} bytes, mem-form)")
             for ln in lines:
                 print(ln)
             (passed if ok else failed).append(name)

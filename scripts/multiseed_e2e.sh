@@ -37,6 +37,12 @@
 #   - MIT-407 (MIT-D2): extend to wvmp_exitnative_pos_sample (ExitNative
 #     越区单向退出两类形态: END-call 等价退出 + 早返回 jcc 退出).
 #     Total: 27 samples × 5 seeds = 135 runs.
+#   - MIT-408 (MIT-C4b): extend to wvmp_sse_rip_sample (SSE mem 形式主样本:
+#     movsd/movss/movaps/movups 读/写 + addsd/addps 等 ALU mem 源 + ucomisd,
+#     rip 全局与非 rip 数组下标 + 栈基址 + D2 对齐/非对齐) +
+#     wvmp_sse_rip_xmm_readback_sample (XmmLoad/XmmStore/ALU-mem 折条的
+#     ctx.xmm 读回影子样本).
+#     Total: 28 samples × 5 seeds = 140 runs.
 #   - MIT-306: REQUIRE_REAL=1 校验日志含 "已生成 N 个入口 stub" 防止 C1 gate
 #     兜底被误判 PASS（仅 byte-exact 不够, C1 gate 函数被跳过仍能输出相同
 #     stdout+rc）。与 multiseed_e2e_real.sh 配套使用。
@@ -95,6 +101,11 @@ samples=(
     # 退出两类越区形态, 两函数须真虚拟化 (REQUIRE_REAL ≥1 stub)。
     # 反例样本 (回跳/超界 → gate) 不进 REQUIRE_REAL 列表, 由 e2e.sh 单独验。
     "build/passes/marker_scan/tests/wvmp_exitnative_pos_sample.exe"
+    # MIT-408 (MIT-C4b): SSE mem 形式主样本 + ctx.xmm 读回影子样本 —
+    # 纯 C++ /Od 天然 mem 形式 (rip 全局 / 非 rip 数组下标 / 栈基址 / D2
+    # 对齐与 非对齐), REQUIRE_REAL 保证真虚拟化非 gate。
+    "build/passes/marker_scan/tests/wvmp_sse_rip_sample.exe"
+    "build/passes/marker_scan/tests/wvmp_sse_rip_xmm_readback_sample.exe"
 )
 
 # Seeds: 1 (small), 12345 (default), 99999 (large), 0xDEADBEEF (magic), 0xCAFEBABE (magic).

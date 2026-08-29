@@ -76,15 +76,29 @@
 - 短期随 C1 的保守拦截兜底；长期需要 call gate（VM 内切原生 → 原生返回后
   re-enter）或 VM 间调用协议。依赖 C1 的分段基础设施。
 
-## C4 rip-relative 内存操作数不支持
+## C4 rip-relative 内存操作数不支持（GP 已 done；SSE mem 由 MIT-408 收口）
 
-- lifter 能识别（映射到 `ir::Reg::Rip`，x86_translate.cpp:320），翻译器
-  emit_address 明确拒绝（translator.cpp:193-194 "rip-relative 未支持"）。
-- x64 下这是访问全局变量的标准形态（`mov eax, [rip+g_n]`），不支持则
-  任何碰全局的函数都无法安全虚拟化。
-- 短期随 C1 兜底；实现上可在翻译期把 rip 基址换算成绝对 RVA 并经
-  stub 传入的 image base 计算（blob 里存 RVA，运行时加基址寄存器）。
-  注意与重定位/ASLR 的配合。
+**现状（MIT-408 实测修正，旧文 "翻译器明确拒绝" 作废）**
+
+- **GP(整数) rip 读/写路径已全线实现**（MIT-248，main eaa73af 起）：
+  translator 五处 dst-rip→`StoreRva` + src-rip→`LoadRva` + `LeaRva`，
+  movzx/movsx/alu-mem/单目全走 `emit_address`（翻译期把 [rip+disp] 换算成
+  绝对 RVA，运行时经 LoadRva/StoreRva/LeaRva 加 image_base 还原 VA）；
+  非 rip（base/index/scale 数组下标）走普通 Load/Store。MIT-248 双样本 +
+  MIT-404 起注册 multiseed。
+- **SSE 族 memory 形式由 MIT-408 收口**：lifter 五处 translate_sse_* 放开
+  `X86_OP_MEM`（mem_operand 通用通道）；translator 经 `emit_address` +
+  `LeaRva`（rip）→ 新原语 `XmmLoad`/`XmmStore`（宽度 4/8/16 经 aux，
+  运行时一律 movups 非对齐语义）；ALU/ucomis 的 mem 源折条走 GP scratch
+  双槽临时（v18..v23 两两作 xmm 宽，指令边界后即死，不动 VmContext 布局）。
+  支持面：addss/addps/addpd/addsd、subss/subps/subpd/subsd、
+  divss/divps/divpd/divsd、movss/movsd/movaps/movapd/movups/movupd、
+  xorps/orps/andps、ucomiss/ucomisd（读 src=mem / 写 dst=mem 两类）。
+- **不支持面（越界即 C1 gate 兜底）**：`add/sub [mem], xmm` 读写双访存形态
+  （D3 砍面留 C4c）、comiss/comisd（0F 2F 系）、AVX/x87/SSE2 整数族
+  （movd/movdqa p 形式）、string movsd（A5，capstone 与 SSE movsd 同 id，
+  由双 MEM 操作数规则区分）。
+- 注意与重定位/ASLR 的配合：RVA + image_base 在运行时还原，不依赖静态 VA。
 
 ## C5 x86 目标实际不可用
 
@@ -110,7 +124,9 @@
 
 1. **C1-保守拦截**（半天级）→ 消灭最大的静默破坏面
 2. **C2 handler 补齐**（sar 最急，其次 adc/sbb）→ 白名单内不再有地雷
-3. C4 rip-relative（解锁"访问全局的真实函数"）→ E2E 样本升级为含全局读写
+3. C4 rip-relative（解锁"访问全局的真实函数"）→ **GP 已 done（MIT-248）；
+   SSE mem 已收口（MIT-408）**；剩余面 = `add/sub [mem],xmm` 双访存形态
+   （C4c，D3 砍面）
 4. C3 call gate（工作量最大，依赖 C1 分段）→ 解锁真实函数
 5. C5 x86 对齐（独立里程碑）
 6. 与 M3 插件池并行推进不冲突（不同代码面）

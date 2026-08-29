@@ -517,6 +517,45 @@ target_link_options(wvmp_sse_bwcmpss_flags_readback_sample PRIVATE
     $<$<CXX_COMPILER_ID:MSVC>:/INCREMENTAL:NO>
 )
 
+# MIT-408 (C4b): 端到端主样本——SSE 指令族 memory 形式 (含 rip-relative 全局
+# 访问) 真虚拟化。**纯 C++ /Od, 不用 MASM**: MSVC 对全局浮点/数组天然 emit
+# mem 形式 (movsd xmm,[rip+g] / addsd xmm,[rip+c] / movsd [rcx+rax],xmm /
+# movaps [rsp+disp],xmm / movups 非对齐), 区域内全部是真 mem 形式 SSE 字节
+# (派活单 §A.3 读/写两类 + D4 ucomisd + D2 对齐/非对齐两组)。值打印 %g
+# byte-exact; 对齐与非对齐全局输出一致即证明运行时 movups 非对齐语义。
+add_executable(wvmp_sse_rip_sample
+    sse_rip_sample_main.cpp
+)
+target_link_libraries(wvmp_sse_rip_sample PRIVATE wvmp::sdk)
+target_compile_options(wvmp_sse_rip_sample PRIVATE
+    $<$<AND:$<CXX_COMPILER_ID:MSVC>,$<COMPILE_LANGUAGE:C,CXX>>:/Od;/Ob0;/utf-8>
+    $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-O0>
+)
+target_link_options(wvmp_sse_rip_sample PRIVATE
+    $<$<CXX_COMPILER_ID:MSVC>:/INCREMENTAL:NO>
+)
+
+# MIT-408 (C4b): 影子样本——SSE mem 原语 (XmmLoad/XmmStore/ALU-mem GP 双槽
+# 折条) 的 ctx.xmm 运行时读回断言 (验收门 #79 纪律: byte-exact 对 SSE 写
+# GPR 槽形态不可见)。与 wvmp_sse_rip_sample 同能力面配对、独立 exe: 区域
+# 由 MASM 直写 5 条 mem 形式 (movups 读/写 + addps mem 源 + movsd 读/写),
+# 区域外把 xmm 槽 128-bit 状态全部打出 (%a / %016llx 逐位可比对): 槽位
+# 落点错 (写 GPR 区)、宽度截断 (movss 替 movups)、movsd 清零语义缺失都会
+# 与 native run 逐字节不一致 → FAIL。
+enable_language(ASM_MASM)
+add_executable(wvmp_sse_rip_xmm_readback_sample
+    sse_rip_xmm_readback_sample_main.cpp
+    sse_rip_xmm_readback_sample_asm.asm
+)
+target_link_libraries(wvmp_sse_rip_xmm_readback_sample PRIVATE wvmp::sdk)
+target_compile_options(wvmp_sse_rip_xmm_readback_sample PRIVATE
+    $<$<AND:$<CXX_COMPILER_ID:MSVC>,$<COMPILE_LANGUAGE:C,CXX>>:/Od;/Ob0;/utf-8>
+    $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-O0>
+)
+target_link_options(wvmp_sse_rip_xmm_readback_sample PRIVATE
+    $<$<CXX_COMPILER_ID:MSVC>:/INCREMENTAL:NO>
+)
+
 # MIT-404: 端到端主样本——区域内含整数除法族 cdq/cdqe/cqo + div/idiv
 # (REG + MEM + rip 形式除数, 32/64 位), 验证整数除法支持后翻译成功、运行时
 # 走真 Cdq/Div/Idiv handler、行为与原生逐字节一致 (商/余/负数组合值正确)。
