@@ -222,6 +222,15 @@ samples=(
     # 单边新增 2 样本 → 42 × 5 = 210 runs。
     "build/passes/marker_scan/tests/wvmp_vex128_sample.exe"
     "build/passes/marker_scan/tests/wvmp_vex128_xmm_readback_sample.exe"
+    # MIT-427 (G1c): movd/movq GP↔xmm 桥主样本 + ctx.xmm 读回影子样本 —
+    # 桥四形 REG (66 0F 6E / 66 REX.W 0F 6E / 66 0F 7E / 66 REX.W 0F 7E,
+    # 新 VmOp::XmmFromGp/GpFromXmm) + mem 双向 (408 通路) + all-xmm 双形态
+    # (F3 0F 7E 清零 / 66 0F D6 保持); 负例区 (paddq/psubq 砍面 + pmovmskb/
+    # pcmpeqd + MMX mm 判据 + movdqa/movdqu C++ 真产物) 各自函数级 gate
+    # 可调用, 行为 byte-exact。B.5 harness 崩溃盲区修随本单搭载。
+    # 单边新增 2 样本 → 44 × 5 = 220 runs。
+    "build/passes/marker_scan/tests/wvmp_sse_bridge_sample.exe"
+    "build/passes/marker_scan/tests/wvmp_sse_bridge_xmm_readback_sample.exe"
 )
 
 # Seeds: 1 (small), 12345 (default), 99999 (large), 0xDEADBEEF (magic), 0xCAFEBABE (magic).
@@ -287,12 +296,43 @@ EOF
         echo $? > "$tmp/rc.expected"
         "$out_win" > "$tmp/stdout.actual" 2>/dev/null
         echo $? > "$tmp/rc.actual"
-        if ! cmp -s "$tmp/stdout.expected" "$tmp/stdout.actual"; then
+        # MIT-427 (G1c) B.5: harness segfault 假 PASS 盲区修 (426 §4 登记, 搭载)。
+        # 实测机制 (#33, Git Bash/MSYS, 2026-08-30): native crash 的 rc 是 MSYS
+        # 映射后的信号值 (STATUS_ACCESS_VIOLATION → 139 = 128+SIGSEGV), 不是裸
+        # Windows 异常码; cmd/PowerShell 口径才报裸码 (rc ≥ 0x80000000 或负值)。
+        # 修复前 "双崩 + 双空 stdout" byte-exact = 假 PASS (426 影子样本首版
+        # 实证; 本单注入 segfault 样本复现 5/5 假 PASS → 修复后 5/5 FAIL)。
+        # 派单 §B.5 的 "rc ≥ 0x80000000 (或负值) 显式 FAIL" 按实测口径修正为
+        # "映射信号 rc (≥128) 或裸异常码 (≥0x80000000/负) 一律 abnormal"。
+        # 处置: 任一侧 abnormal → FAIL, 唯一例外 = 设计性崩溃对拍 (双侧 abnormal
+        # + rc 相等 + stdout 非空, wvmp_div_sample #DE 对拍 404 AC#5 依赖)。
+        # 残余边界 (披露): "双崩 + 相同非空部分输出" 仍走 byte-exact (无法区分
+        # 设计对拍与巧合崩); 127 (command-not-found/未知异常映射) 仅在 stdout
+        # 为空时计 abnormal (wvmp_div_sample 127+194B 不受影响)。
+        rc_e="$(cat "$tmp/rc.expected")"
+        rc_a="$(cat "$tmp/rc.actual")"
+        crash_e=0
+        crash_a=0
+        if (( rc_e >= 128 || rc_e >= 2147483648 || rc_e < 0 )) ||            [[ "$rc_e" == "127" && ! -s "$tmp/stdout.expected" ]]; then
+            crash_e=1
+        fi
+        if (( rc_a >= 128 || rc_a >= 2147483648 || rc_a < 0 )) ||            [[ "$rc_a" == "127" && ! -s "$tmp/stdout.actual" ]]; then
+            crash_a=1
+        fi
+        if [[ "$crash_e" == "1" || "$crash_a" == "1" ]]; then
+            if [[ "$crash_e" == "1" && "$crash_a" == "1" && "$rc_e" == "$rc_a"                   && -s "$tmp/stdout.actual" ]]; then
+                echo "[multiseed] PASS seed=$seed sample=$(basename "$sample") (designed crash pair rc=$rc_e)"
+                pass=$((pass + 1))
+            else
+                echo "[multiseed] FAIL seed=$seed sample=$sample abnormal rc (native=$rc_e packed=$rc_a, MIT-427 B.5 crash guard)" >&2
+                fail=$((fail + 1))
+            fi
+        elif ! cmp -s "$tmp/stdout.expected" "$tmp/stdout.actual"; then
             echo "[multiseed] FAIL seed=$seed sample=$sample stdout mismatch" >&2
             diff "$tmp/stdout.expected" "$tmp/stdout.actual" >&2
             fail=$((fail + 1))
-        elif [[ "$(cat "$tmp/rc.expected")" != "$(cat "$tmp/rc.actual")" ]]; then
-            echo "[multiseed] FAIL seed=$seed sample=$sample rc mismatch $(cat "$tmp/rc.expected") vs $(cat "$tmp/rc.actual")" >&2
+        elif [[ "$rc_e" != "$rc_a" ]]; then
+            echo "[multiseed] FAIL seed=$seed sample=$sample rc mismatch $rc_e vs $rc_a" >&2
             fail=$((fail + 1))
         else
             echo "[multiseed] PASS seed=$seed sample=$(basename "$sample")"

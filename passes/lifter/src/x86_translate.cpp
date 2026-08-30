@@ -1358,6 +1358,25 @@ TranslateResult translate_ucomis(const cs_insn& ci, const cs_x86& x, ir::Arch ar
 enum : int { kSseMulSs = 14, kSseMulSd = 15, kSseMulPs = 16, kSseMulPd = 17,
              kSseAndn = 18 };
 
+// MIT-427 (G1c): movd/movq GP↔xmm 桥 src2 标记 — 与 SSE mul/andn (14..18)
+// 分域连续 (string 0..4 / lock 5..13 / mul+andn 14..18 / bridge 19..21)。
+//   19 kBridgeFromGp:  GP→xmm 桥 (movd/movq xmm, r32/r64 REG 形式), 高位清零
+//   20 kBridgeToGp:    xmm→GP 桥 (movd/movq r32/r64, xmm REG 形式), 宽度截取
+//   21 kBridgeFromXmm: xmm→xmm 低 64 拷贝 + 目的高 64 清零 (F3 0F 7E / VEX
+//                      pp=F3 同语义形态; dst 高位清零是本形态独有语义, 与
+//                      66 0F D6 "高 64 保持" 相区分 — 与 426 §F.4 "假 Mov"
+//                      同款纪律)
+// 载体 = Op::Movss (G3/G4 "op 载体 + src2=imm(族)" 先例): movss 常规构造
+// (translate_sse_mov) 从不写 src2, 零碰撞; size 字段 = 桥宽度 (S32=movd /
+// S64=movq)。IR 操作数约定 (与 SSE 借用 0..7 惯例对账):
+//   kBridgeFromGp:  dst = xmm 索引 0..7 (借用, 翻译期 +24);
+//                   src = GP 真寄存器 (map_reg 全值 0..15)
+//   kBridgeToGp:    dst = GP 真寄存器 (0..15); src = xmm 索引 0..7 (借用)
+//   kBridgeFromXmm: dst/src 均 = xmm 索引 0..7 (借用)
+// mem 操作数形态不经标记 — lifter 直接产 (Op::Movss, mem) 既有载体 →
+// XmmLoad/XmmStore (408 通路, movss/movsd mem 形式自产清零/截断语义)。
+enum : int { kBridgeFromGp = 19, kBridgeToGp = 20, kBridgeFromXmm = 21 };
+
 // MIT-425 (R1): SSE 浮点乘 mulss/mulsd/mulps/mulpd (+ mem 源含 rip 一次
 // 到位, 408 通路现成)。与 translate_sse_add 同构: XMM 寄存器编码借用
 // ir::Reg 值 0..7, 翻译期加 24 偏移 → VmContext.xmm 槽 (XMM 编码设计见
@@ -1418,6 +1437,140 @@ TranslateResult translate_sse_andn(const cs_insn& ci, const cs_x86& x, ir::Arch 
     return ok(r.insn);
 }
 
+// ==================== MIT-427 (G1c): movd/movq GP↔xmm 桥 ====================
+//
+// SDM 表 (编码判据全量 #33 probe 实测, vendored capstone 5.0.6, 2026-08-30;
+// probe 输出见派单报告对照表):
+//   - MOVD  xmm, r32   66 0F 6E /r      id=X86_INS_MOVD (377), prefix[2]=0x66
+//   - MOVQ  xmm, r64   66 REX.W 0F 6E   id=X86_INS_MOVQ (378), rex&8
+//   - MOVD  r32, xmm   66 0F 7E /r      id=X86_INS_MOVD, prefix[2]=0x66
+//   - MOVQ  r64, xmm   66 REX.W 0F 7E   id=X86_INS_MOVQ, rex&8
+//   - MOVQ  xmm, xmm   F3 0F 7E /r      id=X86_INS_MOVQ, **prefix 全零**
+//     (F3 被吸收进 id — 与 ADDSS/MOVSS 同纪律, 不经入口前缀闸)
+//   - MOVQ  xmm, xmm   66 0F D6 /r      id=X86_INS_MOVQ, prefix[2]=0x66
+//   **#33 实测推翻先验 (d6_probe 独立 native 探针, 2026-08-30)**: 66 0F D6
+//   reg-reg 与 F3 0F 7E 语义**逐位相同** — 低 64 拷贝 + 目的高 64 **清零**
+//   (66 0F D6 C8 实测 high=0; SDM MOVQ 条目 register-dest 伪码
+//   DEST[127:64] ← 0 同口径)。"仅写 8 字节不触碰高位" 只对 **mem-dest**
+//   形式成立 (→ XmmStore 截取通路)。reg-reg 全部 → kBridgeFromXmm。
+//   - MOVD/MOVQ mem 操作数形式 (66 0F 6E/7E mem, VEX 同): capstone 报
+//     op.size=4/8, 走既有 (Op::Movss, mem) 载体 → XmmLoad/XmmStore (408
+//     通路; movss/movsd mem 形式自产清零/截断语义, 逐位等价 movd/movq)。
+//   - VEX (B.3, 426 §F.4 ④ 挂账清偿): VMOVD 1025 / VMOVQ 1021, prefix 全零
+//     (VEX bits 被 capstone 吸收)。all-xmm VMOVQ 的 D6/F3 语义由 VEX.pp
+//     区分 (capstone 不暴露 final opcode — 经 ci.bytes 解析 pp: C5 形
+//     bytes[1]&3 / C4 形 bytes[2]&3; pp=1(66)→D6 保持 / pp=2(F3)→清零)。
+//     ymm 形态由 translate_vex128 位宽闸 (op.size>16) 拒, xmm8..15 由
+//     xmm_idx 不可映射拒 (426 §F.3 同口径)。
+//   - **D2 MMX 禁入**: 裸 0F 6E/6F/7E/7F (mm 操作数, 与 x87 共享状态域 —
+//     418 永久 gate 面)。probe 实测: NP 0F 6F → id=MOVQ ops=[mm0,mm1] /
+//     NP 0F 6E → id=MOVD ops=[mm0,ecx] / NP 0F 7E → id=MOVD — **同 id 混入
+//     MMX 形态, mm 操作数判据是唯一可靠闸** (本函数首检查)。
+//   - movdqa/movdqu (66/F3 0F 6F/7F, id 468/469) 不在本单面 → 照旧 default
+//     gate (GAPS G1c 节精确登记; intrinsic /Od 溢出高频形态, 后续单按频率
+//     立项)。
+// 派单方编码自错纠正 (#33): 派单 §A.2 "paddq=66 0F FC" 实测为 PADDB
+// (INSID=388); paddq 真值 = 66 0F D4 (425 GAPS 原文正确, 425 仅 psubq 的
+// 5C→FB 需修) — paddq/psubq 本单砍面 (频率实测 shell32 16/854k + 其余
+// 二进制 0, 见 GAPS G1c 节), 负例样本钉 gate。
+TranslateResult translate_movd_movq(const cs_insn& ci, const cs_x86& x, ir::Arch arch) {
+    if (x.op_count != 2) return unsupported(ci.address, ci.size);
+    // D2 MMX 闸: 任何 mm 操作数 (X86_REG_MM0..MM7) 一律 unsupported。
+    for (int i = 0; i < x.op_count; ++i) {
+        if (x.operands[i].type == X86_OP_REG &&
+            x.operands[i].reg >= X86_REG_MM0 && x.operands[i].reg <= X86_REG_MM7)
+            return unsupported(ci.address, ci.size);
+    }
+    // 手动 XMM 编号映射 (X86_REG_XMM0..XMM7 → 0..7; xmm8..15 → nullopt = gate)。
+    auto xmm_idx = [&](x86_reg r) -> std::optional<u8> {
+        switch (r) {
+        case X86_REG_XMM0: return static_cast<u8>(0); case X86_REG_XMM1: return static_cast<u8>(1);
+        case X86_REG_XMM2: return static_cast<u8>(2); case X86_REG_XMM3: return static_cast<u8>(3);
+        case X86_REG_XMM4: return static_cast<u8>(4); case X86_REG_XMM5: return static_cast<u8>(5);
+        case X86_REG_XMM6: return static_cast<u8>(6); case X86_REG_XMM7: return static_cast<u8>(7);
+        default: return std::nullopt;
+        }
+    };
+    (void)arch;
+    const cs_x86_op& op0 = x.operands[0];
+    const cs_x86_op& op1 = x.operands[1];
+    const bool op0_xmm = op0.type == X86_OP_REG && xmm_idx(op0.reg).has_value();
+    const bool op1_xmm = op1.type == X86_OP_REG && xmm_idx(op1.reg).has_value();
+    const bool op0_gp = op0.type == X86_OP_REG && map_reg(op0.reg).has_value();
+    const bool op1_gp = op1.type == X86_OP_REG && map_reg(op1.reg).has_value();
+    const u64 op0_sz = op0.size;
+    const u64 op1_sz = op1.size;
+    ir::Insn out;
+    out.op = Op::Movss;  // 桥载体 (src2=族标记, 见 kBridge* 注释)
+    out.addr = ci.address;
+    out.updates_flags = false;
+
+    // ---- load 方向: xmm ← r/m (66 0F 6E 系 + VEX vmovd/vmovq load) ----
+    if (op0_xmm) {
+        out.dst = ir::Operand::reg_(static_cast<ir::Reg>(*xmm_idx(op0.reg)));
+        if (op1_gp && op1_sz == 4) {          // MOVD xmm, r32
+            out.size = Size::S32;
+            out.src2 = Operand::imm_(kBridgeFromGp);
+            out.src = ir::Operand::reg_(*map_reg(op1.reg));
+            return ok(out);
+        }
+        if (op1_gp && op1_sz == 8) {          // MOVQ xmm, r64
+            out.size = Size::S64;
+            out.src2 = Operand::imm_(kBridgeFromGp);
+            out.src = ir::Operand::reg_(*map_reg(op1.reg));
+            return ok(out);
+        }
+        if (op1.type == X86_OP_MEM && (op1_sz == 4 || op1_sz == 8)) {
+            // MOVD/MOVQ xmm, m32/m64 → 既有 XmmLoad 载体 (无标记 —
+            // translate_sse_mov mem-load 通路, movsd mem 清零语义直产)。
+            auto m = mem_operand(op1.mem);
+            if (!m) return unsupported(ci.address, ci.size);
+            out.size = op1_sz == 4 ? Size::S32 : Size::S64;
+            out.src = *m;
+            return ok(out);
+        }
+        if (op1_xmm) {
+            // all-xmm MOVQ (F3 0F 7E / 66 0F D6 legacy + VEX 全 pp): #33
+            // 实测语义统一 = 低 64 拷贝 + 目的高 64 **清零** (d6_probe,
+            // 66 0F D6 C8 与 F3 0F 7E C1 逐位同结果) → 全部 kBridgeFromXmm。
+            // (prefix/pp 不参与语义 — D6 与 F3 reg-reg 在本机实测逐位相同。)
+            out.size = Size::S64;                // all-xmm 形态固有 64 位
+            out.dst = ir::Operand::reg_(static_cast<ir::Reg>(*xmm_idx(op0.reg)));
+            out.src = ir::Operand::reg_(static_cast<ir::Reg>(*xmm_idx(op1.reg)));
+            out.src2 = Operand::imm_(kBridgeFromXmm);
+            return ok(out);
+        }
+        return unsupported(ci.address, ci.size);
+    }
+
+    // ---- store 方向: r/m ← xmm (66 0F 7E 系 + VEX store) ----
+    if (op1_xmm) {
+        out.src = ir::Operand::reg_(static_cast<ir::Reg>(*xmm_idx(op1.reg)));
+        if (op0_gp && op0_sz == 4) {          // MOVD r32, xmm
+            out.size = Size::S32;
+            out.src2 = Operand::imm_(kBridgeToGp);
+            out.dst = ir::Operand::reg_(*map_reg(op0.reg));
+            return ok(out);
+        }
+        if (op0_gp && op0_sz == 8) {          // MOVQ r64, xmm
+            out.size = Size::S64;
+            out.src2 = Operand::imm_(kBridgeToGp);
+            out.dst = ir::Operand::reg_(*map_reg(op0.reg));
+            return ok(out);
+        }
+        if (op0.type == X86_OP_MEM && (op0_sz == 4 || op0_sz == 8)) {
+            // MOVD/MOVQ m32/m64, xmm → 既有 XmmStore 载体。
+            auto m = mem_operand(op0.mem);
+            if (!m) return unsupported(ci.address, ci.size);
+            out.size = op0_sz == 4 ? Size::S32 : Size::S64;
+            out.dst = *m;
+            return ok(out);
+        }
+        return unsupported(ci.address, ci.size);
+    }
+    return unsupported(ci.address, ci.size);
+}
+
 // ==================== MIT-426 (G6a): VEX.128 V-pair 折叠进既有 SSE 通路 ====================
 //
 // 路线: MIT-424 (G6r) 裁决 R2 档A — 38 个既有 SSE 白名单 id 的 V-对
@@ -1465,9 +1618,10 @@ TranslateResult translate_sse_andn(const cs_insn& ci, const cs_x86& x, ir::Arch 
 
 // V-pair 家族描述: 全部复用既有 translate 函数 (零新 IR 语义)。
 struct VexDesc {
-    enum class Fam : u8 { Add, Sub, Div, Mul, Bit, Andn, Mov, Ucomis };
+    enum class Fam : u8 { Add, Sub, Div, Mul, Bit, Andn, Mov, Ucomis,
+                          Bridge };  // Bridge = MIT-427 vmovd/vmovq 桥镜像
     Fam fam;
-    Op op;          // IR op 载体 (Add/Sub/Div/Bit/Mov/Ucomis 族)
+    Op op;          // IR op 载体 (Add/Sub/Div/Bit/Mov/Ucomis 族; Bridge 忽略)
     ir::Size sz;    // 形式标签 (与 legacy 同约定: ss=S32 / sd=S64 / packed=S64)
     int marker = 0; // Mul 族 14..17 / Andn 18 (src2 载体标记, 与 425 对账)
     bool commutative = false; // add/mul/位运算 = true; sub/div/andn = false
@@ -1515,6 +1669,10 @@ std::optional<VexDesc> vex_desc_of(x86_insn id) {
     case X86_INS_VMOVAPD: return VexDesc{VexDesc::Fam::Mov, Op::Movapd, ir::Size::S64, 0, false};
     case X86_INS_VMOVUPS: return VexDesc{VexDesc::Fam::Mov, Op::Movups, ir::Size::S64, 0, false};
     case X86_INS_VMOVUPD: return VexDesc{VexDesc::Fam::Mov, Op::Movupd, ir::Size::S64, 0, false};
+    // ---- 桥镜像 (MIT-427 B.3): vmovd/vmovq 2-op 形态, 语义全由操作数
+    // 形状 + VEX pp 判定 (translate_movd_movq 统一处理 legacy/VEX) ----
+    case X86_INS_VMOVD: return VexDesc{VexDesc::Fam::Bridge, Op::Mov, ir::Size::S32};
+    case X86_INS_VMOVQ: return VexDesc{VexDesc::Fam::Bridge, Op::Mov, ir::Size::S64};
     // ---- 比较族 (2-op, flags 通路; 无 3-op 形态) ----
     case X86_INS_VUCOMISS: return VexDesc{VexDesc::Fam::Ucomis, Op::Ucomiss, ir::Size::S32, 0, false};
     case X86_INS_VUCOMISD: return VexDesc{VexDesc::Fam::Ucomis, Op::Ucomisd, ir::Size::S64, 0, false};
@@ -1536,21 +1694,29 @@ TranslateResult vex_invoke(const VexDesc& d, const cs_insn& ci, const cs_x86& x,
     case VexDesc::Fam::Andn:   return translate_sse_andn(ci, x, arch);
     case VexDesc::Fam::Mov:    return translate_sse_mov(ci, x, arch, d.op, d.sz);
     case VexDesc::Fam::Ucomis: return translate_ucomis(ci, x, arch, d.op, d.sz);
+    // MIT-427 (G1c) B.3: vmovd/vmovq 桥镜像 — 操作数形状 + VEX pp 判据在
+    // translate_movd_movq 内, 2-op 直通 (VMOVD/VMOVQ 无 3-op 形态, 不会经
+    // 三地址折叠改写)。
+    case VexDesc::Fam::Bridge: return translate_movd_movq(ci, x, arch);
     }
     return unsupported(ci.address, ci.size);
 }
 
 // VEX.128 V-pair 入口: 位宽闸 → 2-op 直通 / 3-op 三地址折叠 (见顶部说明块)。
 TranslateResult translate_vex128(const cs_insn& ci, const cs_x86& x, ir::Arch arch) {
+    const auto desc = vex_desc_of(static_cast<x86_insn>(ci.id));
+    if (!desc) return unsupported(ci.address, ci.size);  // 白名单外 (现状 gate 保持)
     // ---- B.4 位宽闸: 32B (ymm) 禁入 — 同 mnemonic 覆盖 128/256 两宽 ----
+    // MIT-427 (G1c): Fam::Bridge (vmovd/vmovq) 混合宽度操作数 (r32=4/r64=8)
+    // 是合法形态 — 寄存器 16B 防御检查仅约束 SIMD 家族; 桥的形状/宽度判据
+    // 在 translate_movd_movq 内 (mm 闸 / xmm8..15 闸 / r32|r64 宽度链)。
+    const bool bridge = desc->fam == VexDesc::Fam::Bridge;
     for (u8 i = 0; i < x.op_count; ++i) {
         const cs_x86_op& op = x.operands[i];
         if (op.size > 16) return unsupported(ci.address, ci.size);  // ymm/ymm mem
-        if (op.type == X86_OP_REG && op.size != 16)
+        if (!bridge && op.type == X86_OP_REG && op.size != 16)
             return unsupported(ci.address, ci.size);                // 防御 (寄存器恒 16B)
     }
-    const auto desc = vex_desc_of(static_cast<x86_insn>(ci.id));
-    if (!desc) return unsupported(ci.address, ci.size);  // 白名单外 (现状 gate 保持)
 
     // ---- 2-op 直通: vmov* 拷贝/load/store + vucomis*/vcomis* (D4) ----
     // 操作数形状由既有 translate_sse_* 自检 (dst mem 形式 408 通路; xmm0..7
@@ -2327,6 +2493,13 @@ TranslateResult translate_insn(const cs_insn& ci, ir::Arch arch) {
     case X86_INS_POR:   return translate_sse_bitwise(ci, x, arch, Op::Orps,  Size::S64);
     case X86_INS_PXOR:  return translate_sse_bitwise(ci, x, arch, Op::Xorps, Size::S64);
     case X86_INS_PANDN: return translate_sse_andn(ci, x, arch);
+    // MIT-427 (G1c): movd/movq GP↔xmm 桥 (核心必做 B.1) — 66 0F 6E/7E 系
+    // (REG/MEM 双操作数, REX.W 64 位) + F3 0F 7E + 66 0F D6 全编码形,
+    // MMX 裸 0F 6E/6F/7E/7F (mm 操作数) D2 永久 gate。判据/分域见
+    // translate_movd_movq 注释块。paddq/psubq (66 0F D4/FB) 本单砍面
+    // (频率实测) → 照旧 default gate; movdqa/movdqu (468/469) 同 gate。
+    case X86_INS_MOVD: return translate_movd_movq(ci, x, arch);
+    case X86_INS_MOVQ: return translate_movd_movq(ci, x, arch);
     // MIT-426 (G6a): VEX.128 V-pair 白名单 — 38 id = 既有 SSE 白名单逐行
     // 镜像 (vendored capstone x86.h 全量对账 EXISTS, 映射表见报告)。
     // VEX 前缀 (C4/C5) 被 capstone 吸收进 id (prefix=[0,0,0,0], triage
@@ -2340,6 +2513,11 @@ TranslateResult translate_insn(const cs_insn& ci, ir::Arch arch) {
     case X86_INS_VMULSS: case X86_INS_VMULSD: case X86_INS_VMULPS: case X86_INS_VMULPD:
     case X86_INS_VMOVSS: case X86_INS_VMOVSD: case X86_INS_VMOVAPS: case X86_INS_VMOVAPD:
     case X86_INS_VMOVUPS: case X86_INS_VMOVUPD:
+    // MIT-427 (G1c) B.3: vmovd/vmovq VEX 镜像随桥本体入面 (426 §F.4 ④
+    // 挂账清偿; 2-op 形态直达既有 2-op 直通路径, ymm 位宽闸 + xmm8..15
+    // 闸继承 translate_vex128)。vpaddq/vpsubq 随 paddq/psubq 本体砍面
+    // (D1 频率实测) → 照旧 default gate (G6a ④ 保持)。
+    case X86_INS_VMOVD: case X86_INS_VMOVQ:
     case X86_INS_VXORPS: case X86_INS_VXORPD: case X86_INS_VORPS: case X86_INS_VORPD:
     case X86_INS_VANDPS: case X86_INS_VANDPD: case X86_INS_VPXOR: case X86_INS_VPOR:
     case X86_INS_VPAND:

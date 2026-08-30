@@ -939,6 +939,81 @@ TEST(Interpreter, SbbE2EMirrorChain) {
 // ---------------------------------------------------------------------------
 // 测试入口
 // ---------------------------------------------------------------------------
+// ==================== MIT-427 (G1c): movd/movq GP↔xmm 桥语义 ====================
+//
+// handler 级位级断言 (与影子样本互补: 单测在进程内直接驱动 VM, 影子样本在
+// 真 stub 预载/写回链下驱动):
+//   - XmmFromGp w8 (GP→xmm): dst 槽低 64 ← src GP 槽, 高 64 清零
+//   - XmmFromGp w4:          dst 槽低 32 ← src GP 槽, 高 96 清零
+//   - XmmFromGp xmm 源:      dst 低 64 ← src xmm 槽低 64, 高 64 清零
+//     (F3 0F 7E / 66 0F D6 reg-reg 统一语义 — d6_probe #33 实测)
+//   - GpFromXmm w8:          GP 槽 ← src xmm 槽低 64 截取
+//   - GpFromXmm w4:          GP 槽 ← src 低 32 截取 + **高 32 清零**
+//     (native movd r32 写 32 位寄存器零扩展, writeback S32 同款语义)
+TEST(Interpreter, MovdBridgeSemantic) {
+    wvmp::Rng rng(12345);
+    const auto result = rt::generate_runtime(rng);
+    RwxImage rwx(result.image.code);
+    auto entry = rwx.entry();
+
+    std::vector<u8> s;
+    const u8 sz64 = isa::size_field(ir::Size::S64);
+    const u8 sz32 = isa::size_field(ir::Size::S32);
+    // ① XmmFromGp w8: xmm0(v24) ← v5, 高 64 清零
+    isa::append_insn(s, isa::make_insn(isa::VmOp::XmmFromGp, isa::OpKind::Reg, 24,
+                                       isa::OpKind::Reg, 5, 8, sz64));
+    // ② GpFromXmm w8: v6 ← xmm0 低 64
+    isa::append_insn(s, isa::make_insn(isa::VmOp::GpFromXmm, isa::OpKind::Reg, 6,
+                                       isa::OpKind::Reg, 24, 8, sz64));
+    // ③ GpFromXmm w4: v7 ← xmm0 低 32 (零扩展)
+    isa::append_insn(s, isa::make_insn(isa::VmOp::GpFromXmm, isa::OpKind::Reg, 7,
+                                       isa::OpKind::Reg, 24, 4, sz32));
+    // ④ XmmFromGp w4: xmm1(v25) ← v7, 高 96 清零
+    isa::append_insn(s, isa::make_insn(isa::VmOp::XmmFromGp, isa::OpKind::Reg, 25,
+                                       isa::OpKind::Reg, 7, 4, sz32));
+    // ⑤ XmmFromGp xmm 源 (F3 0F 7E 语义): xmm2(v26) ← xmm0 低 64, 高 64 清零
+    isa::append_insn(s, isa::make_insn(isa::VmOp::XmmFromGp, isa::OpKind::Reg, 26,
+                                       isa::OpKind::Reg, 24, 8, sz64));
+    // ⑥ GpFromXmm w8 → **v0 (Rax 槽)**: stub HALT 写回链从此槽恢复物理 rax —
+    //    movd/movq r64, xmm 真产物最常见落点, 槽 0 必测 (E2E mvq_out 依赖)。
+    isa::append_insn(s, isa::make_insn(isa::VmOp::GpFromXmm, isa::OpKind::Reg, 0,
+                                       isa::OpKind::Reg, 24, 8, sz64));
+    isa::append_insn(s, halt());
+
+    rt::VmContext ctx;
+    ctx.bytecode = s.data();
+    ctx.pc = 0;
+    ctx.scratch_mem = 0;
+    // src GP 槽 v5 = 0x89ABCDEF12345678; xmm0 槽预置高位非零图案 (验证
+    // GpFromXmm 只截取低 64 / XmmFromGp 覆盖高位)。
+    ctx.regs[5] = 0x89ABCDEF12345678ull;
+    ctx.xmm[0].xmm_lo = 0xAABBCCDDEEFF0011ull;
+    ctx.xmm[0].xmm_hi = 0x1122334455667788ull;
+    // 桥探针的无关槽位哨兵 (v6/v7 与 xmm1/xmm2 高位原值非零 — 误写即 FAIL)
+    ctx.regs[6] = 0xCCCCCCCCCCCCCCCCull;
+    ctx.regs[7] = 0xDDDDDDDDDDDDDDDDull;
+    ctx.regs[0] = 0x9999999999999999ull;
+    ctx.xmm[1].xmm_lo = ctx.xmm[1].xmm_hi = 0xEEEEEEEEEEEEEEEEull;
+    ctx.xmm[2].xmm_lo = ctx.xmm[2].xmm_hi = 0xFFFFFFFFFFFFFFFFull;
+    entry(&ctx);
+
+    // ①②: xmm0 高位被 GP 源值覆盖且清零; v6 = 低 64 全量截取
+    EXPECT_EQ(ctx.xmm[0].xmm_lo, 0x89ABCDEF12345678ull);
+    EXPECT_EQ(ctx.xmm[0].xmm_hi, 0ull);
+    EXPECT_EQ(ctx.regs[6], 0x89ABCDEF12345678ull);
+    // ③: v7 = 零扩展低 32
+    EXPECT_EQ(ctx.regs[7], 0x12345678ull);
+    // ④: xmm1 = {低 32, 0} (高 96 清零)
+    EXPECT_EQ(ctx.xmm[1].xmm_lo, 0x12345678ull);
+    EXPECT_EQ(ctx.xmm[1].xmm_hi, 0ull);
+    // ⑤: xmm2 = {低 64, 0} (xmm 源 = 步骤① 覆盖后的 xmm0 — 高 64 清零,
+    // F3/D6 统一语义; 步骤① 已把 xmm0 低 64 写成 v5 值)
+    EXPECT_EQ(ctx.xmm[2].xmm_lo, 0x89ABCDEF12345678ull);
+    EXPECT_EQ(ctx.xmm[2].xmm_hi, 0ull);
+    // ⑥: v0 (Rax 槽) = 低 64 截取 (哨兵被覆盖)
+    EXPECT_EQ(ctx.regs[0], 0x89ABCDEF12345678ull);
+}
+
 TEST(Interpreter, SemanticBattery) {
     wvmp::Rng rng(0xC0FFEE);
     const auto result = rt::generate_runtime(rng);

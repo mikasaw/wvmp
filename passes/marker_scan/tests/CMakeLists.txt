@@ -965,3 +965,42 @@ target_compile_options(wvmp_vex128_xmm_readback_sample PRIVATE
 target_link_options(wvmp_vex128_xmm_readback_sample PRIVATE
     $<$<CXX_COMPILER_ID:MSVC>:/INCREMENTAL:NO>
 )
+
+# MIT-427 (G1c): movd/movq GP↔xmm 桥主样本 — 桥四形 REG + mem 双向 (既有
+# XmmLoad/XmmStore 408 通路) + all-xmm 双形态 (F3 0F 7E 清零 → 新
+# VmOp::XmmFromGp / 66 0F D6 保持 → 既有 (Movss,S64)=Movsd)。区域由 MASM
+# 直写真字节 (MASM 助记符无法区分 F3/66 双形态, db 直发; /Od intrinsic
+# 溢出直产 movdqa/movdqu 砍面 → C++ intrinsic 函数全落负例区)。负例区
+# (函数级分区): paddq/psubq (B.2 砍面) / pmovmskb/pcmpeqd (D3 不本单) /
+# MMX movq (mm 操作数 D2 永久 gate) / movdqa+movdqu (C++ 真产物 gate)。
+add_executable(wvmp_sse_bridge_sample
+    sse_bridge_sample_main.cpp
+    sse_bridge_sample_asm.asm
+)
+target_link_libraries(wvmp_sse_bridge_sample PRIVATE wvmp::sdk)
+target_compile_options(wvmp_sse_bridge_sample PRIVATE
+    $<$<AND:$<CXX_COMPILER_ID:MSVC>,$<COMPILE_LANGUAGE:C,CXX>>:/Od;/Ob0;/utf-8>
+    $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-O0>
+)
+target_link_options(wvmp_sse_bridge_sample PRIVATE
+    $<$<CXX_COMPILER_ID:MSVC>:/INCREMENTAL:NO>
+)
+
+# MIT-427 (G1c): 影子样本 — 桥 handler 的 ctx.xmm 运行时读回断言 (#79
+# 纪律, 与主样本同能力面配对、独立 exe)。9 探针 (位图案全 8 槽预载 +
+# 区域后 8 槽 × 2×u64 全量落盘 + rax GP 读回): movd 高 96 清零 / movq
+# 高 64 清零 / movd r32 零扩展 / F3 vs 66 0F D6 双形态 / mem 装入清零 /
+# mem store 截取 (误写无关槽即 FAIL)。
+enable_language(ASM_MASM)
+add_executable(wvmp_sse_bridge_xmm_readback_sample
+    sse_bridge_xmm_readback_sample_main.cpp
+    sse_bridge_xmm_readback_sample_asm.asm
+)
+target_link_libraries(wvmp_sse_bridge_xmm_readback_sample PRIVATE wvmp::sdk)
+target_compile_options(wvmp_sse_bridge_xmm_readback_sample PRIVATE
+    $<$<AND:$<CXX_COMPILER_ID:MSVC>,$<COMPILE_LANGUAGE:C,CXX>>:/Od;/Ob0;/utf-8>
+    $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-O0>
+)
+target_link_options(wvmp_sse_bridge_xmm_readback_sample PRIVATE
+    $<$<CXX_COMPILER_ID:MSVC>:/INCREMENTAL:NO>
+)

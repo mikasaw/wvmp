@@ -1409,6 +1409,85 @@ public:
         return o;
     }
 
+    // MIT-427 (G1c) XmmFromGp: movd/movq GP↔xmm 桥 load 方向 — src 槽低
+    // 4/8 字节 → dst xmm 槽, **dst 槽其余字节清零** (SDM MOVD 清 bits
+    // 127:32 / MOVQ 清 bits 127:64; F3 0F 7E xmm 源同)。
+    //   编码: a_kind=Reg reg_a=xmm_dst_slot (24..31), b_kind=Reg reg_b=src
+    //   槽 (GP 0..15 或 xmm 24..31 双语义), aux=宽度 (4|8), cond_or_size 占位。
+    //   handler: src 槽域分派 —
+    //     reg_b < 24 (GP 槽): 宽度链 movd/movq xmm0, [GP 槽] (mem 形式
+    //       native 自产清零语义);
+    //     reg_b >= 24 (xmm 槽, 仅 width=8 — F3 0F 7E 形态): movsd xmm0,
+    //       [xmm 槽低 64] (mem 形式清零高 64)。
+    //   dst 槽 16B 全量写回 (movups) — 清零语义落槽。
+    //   不影响 EFLAGS; 直接 advance。
+    std::string build_xmm_from_gp(u64 dispatch) const {
+        const std::string tag = "xmmfg" + std::to_string(seq());
+        const std::string lbl4 = "fg4_" + tag;
+        const std::string lblsx = "fgsx_" + tag;
+        const std::string lbld = "fgd_" + tag;
+        std::string o = decode_prelude();
+        // src 槽域分派: T7 = reg_b
+        o += std::string("    cmp ") + r64(t_[7]) + ", " + imm(24) + "\n";
+        o += "    jae " + lblsx + "\n";
+        // GP 槽: 宽度链 (aux ∈ {4, 8}; 8 为链尾顺延)
+        o += std::string("    cmp ") + r64(t_[5]) + ", " + imm(4) + "\n";
+        o += "    je " + lbl4 + "\n";
+        o += std::string("    movq xmm0, qword ptr [") + r64(ctx_) + " + " +
+             r64(t_[7]) + "*8 + 0x10]\n";
+        o += "    jmp " + lbld + "\n";
+        o += lbl4 + ":\n";
+        o += std::string("    movd xmm0, dword ptr [") + r64(ctx_) + " + " +
+             r64(t_[7]) + "*8 + 0x10]\n";
+        o += "    jmp " + lbld + "\n";
+        // xmm 槽: 低 64 读 + 高 64 清零 (movsd mem 形式语义)
+        o += lblsx + ":\n";
+        o += xmm_offset_into_t9_text(t_[7]);
+        o += std::string("    movsd xmm0, qword ptr [") + r64(ctx_) + " + " +
+             r64(t_[9]) + "]\n";
+        // dst xmm 槽 16B 全量写
+        o += lbld + ":\n";
+        o += xmm_offset_into_t9_text(t_[4]);
+        o += std::string("    movups [") + r64(ctx_) + " + " + r64(t_[9]) + "], xmm0\n";
+        o += advance(dispatch);
+        return o;
+    }
+
+    // MIT-427 (G1c) GpFromXmm: movd/movq GP↔xmm 桥 store 方向 — src xmm
+    // 槽低 4/8 字节截取 → dst GP 槽。
+    //   编码: a_kind=Reg reg_a=gp_dst_slot (0..15), b_kind=Reg reg_b=
+    //   xmm_src_slot (24..31), aux=宽度 (4|8), cond_or_size 占位。
+    //   handler: src xmm 槽 128-bit 读 (movups) → 宽度链截取落盘:
+    //     width=8: movq qword [GP 槽], xmm0 (低 64 截取);
+    //     width=4: movd dword [GP 槽], xmm0 + **高 4 字节清零** — native
+    //       movd r32 写 32 位寄存器本机零扩展 (SDM), 与 writeback 的 S32
+    //       零扩展语义对齐 (asmgen writeback: "S32 写 32 位寄存器自动零
+    //       扩展"), 双 store (低 4 截取 + 高 4 置零) 逐位等价。
+    //   不影响 EFLAGS; 直接 advance。
+    std::string build_gp_from_xmm(u64 dispatch) const {
+        const std::string tag = "gpfx" + std::to_string(seq());
+        const std::string lbl4 = "fx4_" + tag;
+        const std::string lbld = "fxd_" + tag;
+        std::string o = decode_prelude();
+        // src xmm 槽 128-bit 读: T9 = 0x140+(reg_b-24)*16
+        o += xmm_offset_into_t9_text(t_[7]);
+        o += std::string("    movups xmm0, [") + r64(ctx_) + " + " + r64(t_[9]) + "]\n";
+        // dst GP 槽宽度链截取: T4 = reg_a
+        o += std::string("    cmp ") + r64(t_[5]) + ", " + imm(4) + "\n";
+        o += "    je " + lbl4 + "\n";
+        o += std::string("    movq qword ptr [") + r64(ctx_) + " + " +
+             r64(t_[4]) + "*8 + 0x10], xmm0\n";
+        o += "    jmp " + lbld + "\n";
+        o += lbl4 + ":\n";
+        o += std::string("    movd dword ptr [") + r64(ctx_) + " + " +
+             r64(t_[4]) + "*8 + 0x10], xmm0\n";
+        o += std::string("    mov dword ptr [") + r64(ctx_) + " + " +
+             r64(t_[4]) + "*8 + 0x14], " + imm(0) + "\n";
+        o += lbld + ":\n";
+        o += advance(dispatch);
+        return o;
+    }
+
     // MIT-371 Addss: scalar single-precision FP add (xmm1 = xmm1 + xmm2)。
     //   字节结构: F3 0F 58 /r (3 字节 REG-REG, mod=11)。
     //   编码: reg_a=xmm_dst_slot (24..31, translator 从 IR 0..7 加 24 偏移),
@@ -3327,6 +3406,11 @@ RuntimeGenResult generate_runtime(wvmp::Rng& rng) {
         {int(VmOp::Divsd), "divsd", &AsmGen::build_divsd},
         {int(VmOp::XmmLoad), "xmmload", &AsmGen::build_xmm_load},
         {int(VmOp::XmmStore), "xmmstore", &AsmGen::build_xmm_store},
+        // MIT-427 (G1c): movd/movq GP↔xmm 桥原语 (xmm 槽 ↔ GP 槽, 高位
+        // 清零/截取语义经 native movd/movq/movsd mem 形式直产; dump 门
+        // BRIDGE_HANDLERS 注册表同步, scripts/verifier/dump_handler_xmm_check.py)。
+        {int(VmOp::XmmFromGp), "xmmfromgp", &AsmGen::build_xmm_from_gp},
+        {int(VmOp::GpFromXmm), "gpfromxmm", &AsmGen::build_gp_from_xmm},
     };
     rng.shuffle(handlers.begin(), handlers.end());   // 码序随机
 

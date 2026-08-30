@@ -161,12 +161,32 @@
   cl v145 对 _mm_and_si128/_mm_andnot_si128 直产 andps/andnps，编译器
   自身即 ps/p 互认证据，pand 真 66 字节由 MASM 样本直写）。multiseed
   40 样本 × 5 = 200/200。
-- **不支持面（越界即 C1 gate 兜底）**：SSE2 整数档② movd/movq GP↔xmm 桥
-  （66 0F 7E / 0F 7E / REX.W）与 paddq/psubq 系（66 0F D4/5C）——跳表预算
-  kVmOpMax=95 顶格，砍面留 G1c（VEX 镜像 vpaddd 系随本体 gate，见 G6a）；
-  movdqa/movdqu（66 0F 6F/7F）；pcmpeq/pcmpgt 系（SSE 整数比较族）；
-  AVX/VEX 残余面（档A 已收口 38 id V-pair，精确残余见下节 G6a——
-  VEX-GP BMI/ymm/FMA/加密/EVEX 保持 gate）。
+- **MIT-427 (G1c) 收口 (2026-08-31)**：SSE2 整数档② movd/movq GP↔xmm 桥
+  （MOVD 66 0F 6E/7E + MOVQ 66 REX.W 0F 6E/7E + all-xmm F3 0F 7E 与
+  66 0F D6 + VEX vmovd/vmovq 镜像）——REG 形式折叠 2 个新 VmOp
+  （XmmFromGp/GpFromXmm，高位清零/截取语义由 handler 内 movd/movq/movsd
+  mem 形式直产）；mem 形式直接复用既有 (Op::Movss, mem) 载体 →
+  XmmLoad/XmmStore（408 通路）；all-xmm 双编码 #33 实测逐位同语义
+  （d6_probe：66 0F D6 C8 与 F3 0F 7E C1 高 64 均清零——"高 64 保持"
+  先验被推翻，SDM register-dest 伪码 DEST[127:64]←0 同口径；"仅写 8 字节
+  不触碰高位" 只对 mem-dest 成立）→ 全部折叠 kBridgeFromXmm。
+  MMX 裸 0F 6E/6F/7E/7F（mm 操作数）D2 永久 gate——capstone 对 NP 0F 6F
+  报 id=MOVQ 与 SSE 形态同 id 混入，mm 操作数判据唯一可靠闸（单测钉死）。
+  IR 层 (Op::Movss, src2=imm 19..21) 载体标记（19=GP→xmm / 20=xmm→GP /
+  21=xmm→xmm 清零拷贝；域 14..18 连续后延，movss 常规构造从不写 src2）。
+  kVmOpMax 95→97（跳表余量 30）。multiseed 44 样本 × 5 = 220/220。
+- **不支持面（越界即 C1 gate 兜底）**：SSE2 整数算术档② paddq/psubq
+  （**真值 66 0F D4 / 66 0F FB**——425 原文 "D4/5C" 的 5C 有误
+  （5C=SUBPD），MIT-427 派单自纠 "paddq=66 0F FC" 亦误（FC=PADDB），
+  #33 probe 实测钉死）——B.2 频率双向授权砍面：实测 6 二进制
+  854,020 指令 psubq=0、paddq=16（全部 shell32.dll，其余二进制 0，
+  约 0.002%）且与砍面 movdqa 共生（/Od intrinsic probe 实测 paddq 必伴随
+  movdqa 溢出）→ 支持面不可达，砍面留档按频率单开；movdqa/movdqu
+  （66/F3 0F 6F/7F，id 468/469）——/Od intrinsic 溢出高频形态（notepad
+  60+34、shell32 1201+558），后续按频率单开；pmovmskb（66 0F D7）/
+  pcmpeq/pcmpgt 系（SSE 整数比较族）；AVX/VEX 残余面（档A 已收口
+  38 id V-pair，精确残余见下节 G6a——VEX-GP BMI/ymm/FMA/加密/EVEX
+  保持 gate）。
   （string movsd 双形态已由 MIT-415 收口，见 G3 节；
   x87 已拆出独立小节，见下节 "x87 (永久 gate, R3 裁决)"——不是简单"不支持
   兜底"，而是有独立频率数据与行为承诺的裁决面。）
@@ -216,7 +236,7 @@ default → C1 gate 整函数原生保持（424 E2E 实证链不破坏，零逃�
 shlx/pdep/bzhi）不在 SIMD 档A 内**——VEX id 但 GP 域，独立缺口（triage
 §6.2，真实二进制高频如 ClipUp rorx:288）；② ymm/zmm（档B，kCtxSize 冻结
 面 + 跳表扩容前置）；③ FMA 族（双舍入红线，永不拆 mul+add，triage §6.5）；
-④ vpaddd/vpaddq/psubq 系（legacy 本体 paddq 仍 gate→G1c，V-对镜像随本体）；
+④ vpaddd/vpaddq/psubq 系（MIT-427 实测砍面：paddq 16/854k、psubq 0、vpaddd 0——本体与 V-对镜像均 gate，见 G1c 节）；
 ⑤ vzeroupper/vzeroall（档B ABI 面）；⑥ 加密 vaes/vpclmulqdq（直执行另议）；
 ⑦ EVEX/AVX-512 全谱（62 前缀独立 INS 空间，天然不入白名单）。
 

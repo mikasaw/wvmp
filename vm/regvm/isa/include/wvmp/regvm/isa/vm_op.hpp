@@ -550,9 +550,36 @@ enum class VmOp : u16 {
     //   128-bit NOT 原语 (GP Not handler 是单 u64 槽语义, 落 xmm 区即错址),
     //   派活单 §B.2 "新 VmOp 你实测选" — 选新 VmOp, 字节码零膨胀。
     //   不影响 EFLAGS; 直接 advance。
-    Andnps };
+    Andnps,
 
-inline constexpr u16 kVmOpMax = static_cast<u16>(VmOp::Andnps);  // MIT-425: 95
+    // —— MIT-427 (G1c): movd/movq GP↔xmm 桥原语 ——
+    // 64-bit 整数/SIMD 桥 (int↔SIMD 互转/CRC 哈希/序列化代码高频, 425 §A.3
+    // intrinsic 真产物: _mm_cvtsi32_si128 → movd xmm, r32 66 0F 6E 等)。
+    //   XmmFromGp (load 方向, 高位清零): dst xmm 槽低 4/8 字节 ← src 槽,
+    //     **dst 槽其余字节清零** (SDM: MOVD 清 bits 127:32 / MOVQ+F3 0F 7E 清
+    //     bits 127:64)。a_kind=Reg reg_a=xmm_dst_slot (24..31),
+    //     b_kind=Reg reg_b=src_slot (GP 0..15 或 xmm 24..31 双语义, 后者仅
+    //     width=8 — F3 0F 7E xmm 源形态), aux=宽度 (4|8)。
+    //     GP 源读 = handler 内 movd/movq xmm, [GP 槽] mem 形式直产清零语义;
+    //     xmm 源读 = movsd xmm0, [xmm 槽低 64] (mem 形式清零高位)。
+    //   GpFromXmm (store 方向, 宽度截取): dst GP 槽 ← src xmm 槽低 4/8 字节
+    //     (SDM: MOVD/MOVQ r/m, xmm 截取低位)。width=4 时**高 4 字节清零**
+    //     (native movd r32 写 32 位寄存器本机零扩展, writeback 同款语义 —
+    //     截取+清零两步 store)。a_kind=Reg reg_a=gp_dst_slot (0..15),
+    //     b_kind=Reg reg_b=xmm_src_slot (24..31), aux=宽度 (4|8)。
+    //   mem 操作数形态不经本对: movd/movq xmm, [mem] 与 [mem]←xmm 由 lifter
+    //     直接折既有 (Op::Movss, mem) 载体 → XmmLoad/XmmStore (408 通路,
+    //     movss/movsd mem 形式自产清零/截断语义)。
+    //   编码判据 (vendored capstone 5.0.6 probe 实测, 2026-08-30): MOVD
+    //   INSID=377 / MOVQ INSID=378 / VMOVD 1025 / VMOVQ 1021; 66 族
+    //   prefix[2]=0x66, F3 0F 7E 被吸收进 id 后 prefix 全零, MMX 裸 0F
+    //   6E/6F/7E/7F 带 mm 操作数 (D2 永久 gate)。宽度 = 非 xmm 操作数
+    //   size (4/8)。不影响 EFLAGS; 直接 advance。
+    //   派活单 §D 决策: 2 op 必 append-only 在 Andnps 之后 (pitfall #34);
+    //   kVmOpMax+1=98 < 128 跳表余量 30。
+    XmmFromGp, GpFromXmm };
+
+inline constexpr u16 kVmOpMax = static_cast<u16>(VmOp::GpFromXmm);  // MIT-427: 97
 inline constexpr u16 kVmOpLimit = 1u << 14;  // 14 位编码空间上限
 
 constexpr const char* to_string(VmOp op) {
@@ -644,6 +671,9 @@ constexpr const char* to_string(VmOp op) {
         case VmOp::Mulps: return "mulps";
         case VmOp::Mulpd: return "mulpd";
         case VmOp::Andnps: return "andnps";
+        // MIT-427 (G1c): movd/movq GP↔xmm 桥原语.
+        case VmOp::XmmFromGp: return "xmmfromgp";
+        case VmOp::GpFromXmm: return "gpfromxmm";
     }
     return "?";
 }

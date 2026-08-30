@@ -117,6 +117,29 @@ enum : int { kSseMulSs = 14, kSseMulSd = 15, kSseMulPs = 16, kSseMulPd = 17,
     return v == kSseAndn;
 }
 
+// MIT-427 (G1c): movd/movq GP↔xmm 桥 src2 载体标记 — 与 lifter
+// (x86_translate.cpp translate_movd_movq) 的枚举分域严格对账 (19..21;
+// string 0..4 / lock 5..13 / SSE mul+andn 14..18 分区连续不相交):
+//   19 kBridgeFromGp:  GP→xmm 桥 (dst=xmm 借用 0..7 → 翻译期 +24;
+//                      src=GP 真寄存器 0..15 直发槽号)
+//   20 kBridgeToGp:    xmm→GP 桥 (dst=GP 真寄存器 0..15 直发槽号;
+//                      src=xmm 借用 0..7 → 翻译期 +24)
+//   21 kBridgeFromXmm: xmm→xmm 低 64 拷贝 + 目的高 64 清零 (F3 0F 7E /
+//                      66 0F D6 reg-reg 全形态 — #33 实测两编码语义逐位
+//                      相同, d6_probe 2026-08-30; "高 64 保持" 只对 mem-dest
+//                      形式成立, 由 XmmStore 截取通路表达; dst/src 均借用
+//                      0..7 → 双 +24)
+// 载体 = Op::Movss (碰撞对账 425 §B.1 同款审计): src2=imm 写入点全仓 =
+// imul 3-op (op=Imul, 必须本派发 op+标记双限定) / string 载体 (op=Mov,
+// 0..4) / lock (5..13) / SSE mul (op=Mul, 14..17) / andn (op=Andps, 18) /
+// 本域 (op=Movss, 19..21)。movss 常规构造 (translate_sse_mov) 从不写
+// src2 — 本派发必须先于 SSE mov 分支 (marker 载体若落 translate_sse_mov
+// 会错误 emit 真 movss)。
+enum : int { kBridgeFromGp = 19, kBridgeToGp = 20, kBridgeFromXmm = 21 };
+[[nodiscard]] bool is_bridge_marker(i64 v) {
+    return v >= kBridgeFromGp && v <= kBridgeFromXmm;
+}
+
 // ==================== MIT-409 + MIT-413 (G2): 跳转表特化 ====================
 //
 // 识别模式 = 受限模板匹配（D1 决策，派活单 §A.2 实测模板 + G2 三参数
@@ -889,6 +912,13 @@ struct Translator {
                 // MIT-374: SSE 浮点除 dispatch — REG-REG emit 单条; MEM 源
                 // (MIT-408) 折条同 add; (Divss,S64)=divsd → VmOp::Divsd。
                 ok = translate_sse_div(em, sc, in, current_rva, next_ip);
+            } else if (in.op == ir::Op::Movss && in.src2.kind == ir::Operand::Kind::Imm &&
+                       is_bridge_marker(in.src2.imm)) {
+                // MIT-427 (G1c): movd/movq GP↔xmm 桥 dispatch — (Op::Movss,
+                // src2=imm 19..21) 载体标记。**必须先于 SSE mov 分支** (marker
+                // 载体若落 translate_sse_mov 会错误 emit 真 movss; op+标记
+                // 双限定, imul 3-op 教训 419 §B.1)。
+                ok = translate_sse_bridge(em, sc, in, current_rva, next_ip);
             } else if (in.op == ir::Op::Movss || in.op == ir::Op::Movaps ||
                        in.op == ir::Op::Movapd || in.op == ir::Op::Movups ||
                        in.op == ir::Op::Movupd) {
@@ -2283,6 +2313,74 @@ struct Translator {
             return skip(in, "SSE 浮点乘 操作数形态未支持", nullptr);
         const u8 xmm_src_slot = static_cast<u8>(in.src.reg) + 24u;
         em.emit_rr(vop, xmm_dst_slot, xmm_src_slot, isa::size_field(in.size));
+        return true;
+    }
+
+    // ---- MIT-427 (G1c): movd/movq GP↔xmm 桥 (kBridgeFromGp/ToGp/FromXmm) ----
+    //
+    // lifter 载体 (Op::Movss, src2=imm 19..21, 见 is_bridge_marker 注释):
+    //   kBridgeFromGp (19): (Movss,S32/S64, dst=xmm 借用, src=GP 真寄存器)
+    //     → VmOp::XmmFromGp (reg_a=dst+24, reg_b=src 槽号, aux=宽度 4|8)
+    //   kBridgeFromXmm (21): (Movss,S64, dst/src=xmm 借用) → VmOp::XmmFromGp
+    //     (reg_a=dst+24, reg_b=src+24, aux=8 — handler xmm 源路径, 高 64 清零)
+    //   kBridgeToGp (20): (Movss,S32/S64, dst=GP 真寄存器, src=xmm 借用)
+    //     → VmOp::GpFromXmm (reg_a=dst 槽号, reg_b=src+24, aux=宽度)
+    // 高位清零/截断语义全部在 handler (asmgen build_xmm_from_gp /
+    // build_gp_from_xmm) 经 native movd/movq/movsd mem 形式直产 — 翻译器
+    // 零拆条, 单条字节码 (派活单 §F.2 GP 双槽中转折法不取, 字节码零膨胀)。
+    // mem 操作数形态不经本函数 — lifter 直接产 (Op::Movss, mem) 既有载体,
+    // 由 translate_sse_mov 的 XmmLoad/XmmStore 通路处理 (408)。
+    bool translate_sse_bridge(Emitter& em, Scratch& sc, const ir::Insn& in,
+                              u64 current_rva, u64 next_ip) {
+        if (in.op != ir::Op::Movss || in.src2.kind != ir::Operand::Kind::Imm ||
+            !is_bridge_marker(in.src2.imm))
+            return false;
+        (void)sc;
+        (void)current_rva;
+        (void)next_ip;
+        const i64 marker = in.src2.imm;
+        if (in.size != ir::Size::S32 && in.size != ir::Size::S64)
+            return skip(in, "movd/movq 桥 宽度非法", nullptr);
+        const u32 width = in.size == ir::Size::S32 ? 4u : 8u;
+        if (marker == kBridgeFromGp) {
+            // GP→xmm: dst=xmm 借用 (0..7, +24), src=GP 真寄存器 (0..15 槽号)。
+            if (in.dst.kind != ir::Operand::Kind::Reg || in.src.kind != ir::Operand::Kind::Reg)
+                return skip(in, "movd/movq 桥 操作数形态未支持", nullptr);
+            const u8 xmm_idx = static_cast<u8>(in.dst.reg);
+            const u8 gp_slot = static_cast<u8>(in.src.reg);
+            if (xmm_idx > 7u)
+                return skip(in, "movd/movq 桥 xmm 索引越界 (仅支持 xmm0..xmm7)", nullptr);
+            if (gp_slot > 15u)
+                return skip(in, "movd/movq 桥 GP 槽号越界", nullptr);
+            em.emit(VmOp::XmmFromGp, OpKind::Reg, static_cast<u8>(xmm_idx + 24u),
+                    OpKind::Reg, gp_slot, width, isa::size_field(in.size));
+            return true;
+        }
+        if (marker == kBridgeFromXmm) {
+            // xmm→xmm 清零拷贝 (F3 0F 7E): dst/src 均借用 0..7, 固有 64 位。
+            if (in.dst.kind != ir::Operand::Kind::Reg || in.src.kind != ir::Operand::Kind::Reg)
+                return skip(in, "movd/movq 桥 操作数形态未支持", nullptr);
+            const u8 xmm_dst = static_cast<u8>(in.dst.reg);
+            const u8 xmm_src = static_cast<u8>(in.src.reg);
+            if (xmm_dst > 7u || xmm_src > 7u)
+                return skip(in, "movd/movq 桥 xmm 索引越界 (仅支持 xmm0..xmm7)", nullptr);
+            em.emit(VmOp::XmmFromGp, OpKind::Reg, static_cast<u8>(xmm_dst + 24u),
+                    OpKind::Reg, static_cast<u8>(xmm_src + 24u), 8u,
+                    isa::size_field(in.size));
+            return true;
+        }
+        // kBridgeToGp: xmm→GP: dst=GP 真寄存器 (0..15 槽号), src=xmm 借用 (+24)。
+        if (in.dst.kind != ir::Operand::Kind::Reg || in.src.kind != ir::Operand::Kind::Reg)
+            return skip(in, "movd/movq 桥 操作数形态未支持", nullptr);
+        const u8 gp_slot = static_cast<u8>(in.dst.reg);
+        const u8 xmm_idx = static_cast<u8>(in.src.reg);
+        if (gp_slot > 15u)
+            return skip(in, "movd/movq 桥 GP 槽号越界", nullptr);
+        if (xmm_idx > 7u)
+            return skip(in, "movd/movq 桥 xmm 索引越界 (仅支持 xmm0..xmm7)", nullptr);
+        em.emit(VmOp::GpFromXmm, OpKind::Reg, gp_slot,
+                OpKind::Reg, static_cast<u8>(xmm_idx + 24u), width,
+                isa::size_field(in.size));
         return true;
     }
 
