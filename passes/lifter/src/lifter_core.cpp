@@ -167,7 +167,12 @@ void build_blocks(u64 begin_rva, u64 end_rva, std::span<const LiftedItem> items,
             current = out.size() - 1;
             placement.push_back(nullptr);
         }
-        if (it.insn) out[current].insns.push_back(*it.insn);
+        if (it.insn) {
+            // MIT-426 (G6a): 前置 IR 先于主指令入块（pre_insns 与 insn 共享
+            // 同一机器地址，顺序执行语义 = 折叠出的 Mov 前置 + 2-op 载体）。
+            for (const ir::Insn& pre : it.pre_insns) out[current].insns.push_back(pre);
+            out[current].insns.push_back(*it.insn);
+        }
         placement[current] = &it;
     }
 
@@ -236,6 +241,8 @@ u64 disassemble_and_lift(CapstoneSession& session, const u8* code, size_t size, 
         const TranslateResult tr = translate_insn(*ci, fr.arch);
         if (tr.status == TranslateStatus::Ok) {
             item.insn = tr.insn;
+            // MIT-426 (G6a): VEX 三地址折叠前置 IR（dst 独立形态）透传。
+            item.pre_insns = tr.extra;
             item.ctl = control_kind(tr.insn.op);
             if ((item.ctl == LiftedItem::Ctl::Jcc || item.ctl == LiftedItem::Ctl::Jmp ||
                  item.ctl == LiftedItem::Ctl::Call) &&

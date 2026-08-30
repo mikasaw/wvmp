@@ -22,6 +22,11 @@ struct LiftedItem {
     u64 addr = 0;                  // RVA
     u32 raw_size = 0;              // 机器码长度（字节）
     std::optional<ir::Insn> insn;  // nullopt = 未支持/TODO，已跳过
+    // MIT-426 (G6a): VEX 三地址折叠的前置 IR（TranslateResult.extra 透传，
+    // 恒在 insn 之前执行；legacy 通路恒空）。addr 与主 insn 相同（共享
+    // 机器指令地址），翻译器 next_ip_of 按"后者覆盖"重建映射（见
+    // translator.cpp translate_function）。
+    std::vector<ir::Insn> pre_insns;
 
     enum class Ctl : u8 { None, Jcc, Jmp, Call, Ret };
     Ctl ctl = Ctl::None;

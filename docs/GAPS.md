@@ -163,14 +163,68 @@
   40 样本 × 5 = 200/200。
 - **不支持面（越界即 C1 gate 兜底）**：SSE2 整数档② movd/movq GP↔xmm 桥
   （66 0F 7E / 0F 7E / REX.W）与 paddq/psubq 系（66 0F D4/5C）——跳表预算
-  kVmOpMax=95 顶格，砍面留 G1c（G6a/VEX.128 的 movd 依赖同步知会）；
+  kVmOpMax=95 顶格，砍面留 G1c（VEX 镜像 vpaddd 系随本体 gate，见 G6a）；
   movdqa/movdqu（66 0F 6F/7F）；pcmpeq/pcmpgt 系（SSE 整数比较族）；
-  AVX/VEX 全族（转 MIT-424 G6a 档A 路线——VEX.128 标量/ packed FP 折叠
-  复用本单 mul 族与既有 SSE op 1:1，见 .multica/mit-G6r-triage.md §档A）。
+  AVX/VEX 残余面（档A 已收口 38 id V-pair，精确残余见下节 G6a——
+  VEX-GP BMI/ymm/FMA/加密/EVEX 保持 gate）。
   （string movsd 双形态已由 MIT-415 收口，见 G3 节；
   x87 已拆出独立小节，见下节 "x87 (永久 gate, R3 裁决)"——不是简单"不支持
   兜底"，而是有独立频率数据与行为承诺的裁决面。）
 - 注意与重定位/ASLR 的配合：RVA + image_base 在运行时还原，不依赖静态 VA。
+
+## G6a VEX.128 档A（MIT-426 收口：38 id V-pair 三地址折叠，零新 VmOp）
+
+**状态（2026-08-30，MIT-426，R2 裁决档A 落地）**：既有 SSE 白名单 38 id 的
+V-pair（VADDSS..VPANDN，vendored capstone x86.h 全量对账 EXISTS）经 lifter
+三地址折叠（`translate_vex128`）复用既有 translate_sse_* 通路——**零新 IR
+语义、零新 VmOp、零新 handler**（asmgen.cpp 逐字节不动，dump 门
+SSE_HANDLERS 集合与 main 完全一致）。VEX 前缀（C4/C5）被 capstone 吸收进
+id（prefix=[0,0,0,0]），不经入口前缀闸直达白名单 case；白名单外 VEX id 落
+default → C1 gate 整函数原生保持（424 E2E 实证链不破坏，零逃逸）。
+
+**支持面**（D3 标量 FP 优先：/arch:AVX 下 100% 标量浮点走 VEX = 本档价值锚；
+真产物验证 cl v145 /arch:AVX 两函数 vmulsd/vaddsd/vdivsd 全折叠）：
+- 三态折叠（VEX.NDS：op[0]=dst R，op[1]=src1 R=vvvv 只读，op[2]=src2 R/M）：
+  ① dst==src1 → 2-op (dst, s2) 直走；② dst==src2 且可交换（**仅 packed/位
+  运算**，全 128-bit 语义）→ 交换 s1 上位；③ dst 独立 → 前置既有
+  Op::Movaps(dst←src1) 16B 纯拷贝（VEX "dst 高位 ← s1 高位" + 2-op "高位
+  保持" 逐位等价）+ 2-op (dst, s2)。
+- 家族：vaddss/sd/ps/pd、vsubss/sd/ps/pd、vdivss/sd/ps/pd、
+  vmulss/sd/ps/pd（(Op::Mul, src2=14..17) 载体同 legacy）、vmovss/sd/
+  aps/apd/ups/upd（2-op 直通 + 3-op 插入形态 d==s1 折）、vxorps/pd、
+  vorps/pd、vandps/pd、vpxor/por/vpand（折叠既有 ps 位运算）、
+  vandnps/pd/vpandn（(Op::Andps, src2=18) 载体）、vucomiss/sd、
+  vcomiss/sd（2-op flags 通路）。mem 源（含 rip）复用 408 通路。
+
+**gate 面（保守退化整函数原生，行为 byte-identical，非坏壳）**：
+- **d==s2 标量族（可交换含内）**：VEX 标量 "dst 高位 ← s1 高位" 与 2-op
+  "高位保持" 不相容（swap 后高位 = dst 原值错；pre-Mov 又先摧毁 s2==dst
+  的值），正确序列需 xmm→GP 双槽暂存原 dst——既有 VmOp 无此原语
+  （build_xmm_transfer 写路径仅 xmm 区），新 VmOp 违反 D1 → gate。
+  频率实测（MIT-426 B.3，.pdata 域 capstone 全扫）：d==s2 全形态
+  ucrtbase 2.19%（含标量）/ smartscreen 0.00%，合并 0.75% < 1%。
+- d==s2 非交换族（vsub*/vdiv*/vandn*）：同上（无交换出路）。
+- vmovss/vmovsd 3-op 插入形态 d≠s1（§F.4 "假 Mov"：dst 低位 ← s2、
+  高位 ← s1，非纯拷贝非 2-op 可表达）。
+- xmm8..15 任何形态：SSE 跟踪区 ctx.xmm[0..7] 不可映射，与 legacy SSE
+  同口径 gate。
+- ymm/zmm 任何形态（32B 操作数）：**位宽闸按操作数尺寸拒**（X86_INS_VADDPS
+  等 id 同时覆盖 128/256 两宽——仅 mnemonic 白名单会放 ymm 进来错误 lift，
+  必须判 16B 才入面），单测钉死同 mnemonic 双宽负例。
+
+**范围外（显式声明，防误当漏项）**：① **VEX-GP（BMI1/2：rorx/mulx/andn/
+shlx/pdep/bzhi）不在 SIMD 档A 内**——VEX id 但 GP 域，独立缺口（triage
+§6.2，真实二进制高频如 ClipUp rorx:288）；② ymm/zmm（档B，kCtxSize 冻结
+面 + 跳表扩容前置）；③ FMA 族（双舍入红线，永不拆 mul+add，triage §6.5）；
+④ vpaddd/vpaddq/psubq 系（legacy 本体 paddq 仍 gate→G1c，V-对镜像随本体）；
+⑤ vzeroupper/vzeroall（档B ABI 面）；⑥ 加密 vaes/vpclmulqdq（直执行另议）；
+⑦ EVEX/AVX-512 全谱（62 前缀独立 INS 空间，天然不入白名单）。
+
+**回归样本**：`wvmp_vex128_sample`（正例 12 区真虚拟化 + 负例 8 族各自
+函数级 gate 可调用）+ `wvmp_vex128_xmm_readback_sample`（9 探针 ctx.xmm
+8 槽全量读回：d==s1 高位残留 / packed 交换全宽 / d 独立 pre-Mov 槽位 /
+标量高位语义 / D4 拷贝 / vpxor 清零 / mem load）。multiseed 42 样本 × 5 =
+**210/210**。
 
 ## x87 (永久 gate, R3 裁决) —— 文档化不保护
 

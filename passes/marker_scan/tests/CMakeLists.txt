@@ -919,3 +919,49 @@ target_compile_options(wvmp_sse_fin_xmm_readback_sample PRIVATE
 target_link_options(wvmp_sse_fin_xmm_readback_sample PRIVATE
     $<$<CXX_COMPILER_ID:MSVC>:/INCREMENTAL:NO>
 )
+
+# MIT-426 (G6a): VEX.128 档A 端到端主样本 — 38 id V-pair 三地址折叠进既有
+# SSE 通路 (零新 VmOp / 零新 handler)。区域覆盖 (vex128_sample_asm.asm,
+# ml64 直收 AVX 助记符; C4 全前缀 db 直写): 标量 FP 三态 (vaddss d==s1 /
+# vmulps packed d==s2 交换 / vaddps/vsubps/vmulss/vandnps d 独立 Mov 前置)
+# + D4 vmovaps 纯拷贝直折 + 408 mem 通路 (vmovups load / vaddsd mem 源) +
+# vpxor 清零惯用法 (425 整数位运算镜像) + vucomiss+seta flags 通路 +
+# C4 全前缀 vaddsd (D5)。负例区 (函数级分离, 各自整函数 gate, 可调用,
+# 行为 byte-exact): ymm 同 mnemonic (B.4 位宽闸) / FMA (双舍入红线) /
+# rorx (VEX-GP, G8) / vzeroupper (档B ABI) / vpaddd (G1c 镜像) / vsubsd
+# 非交换 d==s2 (D2 裁决) / vmulsd 标量 d==s2 (高位语义不相容) / vmovsd
+# 插入 d≠s1 (§F.4 "假 Mov")。
+# REQUIRE_REAL: 正例区域真虚拟化 (stub ≥1)。
+enable_language(ASM_MASM)
+add_executable(wvmp_vex128_sample
+    vex128_sample_main.cpp
+    vex128_sample_asm.asm
+)
+target_link_libraries(wvmp_vex128_sample PRIVATE wvmp::sdk)
+target_compile_options(wvmp_vex128_sample PRIVATE
+    $<$<AND:$<CXX_COMPILER_ID:MSVC>,$<COMPILE_LANGUAGE:C,CXX>>:/Od;/Ob0;/utf-8>
+    $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-O0>
+)
+target_link_options(wvmp_vex128_sample PRIVATE
+    $<$<CXX_COMPILER_ID:MSVC>:/INCREMENTAL:NO>
+)
+
+# MIT-426 (G6a): 影子样本 — 三态折叠 + D4 拷贝 + mem 通路的 ctx.xmm 运行时
+# 读回断言 (#79 纪律, 与主样本同能力面配对、独立 exe)。9 探针 (位图案全 8
+# 槽预载 + 区域后 8 槽 × 2×u64 全量落盘): d==s1 直走高位残留 / packed
+# d==s2 交换全宽语义 / d 独立 pre-Mov 槽位正确性 (误写无关槽即 FAIL) /
+# 标量 vmulss "dst 高位 ← s1 高位" (pre-Mov 位级证据) / 非交换 d 独立 /
+# vandnps / D4 拷贝 / vpxor 清零 / vmovups mem load。
+enable_language(ASM_MASM)
+add_executable(wvmp_vex128_xmm_readback_sample
+    vex128_xmm_readback_sample_main.cpp
+    vex128_xmm_readback_sample_asm.asm
+)
+target_link_libraries(wvmp_vex128_xmm_readback_sample PRIVATE wvmp::sdk)
+target_compile_options(wvmp_vex128_xmm_readback_sample PRIVATE
+    $<$<AND:$<CXX_COMPILER_ID:MSVC>,$<COMPILE_LANGUAGE:C,CXX>>:/Od;/Ob0;/utf-8>
+    $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-O0>
+)
+target_link_options(wvmp_vex128_xmm_readback_sample PRIVATE
+    $<$<CXX_COMPILER_ID:MSVC>:/INCREMENTAL:NO>
+)

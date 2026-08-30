@@ -1418,6 +1418,225 @@ TranslateResult translate_sse_andn(const cs_insn& ci, const cs_x86& x, ir::Arch 
     return ok(r.insn);
 }
 
+// ==================== MIT-426 (G6a): VEX.128 V-pair 折叠进既有 SSE 通路 ====================
+//
+// 路线: MIT-424 (G6r) 裁决 R2 档A — 38 个既有 SSE 白名单 id 的 V-对
+// (VADDSS..VPANDN, vendored capstone x86.h 全量对账 EXISTS) 经三地址折叠
+// 复用既有 translate_sse_* 函数。硬约束 (派活单 §C):
+//   D1 零新 VmOp — 折叠只产既有 VmOp (Movaps 前置 + 2-op 载体);
+//   D2 d==s2 gate 面 — 非交换族 + **标量族一律 gate** (标量 VEX
+//      "dst 高位 ← s1 高位" 与 2-op "高位保持" 不相容且 pre-Mov 摧毁
+//      s2==dst 的值; 正确序列需 xmm→GP 双槽暂存, 既有 VmOp 无此原语);
+//      packed 可交换族 (add/mul/位运算) swap 直走。频率: d==s2 合并
+//      0.75% < 1% (ucrtbase 单列 2.19% 含标量), 见 GAPS G6a 节;
+//   D3 标量 FP 优先 (/arch:AVX 下 100% 标量浮点走 VEX = 本档价值锚);
+//   D4 vmovaps/vmovups 纯拷贝 2-op 直折单条, 不进 binop 前置框架;
+//   D5 C4 全前缀与 C5 短前缀同 INS id — capstone 已解 VEX bits
+//      (prefix=[0,0,0,0], rex=64 常量, lifter 不消费), 按 id 入面天然
+//      覆盖两编码。
+//
+// 行为链基线 (triage §3, 本单不破坏): 白名单外 VEX id (vpaddd/vfmadd*/
+// rorx/vzeroupper/EVEX 全谱) 仍落 switch default → unsupported → C1 gate
+// 整函数原生保持, 零逃逸 byte-identical。
+//
+// 位宽闸 (派活单 §B.4 最大陷阱): X86_INS_VADDPS 等 id 同时覆盖 128/256
+// 两宽 — 仅靠 mnemonic 白名单会放 ymm 进来 → 错误 lift 静默坏壳。必须
+// 按操作数位宽判: 32B (ymm reg / ymm mem) 落 unsupported → gate;
+// 寄存器非 16B 同拒。SSE 跟踪区只有 8 槽 (ctx.xmm[0..7]) — xmm8..15
+// 与 legacy SSE 同口径 gate (map 不可达 → unsupported)。
+//
+// 三地址折叠 (派活单 §A.3 三分法, VEX.NDS: operand[0]=dst REG,
+// operand[1]=src1 REG (VEX.vvvv, 只读), operand[2]=src2 REG/MEM):
+//   dst==src1            → 2-op (dst, s2) 直走既有通路 (零成本)
+//   dst==src2 且可交换    → 交换: 2-op (dst, s1) (零成本; **仅 packed/位
+//                          运算** — 全 128-bit 语义, 标量 gate 见 D2)
+//   dst 独立             → 前置 Op::Movaps(dst←src1) 16B 纯拷贝
+//                          (既有 VmOp, 寄存器终值与 VEX 语义逐位等价:
+//                          VEX "dst 高位 ← s1 高位" + 2-op "dst 高位保持"
+//                          == 16B 拷贝后接 2-op) + 2-op (dst, s2)
+//   dst==src2 标量/非交换 → D2 gate (见上)
+//   vmovss/vmovsd 3-op    → 插入语义 (§F.4 "假 Mov": dst 低位 ← s2,
+//   (插入形态)               dst 高位 ← s1 ≠ 纯拷贝) — 仅 dst==src1 可折
+//                          (2-op "高位保持" 与 s1 高位一致), 其余 gate。
+//
+// 可交换性披露 (known compromise): 浮点 add/mul 交换 src1/src2 对数值
+// 逐位等价; NaN 载荷传播顺序 (src1 优先) 理论上可差 — 与 MIT-411
+// comiss QNaN 同级别的 v1 披露面, native handler 执行的仍是真 add*/mul*。
+
+// V-pair 家族描述: 全部复用既有 translate 函数 (零新 IR 语义)。
+struct VexDesc {
+    enum class Fam : u8 { Add, Sub, Div, Mul, Bit, Andn, Mov, Ucomis };
+    Fam fam;
+    Op op;          // IR op 载体 (Add/Sub/Div/Bit/Mov/Ucomis 族)
+    ir::Size sz;    // 形式标签 (与 legacy 同约定: ss=S32 / sd=S64 / packed=S64)
+    int marker = 0; // Mul 族 14..17 / Andn 18 (src2 载体标记, 与 425 对账)
+    bool commutative = false; // add/mul/位运算 = true; sub/div/andn = false
+    bool scalar = false;      // ss/sd 标量 (dst 高位 ← s1 高位语义面, 见下)
+};
+
+std::optional<VexDesc> vex_desc_of(x86_insn id) {
+    switch (id) {
+    // ---- 标量 FP (D3 主验收面: /arch:AVX 下 100% 标量走 VEX) ----
+    case X86_INS_VADDSS: return VexDesc{VexDesc::Fam::Add, Op::Addss, ir::Size::S32, 0, true, true};
+    case X86_INS_VADDSD: return VexDesc{VexDesc::Fam::Add, Op::Addss, ir::Size::S64, 0, true, true};
+    case X86_INS_VADDPS: return VexDesc{VexDesc::Fam::Add, Op::Addps, ir::Size::S64, 0, true, false};
+    case X86_INS_VADDPD: return VexDesc{VexDesc::Fam::Add, Op::Addpd, ir::Size::S64, 0, true, false};
+    case X86_INS_VSUBSS: return VexDesc{VexDesc::Fam::Sub, Op::Subss, ir::Size::S32, 0, false, true};
+    case X86_INS_VSUBSD: return VexDesc{VexDesc::Fam::Sub, Op::Subss, ir::Size::S64, 0, false, true};
+    case X86_INS_VSUBPS: return VexDesc{VexDesc::Fam::Sub, Op::Subps, ir::Size::S64, 0, false, false};
+    case X86_INS_VSUBPD: return VexDesc{VexDesc::Fam::Sub, Op::Subpd, ir::Size::S64, 0, false, false};
+    case X86_INS_VDIVSS: return VexDesc{VexDesc::Fam::Div, Op::Divss, ir::Size::S32, 0, false, true};
+    case X86_INS_VDIVSD: return VexDesc{VexDesc::Fam::Div, Op::Divss, ir::Size::S64, 0, false, true};
+    case X86_INS_VDIVPS: return VexDesc{VexDesc::Fam::Div, Op::Divps, ir::Size::S64, 0, false, false};
+    case X86_INS_VDIVPD: return VexDesc{VexDesc::Fam::Div, Op::Divpd, ir::Size::S64, 0, false, false};
+    // ---- mul 族 (Op::Mul + src2 载体标记 14..17, 与 legacy 425 同编码) ----
+    case X86_INS_VMULSS: return VexDesc{VexDesc::Fam::Mul, Op::Mul, ir::Size::S32, kSseMulSs, true, true};
+    case X86_INS_VMULSD: return VexDesc{VexDesc::Fam::Mul, Op::Mul, ir::Size::S64, kSseMulSd, true, true};
+    case X86_INS_VMULPS: return VexDesc{VexDesc::Fam::Mul, Op::Mul, ir::Size::S64, kSseMulPs, true, false};
+    case X86_INS_VMULPD: return VexDesc{VexDesc::Fam::Mul, Op::Mul, ir::Size::S64, kSseMulPd, true, false};
+    // ---- 位运算 (ps/pd 整数 p 系全折叠既有 Bit 载体, 411/425 先例) ----
+    case X86_INS_VXORPS: return VexDesc{VexDesc::Fam::Bit, Op::Xorps, ir::Size::S64, 0, true};
+    case X86_INS_VXORPD: return VexDesc{VexDesc::Fam::Bit, Op::Xorps, ir::Size::S64, 0, true};
+    case X86_INS_VORPS:  return VexDesc{VexDesc::Fam::Bit, Op::Orps,  ir::Size::S64, 0, true};
+    case X86_INS_VORPD:  return VexDesc{VexDesc::Fam::Bit, Op::Orps,  ir::Size::S64, 0, true};
+    case X86_INS_VANDPS: return VexDesc{VexDesc::Fam::Bit, Op::Andps, ir::Size::S64, 0, true};
+    case X86_INS_VANDPD: return VexDesc{VexDesc::Fam::Bit, Op::Andps, ir::Size::S64, 0, true};
+    case X86_INS_VPXOR:  return VexDesc{VexDesc::Fam::Bit, Op::Xorps, ir::Size::S64, 0, true};
+    case X86_INS_VPOR:   return VexDesc{VexDesc::Fam::Bit, Op::Orps,  ir::Size::S64, 0, true};
+    case X86_INS_VPAND:  return VexDesc{VexDesc::Fam::Bit, Op::Andps, ir::Size::S64, 0, true};
+    // ---- andn (dst = ~src1 & src2, 非交换; Op::Andps + kSseAndn 载体) ----
+    case X86_INS_VANDNPS: return VexDesc{VexDesc::Fam::Andn, Op::Andps, ir::Size::S64, kSseAndn, false};
+    case X86_INS_VANDNPD: return VexDesc{VexDesc::Fam::Andn, Op::Andps, ir::Size::S64, kSseAndn, false};
+    case X86_INS_VPANDN:  return VexDesc{VexDesc::Fam::Andn, Op::Andps, ir::Size::S64, kSseAndn, false};
+    // ---- mov 族 (2-op 拷贝/load/store 直通; 3-op 插入形态仅 d==s1) ----
+    case X86_INS_VMOVSS:  return VexDesc{VexDesc::Fam::Mov, Op::Movss,  ir::Size::S32, 0, false};
+    case X86_INS_VMOVSD:  return VexDesc{VexDesc::Fam::Mov, Op::Movss,  ir::Size::S64, 0, false};
+    case X86_INS_VMOVAPS: return VexDesc{VexDesc::Fam::Mov, Op::Movaps, ir::Size::S64, 0, false};
+    case X86_INS_VMOVAPD: return VexDesc{VexDesc::Fam::Mov, Op::Movapd, ir::Size::S64, 0, false};
+    case X86_INS_VMOVUPS: return VexDesc{VexDesc::Fam::Mov, Op::Movups, ir::Size::S64, 0, false};
+    case X86_INS_VMOVUPD: return VexDesc{VexDesc::Fam::Mov, Op::Movupd, ir::Size::S64, 0, false};
+    // ---- 比较族 (2-op, flags 通路; 无 3-op 形态) ----
+    case X86_INS_VUCOMISS: return VexDesc{VexDesc::Fam::Ucomis, Op::Ucomiss, ir::Size::S32, 0, false};
+    case X86_INS_VUCOMISD: return VexDesc{VexDesc::Fam::Ucomis, Op::Ucomisd, ir::Size::S64, 0, false};
+    case X86_INS_VCOMISS:  return VexDesc{VexDesc::Fam::Ucomis, Op::Ucomiss, ir::Size::S32, 0, false};
+    case X86_INS_VCOMISD:  return VexDesc{VexDesc::Fam::Ucomis, Op::Ucomisd, ir::Size::S64, 0, false};
+    default:
+        return std::nullopt;
+    }
+}
+
+// 按 VexDesc 调用既有 translate 函数 (2-op 形态 — legacy 通路原样复用)。
+TranslateResult vex_invoke(const VexDesc& d, const cs_insn& ci, const cs_x86& x, ir::Arch arch) {
+    switch (d.fam) {
+    case VexDesc::Fam::Add:    return translate_sse_add(ci, x, arch, d.op, d.sz);
+    case VexDesc::Fam::Sub:    return translate_sse_sub(ci, x, arch, d.op, d.sz);
+    case VexDesc::Fam::Div:    return translate_sse_div(ci, x, arch, d.op, d.sz);
+    case VexDesc::Fam::Mul:    return translate_sse_mul(ci, x, arch, d.sz, d.marker);
+    case VexDesc::Fam::Bit:    return translate_sse_bitwise(ci, x, arch, d.op, d.sz);
+    case VexDesc::Fam::Andn:   return translate_sse_andn(ci, x, arch);
+    case VexDesc::Fam::Mov:    return translate_sse_mov(ci, x, arch, d.op, d.sz);
+    case VexDesc::Fam::Ucomis: return translate_ucomis(ci, x, arch, d.op, d.sz);
+    }
+    return unsupported(ci.address, ci.size);
+}
+
+// VEX.128 V-pair 入口: 位宽闸 → 2-op 直通 / 3-op 三地址折叠 (见顶部说明块)。
+TranslateResult translate_vex128(const cs_insn& ci, const cs_x86& x, ir::Arch arch) {
+    // ---- B.4 位宽闸: 32B (ymm) 禁入 — 同 mnemonic 覆盖 128/256 两宽 ----
+    for (u8 i = 0; i < x.op_count; ++i) {
+        const cs_x86_op& op = x.operands[i];
+        if (op.size > 16) return unsupported(ci.address, ci.size);  // ymm/ymm mem
+        if (op.type == X86_OP_REG && op.size != 16)
+            return unsupported(ci.address, ci.size);                // 防御 (寄存器恒 16B)
+    }
+    const auto desc = vex_desc_of(static_cast<x86_insn>(ci.id));
+    if (!desc) return unsupported(ci.address, ci.size);  // 白名单外 (现状 gate 保持)
+
+    // ---- 2-op 直通: vmov* 拷贝/load/store + vucomis*/vcomis* (D4) ----
+    // 操作数形状由既有 translate_sse_* 自检 (dst mem 形式 408 通路; xmm0..7
+    // 之外不可映射 → nullopt → gate, 与 legacy SSE 同口径)。
+    if (x.op_count == 2) return vex_invoke(*desc, ci, x, arch);
+    if (x.op_count != 3) return unsupported(ci.address, ci.size);
+
+    // ---- 3-op VEX.NDS: [0]=dst REG, [1]=src1 REG (VEX.vvvv), [2]=src2 R/M ----
+    // (slot 语义 capstone 5 实测: C5 FA 58 C1 → vaddss xmm0, xmm0, xmm1,
+    //  ops=[xmm0, xmm0, xmm1]; 报告附对照表)
+    if (x.operands[0].type != X86_OP_REG || x.operands[1].type != X86_OP_REG)
+        return unsupported(ci.address, ci.size);
+    auto xmm_idx = [&](x86_reg r) -> std::optional<u8> {
+        switch (r) {
+        case X86_REG_XMM0: return static_cast<u8>(0); case X86_REG_XMM1: return static_cast<u8>(1);
+        case X86_REG_XMM2: return static_cast<u8>(2); case X86_REG_XMM3: return static_cast<u8>(3);
+        case X86_REG_XMM4: return static_cast<u8>(4); case X86_REG_XMM5: return static_cast<u8>(5);
+        case X86_REG_XMM6: return static_cast<u8>(6); case X86_REG_XMM7: return static_cast<u8>(7);
+        default: return std::nullopt;  // xmm8..15 / ymm (位宽闸已拒 ymm, 双保险)
+        }
+    };
+    const auto di = xmm_idx(x.operands[0].reg);
+    if (!di) return unsupported(ci.address, ci.size);
+    const auto s1i = xmm_idx(x.operands[1].reg);
+    if (!s1i) return unsupported(ci.address, ci.size);
+    const bool s2_reg = x.operands[2].type == X86_OP_REG;
+    const bool s2_mem = x.operands[2].type == X86_OP_MEM;
+    if (!s2_reg && !s2_mem) return unsupported(ci.address, ci.size);
+    std::optional<u8> s2i;
+    if (s2_reg) {
+        s2i = xmm_idx(x.operands[2].reg);
+        if (!s2i) return unsupported(ci.address, ci.size);
+    }
+
+    // 比较族无 3-op 形态 (SDM); 防御 gate。
+    if (desc->fam == VexDesc::Fam::Ucomis) return unsupported(ci.address, ci.size);
+
+    const bool d_eq_s1 = *di == *s1i;
+    const bool d_eq_s2 = s2_reg && *di == *s2i;
+
+    // vmovss/vmovsd 3-op 插入语义 (§F.4 "假 Mov"): dst 低 32/64 位 ← src2、
+    // 高位 ← src1 — 非 2-op 表达, 仅 dst==src1 可折 (2-op "dst 高位保持"
+    // 恰等于 s1 高位); d==s2 交换/d 独立一律 gate。
+    if (desc->fam == VexDesc::Fam::Mov && !d_eq_s1)
+        return unsupported(ci.address, ci.size);
+
+    // D2 裁决: d==s2 的折叠边界 —
+    //   packed/位运算 (全 128-bit 语义): 可交换族 swap 直走 (值与位全等价);
+    //   **标量 (ss/sd): 一律 gate** — VEX 标量 "dst 高位 ← s1 高位" 与
+    //   2-op 通路 "dst 高位保持" 不相容: swap 后高位 = dst 原值 (≠ s1
+    //   高位, 错); pre-Mov(dst←s1) 又先摧毁 s2(==dst) 的值 (低 32/64 位
+    //   错)。正确序列需先暂存原 dst (xmm→GP 双槽), 既有 VmOp 无此原语
+    //   (build_xmm_transfer 写路径仅 xmm 区), 新 VmOp 违反 D1 → gate
+    //   (保守退化整函数原生, 非坏壳)。频率: d==s2 合并 0.75% (<1%),
+    //   ucrtbase 单列 2.19% (含标量), 见 GAPS G6a 节。
+    //   (非交换族 sub/div/andn 的 d==s2 同 gate — 交换不成立, 同上理由。)
+    if (d_eq_s2 && (!desc->commutative || desc->scalar))
+        return unsupported(ci.address, ci.size);
+
+    // ---- 三地址折叠 (派活单 §B.2) ----
+    cs_x86 x0 = x;
+    if (d_eq_s1 || d_eq_s2) {
+        // d==s1: 2-op (dst, s2) 直走; d==s2 (可交换): 交换 s1 上位。
+        x0.op_count = 2;
+        x0.operands[1] = x.operands[d_eq_s1 ? 2 : 1];
+        return vex_invoke(*desc, ci, x0, arch);
+    }
+    // dst 独立 → 前置 Op::Movaps(dst←src1) 16B 纯拷贝 (既有 VmOp 通路),
+    // 再 2-op (dst, s2)。pre-Mov 借用 Op::Movaps→VmOp::Movaps (16B movups
+    // 语义, 425 惯例); 与 VEX "dst 高位 ← s1 高位" + 2-op "高位保持"
+    // 逐位等价 (标量/packed/整数统一成立)。
+    x0.op_count = 2;
+    x0.operands[1] = x.operands[2];
+    TranslateResult r = vex_invoke(*desc, ci, x0, arch);
+    if (r.status != TranslateStatus::Ok) return r;
+    ir::Insn pre;
+    pre.op = Op::Movaps;
+    pre.size = ir::Size::S64;   // 16B (128-bit 全量)
+    pre.updates_flags = false;
+    pre.addr = ci.address;      // 与主 insn 共享机器地址 (next_ip_of 覆盖语义)
+    pre.dst = ir::Operand::reg_(static_cast<ir::Reg>(*di));
+    pre.src = ir::Operand::reg_(static_cast<ir::Reg>(*s1i));
+    r.extra.push_back(std::move(pre));
+    return r;
+}
+
 TranslateResult translate_cmpxchg(const cs_insn& ci, const cs_x86& x, ir::Arch arch) {
     if (x.op_count != 2) return unsupported(ci.address, ci.size);
     // dst 必为 r/m (REG 或 MEM); src 必为 REG
@@ -2033,8 +2252,10 @@ TranslateResult translate_insn(const cs_insn& ci, ir::Arch arch) {
     // MIT-376: SSE 浮点位运算 xorps/orps/andps (REG-REG only, mod=11).
     //   - xorps 0F 57 /r / orps 0F 56 /r / andps 0F 54 /r (全 128-bit 按位,
     //     size=S64)。updates_flags=false (位运算不影响 EFLAGS)。
-    //   - AVX VEX 编码 (vpxor/vpor/vpand, VEX.NDS.128.0F.WIG 57/56/54) 由
-    //     capstone 报独立 INS id, 不在本单范围 → C1 gate 兜底。
+    //   - AVX VEX 编码 (vxorps/vorps/vandps, VEX.NDS.128.0F.WIG 57/56/54 —
+    //     triage §0.6 名实对齐: 57/56/54 是 float 位运算编码, 整数 vpxor/
+    //     vpor/vpand 为 VEX.128.66.0F WIG EF/EB/DA) 由 capstone 报独立
+    //     INS id; MIT-426 (G6a) 起 V-pair 白名单折叠, 见 translate_vex128。
     // MIT-411 (G1-c): pd 位运算族 (66 0F 54/56/57) — andpd/orpd/xorpd 与
     // ps 同名位运算逐位同语义 (全 128-bit 按位, 不解释浮点值, 零 flags,
     // 零异常) → **零新 VmOp** 复用 ps 编码 (派活单 §C D1)。实证: ml64
@@ -2106,6 +2327,25 @@ TranslateResult translate_insn(const cs_insn& ci, ir::Arch arch) {
     case X86_INS_POR:   return translate_sse_bitwise(ci, x, arch, Op::Orps,  Size::S64);
     case X86_INS_PXOR:  return translate_sse_bitwise(ci, x, arch, Op::Xorps, Size::S64);
     case X86_INS_PANDN: return translate_sse_andn(ci, x, arch);
+    // MIT-426 (G6a): VEX.128 V-pair 白名单 — 38 id = 既有 SSE 白名单逐行
+    // 镜像 (vendored capstone x86.h 全量对账 EXISTS, 映射表见报告)。
+    // VEX 前缀 (C4/C5) 被 capstone 吸收进 id (prefix=[0,0,0,0], triage
+    // §2.4), 不经入口前缀闸, 直达本 case → translate_vex128 (位宽闸 +
+    // 三地址折叠, 零新 IR 语义 / 零新 VmOp / 零新 handler)。白名单外 VEX
+    // id (vpaddd/vfmadd*/rorx/vzeroupper/EVEX 全谱) 落 default → 现状
+    // C1 gate 整函数原生保持, 零逃逸。
+    case X86_INS_VADDSS: case X86_INS_VADDSD: case X86_INS_VADDPS: case X86_INS_VADDPD:
+    case X86_INS_VSUBSS: case X86_INS_VSUBSD: case X86_INS_VSUBPS: case X86_INS_VSUBPD:
+    case X86_INS_VDIVSS: case X86_INS_VDIVSD: case X86_INS_VDIVPS: case X86_INS_VDIVPD:
+    case X86_INS_VMULSS: case X86_INS_VMULSD: case X86_INS_VMULPS: case X86_INS_VMULPD:
+    case X86_INS_VMOVSS: case X86_INS_VMOVSD: case X86_INS_VMOVAPS: case X86_INS_VMOVAPD:
+    case X86_INS_VMOVUPS: case X86_INS_VMOVUPD:
+    case X86_INS_VXORPS: case X86_INS_VXORPD: case X86_INS_VORPS: case X86_INS_VORPD:
+    case X86_INS_VANDPS: case X86_INS_VANDPD: case X86_INS_VPXOR: case X86_INS_VPOR:
+    case X86_INS_VPAND:
+    case X86_INS_VANDNPS: case X86_INS_VANDNPD: case X86_INS_VPANDN:
+    case X86_INS_VUCOMISS: case X86_INS_VUCOMISD: case X86_INS_VCOMISS: case X86_INS_VCOMISD:
+        return translate_vex128(ci, x, arch);
     case X86_INS_BSWAP: return translate_bswap(ci, x, arch);
     case X86_INS_XCHG: return translate_xchg(ci, x, arch);
     // MIT-336: setcc 16 variants (0F 90+cc+rm, mod=11 REG / mod=00 MEM).

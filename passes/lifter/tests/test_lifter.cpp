@@ -2212,6 +2212,301 @@ TEST_F(LifterTranslate, PaddqStillUnsupported) {
 }
 
 // =============================================================================
+// MIT-426 (G6a): VEX.128 V-pair 三地址折叠 — 38 id 白名单 + 位宽闸 + 三态
+// =============================================================================
+// 全部字节经 vendored capstone 5 probe 实测对账 (2026-08-30; vvvv 取反/
+// pp 映射 0F=00,66=01,F3=10,F2=11 手算曾错 4 处被 probe 纠正 — #33 纪律)。
+// 断言口径: dst/src 的 ir::Reg 值 = xmm 槽号 0..7 (借用 ir::Reg 0..7 约定)。
+
+TEST_F(LifterTranslate, VexAddssDstSrc1Direct) {
+    // C5 FA 58 C1: vaddss xmm0, xmm0, xmm1 — dst==src1 三态① 零成本直走
+    // (2-op (dst, s2))。C5 短前缀形态 (D5 双编码之一)。
+    const wvmp::u8 b[] = {0xC5, 0xFA, 0x58, 0xC1};
+    auto r = translate_bytes(x64, b, ir::Arch::X64);
+    ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r.insn.op, ir::Op::Addss);
+    EXPECT_EQ(r.insn.size, ir::Size::S32);
+    EXPECT_EQ(static_cast<int>(r.insn.dst.reg), 0);   // xmm0
+    EXPECT_EQ(static_cast<int>(r.insn.src.reg), 1);   // src2 = xmm1
+    EXPECT_TRUE(r.extra.empty());                     // 直走无前置
+    EXPECT_FALSE(r.insn.updates_flags);
+}
+
+TEST_F(LifterTranslate, VexAddsdC4FullEncoding) {
+    // C4 E1 7B 58 C1: vaddsd xmm0, xmm0, xmm1 — C4 全前缀形态 (D5 双编码
+    // 之二; 同 INS id, prefix=[0,0,0,0] 不经入口前缀闸)。(Addss,S64) 编码。
+    const wvmp::u8 b[] = {0xC4, 0xE1, 0x7B, 0x58, 0xC1};
+    auto r = translate_bytes(x64, b, ir::Arch::X64);
+    ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r.insn.op, ir::Op::Addss);
+    EXPECT_EQ(r.insn.size, ir::Size::S64);            // (Addss,S64) = addsd
+    EXPECT_EQ(static_cast<int>(r.insn.dst.reg), 0);
+    EXPECT_EQ(static_cast<int>(r.insn.src.reg), 1);
+    EXPECT_TRUE(r.extra.empty());
+}
+
+TEST_F(LifterTranslate, VexAddpsDstSrc2CommutativeSwap) {
+    // C5 F8 58 D2: vaddps xmm2, xmm0, xmm2 — dst==src2 三态② 可交换
+    // (swap: src1 上位) → 2-op (dst=xmm2, src=xmm0), 零成本。
+    const wvmp::u8 b[] = {0xC5, 0xF8, 0x58, 0xD2};
+    auto r = translate_bytes(x64, b, ir::Arch::X64);
+    ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r.insn.op, ir::Op::Addps);
+    EXPECT_EQ(static_cast<int>(r.insn.dst.reg), 2);
+    EXPECT_EQ(static_cast<int>(r.insn.src.reg), 0);   // 交换后 = 原 src1
+    EXPECT_TRUE(r.extra.empty());
+}
+
+TEST_F(LifterTranslate, VexMulpsDstSrc2CommutativeSwap) {
+    // C5 F8 59 D2: vmulps xmm2, xmm0, xmm2 — mul 族 d==s2 交换 (可交换族
+    // 第二形态, 三态② 各 ≥2 断言之一)。(Mul, src2=kSseMulPs)。
+    const wvmp::u8 b[] = {0xC5, 0xF8, 0x59, 0xD2};
+    auto r = translate_bytes(x64, b, ir::Arch::X64);
+    ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r.insn.op, ir::Op::Mul);
+    EXPECT_EQ(r.insn.src2.imm, 16);                   // kSseMulPs
+    EXPECT_EQ(static_cast<int>(r.insn.dst.reg), 2);
+    EXPECT_EQ(static_cast<int>(r.insn.src.reg), 0);
+    EXPECT_TRUE(r.extra.empty());
+}
+
+TEST_F(LifterTranslate, VexMulssDstIndependentPreMov) {
+    // C5 FA 59 CA: vmulss xmm1, xmm0, xmm2 — dst 独立 三态③ → 前置
+    // Op::Movaps(xmm1←xmm0) 16B 纯拷贝 + 主 (Mul, src2=14, dst=1, src=2)。
+    // VEX 标量 "dst 高位 ← src1 高位" == 16B 拷贝后 2-op "高位保持"。
+    const wvmp::u8 b[] = {0xC5, 0xFA, 0x59, 0xCA};
+    auto r = translate_bytes(x64, b, ir::Arch::X64);
+    ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r.insn.op, ir::Op::Mul);
+    EXPECT_EQ(r.insn.src2.imm, 14);                   // kSseMulSs
+    EXPECT_EQ(r.insn.size, ir::Size::S32);
+    EXPECT_EQ(static_cast<int>(r.insn.dst.reg), 1);
+    EXPECT_EQ(static_cast<int>(r.insn.src.reg), 2);
+    ASSERT_EQ(r.extra.size(), 1u);                    // 前置 Movaps
+    EXPECT_EQ(r.extra[0].op, ir::Op::Movaps);
+    EXPECT_EQ(r.extra[0].size, ir::Size::S64);        // 16B 全量
+    EXPECT_EQ(static_cast<int>(r.extra[0].dst.reg), 1);
+    EXPECT_EQ(static_cast<int>(r.extra[0].src.reg), 0);
+    EXPECT_EQ(r.extra[0].addr, r.insn.addr);          // 共享机器地址
+    EXPECT_FALSE(r.extra[0].updates_flags);
+}
+
+TEST_F(LifterTranslate, VexSubpsDstIndependentNoncommPreMov) {
+    // C5 F8 5C D1: vsubps xmm2, xmm0, xmm1 — 非交换族 dst 独立 (三态③ 对
+    // sub 也成立: pre-Mov(dst←s1) + 2-op = s1 - s2 逐位等价)。
+    const wvmp::u8 b[] = {0xC5, 0xF8, 0x5C, 0xD1};
+    auto r = translate_bytes(x64, b, ir::Arch::X64);
+    ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r.insn.op, ir::Op::Subps);
+    EXPECT_EQ(static_cast<int>(r.insn.dst.reg), 2);
+    EXPECT_EQ(static_cast<int>(r.insn.src.reg), 1);   // s2
+    ASSERT_EQ(r.extra.size(), 1u);
+    EXPECT_EQ(r.extra[0].op, ir::Op::Movaps);
+    EXPECT_EQ(static_cast<int>(r.extra[0].dst.reg), 2);
+    EXPECT_EQ(static_cast<int>(r.extra[0].src.reg), 0);  // s1
+}
+
+TEST_F(LifterTranslate, VexMulsdRipMemDstIndependentPreMov) {
+    // C5 FB 59 0D xx: vmulsd xmm1, xmm0, qword ptr [rip] — mem 源 + dst
+    // 独立组合 (408 通路 × pre-Mov 前置; next_ip_of 覆盖语义见 translator)。
+    const wvmp::u8 b[] = {0xC5, 0xFB, 0x59, 0x0D, 0x78, 0x56, 0x34, 0x12};
+    auto r = translate_bytes(x64, b, ir::Arch::X64);
+    ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r.insn.op, ir::Op::Mul);
+    EXPECT_EQ(r.insn.src2.imm, 15);                   // kSseMulSd
+    ASSERT_EQ(r.insn.src.kind, ir::Operand::Kind::Mem);
+    EXPECT_EQ(r.insn.src.mem.base, ir::Reg::Rip);
+    ASSERT_EQ(r.extra.size(), 1u);
+    EXPECT_EQ(r.extra[0].op, ir::Op::Movaps);
+    EXPECT_EQ(static_cast<int>(r.extra[0].dst.reg), 1);
+    EXPECT_EQ(static_cast<int>(r.extra[0].src.reg), 0);
+}
+
+TEST_F(LifterTranslate, VexVmulsdDstSrc2ScalarGate) {
+    // C5 FB 59 C9: vmulsd xmm1, xmm0, xmm1 — **标量 d==s2 一律 gate**
+    // (D2 边界): VEX 标量 "dst 高位 ← s1 高位" 与 2-op "高位保持" 不相容
+    // (swap 后高位 = dst 原值 ≠ s1 高位), pre-Mov 又先摧毁 s2(==dst) 的
+    // 值; 正确序列需 xmm→GP 双槽暂存原 dst, 既有 VmOp 无此原语 (D1 禁新)
+    // → gate 保守退化。packed 交换 (上方 Addps/Mulps swap) 不受影响。
+    const wvmp::u8 b[] = {0xC5, 0xFB, 0x59, 0xC9};
+    auto r = translate_bytes(x64, b, ir::Arch::X64);
+    EXPECT_EQ(r.status, lifter::TranslateStatus::Unsupported);
+    ASSERT_EQ(r.skipped_ranges.size(), 1u);
+}
+
+TEST_F(LifterTranslate, VexSubsdDstSrc2NoncommGate) {
+    // C5 FB 5C D2: vsubsd xmm2, xmm0, xmm2 — 非交换 dst==src2 → D2 裁决
+    // gate (频率: ucrtbase 2.19% / smartscreen 0.00% 合并 0.75%; 折叠需
+    // xmm→GP 双槽暂存原 dst, 既有 VmOp 无此原语, 新 VmOp 违反 D1 →
+    // 保守退化整函数原生, 见 GAPS G6a)。
+    const wvmp::u8 b[] = {0xC5, 0xFB, 0x5C, 0xD2};
+    auto r = translate_bytes(x64, b, ir::Arch::X64);
+    EXPECT_EQ(r.status, lifter::TranslateStatus::Unsupported);
+    ASSERT_EQ(r.skipped_ranges.size(), 1u);           // C1 gate 链 (字节级)
+    EXPECT_EQ(r.skipped_ranges[0].first, 0u);
+    EXPECT_EQ(r.skipped_ranges[0].second, 4u);
+}
+
+TEST_F(LifterTranslate, VexYmmWidthGateNegative) {
+    // C5 FC 58 C1: vaddps ymm0, ymm0, ymm1 — **本单最大陷阱钉死** (B.4):
+    // 与 vaddps xmm 同 INS id (X86_INS_VADDPS 覆盖 128/256 两宽), 位宽闸
+    // 必须按操作数 32B 拒 — 放行 = 错误 lift 静默坏壳。
+    const wvmp::u8 b[] = {0xC5, 0xFC, 0x58, 0xC1};
+    auto r = translate_bytes(x64, b, ir::Arch::X64);
+    EXPECT_EQ(r.status, lifter::TranslateStatus::Unsupported);
+    ASSERT_EQ(r.skipped_ranges.size(), 1u);
+}
+
+TEST_F(LifterTranslate, VexYmmMovapsGateNegative) {
+    // C5 FC 28 C8: vmovaps ymm1, ymm0 — ymm 2-op 拷贝同拒 (D4 注意
+    // "vmovaps 在 AVX 有 ymm 变体", 派活单 §E)。
+    const wvmp::u8 b[] = {0xC5, 0xFC, 0x28, 0xC8};
+    auto r = translate_bytes(x64, b, ir::Arch::X64);
+    EXPECT_EQ(r.status, lifter::TranslateStatus::Unsupported);
+}
+
+TEST_F(LifterTranslate, VexXmm8UnmappedGate) {
+    // C5 78 58 C1: vaddps xmm8, xmm0, xmm1 — xmm8..15 不在 SSE 跟踪区
+    // (ctx.xmm[0..7]), 与 legacy SSE 同口径 gate (不可映射 → unsupported)。
+    const wvmp::u8 b[] = {0xC5, 0x78, 0x58, 0xC1};
+    auto r = translate_bytes(x64, b, ir::Arch::X64);
+    EXPECT_EQ(r.status, lifter::TranslateStatus::Unsupported);
+}
+
+TEST_F(LifterTranslate, VexMovapsTwoOpDirect) {
+    // C5 F8 28 C8: vmovaps xmm1, xmm0 — 2-op 纯拷贝直折单条 (D4: 不进
+    // binop 前置框架; capstone 报 op_count=2, 走既有 translate_sse_mov)。
+    const wvmp::u8 b[] = {0xC5, 0xF8, 0x28, 0xC8};
+    auto r = translate_bytes(x64, b, ir::Arch::X64);
+    ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r.insn.op, ir::Op::Movaps);
+    EXPECT_EQ(r.insn.size, ir::Size::S64);
+    EXPECT_EQ(static_cast<int>(r.insn.dst.reg), 1);
+    EXPECT_EQ(static_cast<int>(r.insn.src.reg), 0);
+    EXPECT_TRUE(r.extra.empty());
+}
+
+TEST_F(LifterTranslate, VexMovupsRipMemLoad) {
+    // C5 F8 10 05 xx: vmovups xmm0, xmmword ptr [rip] — 2-op mem load 直通
+    // (408 store/load 通路; 与 legacy movups 同形)。
+    const wvmp::u8 b[] = {0xC5, 0xF8, 0x10, 0x05, 0x78, 0x56, 0x34, 0x12};
+    auto r = translate_bytes(x64, b, ir::Arch::X64);
+    ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r.insn.op, ir::Op::Movups);
+    ASSERT_EQ(r.insn.src.kind, ir::Operand::Kind::Mem);
+    EXPECT_EQ(r.insn.src.mem.base, ir::Reg::Rip);
+    EXPECT_TRUE(r.extra.empty());
+}
+
+TEST_F(LifterTranslate, VexMovsdInsertDstSrc1Fold) {
+    // C5 FB 10 C1: vmovsd xmm0, xmm0, xmm1 — 3-op 插入形态 (§F.4 "假 Mov")
+    // dst==src1 可折: 2-op (dst, s2) "dst 高位保持" == s1 高位 (因 dst==s1)。
+    // capstone 对 2 寄存器 vmovss/vmovsd 亦规范成 3-op (s1=dst) — 同路径。
+    const wvmp::u8 b[] = {0xC5, 0xFB, 0x10, 0xC1};
+    auto r = translate_bytes(x64, b, ir::Arch::X64);
+    ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r.insn.op, ir::Op::Movss);
+    EXPECT_EQ(r.insn.size, ir::Size::S64);            // (Movss,S64) = movsd
+    EXPECT_EQ(static_cast<int>(r.insn.dst.reg), 0);
+    EXPECT_EQ(static_cast<int>(r.insn.src.reg), 1);
+    EXPECT_TRUE(r.extra.empty());
+}
+
+TEST_F(LifterTranslate, VexMovsdInsertDstIndepGate) {
+    // C5 FB 10 D1: vmovsd xmm2, xmm0, xmm1 — 插入语义 d≠s1 → gate
+    // (dst 高位 ← s1 非 2-op 可表达; 禁当纯拷贝直折, §F.4)。
+    const wvmp::u8 b[] = {0xC5, 0xFB, 0x10, 0xD1};
+    auto r = translate_bytes(x64, b, ir::Arch::X64);
+    EXPECT_EQ(r.status, lifter::TranslateStatus::Unsupported);
+}
+
+TEST_F(LifterTranslate, VexAndnpsDstSrc1Direct) {
+    // C5 F8 55 C1: vandnps xmm0, xmm0, xmm1 — andn (非交换) dst==src1 直走
+    // (Op::Andps + kSseAndn 载体, 与 legacy 425 同编码)。
+    const wvmp::u8 b[] = {0xC5, 0xF8, 0x55, 0xC1};
+    auto r = translate_bytes(x64, b, ir::Arch::X64);
+    ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r.insn.op, ir::Op::Andps);
+    EXPECT_EQ(r.insn.src2.imm, 18);                   // kSseAndn
+    EXPECT_EQ(static_cast<int>(r.insn.dst.reg), 0);
+    EXPECT_EQ(static_cast<int>(r.insn.src.reg), 1);
+    EXPECT_TRUE(r.extra.empty());
+}
+
+TEST_F(LifterTranslate, VexAndnpsDstIndepPreMov) {
+    // C5 F8 55 D1: vandnps xmm2, xmm0, xmm1 — andn dst 独立: pre-Mov(2←0)
+    // + 2-op = ~xmm0 & xmm1 逐位等价 (VEX dst=~s1&s2)。
+    const wvmp::u8 b[] = {0xC5, 0xF8, 0x55, 0xD1};
+    auto r = translate_bytes(x64, b, ir::Arch::X64);
+    ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r.insn.op, ir::Op::Andps);
+    EXPECT_EQ(r.insn.src2.imm, 18);
+    EXPECT_EQ(static_cast<int>(r.insn.dst.reg), 2);
+    EXPECT_EQ(static_cast<int>(r.insn.src.reg), 1);
+    ASSERT_EQ(r.extra.size(), 1u);
+    EXPECT_EQ(static_cast<int>(r.extra[0].dst.reg), 2);
+    EXPECT_EQ(static_cast<int>(r.extra[0].src.reg), 0);
+}
+
+TEST_F(LifterTranslate, VexPxorZeroingIdiom) {
+    // C5 F9 EF C0: vpxor xmm0, xmm0, xmm0 — 整数清零惯用法 (python314 语料
+    // dst 独立占比主导形态的实源): d==s1==s2 → 2-op (dst, s2) 直走。
+    const wvmp::u8 b[] = {0xC5, 0xF9, 0xEF, 0xC0};
+    auto r = translate_bytes(x64, b, ir::Arch::X64);
+    ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r.insn.op, ir::Op::Xorps);
+    EXPECT_EQ(static_cast<int>(r.insn.dst.reg), 0);
+    EXPECT_EQ(static_cast<int>(r.insn.src.reg), 0);
+    EXPECT_TRUE(r.extra.empty());
+}
+
+TEST_F(LifterTranslate, VexUcomissTwoOpFlags) {
+    // C5 F8 2E C1: vucomiss xmm0, xmm1 — 2-op 比较直通, flags 通路保真
+    // (updates_flags=true, 区域内 setcc/jcc 读真比较结果)。
+    const wvmp::u8 b[] = {0xC5, 0xF8, 0x2E, 0xC1};
+    auto r = translate_bytes(x64, b, ir::Arch::X64);
+    ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r.insn.op, ir::Op::Ucomiss);
+    EXPECT_EQ(r.insn.size, ir::Size::S32);
+    EXPECT_TRUE(r.insn.updates_flags);
+    EXPECT_EQ(static_cast<int>(r.insn.dst.reg), 0);
+    EXPECT_EQ(static_cast<int>(r.insn.src.reg), 1);
+    EXPECT_TRUE(r.extra.empty());
+}
+
+TEST_F(LifterTranslate, VexVzeroupperGate) {
+    // C5 F8 77: vzeroupper — 白名单外 (档B ABI 面) → 现状 gate 保持。
+    const wvmp::u8 b[] = {0xC5, 0xF8, 0x77};
+    auto r = translate_bytes(x64, b, ir::Arch::X64);
+    EXPECT_EQ(r.status, lifter::TranslateStatus::Unsupported);
+}
+
+TEST_F(LifterTranslate, VexVpadddGate) {
+    // C5 F9 FE C1: vpaddd xmm0, xmm0, xmm1 — SSE2 整数加法族 (G1c 本体
+    // paddq 砍面的 V-对镜像) → 现状 gate 保持 (随本体)。
+    const wvmp::u8 b[] = {0xC5, 0xF9, 0xFE, 0xC1};
+    auto r = translate_bytes(x64, b, ir::Arch::X64);
+    EXPECT_EQ(r.status, lifter::TranslateStatus::Unsupported);
+}
+
+TEST_F(LifterTranslate, VexRorxGate) {
+    // C4 E3 7B F0 C1 03: rorx eax, ecx, 3 — BMI GP 域 VEX id (G8 独立缺口,
+    // triage §6.2 "VEX-GP 不在 SIMD 档A 内") → 现状 gate 保持。(字节经
+    // vendored capstone probe 实测 — SDM 手算 mmmmm 档位差 1, 以 probe 为准。)
+    const wvmp::u8 b[] = {0xC4, 0xE3, 0x7B, 0xF0, 0xC1, 0x03};
+    auto r = translate_bytes(x64, b, ir::Arch::X64);
+    EXPECT_EQ(r.status, lifter::TranslateStatus::Unsupported);
+}
+
+TEST_F(LifterTranslate, VexFmaGate) {
+    // C4 E2 F1 99 C2: vfmadd132sd xmm0, xmm1, xmm2 — FMA 双舍入红线
+    // (triage §6.5, 永不拆 mul+add) → 现状 gate 保持。(字节 probe 实测。)
+    const wvmp::u8 b[] = {0xC4, 0xE2, 0xF1, 0x99, 0xC2};
+    auto r = translate_bytes(x64, b, ir::Arch::X64);
+    EXPECT_EQ(r.status, lifter::TranslateStatus::Unsupported);
+}
+
+// =============================================================================
 // MIT-415 (G3): rep/repnz 串指令族 (movs/stos/scas/cmps/lods) 前缀闸放行
 // =============================================================================
 // 挂点 = 前缀闸 (x86_translate.cpp translate_insn :1494 起); 放行判定 =

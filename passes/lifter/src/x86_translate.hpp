@@ -59,6 +59,14 @@ struct TranslateResult {
     // 下游 (translator / virtualize) 据此识别 IR 缺字节并触发 C1 gate。
     // status == Ok 时为空。
     std::vector<std::pair<u64, u64>> skipped_ranges;
+
+    // MIT-426 (G6a): VEX.128 三地址折叠的**前置 IR**（status == Ok 时有效）。
+    // dst 独立形态 (`vaddps xmm2, xmm0, xmm1`) 一条 x86 指令折叠为两条 IR：
+    // 先执行 extra 中的 Op::Movaps(dst←src1) 16B 纯拷贝，再执行主 insn
+    // (2-op 载体)。legacy 通路恒为空——零新 IR 语义、零新 VmOp。
+    // ⚠️ 追加在尾部（append-only）：既有聚合初始化 {status, insn,
+    // skipped_ranges} 逐位兼容。
+    std::vector<ir::Insn> extra;
 };
 
 // 把一条 capstone 已反汇编的指令映射为 ir::Insn。

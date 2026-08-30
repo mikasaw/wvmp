@@ -214,6 +214,14 @@ samples=(
     # 负例 paddq (66 0F D4) 砍面留 G1c 照旧 gate (行为 byte-exact)。
     "build/passes/marker_scan/tests/wvmp_sse_fin_sample.exe"
     "build/passes/marker_scan/tests/wvmp_sse_fin_xmm_readback_sample.exe"
+    # MIT-426 (G6a): VEX.128 档A 主样本 + ctx.xmm 读回影子样本 — 38 id
+    # V-pair 三地址折叠 (标量 FP 三态 / packed 交换 / d 独立 Mov 前置 /
+    # D4 拷贝 / 408 mem 通路 / vpxor 惯用法 / flags 通路 / C4 全前缀 db);
+    # 负例区七族全 gate (ymm 位宽闸 / FMA / rorx / vzeroupper / vpaddd /
+    # 非交换+标量 d==s2 / vmovsd 插入) 可调用行为 byte-exact。
+    # 单边新增 2 样本 → 42 × 5 = 210 runs。
+    "build/passes/marker_scan/tests/wvmp_vex128_sample.exe"
+    "build/passes/marker_scan/tests/wvmp_vex128_xmm_readback_sample.exe"
 )
 
 # Seeds: 1 (small), 12345 (default), 99999 (large), 0xDEADBEEF (magic), 0xCAFEBABE (magic).

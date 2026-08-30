@@ -2612,7 +2612,13 @@ TranslateResult translate_function(const ir::FunctionRegion& fn,
             } else {
                 nxt = fn.end_rva;
             }
-            next_ip_of.emplace(cur, nxt);
+            // MIT-426 (G6a): VEX 三地址折叠的前置 Movaps 与主 insn 共享同一
+            // 机器地址 (lifter 透传 pre_insns)。用 insert_or_assign 让**主
+            // insn** (后出现者) 的 next 覆盖前置条的 A→A 占位 — rip-relative
+            // 位移解析 (emit_address) 用的 next_ip = 原指令结束地址, 与
+            // legacy 语义逐位一致。unique-addr 场景与 emplace 行为完全相同
+            // (既有通路零变化)。
+            next_ip_of.insert_or_assign(cur, nxt);
         }
     }
 
