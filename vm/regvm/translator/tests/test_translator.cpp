@@ -1480,4 +1480,143 @@ TEST(Translate, ImulThreeOpImmAtNewMarkerValuesNotIntercepted) {
     }
 }
 
+// ---------------- MIT-425 (G1b): SSE mul 族 + andnps/pandn 折叠 ----------------
+
+namespace {
+constexpr u8 kXmm0 = 24;  // ctx.xmm 槽 = xmm 索引 + 24 (MIT-371 编码约定)
+constexpr u8 kXmm1 = 25;
+constexpr u8 kXmm2 = 26;
+constexpr i64 kSseMulSs = 14, kSseMulSd = 15, kSseMulPs = 16, kSseMulPd = 17,
+              kSseAndn = 18;  // 与 lifter x86_translate.cpp / translator.cpp 对账
+
+ir::Insn sse_mul(i64 marker, ir::Size sz, ir::Operand src) {
+    ir::Insn i = I(ir::Op::Mul, sz);
+    i.dst = ir::Operand::reg_(ir::Reg::Rax);   // xmm0 (0..7 借用)
+    i.src = std::move(src);
+    i.src2 = ir::Operand::imm_(marker);
+    i.updates_flags = false;
+    return i;
+}
+} // namespace
+
+TEST(Translate, SseMulRegRegFourFormsEmitMulVmOps) {
+    // (Op::Mul, src2=imm 14..17) 载体 → VmOp::Mulss/Mulsd/Mulps/Mulpd 单条。
+    const struct { i64 marker; VmOp vop; ir::Size sz; } forms[] = {
+        {kSseMulSs, VmOp::Mulss, ir::Size::S32},
+        {kSseMulSd, VmOp::Mulsd, ir::Size::S64},
+        {kSseMulPs, VmOp::Mulps, ir::Size::S64},
+        {kSseMulPd, VmOp::Mulpd, ir::Size::S64},
+    };
+    for (const auto& f : forms) {
+        const Decoded d = one_insn(sse_mul(f.marker, f.sz,
+                                           ir::Operand::reg_(ir::Reg::Rcx)));  // xmm1
+        ASSERT_EQ(d.insns.size(), static_cast<size_t>(3));  // mul + Jmp+1 + Halt
+        expect_is(d.insns[0], f.vop, OpKind::Reg, kXmm0, OpKind::Reg, kXmm1, 0,
+                  isa::size_field(f.sz));
+    }
+}
+
+TEST(Translate, SseMulMemSourceFoldsXmmLoad) {
+    // MEM 源: emit_sse_mem_addr (rip → Mov+LeaRva) + XmmLoad(临时双槽) +
+    // mul(dst, 双槽)。宽度由标记本地导出: ss=4 / sd=8 / ps,pd=16 —
+    // sse_mem_width 的 default=16 对 ss/sd 会错, 本用例钉死本地表。
+    const struct { i64 marker; VmOp vop; u32 width; } forms[] = {
+        {kSseMulSs, VmOp::Mulss, 4},
+        {kSseMulSd, VmOp::Mulsd, 8},
+        {kSseMulPs, VmOp::Mulps, 16},
+        {kSseMulPd, VmOp::Mulpd, 16},
+    };
+    for (const auto& f : forms) {
+        ir::MemOperand mem = m(ir::Reg::Rip, ir::Reg::Flags, 0, 0x20);
+        const Decoded d = one_insn(sse_mul(f.marker, ir::Size::S64,
+                                           ir::Operand::mem_(mem)));
+        // Mov(rva) + LeaRva + XmmLoad + mul + Jmp + Halt
+        // (next_ip: 单块末条 = fn.end_rva = 0x3000 → rva = 0x3000 + disp 0x20)
+        ASSERT_EQ(d.insns.size(), static_cast<size_t>(6));
+        const u8 acc = isa::kScratchFirst;
+        expect_is(d.insns[0], VmOp::Mov, OpKind::Reg, acc, OpKind::Imm, 0,
+                  0x3020, kS64);
+        expect_is(d.insns[1], VmOp::LeaRva, OpKind::Reg, acc, OpKind::Reg, acc, 0, kS64);
+        expect_is(d.insns[2], VmOp::XmmLoad, OpKind::Reg, acc + 1, OpKind::Reg, acc,
+                  f.width, kS64);
+        expect_is(d.insns[3], f.vop, OpKind::Reg, kXmm0, OpKind::Reg, acc + 1, 0, kS64);
+    }
+}
+
+TEST(Translate, GpMulUnaffectedByMarkerDomain) {
+    // 回归固化 (419 op 限定对账延伸): GP Op::Mul (src2 恒空) 仍走 VmOp::Mul
+    // 通路; imul 3-op 的 14..17 立即数 (恰在新 SSE mul 标记域) 不得误拦。
+    {
+        ir::Insn i = I(ir::Op::Mul, ir::Size::S64);
+        i.dst = ir::Operand::reg_(ir::Reg::Rdx);  // GP mul 约定 dst=Rdx
+        i.src = ir::Operand::reg_(ir::Reg::Rcx);
+        i.updates_flags = true;
+        const Decoded d = one_insn(i);
+        ASSERT_EQ(d.insns.size(), static_cast<size_t>(3));
+        expect_is(d.insns[0], VmOp::Mul, OpKind::Reg, kRdx, OpKind::Reg, kRcx, 0, kS64);
+    }
+    for (const i64 v : {14, 15, 16, 17, 18}) {
+        ir::Insn i = I(ir::Op::Imul, ir::Size::S64);
+        i.dst = ir::Operand::reg_(ir::Reg::Rax);
+        i.src = ir::Operand::reg_(ir::Reg::Rcx);
+        i.src2 = ir::Operand::imm_(v);  // 恰在新标记域 (14..18) 的合法 imul 乘数
+        const Decoded d = one_insn(i);  // notes 空 = 未被 SSE/lock 拦截
+        const u8 s18 = isa::kScratchFirst;
+        expect_is(d.insns[1], VmOp::Imul, OpKind::Reg, kRax, OpKind::Reg, s18, 0, kS64);
+    }
+}
+
+TEST(Translate, AndnCarrierFoldsToAndnpsVmOp) {
+    // (Op::Andps, src2=imm(18)=kSseAndn) → VmOp::Andnps (andnps/andnpd/
+    // pandn 折叠); 常规 Andps (src2 空) 不受影响。
+    {
+        ir::Insn i = I(ir::Op::Andps, ir::Size::S64);
+        i.dst = ir::Operand::reg_(ir::Reg::Rax);
+        i.src = ir::Operand::reg_(ir::Reg::Rcx);
+        i.src2 = ir::Operand::imm_(kSseAndn);
+        const Decoded d = one_insn(i);
+        ASSERT_EQ(d.insns.size(), static_cast<size_t>(3));
+        expect_is(d.insns[0], VmOp::Andnps, OpKind::Reg, kXmm0, OpKind::Reg, kXmm1, 0, kS64);
+    }
+    {
+        ir::Insn i = I(ir::Op::Andps, ir::Size::S64);
+        i.dst = ir::Operand::reg_(ir::Reg::Rax);
+        i.src = ir::Operand::reg_(ir::Reg::Rcx);
+        const Decoded d = one_insn(i);
+        expect_is(d.insns[0], VmOp::Andps, OpKind::Reg, kXmm0, OpKind::Reg, kXmm1, 0, kS64);
+    }
+}
+
+TEST(Translate, PandPorPxorReusePsBitwiseVmOps) {
+    // SSE2 整数位运算族 (R2 档①) 零新 VmOp 折叠: pand→Andps / por→Orps /
+    // pxor→Xorps (IR 层 lifter 直接产 Op::Andps/Orps/Xorps)。
+    const struct { ir::Op op; VmOp vop; } forms[] = {
+        {ir::Op::Andps, VmOp::Andps},
+        {ir::Op::Orps,  VmOp::Orps},
+        {ir::Op::Xorps, VmOp::Xorps},
+    };
+    for (const auto& f : forms) {
+        ir::Insn i = I(f.op, ir::Size::S64);
+        i.dst = ir::Operand::reg_(ir::Reg::Rax);
+        i.src = ir::Operand::reg_(ir::Reg::Rcx);
+        const Decoded d = one_insn(i);
+        ASSERT_EQ(d.insns.size(), static_cast<size_t>(3));
+        expect_is(d.insns[0], f.vop, OpKind::Reg, kXmm0, OpKind::Reg, kXmm1, 0, kS64);
+    }
+}
+
+TEST(Translate, AndnMemSourceFoldsXmmLoad) {
+    // andnps mem 源: XmmLoad(临时双槽, 16B) + Andnps(dst, 双槽)。
+    ir::MemOperand mem = m(ir::Reg::Rip, ir::Reg::Flags, 0, 0x30);
+    ir::Insn i = I(ir::Op::Andps, ir::Size::S64);
+    i.dst = ir::Operand::reg_(ir::Reg::Rax);
+    i.src = ir::Operand::mem_(mem);
+    i.src2 = ir::Operand::imm_(kSseAndn);
+    const Decoded d = one_insn(i);
+    ASSERT_EQ(d.insns.size(), static_cast<size_t>(6));
+    const u8 acc = isa::kScratchFirst;
+    expect_is(d.insns[2], VmOp::XmmLoad, OpKind::Reg, acc + 1, OpKind::Reg, acc, 16, kS64);
+    expect_is(d.insns[3], VmOp::Andnps, OpKind::Reg, kXmm0, OpKind::Reg, acc + 1, 0, kS64);
+}
+
 } // namespace

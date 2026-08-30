@@ -50,7 +50,8 @@
 #   - MIT-411 (G1): extend to wvmp_sse_memop_sample (SSE 尾扫包主样本: 双访存
 #     读改写 triple + comiss/comisd (0F 2F 系折叠 ucomis, MSVC 天然 comiss +
 #     MASM mem 源) + pd 位运算族 andpd/orpd/xorpd (66 0F 54/56/57 折叠 ps,
-#     零新 VmOp) + 负例 andnps gate) + wvmp_sse_memop_xmm_readback_sample
+#     零新 VmOp) + andnps (MIT-425 起正例翻转)) +
+#     wvmp_sse_memop_xmm_readback_sample
 #     (comiss/comisd flags + pd 位运算 ctx.xmm 读回影子样本).
 #     Total: 32 samples × 5 seeds = 160 runs.
 #   - MIT-413 (G2): extend to wvmp_jmp_table8_sample (跳转表残余形态主样本:
@@ -93,6 +94,14 @@
 #     lock xadd ±1 内联 — 走 419 Xadd 原子通路); 负例 lock not (D2 gate,
 #     可调用, 原生行为保真) + lock inc ecx (reg-dst 非法, db 直发, 禁调用)。
 #     单边新增 1 样本 → 38 × 5 = 190 runs。
+#   - MIT-425 (G1b): extend to wvmp_sse_fin_sample (SSE 收官包主样本: mul
+#     族 mulss/mulsd/mulps/mulpd — C++ 天然 /Od mulsd/mulss [rip] mem 形式
+#     + MASM 0F 59 系四编码 REG-REG/rip mem 源; andnps/andnpd 0F 55 系 —
+#     411 负例 §B.4 正例翻转, 新 VmOp::Andnps; SSE2 整数位运算 pand/por/
+#     pxor/pandn 66 0F DB/EB/EF/DF 折叠 ps 位运算零新 VmOp; 负例 paddq
+#     66 0F D4 → R2 档② 砍面留 G1c, 照旧 gate 行为 byte-exact) +
+#     wvmp_sse_fin_xmm_readback_sample (13 探针 ctx.xmm 8 槽全量读回影子
+#     样本)。单边新增 2 样本 → 40 × 5 = 200 runs。
 #   - MIT-306: REQUIRE_REAL=1 校验日志含 "已生成 N 个入口 stub" 防止 C1 gate
 #     兜底被误判 PASS（仅 byte-exact 不够, C1 gate 函数被跳过仍能输出相同
 #     stdout+rc）。与 multiseed_e2e_real.sh 配套使用。
@@ -162,8 +171,8 @@ samples=(
     "build/passes/marker_scan/tests/wvmp_jmp_table_sample.exe"
     # MIT-411 (G1): SSE 尾扫包主样本 + ctx.xmm/flags 读回影子样本 — 双访存
     # 读改写 triple / comiss/comisd (折叠 ucomis) / andpd/orpd/xorpd (折叠 ps),
-    # 负例 andnps 同 exe 内照旧 gate (行为 byte-exact); REQUIRE_REAL 保证
-    # 新形态真虚拟化非 gate。
+    # andnps 同 exe 内真虚拟化 (MIT-425 (G1b) §B.4 正例翻转, 行为 byte-exact);
+    # REQUIRE_REAL 保证新形态真虚拟化非 gate。
     "build/passes/marker_scan/tests/wvmp_sse_memop_sample.exe"
     "build/passes/marker_scan/tests/wvmp_sse_memop_xmm_readback_sample.exe"
     # MIT-413 (G2): 跳转表残余形态主样本 — REG 8B 绝对/delta/delta-from-jmp
@@ -198,6 +207,13 @@ samples=(
     # (REQUIRE_REAL ≥1 stub); C++ _Interlocked* 真产物区域 (lock xadd ±1
     # 内联展开); 负例 lock not (D2 gate, 可调用) + lock inc ecx (禁调用)。
     "build/passes/marker_scan/tests/wvmp_atomic_incdec_sample.exe"
+    # MIT-425 (G1b): SSE 收官包主样本 + ctx.xmm 读回影子样本 — mul 族
+    # (mulss/mulsd/mulps/mulpd, C++ 天然 + MASM 0F 59 系四编码) +
+    # andnps/andnpd (0F 55 系, 411 负例正例翻转, 新 VmOp::Andnps) +
+    # SSE2 整数位运算族 (pand/por/pxor/pandn 折叠 ps 零新 VmOp);
+    # 负例 paddq (66 0F D4) 砍面留 G1c 照旧 gate (行为 byte-exact)。
+    "build/passes/marker_scan/tests/wvmp_sse_fin_sample.exe"
+    "build/passes/marker_scan/tests/wvmp_sse_fin_xmm_readback_sample.exe"
 )
 
 # Seeds: 1 (small), 12345 (default), 99999 (large), 0xDEADBEEF (magic), 0xCAFEBABE (magic).

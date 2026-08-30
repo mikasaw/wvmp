@@ -13,9 +13,9 @@
 ;   ⑥ memop_comisd_mem : comisd xmm0, [g_d] (66 0F 2F 05 rel32) + seta
 ;   ⑧ memop_{and,or,xor}pd_reg : 66 0F 54/56/57 C1 REG-REG (pd 位运算族)
 ;   ⑨ memop_{and,or,xor}pd_mem : 66 0F 54/56/57 05 rel32 rip mem 源
-;   ⑩ memop_andnps_neg  : andnps xmm0, xmm1 (0F 55 C1) — 负例: 0F 55 系
-;                        不在本单范围 (派活单 §C D4) → lifter unsupported
-;                         → C1 gate 兜底, 行为 byte-exact。
+;   ⑩ memop_andnps_neg  : andnps xmm0, xmm1 (0F 55 C1) — MIT-411 时代为
+;                        负例 (gate); MIT-425 (G1b) andnps 入面→正例真虚
+;                        拟化 (§B.4 翻转), 行为 byte-exact 不变。
 ;
 ; Win64 ABI: 整型参数 rcx/rdx; 浮点参数 xmm0/xmm1; 返回值 rax/xmm0。
 ; ⚠️ rax 跨 marker_end/marker_begin 调用会被 clobber (SDK `mov rax, imm64`
@@ -237,7 +237,8 @@ memop_xorpd_mem PROC
     ret
 memop_xorpd_mem ENDP
 
-; unsigned int memop_andnps_neg(a, b): andnps xmm0, xmm1 (0F 55 C1) — 负例。
+; unsigned int memop_andnps_neg(a, b): andnps xmm0, xmm1 (0F 55 C1) —
+;   MIT-425 (G1b) 起为正例 (0F 55 入面, 折叠新 VmOp::Andnps)。
 ;   andnps 语义 = NOT(xmm0) & xmm1 (SDM: NOT 作用于第一操作数), 样本输入
 ;   a=0x0F0F0F0F, b=0xFFFFFFFF → 0xF0F0F0F0。
 ;   0F 55 系不在本单范围 (派活单 §C D4, 留 412+) → lifter unsupported →
@@ -250,7 +251,7 @@ memop_andnps_neg PROC
 
     ; ===== marker region begin =====
     call ?marker_begin@sdk@wvmp@@YAXXZ
-    andnps xmm0, xmm1                ; 0F 55 C1 (负例 → gate)
+    andnps xmm0, xmm1                ; 0F 55 C1 (MIT-425 起正例)
     nop
     nop
     call ?marker_end@sdk@wvmp@@YAXXZ

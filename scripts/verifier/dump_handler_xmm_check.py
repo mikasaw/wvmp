@@ -88,7 +88,12 @@ except ImportError:
 SSE_HANDLERS = {"addss", "addps", "addpd", "subss", "subps", "subpd",
                 "divss", "divps", "divpd",
                 "xorps", "orps", "andps",
-                "addsd", "subsd", "divsd", "movsd"}
+                "addsd", "subsd", "divsd", "movsd",
+                # MIT-425 (G1b): SSE mul family + andnps (all share the
+                # build_xmm_transfer four-step template with dual_src=True;
+                # pand/por/pxor/pandn fold onto andps/orps/xorps/andnps so
+                # no separate handlers exist for them).
+                "mulss", "mulsd", "mulps", "mulpd", "andnps"}
 
 # MIT-408: mem-form primitives (XmmLoad / XmmStore).  Expected shape:
 #   - memory-operand FP instruction present (movss/movsd/movups with a
@@ -117,10 +122,10 @@ MEM_MIN_PROLOGUE_COUNT = 1
 MEM_WIDTH_CMP_IMMS = {4, 8}
 
 FP_MNEMONIC_RE = re.compile(
-    r"^(addss|addps|addpd|addsd|subss|subps|subpd|subsd|mulss|mulps|mulpd|"
+    r"^(addss|addps|addpd|addsd|subss|subps|subpd|subsd|mulss|mulsd|mulps|mulpd|"
     r"divss|divps|divpd|divsd|"
     r"movss|movps|movsd|movapd|movaps|movups|movupd|xorps|orps|andps|andpd|"
-    r"comiss|ucomiss|comisd|ucomisd)$"
+    r"andnps|comiss|ucomiss|comisd|ucomisd)$"
 )
 
 

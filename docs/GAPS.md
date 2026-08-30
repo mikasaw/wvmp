@@ -149,9 +149,25 @@
   双访存"（C4c）经 MIT-411 实测判伪：SSE ALU 指令目标恒为 XMM 寄存器、
   内存只可能是源（ml64 A2000 + capstone 实证），真实"读→算→写回"语义 =
   movsd/addsd/movsd 三连，逐条已支持。
-- **不支持面（越界即 C1 gate 兜底）**：andnps/andnpd（0F 55 系，留 412+）、
-  AVX/SSE2 整数族（movd/movdqa p 形式）、SSE mul 族
-  （mulss/mulps/mulpd）。（string movsd 双形态已由 MIT-415 收口，见 G3 节；
+- **MIT-425 (G1b) 收口 (2026-08-30)**：SSE mul 族 mulss/mulsd/mulps/mulpd
+  （0F 59 系，reg-reg + mem 源含 rip，408 通路；IR 层 (Op::Mul,
+  src2=imm 14..17) 载体标记折叠 4 个新 VmOp——ir::Op 冻结下 (Op,Size)
+  双语义被 GP mul (S32/S64) 占用装不下 4 形态，D2 授权选型见标记域注释）、
+  andnps/andnpd（0F 55/66 0F 55，dst=~dst&src 非纯位运算三元组，VM 无
+  128-bit NOT 原故双折不可行 → 新 VmOp::Andnps；411 负例样本按 §B.4
+  正例翻转）、SSE2 整数位运算档① pand/por/pxor/pandn（66 0F
+  DB/EB/EF/DF，与 ps 位运算逐位同语义，零新 VmOp 折叠
+  Andps/Orps/Xorps/Andnps——411 pd 折叠 ps 先例的整数扩展；#33 实测修正：
+  cl v145 对 _mm_and_si128/_mm_andnot_si128 直产 andps/andnps，编译器
+  自身即 ps/p 互认证据，pand 真 66 字节由 MASM 样本直写）。multiseed
+  40 样本 × 5 = 200/200。
+- **不支持面（越界即 C1 gate 兜底）**：SSE2 整数档② movd/movq GP↔xmm 桥
+  （66 0F 7E / 0F 7E / REX.W）与 paddq/psubq 系（66 0F D4/5C）——跳表预算
+  kVmOpMax=95 顶格，砍面留 G1c（G6a/VEX.128 的 movd 依赖同步知会）；
+  movdqa/movdqu（66 0F 6F/7F）；pcmpeq/pcmpgt 系（SSE 整数比较族）；
+  AVX/VEX 全族（转 MIT-424 G6a 档A 路线——VEX.128 标量/ packed FP 折叠
+  复用本单 mul 族与既有 SSE op 1:1，见 .multica/mit-G6r-triage.md §档A）。
+  （string movsd 双形态已由 MIT-415 收口，见 G3 节；
   x87 已拆出独立小节，见下节 "x87 (永久 gate, R3 裁决)"——不是简单"不支持
   兜底"，而是有独立频率数据与行为承诺的裁决面。）
 - 注意与重定位/ASLR 的配合：RVA + image_base 在运行时还原，不依赖静态 VA。
@@ -191,9 +207,10 @@ v145 MSVC x86 默认 /arch:SSE2（cl /help 实测），显式 /arch:IA32 才涌�
   ST 栈模型成本量化）留档 `.multica/mit-G5r-triage.md` §4/§5，若未来 G7 x86
   P1 立项且走 IA32，IA32 浮点档口重开、蓝图直接生效；
 - **R2（32 位目标捆绑）随 G7 P1 立项时评估**，不单独投；
-- **跳表 128→256 扩容** = G7/x87 未来前置（kTableEntries=128；kVmOpMax=86
-  即 87 项已用，fa08d50/MIT-408 后实测 vm_op.hpp:506；x87 全族 ~80 新 VmOp
-  会把 128 撑爆，拆单蓝图预埋，见 triage §6 #2）；
+- **跳表 128→256 扩容** = G7/x87 未来前置（kTableEntries=128；kVmOpMax=95
+  即 96 项已用（0 哨兵 + 1..95），MIT-425/G1b 后实测 vm_op.hpp——mul 族
+  4 op + Andnps 顶格预算 95，余量 32；x87 全族 ~80 新 VmOp 会把 128 撑爆，
+  拆单蓝图预埋，见 triage §6 #2）；
 - **callgate FP 参数/返回值修复** = x87 任何路线的前置依赖（P0，独立派单
   MIT-417，当前 SSE 世界即中招，见 triage §6 #1）；
 - 16-bit 目标不可行（交叉引用 C5 节，PE 格式白名单只收 0x014C/0x8664）。

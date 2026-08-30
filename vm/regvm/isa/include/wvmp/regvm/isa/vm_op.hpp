@@ -523,9 +523,36 @@ enum class VmOp : u16 {
     //   cond_or_size=size (S32/S64; bts 无字节形式, S8/S16 块防御 no-op)。
     //   flags: 仅 CF 有定义 (SDM: 其余未定义) — setcc5 捕 host CPU 真值,
     //   flags_tail 装配, 与原生执行同 CPU 行为 (undefined 位逐 CPU 一致)。
-    Bts, Btr, Btc };
+    Bts, Btr, Btc,
 
-inline constexpr u16 kVmOpMax = static_cast<u16>(VmOp::Btc);  // MIT-419: 90
+    // —— MIT-425 (G1b): SSE 浮点乘 mul 族 + andnps/andnpd ——
+    // Mulss/Mulsd/Mulps/Mulpd (Reg-Reg / Reg-Mem 折条): 与 Addss 族同构,
+    //   读 dst 槽 → 读 src 槽 (load_src_slot_into_xmm1 双语义, MIT-408 MEM
+    //   源经 GP 双槽) → native mul* → 写回 dst 槽 → advance。
+    //   a_kind=Reg reg_a=xmm_dst_slot (24..31), b_kind=Reg reg_b=xmm_src_slot
+    //   或 GP 双槽 (18..23), aux=0, cond_or_size=ir::Size 标签 (Mulss=S32
+    //   scalar single / Mulsd=S64 scalar double / Mulps,S64=Mulps packed /
+    //   Mulpd,S64=Mulpd packed, 与 Addss/Addsd/Addps/Addpd 同约定)。
+    //   IR 层 (x86_translate.cpp translate_sse_mul): ir::Op 冻结不可增枚举,
+    //   SSE mul 以 (Op::Mul, src2=imm(kSseMulSs..kSseMulPd, 14..17)) 载体
+    //   标记编码 — 沿用 G3 串指令 / G4 lock 的 "op 载体 + src2=imm(族)"
+    //   先例 (14..18 与既有域 0..4 string / 5..13 lock 分区连续, 零碰撞;
+    //   写入点唯一 = translate_sse_mul, GP mul/1-op imul→Mul 从不写 src2)。
+    //   不影响 EFLAGS; 不调 setcc5/flags_tail, 直接 advance。
+    //   派活单 §D 决策: 4 op 必 append-only 在 Btc 之后 (pitfall #34)。
+    Mulss, Mulsd, Mulps, Mulpd,
+    // Andnps (Reg-Reg / Reg-Mem 折条): dst = ~dst & src (SDM ANDNPS/PANDN
+    //   逐位同语义 — andnpd/pandn 66 前缀变体按 411 ps/pd 互认折叠到本 op,
+    //   位运算不解释浮点值)。与 Xorps/Orps/Andps 同一 build_xmm_transfer
+    //   四步模板, 中间行 native "andnps"。IR 层: (Op::Andps,
+    //   src2=imm(kSseAndn=18)) 载体标记 — Op::Andps 常规构造 (translate_sse_
+    //   bitwise) 从不写 src2, 零碰撞。andnps 双折 (Not+And) 不可行: VM 无
+    //   128-bit NOT 原语 (GP Not handler 是单 u64 槽语义, 落 xmm 区即错址),
+    //   派活单 §B.2 "新 VmOp 你实测选" — 选新 VmOp, 字节码零膨胀。
+    //   不影响 EFLAGS; 直接 advance。
+    Andnps };
+
+inline constexpr u16 kVmOpMax = static_cast<u16>(VmOp::Andnps);  // MIT-425: 95
 inline constexpr u16 kVmOpLimit = 1u << 14;  // 14 位编码空间上限
 
 constexpr const char* to_string(VmOp op) {
@@ -611,6 +638,12 @@ constexpr const char* to_string(VmOp op) {
         case VmOp::Bts: return "bts";
         case VmOp::Btr: return "btr";
         case VmOp::Btc: return "btc";
+        // MIT-425 (G1b): SSE 浮点乘 mul 族 + andnps.
+        case VmOp::Mulss: return "mulss";
+        case VmOp::Mulsd: return "mulsd";
+        case VmOp::Mulps: return "mulps";
+        case VmOp::Mulpd: return "mulpd";
+        case VmOp::Andnps: return "andnps";
     }
     return "?";
 }

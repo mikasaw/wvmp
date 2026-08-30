@@ -93,6 +93,30 @@ enum : int { kLockXadd = 5, kLockBts = 6, kLockBtr = 7, kLockBtc = 8,
     }
 }
 
+// MIT-425 (G1b): SSE mul 族 + andn 的 src2 载体标记 — 与 lifter
+// (x86_translate.cpp translate_sse_mul / translate_sse_andn) 的枚举分域
+// 严格对账 (14..18; string family 0..4 / lock 5..13 分区连续不相交):
+//   14..17: Op::Mul 载体族 (mulss/mulsd/mulps/mulpd — ir::Op 冻结契约不可
+//           增枚举, GP Op::Mul 的 (Mul,S32/S64) 双占用使 (Op,Size) 双语义
+//           装不下 4 形态; (Addss,S8)=mulss 类映射 op 名与语义相反, 弃。
+//           沿用 G3/G4 "op 载体 + src2=imm(族)" 先例)
+//   18:     Op::Andps 载体 (andnps/andnpd/pandn 折叠 Andnps — dst=~dst&src
+//           非纯位运算三元组, 无法单折 Andps; VM 无 128-bit NOT 原语,
+//           双折不可行, 派活单 §B.2 选新 VmOp)
+// 碰撞对账 (419 §B.1 同款审计): src2=imm 写入点全仓 = imul 3-op (op=Imul,
+// 立即数任意 — 14..18 同为合法 imul 立即数, **必须 op 限定**) / string
+// 载体 (op=Mov, 0..4) / lock (5..13) / 本域 (op=Mul|Andps, 仅 14..18)。
+// GP mul 与 1-op imul→Mul 路径 (translate_imul 1-op/translate_mul) 从不写
+// src2 (默认 kind=None); translate_sse_bitwise (Andps 常规构造) 同样不写。
+enum : int { kSseMulSs = 14, kSseMulSd = 15, kSseMulPs = 16, kSseMulPd = 17,
+             kSseAndn = 18 };
+[[nodiscard]] bool is_sse_mul_marker(i64 v) {
+    return v >= kSseMulSs && v <= kSseMulPd;
+}
+[[nodiscard]] bool is_andn_marker(i64 v) {
+    return v == kSseAndn;
+}
+
 // ==================== MIT-409 + MIT-413 (G2): 跳转表特化 ====================
 //
 // 识别模式 = 受限模板匹配（D1 决策，派活单 §A.2 实测模板 + G2 三参数
@@ -823,6 +847,14 @@ struct Translator {
         default:
             if (in.op == ir::Op::Imul) {
                 ok = translate_imul(em, sc, in, current_rva, next_ip);
+            } else if (in.op == ir::Op::Mul && in.src2.kind == ir::Operand::Kind::Imm &&
+                       is_sse_mul_marker(in.src2.imm)) {
+                // MIT-425 (G1b): SSE 浮点乘 dispatch — (Op::Mul, src2=imm
+                // 14..17) 载体标记, REG-REG emit 单条 VmOp::Mulss/Mulsd/
+                // Mulps/Mulpd; MEM 源 (含 rip) 折条同 add。**必须先于 GP
+                // mul 分支**且 op+标记双限定 (imul 3-op 的任意 src2 imm
+                // 教训, 419 §B.1)。
+                ok = translate_sse_mul(em, sc, in, current_rva, next_ip);
             } else if (in.op == ir::Op::Mul) {
                 ok = translate_mul(em, in);
             } else if (in.op == ir::Op::Movsxd) {
@@ -2133,8 +2165,13 @@ struct Translator {
         if (xmm_idx_dst > 7u)
             return skip(in, "SSE 浮点位运算 xmm 索引越界 (仅支持 xmm0..xmm7)", nullptr);
         const u8 xmm_dst_slot = static_cast<u8>(xmm_idx_dst + 24u);
+        // MIT-425 (G1b): andnps/andnpd/pandn — lifter 以 (Op::Andps,
+        // src2=imm(kSseAndn=18)) 载体标记折叠到 VmOp::Andnps (dst=~dst&src,
+        // 逐位同语义; op 必须限定 Andps, 见标记域碰撞对账)。
         VmOp vop = (in.op == ir::Op::Xorps) ? VmOp::Xorps :
-                   (in.op == ir::Op::Orps)  ? VmOp::Orps : VmOp::Andps;
+                   (in.op == ir::Op::Orps)  ? VmOp::Orps  :
+                   (in.src2.kind == ir::Operand::Kind::Imm &&
+                    is_andn_marker(in.src2.imm)) ? VmOp::Andnps : VmOp::Andps;
         if (in.src.kind == ir::Operand::Kind::Mem) {
             u8 acc = 0;
             if (!emit_sse_mem_addr(em, sc, in.src.mem, current_rva, next_ip, acc))
@@ -2195,6 +2232,56 @@ struct Translator {
         if (xmm_idx_src > 7u)
             return skip(in, "SSE 浮点比较 xmm 索引越界 (仅支持 xmm0..xmm7)", nullptr);
         const u8 xmm_src_slot = static_cast<u8>(xmm_idx_src + 24u);
+        em.emit_rr(vop, xmm_dst_slot, xmm_src_slot, isa::size_field(in.size));
+        return true;
+    }
+
+    // ---- MIT-425 (G1b): SSE 浮点乘 mulss/mulsd/mulps/mulpd ----
+    //
+    // 与 MIT-371 translate_sse_add 完全同构: lifter 用 IR.dst.reg /
+    // IR.src.reg 借用 ir::Reg 值 0..7 代表 xmm0..7 (加 24 偏移 → ctx.xmm
+    // 槽), MEM 源折条 XmmLoad(临时双槽) + mul(dst, 双槽)。IR 编码 =
+    // (Op::Mul, src2=imm(kSseMulSs..kSseMulPd, 14..17)) 载体标记 (ir::Op
+    // 冻结不可增枚举; GP Op::Mul 占用 (Mul,S32/S64) 使 (Op,Size) 双语义
+    // 装不下 4 形态 — 选型披露见 translator.cpp 标记域注释)。
+    // VmOp 选定后 mem 宽度由标记本地导出 (ss=4 / sd=8 / ps,pd=16), 不经
+    // sse_mem_width (其 default 分支对未知 op 恒回 16, 对 ss/sd 会错)。
+    //
+    // 编码: a_kind=Reg reg_a=xmm_slot, b_kind=Reg reg_b=xmm_slot (REG-REG)
+    //   或 gp_pair (MEM 源), aux=0 / 4|8|16 (XmmLoad 宽度), cond_or_size=size。
+    bool translate_sse_mul(Emitter& em, Scratch& sc, const ir::Insn& in,
+                           u64 current_rva, u64 next_ip) {
+        if (in.op != ir::Op::Mul ||
+            in.src2.kind != ir::Operand::Kind::Imm ||
+            !is_sse_mul_marker(in.src2.imm))
+            return false;
+        if (in.dst.kind != ir::Operand::Kind::Reg)
+            return skip(in, "SSE 浮点乘 操作数形态未支持", nullptr);
+        const u8 xmm_dst_slot = static_cast<u8>(in.dst.reg) + 24u;
+        VmOp vop = VmOp::Mulss;
+        u32 mem_width = 4;
+        switch (static_cast<int>(in.src2.imm)) {
+        case kSseMulSs: vop = VmOp::Mulss; mem_width = 4;  break;
+        case kSseMulSd: vop = VmOp::Mulsd; mem_width = 8;  break;
+        case kSseMulPs: vop = VmOp::Mulps; mem_width = 16; break;
+        case kSseMulPd: vop = VmOp::Mulpd; mem_width = 16; break;
+        default: return skip(in, "SSE 浮点乘 标记非法，建议 gate", nullptr);
+        }
+        if (in.src.kind == ir::Operand::Kind::Mem) {
+            // MEM 源: XmmLoad(临时双槽) + mul(xmm_dst, 临时双槽)。
+            // scratch 预算: emit_address ≤4 + 临时双槽 1 = ≤5, 在 6 预算内。
+            u8 acc = 0;
+            if (!emit_sse_mem_addr(em, sc, in.src.mem, current_rva, next_ip, acc))
+                return skip(in, "SSE 浮点乘 地址形态未支持", &in.src.mem);
+            const u8 pair = sc.take();  // 占用 pair 与 pair+1 (16B GP 双槽)
+            em.emit(VmOp::XmmLoad, OpKind::Reg, pair, OpKind::Reg, acc,
+                    mem_width, isa::size_field(ir::Size::S64));
+            em.emit_rr(vop, xmm_dst_slot, pair, isa::size_field(in.size));
+            return true;
+        }
+        if (in.src.kind != ir::Operand::Kind::Reg)
+            return skip(in, "SSE 浮点乘 操作数形态未支持", nullptr);
+        const u8 xmm_src_slot = static_cast<u8>(in.src.reg) + 24u;
         em.emit_rr(vop, xmm_dst_slot, xmm_src_slot, isa::size_field(in.size));
         return true;
     }

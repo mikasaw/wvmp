@@ -2069,10 +2069,144 @@ TEST_F(LifterTranslate, XorpdMemSrcFoldsToXorps) {
     EXPECT_EQ(r.insn.src.mem.base, ir::Reg::Rip);
 }
 
-TEST_F(LifterTranslate, AndnpsStillUnsupported) {
-    // 0F 55 C1: andnps xmm0, xmm1 — 0F 55 系不在 MIT-411 范围 (派活单 §C D4,
-    // 留 412+) → unsupported → C1 gate 兜底 (负例断言照旧)
+TEST_F(LifterTranslate, AndnpsRegRegFoldsToAndnCarrier) {
+    // 0F 55 C1: andnps xmm0, xmm1 — MIT-425 (G1b R3) 入面。dst = ~dst & src
+    // 非纯位运算三元组 (VM 无 128-bit NOT 原语, 双折不可行) → 新 VmOp::
+    // Andnps; IR 层 = (Op::Andps, src2=imm(kSseAndn=18)) 载体标记。
+    // (MIT-411 时代本用例为负例断言 AndnpsStillUnsupported, 按 §B.4 翻转。)
     const wvmp::u8 b[] = {0x0F, 0x55, 0xC1};
+    auto r = translate_bytes(x64, b, ir::Arch::X64);
+    ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r.insn.op, ir::Op::Andps);          // Andps 载体
+    EXPECT_EQ(r.insn.src2.kind, ir::Operand::Kind::Imm);
+    EXPECT_EQ(r.insn.src2.imm, 18);               // kSseAndn 标记
+    EXPECT_EQ(r.insn.size, ir::Size::S64);
+    EXPECT_FALSE(r.insn.updates_flags);
+    EXPECT_EQ(r.insn.dst.reg, ir::Reg::Rax);      // xmm0
+    EXPECT_EQ(r.insn.src.reg, ir::Reg::Rcx);      // xmm1
+}
+
+TEST_F(LifterTranslate, AndnpdFoldsToAndnCarrier) {
+    // 66 0F 55 C1: andnpd xmm0, xmm1 — 66 前缀吸收进 id (prefix[0]=0),
+    // 与 andnps 逐位同语义, 折叠同一 Andnps 载体 (411 ps/pd 互认先验)。
+    const wvmp::u8 b[] = {0x66, 0x0F, 0x55, 0xC1};
+    auto r = translate_bytes(x64, b, ir::Arch::X64);
+    ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r.insn.op, ir::Op::Andps);
+    EXPECT_EQ(r.insn.src2.imm, 18);               // kSseAndn
+}
+
+TEST_F(LifterTranslate, PandnMemSrcFoldsToAndnCarrier) {
+    // 66 0F DF 05 xx: pandn xmm0, xmmword ptr [rip] — SSE2 整数 andn,
+    // 与 andnps 逐位同语义 → 同一 (Andps, kSseAndn) 载体 (R2 档①)。
+    const wvmp::u8 b[] = {0x66, 0x0F, 0xDF, 0x05, 0x00, 0x00, 0x00, 0x00};
+    auto r = translate_bytes(x64, b, ir::Arch::X64);
+    ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r.insn.op, ir::Op::Andps);
+    EXPECT_EQ(r.insn.src2.imm, 18);               // kSseAndn
+    ASSERT_EQ(r.insn.src.kind, ir::Operand::Kind::Mem);
+    EXPECT_EQ(r.insn.src.mem.base, ir::Reg::Rip);
+}
+
+TEST_F(LifterTranslate, PandPorPxorFoldToPsBitwise) {
+    // 66 0F DB/EB/EF C1: pand/por/pxor xmm0, xmm1 — 128-bit 按位同语义,
+    // 零新 VmOp 折叠 Andps/Orps/Xorps (411 pd 折叠 ps 的整数扩展, R2 档①)。
+    const wvmp::u8 pand[]  = {0x66, 0x0F, 0xDB, 0xC1};
+    const wvmp::u8 por[]   = {0x66, 0x0F, 0xEB, 0xC1};
+    const wvmp::u8 pxor[]  = {0x66, 0x0F, 0xEF, 0xC1};
+    auto a = translate_bytes(x64, pand, ir::Arch::X64);
+    ASSERT_EQ(a.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(a.insn.op, ir::Op::Andps);
+    auto o = translate_bytes(x64, por, ir::Arch::X64);
+    ASSERT_EQ(o.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(o.insn.op, ir::Op::Orps);
+    auto x = translate_bytes(x64, pxor, ir::Arch::X64);
+    ASSERT_EQ(x.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(x.insn.op, ir::Op::Xorps);
+    EXPECT_FALSE(a.insn.updates_flags);
+    EXPECT_FALSE(o.insn.updates_flags);
+    EXPECT_FALSE(x.insn.updates_flags);
+}
+
+TEST_F(LifterTranslate, PandMemSrcFoldsToAndps) {
+    // 66 0F DB 05 xx: pand xmm0, xmmword ptr [rip] — mem 源 (408 通道)。
+    const wvmp::u8 b[] = {0x66, 0x0F, 0xDB, 0x05, 0x00, 0x00, 0x00, 0x00};
+    auto r = translate_bytes(x64, b, ir::Arch::X64);
+    ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r.insn.op, ir::Op::Andps);
+    ASSERT_EQ(r.insn.src.kind, ir::Operand::Kind::Mem);
+    EXPECT_EQ(r.insn.src.mem.base, ir::Reg::Rip);
+}
+
+TEST_F(LifterTranslate, MulssRegRegMulCarrierMarker14) {
+    // F3 0F 59 C1: mulss xmm0, xmm1 — (Op::Mul, src2=imm(14)=kSseMulSs)
+    // 载体标记 (R1)。size=S32 (scalar single 形式标签)。
+    const wvmp::u8 b[] = {0xF3, 0x0F, 0x59, 0xC1};
+    auto r = translate_bytes(x64, b, ir::Arch::X64);
+    ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r.insn.op, ir::Op::Mul);
+    EXPECT_EQ(r.insn.src2.kind, ir::Operand::Kind::Imm);
+    EXPECT_EQ(r.insn.src2.imm, 14);               // kSseMulSs
+    EXPECT_EQ(r.insn.size, ir::Size::S32);
+    EXPECT_FALSE(r.insn.updates_flags);           // SSE 不写 EFLAGS (GP mul 恒 true)
+    EXPECT_EQ(r.insn.dst.reg, ir::Reg::Rax);      // xmm0
+    EXPECT_EQ(r.insn.src.reg, ir::Reg::Rcx);      // xmm1
+}
+
+TEST_F(LifterTranslate, MulsdRegRegMulCarrierMarker15) {
+    // F2 0F 59 C1: mulsd xmm0, xmm1 — (Mul, src2=imm(15)=kSseMulSd), S64。
+    const wvmp::u8 b[] = {0xF2, 0x0F, 0x59, 0xC1};
+    auto r = translate_bytes(x64, b, ir::Arch::X64);
+    ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r.insn.op, ir::Op::Mul);
+    EXPECT_EQ(r.insn.src2.imm, 15);               // kSseMulSd
+    EXPECT_EQ(r.insn.size, ir::Size::S64);
+}
+
+TEST_F(LifterTranslate, MulpsMulpdRegRegMulCarrierMarker16_17) {
+    // 0F 59 C1: mulps / 66 0F 59 C1: mulpd — (Mul, 16/17), packed S64 标签。
+    const wvmp::u8 ps[] = {0x0F, 0x59, 0xC1};
+    const wvmp::u8 pd[] = {0x66, 0x0F, 0x59, 0xC1};
+    auto p = translate_bytes(x64, ps, ir::Arch::X64);
+    ASSERT_EQ(p.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(p.insn.op, ir::Op::Mul);
+    EXPECT_EQ(p.insn.src2.imm, 16);               // kSseMulPs
+    EXPECT_EQ(p.insn.size, ir::Size::S64);
+    auto d = translate_bytes(x64, pd, ir::Arch::X64);
+    ASSERT_EQ(d.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(d.insn.op, ir::Op::Mul);
+    EXPECT_EQ(d.insn.src2.imm, 17);               // kSseMulPd
+    EXPECT_EQ(d.insn.size, ir::Size::S64);
+}
+
+TEST_F(LifterTranslate, MulsdRipMemSource) {
+    // F2 0F 59 05 xx: mulsd xmm0, qword ptr [rip] — mem 源含 rip (408 通路
+    // 一次到位, 派活单 §B.1)。MSVC /Od 对 `g_a *= g_b` 天然产此形态。
+    const wvmp::u8 b[] = {0xF2, 0x0F, 0x59, 0x05, 0x00, 0x00, 0x00, 0x00};
+    auto r = translate_bytes(x64, b, ir::Arch::X64);
+    ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r.insn.op, ir::Op::Mul);
+    EXPECT_EQ(r.insn.src2.imm, 15);               // kSseMulSd
+    ASSERT_EQ(r.insn.src.kind, ir::Operand::Kind::Mem);
+    EXPECT_EQ(r.insn.src.mem.base, ir::Reg::Rip);
+}
+
+TEST_F(LifterTranslate, MulpsMemSource) {
+    // 0F 59 05 xx: mulps xmm0, xmmword ptr [rip] — packed mem 源。
+    const wvmp::u8 b[] = {0x0F, 0x59, 0x05, 0x00, 0x00, 0x00, 0x00};
+    auto r = translate_bytes(x64, b, ir::Arch::X64);
+    ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r.insn.op, ir::Op::Mul);
+    EXPECT_EQ(r.insn.src2.imm, 16);               // kSseMulPs
+    ASSERT_EQ(r.insn.src.kind, ir::Operand::Kind::Mem);
+    EXPECT_EQ(r.insn.src.mem.base, ir::Reg::Rip);
+}
+
+TEST_F(LifterTranslate, PaddqStillUnsupported) {
+    // 66 0F D4 C1: paddq xmm0, xmm1 — SSE2 加法族不在 G1b 面 (跳表预算
+    // 95 顶格, R2 档② 砍面留 G1c, 派活单 §B.3/D1) → unsupported → C1 gate
+    // 兜底 (负例断言; 同款: psubq/pcmpeq 系)。
+    const wvmp::u8 b[] = {0x66, 0x0F, 0xD4, 0xC1};
     auto r = translate_bytes(x64, b, ir::Arch::X64);
     EXPECT_EQ(r.status, lifter::TranslateStatus::Unsupported);
 }

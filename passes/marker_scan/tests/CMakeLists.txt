@@ -730,7 +730,8 @@ target_link_options(wvmp_jmp_table8_sample PRIVATE
 #     (pd/ps 互换无损的编译器证据);
 #   - MASM helper 直写: addsd xmm0,[rsp+40] 栈基址 mem 源 / comiss/comisd
 #     rip mem 源 + seta (flags 读回) / 真 66-prefix andpd/orpd/xorpd
-#     (REG-REG + rip mem 源) / 负例 andnps (0F 55 系留 412+, C1 gate)。
+#     (REG-REG + rip mem 源) / andnps (MIT-411 负例 gate, MIT-425 (G1b)
+#     入面按 §B.4 正例翻转 — 真虚拟化, 行为 byte-exact 不变)。
 # REQUIRE_REAL: main 区域 + helper 区域真虚拟化 (stub ≥1); 负例函数 gate
 # 由保护日志 Note 验证。
 enable_language(ASM_MASM)
@@ -872,5 +873,49 @@ target_compile_options(wvmp_atomic_incdec_sample PRIVATE
     $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-O0>
 )
 target_link_options(wvmp_atomic_incdec_sample PRIVATE
+    $<$<CXX_COMPILER_ID:MSVC>:/INCREMENTAL:NO>
+)
+
+# MIT-425 (G1b): SSE 收官包端到端主样本——mul 族 (mulss/mulsd/mulps/mulpd)
+# + andnps/andnpd + SSE2 整数位运算族 (pand/por/pxor/pandn)。
+# 区域覆盖:
+#   - C++ 天然 mul 区域 (/Od 直产 movss/mulsd [rip]+movss/movsd — cl v145
+#     实测, mul 族编译器自然产物高频形态);
+#   - MASM 直写: 0F 59 系四编码 (REG-REG + rip mem 源) / 0F 55 andnps
+#     (_mm_andnot_si128 MSVC 真产物形态) / 66 0F 55 andnpd / 66 0F DF
+#     pandn / 66 0F DB/EB/EF pand/por/pxor (REG-REG + rip mem 源);
+#   - 负例 paddq (66 0F D4): R2 档② 砍面留 G1c (跳表预算 95 顶格) →
+#     C1 gate 整函数保持原生 (可调用, 行为 byte-exact)。
+# REQUIRE_REAL: C++ 区域 + MASM 正例区域真虚拟化 (stub ≥1)。
+enable_language(ASM_MASM)
+add_executable(wvmp_sse_fin_sample
+    sse_fin_sample_main.cpp
+    sse_fin_sample_asm.asm
+)
+target_link_libraries(wvmp_sse_fin_sample PRIVATE wvmp::sdk)
+target_compile_options(wvmp_sse_fin_sample PRIVATE
+    $<$<AND:$<CXX_COMPILER_ID:MSVC>,$<COMPILE_LANGUAGE:C,CXX>>:/Od;/Ob0;/utf-8>
+    $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-O0>
+)
+target_link_options(wvmp_sse_fin_sample PRIVATE
+    $<$<CXX_COMPILER_ID:MSVC>:/INCREMENTAL:NO>
+)
+
+# MIT-425 (G1b): 影子样本——mul 族 + andnps/andnpd/pandn + pand/por/pxor
+# 的 ctx.xmm 运行时读回断言 (验收门 #79 纪律, 与主样本同能力面配对、独立
+# exe)。区域由 MASM 直写 13 条探针 (单指令区域 + nop 垫), 区域外 8 槽 ×
+# 2×u64 全量位图案打印: 槽位公式错 (MIT-371 空转形态 sub 0x24)、写 GPR
+# 槽区、宽度截断、标量高位丢失均与 native run 逐字节不一致 → FAIL。
+enable_language(ASM_MASM)
+add_executable(wvmp_sse_fin_xmm_readback_sample
+    sse_fin_xmm_readback_sample_main.cpp
+    sse_fin_xmm_readback_sample_asm.asm
+)
+target_link_libraries(wvmp_sse_fin_xmm_readback_sample PRIVATE wvmp::sdk)
+target_compile_options(wvmp_sse_fin_xmm_readback_sample PRIVATE
+    $<$<AND:$<CXX_COMPILER_ID:MSVC>,$<COMPILE_LANGUAGE:C,CXX>>:/Od;/Ob0;/utf-8>
+    $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-O0>
+)
+target_link_options(wvmp_sse_fin_xmm_readback_sample PRIVATE
     $<$<CXX_COMPILER_ID:MSVC>:/INCREMENTAL:NO>
 )

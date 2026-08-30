@@ -1777,6 +1777,22 @@ public:
     std::string build_orps(u64 d)  const { return build_xmm_transfer(d, "orps", /*dual_src=*/true); }
     std::string build_andps(u64 d) const { return build_xmm_transfer(d, "andps", /*dual_src=*/true); }
 
+    // ---- MIT-425 (G1b): SSE 浮点乘 mul 族 + andnps/andnpd/pandn 折叠 ----
+    //
+    // 四条 mul 复用 build_xmm_transfer 四步模板 (读 dst 槽 → 读 src 槽
+    // [load_src_slot_into_xmm1 双语义, MIT-408 MEM 源经 GP 双槽] → native
+    // mul* → 写回 dst 槽 → advance), 与 xorps/orps/andps 唯一差别是中间行
+    // 助记符。槽位偏移常量 24/4/0x140 全走 imm() (pitfall #78)。
+    // Andnps 同模板 (native "andnps": dst = ~dst & src, 逐位, 不解释浮点
+    // 值); andnpd/pandn (66 前缀) 由翻译器按 411 ps/pd 互认折叠到本 op
+    // (位运算逐位同语义, 见 translator.cpp translate_sse_andn)。
+    // 不影响 EFLAGS; 不调 setcc5/flags_tail, 直接 advance。
+    std::string build_mulss(u64 d)  const { return build_xmm_transfer(d, "mulss", /*dual_src=*/true); }
+    std::string build_mulsd(u64 d)  const { return build_xmm_transfer(d, "mulsd", /*dual_src=*/true); }
+    std::string build_mulps(u64 d)  const { return build_xmm_transfer(d, "mulps", /*dual_src=*/true); }
+    std::string build_mulpd(u64 d)  const { return build_xmm_transfer(d, "mulpd", /*dual_src=*/true); }
+    std::string build_andnps(u64 d) const { return build_xmm_transfer(d, "andnps", /*dual_src=*/true); }
+
     // ---- MIT-376: SSE 浮点比较 ucomiss / ucomisd ----
     //
     // Ucomis* 与位运算/传送族本质不同: **只写 EFLAGS (ZF/PF/CF), 不改 xmm
@@ -3263,6 +3279,15 @@ RuntimeGenResult generate_runtime(wvmp::Rng& rng) {
         {int(VmOp::Xorps), "xorps", &AsmGen::build_xorps},
         {int(VmOp::Orps), "orps", &AsmGen::build_orps},
         {int(VmOp::Andps), "andps", &AsmGen::build_andps},
+        // MIT-425 (G1b): SSE 浮点乘 mul 族 (mulss/mulsd/mulps/mulpd, 与
+        // add/sub/div 族同模板; MSVC /Od 对 double/float 乘法天然直产
+        // mulsd/mulss, intrinsic 直产 mulps/mulpd) + andnps (dst=~dst&src,
+        // _mm_andnot_si128/_mm_andnot_pd 真产物 0F 55; andnpd/pandn 折叠)。
+        {int(VmOp::Mulss), "mulss", &AsmGen::build_mulss},
+        {int(VmOp::Mulsd), "mulsd", &AsmGen::build_mulsd},
+        {int(VmOp::Mulps), "mulps", &AsmGen::build_mulps},
+        {int(VmOp::Mulpd), "mulpd", &AsmGen::build_mulpd},
+        {int(VmOp::Andnps), "andnps", &AsmGen::build_andnps},
         // MIT-376: SSE 浮点比较 ucomiss/ucomisd (REG-REG only, 只写 EFLAGS 不改
         // xmm; 走 ALU binop 同一条 flags 通路 zero5 → native → setcc5 →
         // flags_tail, 与 setcc/jcc handler 共享 flags_ 寄存器 — 派活单 §D D1.1,

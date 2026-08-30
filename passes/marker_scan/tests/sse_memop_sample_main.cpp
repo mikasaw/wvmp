@@ -17,8 +17,8 @@
 //     MSVC 对 _mm_and_pd/_mm_or_pd/_mm_xor_pd 直出 andps/orps/xorps
 //     (ps/pd 互换无损, 编译器自身即证据, 区域 ⑦); 真 66-prefix pd 字节
 //     由 MASM 直写 (区域 ⑧⑨, REG-REG + rip mem 源)。
-//   负例: andnps (0F 55) 不在本单范围 (派活单 §C D4, 留 412+) → 区域 ⑩
-//     unsupported → C1 gate 兜底, 行为 byte-exact。
+//   ⑩ andnps (0F 55): MIT-411 时代为负例 (gate); MIT-425 (G1b) 入面 →
+//     按 §B.4 翻转为正例 (F0F0F0F0 基线断言保留, 行为 byte-exact 不变)。
 //
 // 区域只含白名单 (SSE + mov/lea/jcc/setcc/movzx/mov 等), printf 在 main
 // 区域外。REQUIRE_REAL: main 区域 + MASM helper 区域真虚拟化 (stub ≥1),
@@ -48,7 +48,7 @@ extern "C" unsigned long long memop_xorpd_reg(unsigned long long a, unsigned lon
 extern "C" unsigned long long memop_andpd_mem(unsigned long long a);                        // ⑨ rip mem 源
 extern "C" unsigned long long memop_orpd_mem(unsigned long long a);                         // ⑨
 extern "C" unsigned long long memop_xorpd_mem(unsigned long long a);                        // ⑨
-extern "C" unsigned int memop_andnps_neg(unsigned int a, unsigned int b);  // ⑩ 负例 gate
+extern "C" unsigned int memop_andnps_neg(unsigned int a, unsigned int b);  // ⑩ (425 起正例)
 
 int main() {
     int r = 0;
@@ -84,7 +84,7 @@ int main() {
     const unsigned long long p_am  = memop_andpd_mem(0xFFFF0000FFFF0000ull);   // & g_pd
     const unsigned long long p_om  = memop_orpd_mem(0x0F0F0F0F0F0F0F0Full);    // | g_pd
     const unsigned long long p_xm  = memop_xorpd_mem(0x33CC33CC33CC33CCull);   // ^ g_pd
-    // ⑩ 负例: andnps → C1 gate (行为 byte-exact; andnps = NOT(dst) & src,
+    // ⑩ andnps (MIT-411 负例, MIT-425 翻转正例; andnps = NOT(dst) & src,
     //    SDM: NOT 作用于第一操作数 — 0x0F0F0F0F & ~0xFFFFFFFF = 0xF0F0F0F0)
     const unsigned int n = memop_andnps_neg(0x0F0F0F0Fu, 0xFFFFFFFFu);
 

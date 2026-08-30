@@ -1347,6 +1347,77 @@ TranslateResult translate_ucomis(const cs_insn& ci, const cs_x86& x, ir::Arch ar
     return ok(out);
 }
 
+// ==================== MIT-425 (G1b): SSE mul 族 + andnps/andnpd/pandn ====================
+//
+// src2 载体标记域 (与 translator.cpp is_sse_mul_marker/is_andn_marker 对账):
+//   14..17 = SSE mul 族 (Op::Mul 载体) / 18 = andn (Op::Andps 载体)。
+//   与 string family (0..4) / lock 标记 (5..13) 分区连续零碰撞; src2=imm
+//   写入点对账: imul 3-op (op=Imul, 立即数任意 — 翻译器 Mul/Andps 派发
+//   必须 op+标记双限定) / 本域唯一。GP mul 与 1-op imul→Mul 路径从不写
+//   src2 (Operand 默认 kind=None)。
+enum : int { kSseMulSs = 14, kSseMulSd = 15, kSseMulPs = 16, kSseMulPd = 17,
+             kSseAndn = 18 };
+
+// MIT-425 (R1): SSE 浮点乘 mulss/mulsd/mulps/mulpd (+ mem 源含 rip 一次
+// 到位, 408 通路现成)。与 translate_sse_add 同构: XMM 寄存器编码借用
+// ir::Reg 值 0..7, 翻译期加 24 偏移 → VmContext.xmm 槽 (XMM 编码设计见
+// translate_sse_add 注释块); IR 编码 = (Op::Mul, src2=imm(marker)) 载体,
+// size 字段为形式标签 (ss=S32 / sd,ps,pd=S64, 与 Addss/Addsd/Addps/Addpd
+// 同约定)。updates_flags=false (SSE 浮点乘不影响 x86 EFLAGS; MXCSR
+// rounding mode v1 不追踪)。
+TranslateResult translate_sse_mul(const cs_insn& ci, const cs_x86& x, ir::Arch arch,
+                                  ir::Size sz, int marker) {
+    if (x.op_count != 2) return unsupported(ci.address, ci.size);
+    // dst 必是 XMM 寄存器; src 是 XMM 寄存器或内存 (408: MEM form 放开)。
+    if (x.operands[0].type != X86_OP_REG) return unsupported(ci.address, ci.size);
+    if (x.operands[1].type != X86_OP_REG && x.operands[1].type != X86_OP_MEM)
+        return unsupported(ci.address, ci.size);
+    // 手动 XMM 编号映射 (X86_REG_XMM0..XMM7 → 0..7), 不调 to_operand/map_reg
+    // (它们对 XMM* 返回 nullopt, 沿用 SEG/xmm 不可映射的现有约定)。
+    auto xmm_idx = [&](x86_reg r) -> std::optional<u8> {
+        switch (r) {
+        case X86_REG_XMM0: return static_cast<u8>(0); case X86_REG_XMM1: return static_cast<u8>(1);
+        case X86_REG_XMM2: return static_cast<u8>(2); case X86_REG_XMM3: return static_cast<u8>(3);
+        case X86_REG_XMM4: return static_cast<u8>(4); case X86_REG_XMM5: return static_cast<u8>(5);
+        case X86_REG_XMM6: return static_cast<u8>(6); case X86_REG_XMM7: return static_cast<u8>(7);
+        default: return std::nullopt;
+        }
+    };
+    auto di = xmm_idx(x.operands[0].reg);
+    if (!di) return unsupported(ci.address, ci.size);
+    (void)arch;
+    ir::Insn out;
+    out.op = Op::Mul;  // 载体 (src2=族标记区分 SSE/GP, 见上)
+    out.addr = ci.address;
+    out.size = sz;
+    out.updates_flags = false;
+    out.src2 = Operand::imm_(marker);
+    out.dst = ir::Operand::reg_(static_cast<ir::Reg>(*di));
+    if (x.operands[1].type == X86_OP_MEM) {
+        // 内存源: mem_operand 通用通道, 翻译器折条 (408 通路)。
+        auto m = mem_operand(x.operands[1].mem);
+        if (!m) return unsupported(ci.address, ci.size);
+        out.src = *m;
+    } else {
+        auto si = xmm_idx(x.operands[1].reg);
+        if (!si) return unsupported(ci.address, ci.size);
+        out.src = ir::Operand::reg_(static_cast<ir::Reg>(*si));
+    }
+    return ok(out);
+}
+
+// MIT-425 (R3/R2 档①): andnps/andnpd/pandn → (Op::Andps,
+// src2=imm(kSseAndn)) 载体, 翻译器折叠单条 VmOp::Andnps (dst = ~dst & src;
+// 三编码逐位同语义 — SDM ANDNPS/ANDNPD/PANDN 均为 128-bit 按位
+// NOT(第一操作数) AND 第二操作数, 不解释浮点值)。操作数形状与位运算族
+// 完全一致, 复用 translate_sse_bitwise 后补标记。
+TranslateResult translate_sse_andn(const cs_insn& ci, const cs_x86& x, ir::Arch arch) {
+    auto r = translate_sse_bitwise(ci, x, arch, Op::Andps, Size::S64);
+    if (r.status != TranslateStatus::Ok) return r;
+    r.insn.src2 = Operand::imm_(kSseAndn);
+    return ok(r.insn);
+}
+
 TranslateResult translate_cmpxchg(const cs_insn& ci, const cs_x86& x, ir::Arch arch) {
     if (x.op_count != 2) return unsupported(ci.address, ci.size);
     // dst 必为 r/m (REG 或 MEM); src 必为 REG
@@ -1993,6 +2064,48 @@ TranslateResult translate_insn(const cs_insn& ci, ir::Arch arch) {
     case X86_INS_UCOMISD: return translate_ucomis(ci, x, arch, Op::Ucomisd, Size::S64);
     case X86_INS_COMISS:  return translate_ucomis(ci, x, arch, Op::Ucomiss, Size::S32);
     case X86_INS_COMISD:  return translate_ucomis(ci, x, arch, Op::Ucomisd, Size::S64);
+    // MIT-425 (G1b): SSE 浮点乘 mul 族 (R1) + andnps/andnpd (R3) + SSE2
+    // 整数位运算族 pand/por/pxor/pandn (R2 档①)。
+    //   - mulss xmm1, xmm2/m32  F3 0F 59 /r  (scalar single, size=S32)
+    //   - mulsd xmm1, xmm2/m64  F2 0F 59 /r  (scalar double, size=S64)
+    //   - mulps xmm1, xmm2/m128 0F 59 /r     (packed single, size=S64)
+    //   - mulpd xmm1, xmm2/m128 66 0F 59 /r  (packed double, size=S64)
+    //     (capstone 实证: F30F59C1/F20F59C1/0F59C1/660F59C1 → MULSS/MULSD/
+    //      MULPS/MULPD xmm0,xmm1; 66 前缀被吸收进 id, prefix[0]=0, 与
+    //      ANDPD 同纪律不经入口前缀拒)。vendored capstone 枚举名实测
+    //      (x86.h): X86_INS_MULSS/MULSD/MULPS/MULPD 独立于 GP MUL/IMUL —
+    //      404 CDQE/MOVSXD 分裂教训面, 四 id 全显式收口。
+    //     IR 编码: (Op::Mul, src2=imm(kSseMulSs..kSseMulPd, 14..17)) 载体
+    //     标记 — ir::Op 冻结不可增枚举, GP Op::Mul 占用 (Mul,S32/S64)
+    //     使 (Op,Size) 双语义装不下 4 形态 ((Addss,S8)=mulss 类映射 op
+    //     名与语义相反, 弃); 沿用 G3 串指令 / G4 lock 的 "op 载体 +
+    //     src2=imm(族)" 先例 (域 14..17 与 0..4 string / 5..13 lock 分区
+    //     连续, 零碰撞; 写入点唯一, GP mul / 1-op imul→Mul 从不写 src2)。
+    //     选型披露: D2 禁 aux 位域 hack — 本方案零 aux 使用, 见报告 §选型。
+    //   - andnps xmm1, xmm2/m128 0F 55 /r  / andnpd 66 0F 55 /r:
+    //     dst = ~dst & src — 非纯位运算三元组, 无法单折 Andps; VM 无
+    //     128-bit NOT 原语 (GP Not 单 u64 槽语义), 双折不可行 → 新
+    //     VmOp::Andnps (派活单 §B.2 "两条折 或 新 VmOp 你实测选")。
+    //     IR: (Op::Andps, src2=imm(kSseAndn=18)) 载体标记。
+    //   - pand (66 0F DB) / por (66 0F EB) / pxor (66 0F EF) / pandn
+    //     (66 0F DF): 与 ps 位运算逐位同语义 (128-bit 按位, 不解释操作
+    //     数类型, 零 flags) → 零新 VmOp 折叠 Andps/Orps/Xorps (411
+    //     pd 折叠 ps 先例的整数扩展; MSVC v145 对 _mm_and_si128/
+    //     _mm_andnot_si128 实测直产 andps/andnps — 编译器自身即互认证据,
+    //     424 "pand 直产 legacy" 先验被本机实测推翻, pand 真 66 字节由
+    //     MASM 样本直写)。pandn 折叠 Andnps (与 andnps 逐位同语义)。
+    //   - paddq/psubq 系 (66 0F D4/5C) 不在本单面 (跳表预算 95 顶格,
+    //     砍面留 G1c, 见报告) → 落 default 照旧 C1 gate。
+    case X86_INS_MULSS: return translate_sse_mul(ci, x, arch, Size::S32, kSseMulSs);
+    case X86_INS_MULSD: return translate_sse_mul(ci, x, arch, Size::S64, kSseMulSd);
+    case X86_INS_MULPS: return translate_sse_mul(ci, x, arch, Size::S64, kSseMulPs);
+    case X86_INS_MULPD: return translate_sse_mul(ci, x, arch, Size::S64, kSseMulPd);
+    case X86_INS_ANDNPS: return translate_sse_andn(ci, x, arch);
+    case X86_INS_ANDNPD: return translate_sse_andn(ci, x, arch);
+    case X86_INS_PAND:  return translate_sse_bitwise(ci, x, arch, Op::Andps, Size::S64);
+    case X86_INS_POR:   return translate_sse_bitwise(ci, x, arch, Op::Orps,  Size::S64);
+    case X86_INS_PXOR:  return translate_sse_bitwise(ci, x, arch, Op::Xorps, Size::S64);
+    case X86_INS_PANDN: return translate_sse_andn(ci, x, arch);
     case X86_INS_BSWAP: return translate_bswap(ci, x, arch);
     case X86_INS_XCHG: return translate_xchg(ci, x, arch);
     // MIT-336: setcc 16 variants (0F 90+cc+rm, mod=11 REG / mod=00 MEM).
