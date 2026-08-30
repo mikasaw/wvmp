@@ -1466,9 +1466,8 @@ TranslateResult translate_sse_andn(const cs_insn& ci, const cs_x86& x, ir::Arch 
 //     418 永久 gate 面)。probe 实测: NP 0F 6F → id=MOVQ ops=[mm0,mm1] /
 //     NP 0F 6E → id=MOVD ops=[mm0,ecx] / NP 0F 7E → id=MOVD — **同 id 混入
 //     MMX 形态, mm 操作数判据是唯一可靠闸** (本函数首检查)。
-//   - movdqa/movdqu (66/F3 0F 6F/7F, id 468/469) 不在本单面 → 照旧 default
-//     gate (GAPS G1c 节精确登记; intrinsic /Od 溢出高频形态, 后续单按频率
-//     立项)。
+//   - movdqa/movdqu (66/F3 0F 6F/7F, id 468/469) MIT-428 (G1d) 起入面
+//     (translate_sse_mov 直复用, 零新 VmOp; 427 时点为砍面留档)。
 // 派单方编码自错纠正 (#33): 派单 §A.2 "paddq=66 0F FC" 实测为 PADDB
 // (INSID=388); paddq 真值 = 66 0F D4 (425 GAPS 原文正确, 425 仅 psubq 的
 // 5C→FB 需修) — paddq/psubq 本单砍面 (频率实测 shell32 16/854k + 其余
@@ -1668,6 +1667,12 @@ std::optional<VexDesc> vex_desc_of(x86_insn id) {
     case X86_INS_VMOVAPS: return VexDesc{VexDesc::Fam::Mov, Op::Movaps, ir::Size::S64, 0, false};
     case X86_INS_VMOVAPD: return VexDesc{VexDesc::Fam::Mov, Op::Movapd, ir::Size::S64, 0, false};
     case X86_INS_VMOVUPS: return VexDesc{VexDesc::Fam::Mov, Op::Movups, ir::Size::S64, 0, false};
+    // MIT-428 (G1d): vmovdqa/vmovdqu 镜像 (1028/1033, probe 实测 id) —
+    // 纯拷贝 2-op 直折 (426 D4 vmovaps 先例); ymm 位宽闸 + xmm8..15 闸
+    // 继承 translate_vex128; EVEX VMOVDQA32/64/8/16 (x86.h:1413-1419)
+    // 独立 INS id 天然不入面 (426 §F.3 同款)。
+    case X86_INS_VMOVDQA: return VexDesc{VexDesc::Fam::Mov, Op::Movaps, ir::Size::S64, 0, false};
+    case X86_INS_VMOVDQU: return VexDesc{VexDesc::Fam::Mov, Op::Movups, ir::Size::S64, 0, false};
     case X86_INS_VMOVUPD: return VexDesc{VexDesc::Fam::Mov, Op::Movupd, ir::Size::S64, 0, false};
     // ---- 桥镜像 (MIT-427 B.3): vmovd/vmovq 2-op 形态, 语义全由操作数
     // 形状 + VEX pp 判定 (translate_movd_movq 统一处理 legacy/VEX) ----
@@ -2410,6 +2415,23 @@ TranslateResult translate_insn(const cs_insn& ci, ir::Arch arch) {
     case X86_INS_MOVAPD: return translate_sse_mov(ci, x, arch, Op::Movapd, Size::S64);
     case X86_INS_MOVUPS: return translate_sse_mov(ci, x, arch, Op::Movups, Size::S64);
     case X86_INS_MOVUPD: return translate_sse_mov(ci, x, arch, Op::Movupd, Size::S64);
+    // MIT-428 (G1d): SSE2 对齐传送 movdqa/movdqu (66/F3 0F 6F load /
+    // 66/F3 0F 7F store) — 语义 = 16B 全宽拷贝, 与 movaps/movups 同构,
+    // 直复用 translate_sse_mov (零新 VmOp / 零新 handler, D1 硬约束)。
+    //   - movdqa xmm1, xmm2/m128  66 0F 6F /r   (对齐形式, 16B 全宽)
+    //   - movdqu xmm1, xmm2/m128  F3 0F 6F /r   (非对齐形式, 16B 全宽)
+    //   - 存储方向 66/F3 0F 7F /r (Mem,Reg 形) — 与 movaps 0F 29 同构。
+    // §A.4 编码方向 probe 实测 (2026-08-31, vendored capstone 5.0.6):
+    //   6F (reg 字段=dst) 与 7F (rm 字段=dst, reg,reg 反写合法形) 双编码
+    //   capstone 均归一化为 dst-first 报操作数 (access W 位钉死) —
+    //   66 0F 7F C8 报 [xmm0 W, xmm1 R], 与 6F C1 报序一致, 无需调度层
+    //   方向修正 (先验 "7F 反写需手动换位" 被实测推翻)。
+    // 对齐语义 (D2, 375 先例): movdqa 对齐陷阱 #GP 不模拟 — mem 形式折
+    // XmmLoad/XmmStore (408 通路, 运行时 movups 非对齐宽松语义), reg-reg
+    // 折 Movaps (handler 中间行 = native movaps xmm0, xmm1 寄存器形态,
+    // 无对齐语义面)。EVEX VMOVDQA32/64 (x86.h:1413-1414) 显式不入面。
+    case X86_INS_MOVDQA: return translate_sse_mov(ci, x, arch, Op::Movaps, Size::S64);
+    case X86_INS_MOVDQU: return translate_sse_mov(ci, x, arch, Op::Movups, Size::S64);
     // MIT-408: movsd (F2 0F 10/11, scalar double, load/store 双向) 经
     // (Movss,S64) 编码。capstone 把 string movsd (A5, mem,mem) 与 SSE movsd
     // 报同一 X86_INS_MOVSD (实证 id=486) — 由 translate_sse_mov 的双 MEM
@@ -2497,7 +2519,8 @@ TranslateResult translate_insn(const cs_insn& ci, ir::Arch arch) {
     // (REG/MEM 双操作数, REX.W 64 位) + F3 0F 7E + 66 0F D6 全编码形,
     // MMX 裸 0F 6E/6F/7E/7F (mm 操作数) D2 永久 gate。判据/分域见
     // translate_movd_movq 注释块。paddq/psubq (66 0F D4/FB) 本单砍面
-    // (频率实测) → 照旧 default gate; movdqa/movdqu (468/469) 同 gate。
+    // (频率实测) → 照旧 default gate; movdqa/movdqu (468/469) 已由
+    // MIT-428 (G1d) 折叠入面 (translate_sse_mov 通路)。
     case X86_INS_MOVD: return translate_movd_movq(ci, x, arch);
     case X86_INS_MOVQ: return translate_movd_movq(ci, x, arch);
     // MIT-426 (G6a): VEX.128 V-pair 白名单 — 38 id = 既有 SSE 白名单逐行
@@ -2513,6 +2536,9 @@ TranslateResult translate_insn(const cs_insn& ci, ir::Arch arch) {
     case X86_INS_VMULSS: case X86_INS_VMULSD: case X86_INS_VMULPS: case X86_INS_VMULPD:
     case X86_INS_VMOVSS: case X86_INS_VMOVSD: case X86_INS_VMOVAPS: case X86_INS_VMOVAPD:
     case X86_INS_VMOVUPS: case X86_INS_VMOVUPD:
+    // MIT-428 (G1d): vmovdqa/vmovdqu 对齐传送镜像入面 (零新 VmOp, 折叠
+    // 既有 Mov 通路; ymm 位宽闸 / xmm8..15 闸 / EVEX 不入面见 vex_desc_of)。
+    case X86_INS_VMOVDQA: case X86_INS_VMOVDQU:
     // MIT-427 (G1c) B.3: vmovd/vmovq VEX 镜像随桥本体入面 (426 §F.4 ④
     // 挂账清偿; 2-op 形态直达既有 2-op 直通路径, ymm 位宽闸 + xmm8..15
     // 闸继承 translate_vex128)。vpaddq/vpsubq 随 paddq/psubq 本体砍面

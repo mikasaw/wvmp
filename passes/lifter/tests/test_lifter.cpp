@@ -2810,14 +2810,8 @@ TEST_F(LifterTranslate, MovdBridgeGatedFaces) {
     const wvmp::u8 paddb[] = {0x66, 0x0F, 0xFC, 0xC1};
     EXPECT_EQ(translate_bytes(x64, paddb, ir::Arch::X64).status,
               lifter::TranslateStatus::Unsupported);
-    // 砍面维持: movdqa/movdqu (66/F3 0F 6F) — /Od intrinsic 溢出高频形态,
-    // GAPS G1c 精确登记, 后续按频率单开。
-    const wvmp::u8 dqa[] = {0x66, 0x0F, 0x6F, 0xC1};
-    EXPECT_EQ(translate_bytes(x64, dqa, ir::Arch::X64).status,
-              lifter::TranslateStatus::Unsupported);
-    const wvmp::u8 dqu[] = {0xF3, 0x0F, 0x6F, 0xC1};
-    EXPECT_EQ(translate_bytes(x64, dqu, ir::Arch::X64).status,
-              lifter::TranslateStatus::Unsupported);
+    // movdqa/movdqu (66/F3 0F 6F) 已由 MIT-428 (G1d) 折叠入面 — 原砍面
+    // 负例断言移除 (翻转闭环), 方向矩阵与 VEX 镜像见 MIT-428 测试块。
     // D3 不本单: pmovmskb 66 0F D7 / pcmpeqd 66 0F 76 → gate。
     const wvmp::u8 pmskb[] = {0x66, 0x0F, 0xD7, 0xC0};
     EXPECT_EQ(translate_bytes(x64, pmskb, ir::Arch::X64).status,
@@ -2828,6 +2822,155 @@ TEST_F(LifterTranslate, MovdBridgeGatedFaces) {
     // B.3: vpaddq 随 paddq 本体砍面 → gate (G6a ④ 保持)。
     const wvmp::u8 vpaddq[] = {0xC4, 0xE1, 0xF1, 0xD4, 0xC1};
     EXPECT_EQ(translate_bytes(x64, vpaddq, ir::Arch::X64).status,
+              lifter::TranslateStatus::Unsupported);
+}
+
+// ==================== MIT-428 (G1d): movdqa/movdqu 对齐传送 ====================
+//
+// 判据基线 = vendored capstone 5.0.6 probe 实测 (2026-08-31, 报告对照表):
+// MOVDQA id=468 / MOVDQU id=469 (legacy 66/F3 0F 6F/7F) / VMOVDQA id=1028 /
+// VMOVDQU id=1033 (VEX) / VMOVDQA32 1026 / VMOVDQA64 1027 (EVEX, 不入面)。
+// §A.4 方向 probe 实测钉死: 6F (reg 字段=dst) 与 7F (rm 字段=dst, reg,reg
+// 反写合法形) 双编码 capstone 均归一化 dst-first 报操作数 — 零调度层修正。
+
+TEST_F(LifterTranslate, MovdqaMovdquEncodingDirectionMatrix) {
+    // ---- 双编码 reg-reg: 6F 与 7F 反写形折叠结果一致 (probe 归一化钉) ----
+    // 66 0F 6F C1: movdqa xmm0, xmm1 (reg 字段=dst) → (Movaps,S64) 全宽拷贝
+    const wvmp::u8 dqa_6f[] = {0x66, 0x0F, 0x6F, 0xC1};
+    auto r1 = translate_bytes(x64, dqa_6f, ir::Arch::X64);
+    ASSERT_EQ(r1.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r1.insn.op, ir::Op::Movaps);
+    EXPECT_EQ(r1.insn.size, ir::Size::S64);
+    EXPECT_EQ(r1.insn.updates_flags, false);
+    ASSERT_EQ(r1.insn.dst.kind, ir::Operand::Kind::Reg);
+    EXPECT_EQ(r1.insn.dst.reg, ir::Reg::Rax);   // 借用 0 = xmm0 (dst)
+    ASSERT_EQ(r1.insn.src.kind, ir::Operand::Kind::Reg);
+    EXPECT_EQ(r1.insn.src.reg, ir::Reg::Rcx);   // 借用 1 = xmm1 (src)
+    // 66 0F 7F C8: movdqa xmm0, xmm1 (rm 字段=dst 反写形) — capstone 归一化
+    // dst-first, 折叠与 6F 形逐字段一致 (§A.4 probe: op[0] access=W)
+    const wvmp::u8 dqa_7f_rev[] = {0x66, 0x0F, 0x7F, 0xC8};
+    auto r2 = translate_bytes(x64, dqa_7f_rev, ir::Arch::X64);
+    ASSERT_EQ(r2.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r2.insn.op, ir::Op::Movaps);
+    EXPECT_EQ(r2.insn.dst.reg, ir::Reg::Rax);
+    EXPECT_EQ(r2.insn.src.reg, ir::Reg::Rcx);
+    // F3 0F 6F C1 / F3 0F 7F C8: movdqu 双编码 → (Movups,S64)
+    const wvmp::u8 dqu_6f[] = {0xF3, 0x0F, 0x6F, 0xC1};
+    auto r3 = translate_bytes(x64, dqu_6f, ir::Arch::X64);
+    ASSERT_EQ(r3.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r3.insn.op, ir::Op::Movups);
+    EXPECT_EQ(r3.insn.dst.reg, ir::Reg::Rax);
+    EXPECT_EQ(r3.insn.src.reg, ir::Reg::Rcx);
+    const wvmp::u8 dqu_7f_rev[] = {0xF3, 0x0F, 0x7F, 0xC8};
+    auto r4 = translate_bytes(x64, dqu_7f_rev, ir::Arch::X64);
+    ASSERT_EQ(r4.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r4.insn.op, ir::Op::Movups);
+    EXPECT_EQ(r4.insn.dst.reg, ir::Reg::Rax);
+    EXPECT_EQ(r4.insn.src.reg, ir::Reg::Rcx);
+
+    // ---- mem 双向: load (6F) → XmmLoad 载体 / store (7F) → XmmStore 载体 ----
+    // 66 0F 6F 01: movdqa xmm0, [rcx] → (Movaps,S64, mem src)
+    const wvmp::u8 dqa_ld[] = {0x66, 0x0F, 0x6F, 0x01};
+    auto r5 = translate_bytes(x64, dqa_ld, ir::Arch::X64);
+    ASSERT_EQ(r5.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r5.insn.op, ir::Op::Movaps);
+    ASSERT_EQ(r5.insn.dst.kind, ir::Operand::Kind::Reg);
+    EXPECT_EQ(r5.insn.dst.reg, ir::Reg::Rax);
+    ASSERT_EQ(r5.insn.src.kind, ir::Operand::Kind::Mem);
+    EXPECT_EQ(r5.insn.src.mem.base, ir::Reg::Rcx);
+    // 66 0F 7F 01: movdqa [rcx], xmm0 → (Movaps,S64, mem dst) = XmmStore
+    const wvmp::u8 dqa_st[] = {0x66, 0x0F, 0x7F, 0x01};
+    auto r6 = translate_bytes(x64, dqa_st, ir::Arch::X64);
+    ASSERT_EQ(r6.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r6.insn.op, ir::Op::Movaps);
+    ASSERT_EQ(r6.insn.dst.kind, ir::Operand::Kind::Mem);
+    EXPECT_EQ(r6.insn.dst.mem.base, ir::Reg::Rcx);
+    ASSERT_EQ(r6.insn.src.kind, ir::Operand::Kind::Reg);
+    EXPECT_EQ(r6.insn.src.reg, ir::Reg::Rax);
+    // F3 0F 6F 01 / F3 0F 7F 01: movdqu mem 双向 → (Movups,S64)
+    const wvmp::u8 dqu_ld[] = {0xF3, 0x0F, 0x6F, 0x01};
+    auto r7 = translate_bytes(x64, dqu_ld, ir::Arch::X64);
+    ASSERT_EQ(r7.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r7.insn.op, ir::Op::Movups);
+    ASSERT_EQ(r7.insn.src.kind, ir::Operand::Kind::Mem);
+    EXPECT_EQ(r7.insn.src.mem.base, ir::Reg::Rcx);
+    const wvmp::u8 dqu_st[] = {0xF3, 0x0F, 0x7F, 0x01};
+    auto r8 = translate_bytes(x64, dqu_st, ir::Arch::X64);
+    ASSERT_EQ(r8.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r8.insn.op, ir::Op::Movups);
+    ASSERT_EQ(r8.insn.dst.kind, ir::Operand::Kind::Mem);
+    EXPECT_EQ(r8.insn.dst.mem.base, ir::Reg::Rcx);
+
+    // ---- rip 形式 (408 通路): 66 0F 6F 05 disp32 → mem base=Rip ----
+    const wvmp::u8 dqa_rip[] = {0x66, 0x0F, 0x6F, 0x05, 0x10, 0x00, 0x00, 0x00};
+    auto r9 = translate_bytes(x64, dqa_rip, ir::Arch::X64);
+    ASSERT_EQ(r9.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r9.insn.op, ir::Op::Movaps);
+    ASSERT_EQ(r9.insn.src.kind, ir::Operand::Kind::Mem);
+    EXPECT_EQ(r9.insn.src.mem.base, ir::Reg::Rip);
+    const wvmp::u8 dqu_rip[] = {0xF3, 0x0F, 0x7F, 0x05, 0x10, 0x00, 0x00, 0x00};
+    auto r10 = translate_bytes(x64, dqu_rip, ir::Arch::X64);
+    ASSERT_EQ(r10.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r10.insn.op, ir::Op::Movups);
+    ASSERT_EQ(r10.insn.dst.kind, ir::Operand::Kind::Mem);
+    EXPECT_EQ(r10.insn.dst.mem.base, ir::Reg::Rip);
+}
+
+TEST_F(LifterTranslate, VexVmovdqaVmovdquMirror) {
+    // B.2 VEX 镜像 (probe 实测 id: VMOVDQA 1028 / VMOVDQU 1033):
+    // C5/C4 双编码 × dqa/dqu 双形式直折既有 Mov 通路 (426 D4 先例);
+    // ymm 位宽闸 + xmm8..15 闸继承 translate_vex128。
+    // C5 F9 6F C1: vmovdqa xmm0, xmm1 (C5 2B VEX) → (Movaps,S64)
+    const wvmp::u8 vdqa_c5[] = {0xC5, 0xF9, 0x6F, 0xC1};
+    auto r1 = translate_bytes(x64, vdqa_c5, ir::Arch::X64);
+    ASSERT_EQ(r1.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r1.insn.op, ir::Op::Movaps);
+    EXPECT_EQ(r1.insn.size, ir::Size::S64);
+    EXPECT_EQ(r1.insn.dst.reg, ir::Reg::Rax);
+    EXPECT_EQ(r1.insn.src.reg, ir::Reg::Rcx);
+    // C4 E1 F9 6F C1: vmovdqa xmm0, xmm1 (C4 3B VEX, WIG)
+    const wvmp::u8 vdqa_c4[] = {0xC4, 0xE1, 0xF9, 0x6F, 0xC1};
+    auto r2 = translate_bytes(x64, vdqa_c4, ir::Arch::X64);
+    ASSERT_EQ(r2.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r2.insn.op, ir::Op::Movaps);
+    // C5 FA 6F C1: vmovdqu xmm0, xmm1 (C5, pp=F3) → (Movups,S64)
+    const wvmp::u8 vdqu_c5[] = {0xC5, 0xFA, 0x6F, 0xC1};
+    auto r3 = translate_bytes(x64, vdqu_c5, ir::Arch::X64);
+    ASSERT_EQ(r3.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r3.insn.op, ir::Op::Movups);
+    // C4 E1 7A 6F C1: vmovdqu xmm0, xmm1 (C4, pp=F3 — probe 修正: 3B VEX
+    // byte3 pp=F3=10b → 0x7A, 误编 0x7F 带错误 mmmmm 不可解码)
+    const wvmp::u8 vdqu_c4[] = {0xC4, 0xE1, 0x7A, 0x6F, 0xC1};
+    auto r4 = translate_bytes(x64, vdqu_c4, ir::Arch::X64);
+    ASSERT_EQ(r4.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r4.insn.op, ir::Op::Movups);
+    // C5 F9 7F 01: vmovdqa [rcx], xmm0 (store 方向) → XmmStore 载体
+    const wvmp::u8 vdqa_st[] = {0xC5, 0xF9, 0x7F, 0x01};
+    auto r5 = translate_bytes(x64, vdqa_st, ir::Arch::X64);
+    ASSERT_EQ(r5.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r5.insn.op, ir::Op::Movaps);
+    ASSERT_EQ(r5.insn.dst.kind, ir::Operand::Kind::Mem);
+    EXPECT_EQ(r5.insn.dst.mem.base, ir::Reg::Rcx);
+    // xmm8..15 闸: C4 41 F9 6F C0 (vmovdqa xmm8, xmm0 — probe 实测报
+    // reg=130 xmm8) → xmm_idx 不可映射 → gate (426 §F.3 同口径)
+    const wvmp::u8 vdqa_x8[] = {0xC4, 0x41, 0xF9, 0x6F, 0xC0};
+    EXPECT_EQ(translate_bytes(x64, vdqa_x8, ir::Arch::X64).status,
+              lifter::TranslateStatus::Unsupported);
+    // ymm 位宽闸: C5 FD 6F C1 (vmovdqa ymm0, ymm1 — op.size=32, 同 mnemonic
+    // 覆盖 128/256 两宽, B.4 陷阱) → gate; vmovdqu ymm 同
+    const wvmp::u8 vdqa_ymm[] = {0xC5, 0xFD, 0x6F, 0xC1};
+    EXPECT_EQ(translate_bytes(x64, vdqa_ymm, ir::Arch::X64).status,
+              lifter::TranslateStatus::Unsupported);
+    const wvmp::u8 vdqu_ymm[] = {0xC5, 0xFE, 0x6F, 0xC1};
+    EXPECT_EQ(translate_bytes(x64, vdqu_ymm, ir::Arch::X64).status,
+              lifter::TranslateStatus::Unsupported);
+    // EVEX 不入面 (独立 INS id 天然 gate, 426 §F.3 同款): 62 F1 7D 08 6F C1
+    // (vmovdqa32 xmm0, xmm1 — probe 实测 id=1026) / vmovdqa64 id=1027
+    const wvmp::u8 evex32[] = {0x62, 0xF1, 0x7D, 0x08, 0x6F, 0xC1};
+    EXPECT_EQ(translate_bytes(x64, evex32, ir::Arch::X64).status,
+              lifter::TranslateStatus::Unsupported);
+    const wvmp::u8 evex64[] = {0x62, 0xF1, 0xFD, 0x08, 0x6F, 0xC1};
+    EXPECT_EQ(translate_bytes(x64, evex64, ir::Arch::X64).status,
               lifter::TranslateStatus::Unsupported);
 }
 

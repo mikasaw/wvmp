@@ -175,22 +175,75 @@
   IR 层 (Op::Movss, src2=imm 19..21) 载体标记（19=GP→xmm / 20=xmm→GP /
   21=xmm→xmm 清零拷贝；域 14..18 连续后延，movss 常规构造从不写 src2）。
   kVmOpMax 95→97（跳表余量 30）。multiseed 44 样本 × 5 = 220/220。
+- **MIT-428 (G1d) 收口 (2026-08-31)**：SSE2 对齐传送 movdqa/movdqu
+  （66/F3 0F 6F load + 66/F3 0F 7F store，id 468/469）零新 VmOp 折叠入面
+  （translate_sse_mov 直复用，与 movaps/movups 全宽 16B 拷贝语义同构；
+  §A.4 方向 probe 实测 6F/7F 双编码 reg-reg capstone 均归一化 dst-first，
+  零调度层修正；VEX vmovdqa/vmovdqu 1028/1033 经 vex_desc_of 镜像入面）；
+  427 桥样本 C++ intrinsic 负例翻转闭环（cpp_movdqu_neg 全翻真虚拟化、
+  cpp_movdqa_neg movdqa 翻走仅剩 punpck 族 gate）。详见下节 G1d。
 - **不支持面（越界即 C1 gate 兜底）**：SSE2 整数算术档② paddq/psubq
   （**真值 66 0F D4 / 66 0F FB**——425 原文 "D4/5C" 的 5C 有误
   （5C=SUBPD），MIT-427 派单自纠 "paddq=66 0F FC" 亦误（FC=PADDB），
   #33 probe 实测钉死）——B.2 频率双向授权砍面：实测 6 二进制
   854,020 指令 psubq=0、paddq=16（全部 shell32.dll，其余二进制 0，
   约 0.002%）且与砍面 movdqa 共生（/Od intrinsic probe 实测 paddq 必伴随
-  movdqa 溢出）→ 支持面不可达，砍面留档按频率单开；movdqa/movdqu
-  （66/F3 0F 6F/7F，id 468/469）——/Od intrinsic 溢出高频形态（notepad
-  60+34、shell32 1201+558），后续按频率单开；pmovmskb（66 0F D7）/
-  pcmpeq/pcmpgt 系（SSE 整数比较族）；AVX/VEX 残余面（档A 已收口
+  movdqa 溢出）→ 支持面不可达，砍面留档按频率单开（**movdqa/movdqu 一半
+  已由 MIT-428/G1d 翻转——paddq/psubq 本体仍砍面**，本体翻转需重测频率
+  与 G1d 通路叠加）；pmovmskb（66 0F D7）/ pcmpeq/pcmpgt 系（SSE 整数
+  比较族）/ punpckldq/punpcklqdq（66 0F 62/6C 交织语义，D4 裁决非纯拷贝
+  不入拷贝通路）；AVX/VEX 残余面（档A 已收口
   38 id V-pair，精确残余见下节 G6a——VEX-GP BMI/ymm/FMA/加密/EVEX
   保持 gate）。
   （string movsd 双形态已由 MIT-415 收口，见 G3 节；
   x87 已拆出独立小节，见下节 "x87 (永久 gate, R3 裁决)"——不是简单"不支持
   兜底"，而是有独立频率数据与行为承诺的裁决面。）
 - 注意与重定位/ASLR 的配合：RVA + image_base 在运行时还原，不依赖静态 VA。
+
+## G1d SSE2 对齐传送 movdqa/movdqu（MIT-428 收口：零新 VmOp 折叠 + 427 桥溢出负例翻转）
+
+**状态（2026-08-31，MIT-428，G1d 落地）**：movdqa/movdqu（legacy 66/F3
+0F 6F load / 66/F3 0F 7F store，id 468/469）+ VEX vmovdqa/vmovdqu（1028/
+1033）零新 VmOp 折叠入面——语义 = 16B 全宽拷贝，与 movaps/movups 同构，
+lifter 两个 case 直复用 `translate_sse_mov`（(Movaps,S64)/(Movups,S64)
+既有载体，REG 三形 + mem 408 通路全现成）；VEX 经 426 `vex_desc_of`
+Fam::Mov 挂载（D4 纯拷贝 2-op 直折先例）。**零新 VmOp（kVmOpMax=97 不动）、
+零新 handler、translator/asmgen/VM 逐字节不动**（dump 门 SSE_HANDLERS
+集合恒等 = 零新 VmOp 机器证明，426 §D.7 同款）。
+
+**§A.4 编码方向矩阵（#33 probe 实测，vendored capstone 5.0.6，2026-08-31）**：
+movdqa/movdqu 仅 6F（load）/7F（store）两 opcode，但 **reg,reg 形态两编码
+都能编**（66/F3 0F 7F reg,reg = rm 字段为 dst 的反写合法形）。probe 实测
+（每编码×每形态）：6F（reg 字段=dst）与 7F（rm 字段=dst，如 66 0F 7F C8）
+双编码 capstone **均归一化为 dst-first 报操作数**（access W 位钉死）——
+先验 "7F 反写需调度层手动换位" 被实测推翻，`translate_sse_mov` 零方向
+修正。EVEX VMOVDQA32/64/8/16（x86.h:1413-1419，62 前缀独立 INS id）显式
+不入面 → 白名单外 C1 gate；ymm（C5 FD/FE 6F）由 translate_vex128 位宽闸
+按操作数 32B 拒；xmm8..15 由 xmm_idx 不可映射拒（426 §F.3 同口径）。
+
+**对齐语义（D2 沿用 375 :1188 先例）**：movdqa 对齐陷阱 #GP 不模拟——
+mem 形式折 XmmLoad/XmmStore（408 通路，运行时 movups 非对齐宽松语义）；
+reg-reg 折 Op::Movaps（handler 中间行 = native movaps xmm0, xmm1 寄存器
+形态，无对齐语义面）。D2 对账实测：既有 build_movaps 与 build_movups
+handler 唯一差异 = 中间行助记符（寄存器间拷贝无对齐分叉），槽位读写全走
+movups——**无对齐强校验分叉需统一**。宽松化论证：MSVC /Od 产物仅对保证
+对齐的目标（__m128i 16B 对齐栈槽 / alignas 全局）emit movdqa，运行时分歧
+仅存在于程序显式依赖 #GP trap 的场景（真实代码不存在）；native 对非对齐
+地址 movdqa 会 #GP 而 VM 宽松放行——known compromise，样本行为钉用
+movdqu 非对齐栈槽/全局（⑥⑨）与 movdqa 对齐栈槽/全局（⑤⑦⑧）配对表达。
+
+**样本**：`wvmp_aligned_mov_sample`（正例 12 区真虚拟化：movdqa/movdqu
+双编码 × reg-reg/栈槽/rip 三形态 + VEX vmovdqa/vmovdqu 三形 + /Od
+intrinsic 翻转正例 3 函数；负例 4 族函数级 gate 可调用 byte-exact：
+EVEX vmovdqa32 / vpaddd ymm / punpcklqdq / pmovmskb）+
+`wvmp_aligned_mov_xmm_readback_sample`（9 探针 ctx.xmm 8 槽全量读回：
+16B 全宽高位语义 / 7F 反写归一化 / 对齐与非对齐栈槽 / rip load+store /
+VEX 双形式）。multiseed 46 样本 × 5 = **230/230**。
+
+**残余（精确登记，防误当漏项）**：punpckldq/punpcklqdq（66 0F 62/6C，
+交织语义非纯拷贝——D4 裁决，427 桥样本 cpp_movdqa_neg 由此保持 gate）/
+pmovmskb（66 0F D7）/ pcmpeq/pcmpgt 系 / paddq/psubq 本体（66 0F D4/FB
+砍面）+ G8-BMI + 档B ymm + EVEX 全谱——照旧 C1 gate。
 
 ## G6a VEX.128 档A（MIT-426 收口：38 id V-pair 三地址折叠，零新 VmOp）
 

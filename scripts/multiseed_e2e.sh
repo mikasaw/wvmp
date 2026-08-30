@@ -231,6 +231,13 @@ samples=(
     # 单边新增 2 样本 → 44 × 5 = 220 runs。
     "build/passes/marker_scan/tests/wvmp_sse_bridge_sample.exe"
     "build/passes/marker_scan/tests/wvmp_sse_bridge_xmm_readback_sample.exe"
+    # MIT-428 (G1d): movdqa/movdqu 对齐传送主样本 + ctx.xmm 读回影子样本 —
+    # 双编码 (6F/7F 反写) × 三形态 (reg-reg/栈槽/rip) + VEX vmovdqa/vmovdqu +
+    # /Od intrinsic 翻转正例 (427 #33④ 闭环); 负例区 EVEX vmovdqa32/vpaddd
+    # ymm/punpcklqdq/pmovmskb 各自函数级 gate 可调用 byte-exact。
+    # 单边新增 2 样本 → 46 × 5 = 230 runs。
+    "build/passes/marker_scan/tests/wvmp_aligned_mov_sample.exe"
+    "build/passes/marker_scan/tests/wvmp_aligned_mov_xmm_readback_sample.exe"
 )
 
 # Seeds: 1 (small), 12345 (default), 99999 (large), 0xDEADBEEF (magic), 0xCAFEBABE (magic).

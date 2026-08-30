@@ -1004,3 +1004,44 @@ target_compile_options(wvmp_sse_bridge_xmm_readback_sample PRIVATE
 target_link_options(wvmp_sse_bridge_xmm_readback_sample PRIVATE
     $<$<CXX_COMPILER_ID:MSVC>:/INCREMENTAL:NO>
 )
+
+# MIT-428 (G1d): movdqa/movdqu 对齐传送主样本 — 双编码 (6F/7F 反写 db 直发)
+# × 三形态 (reg-reg / 栈槽 对齐+非对齐 / rip 对齐 load+store 与非对齐 store)
+# + VEX vmovdqa/vmovdqu (rr 双向 + rip store) + /Od intrinsic 翻转正例 3 函数
+# (427 #33④ 闭环: movd/movq 桥 + movdqa/movdqu spill 共存形态真虚拟化)。
+# 负例区 (函数级分区, 各自整函数 gate 可调用, 行为 byte-exact): EVEX
+# vmovdqa32 (id=1026 白名单外) / vpaddd ymm (位宽闸) / punpcklqdq (D4 交织) /
+# pmovmskb (D3)。本机 AVX2 + AVX-512F/VL 在位 (cpuid probe 2026-08-31)。
+enable_language(ASM_MASM)
+add_executable(wvmp_aligned_mov_sample
+    aligned_mov_sample_main.cpp
+    aligned_mov_sample_asm.asm
+)
+target_link_libraries(wvmp_aligned_mov_sample PRIVATE wvmp::sdk)
+target_compile_options(wvmp_aligned_mov_sample PRIVATE
+    $<$<AND:$<CXX_COMPILER_ID:MSVC>,$<COMPILE_LANGUAGE:C,CXX>>:/Od;/Ob0;/utf-8>
+    $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-O0>
+)
+target_link_options(wvmp_aligned_mov_sample PRIVATE
+    $<$<CXX_COMPILER_ID:MSVC>:/INCREMENTAL:NO>
+)
+
+# MIT-428 (G1d): 影子样本 — 既有 Movaps/Movups handler 的 ctx.xmm 运行时
+# 读回断言 (#79 纪律, 与主样本同能力面配对、独立 exe)。9 探针 (位图案全 8
+# 槽预载 + 区域后 8 槽 × 2×u64 全量落盘): 16B 全宽拷贝 (高位 = 源高位, 与
+# 427 桥清零语义对照) / 7F 反写形归一化 / 对齐栈槽 + 非对齐栈槽 (movups
+# 宽松语义行为钉) / rip load+store / VEX 双形式。零新 handler → dump 门
+# SSE_HANDLERS 集合恒等 = 零新 VmOp 机器证明 (426 §D.7)。
+enable_language(ASM_MASM)
+add_executable(wvmp_aligned_mov_xmm_readback_sample
+    aligned_mov_xmm_readback_sample_main.cpp
+    aligned_mov_xmm_readback_sample_asm.asm
+)
+target_link_libraries(wvmp_aligned_mov_xmm_readback_sample PRIVATE wvmp::sdk)
+target_compile_options(wvmp_aligned_mov_xmm_readback_sample PRIVATE
+    $<$<AND:$<CXX_COMPILER_ID:MSVC>,$<COMPILE_LANGUAGE:C,CXX>>:/Od;/Ob0;/utf-8>
+    $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-O0>
+)
+target_link_options(wvmp_aligned_mov_xmm_readback_sample PRIVATE
+    $<$<CXX_COMPILER_ID:MSVC>:/INCREMENTAL:NO>
+)
