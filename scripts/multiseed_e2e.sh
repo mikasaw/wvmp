@@ -85,6 +85,14 @@
 #     note 披露; 负例 lock mov/lock nop db 直发 → capstone 拒解码 → C1
 #     gate, 原生 #UD 禁入可执行路径, gate 证据 = protect 日志; REQUIRE_REAL
 #     8 函数真虚拟化)。单边新增 1 样本 → 37 × 5 = 185 runs。
+#   - MIT-423 (G4b): extend to wvmp_atomic_incdec_sample (lock inc/dec 原子
+#     补齐主样本: MASM 裸 lock inc/dec dword/qword 双宽 + rip 目标 + dec
+#     r8d;jnz 循环计数惯用法 + add→CF→lock inc→jc CF 保真探针 (SDM: inc/
+#     dec 不写 CF) 本体折条真虚拟化 (D1 零新 VmOp, lock-strip note); C++
+#     _InterlockedIncrement/Decrement 真产物区域 (#33 实测 cl v145 产
+#     lock xadd ±1 内联 — 走 419 Xadd 原子通路); 负例 lock not (D2 gate,
+#     可调用, 原生行为保真) + lock inc ecx (reg-dst 非法, db 直发, 禁调用)。
+#     单边新增 1 样本 → 38 × 5 = 190 runs。
 #   - MIT-306: REQUIRE_REAL=1 校验日志含 "已生成 N 个入口 stub" 防止 C1 gate
 #     兜底被误判 PASS（仅 byte-exact 不够, C1 gate 函数被跳过仍能输出相同
 #     stdout+rc）。与 multiseed_e2e_real.sh 配套使用。
@@ -185,6 +193,11 @@ samples=(
     # 8 函数); 负例 lock mov/lock nop db 直发 → capstone 拒解码 → C1 gate
     # (原生 #UD 禁入可执行路径, main 只取地址, gate 证据 = protect 日志)。
     "build/passes/marker_scan/tests/wvmp_atomic_ops_sample.exe"
+    # MIT-423 (G4b): lock inc/dec 原子补齐主样本 — MASM 裸 lock inc/dec
+    # dword/qword + rip 目标 + dec/jnz 循环 + CF 保真探针本体折条真虚拟化
+    # (REQUIRE_REAL ≥1 stub); C++ _Interlocked* 真产物区域 (lock xadd ±1
+    # 内联展开); 负例 lock not (D2 gate, 可调用) + lock inc ecx (禁调用)。
+    "build/passes/marker_scan/tests/wvmp_atomic_incdec_sample.exe"
 )
 
 # Seeds: 1 (small), 12345 (default), 99999 (large), 0xDEADBEEF (magic), 0xCAFEBABE (magic).

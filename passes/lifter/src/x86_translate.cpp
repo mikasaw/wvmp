@@ -1428,12 +1428,20 @@ enum : int { kStrMovs = 0, kStrStos = 1, kStrScas = 2, kStrCmps = 3, kStrLods = 
 //     沿用 G3 串指令 "Op::Mov + src2=imm(family)" 载体先例)
 //   - 9..11: 本体 op 族 (ALU/Cmpxchg/Xchg — op 字段已表达语义, 标记仅声明
 //     "曾带 lock 前缀", 供翻译器发 lock-strip note 且不影响本体折条)
+//   - 12..13: 本体 op 族 (Inc/Dec — MIT-423 G4b; 本体通路 translate_unary
+//     已有, 标记仅声明"曾带 lock", 供翻译器发 note 后派发回本体折条)。
+//     载体域对账 (MIT-423 B.1, 419 铁律第 4 次教训): src2=imm **任意值**
+//     写入点全仓仅 translate_imul 3-op 形式一处 (op=Imul 不入
+//     is_lock_carrier_op, 12/13 不误拦 — 回归用例锁死); 其余写点全为上列
+//     固定标记值。Inc/Dec 唯一构造点 translate_unary 不写 src2 (Operand
+//     默认 kind=None, operand.hpp), 加进 is_lock_carrier_op 无碰撞面。
 enum : int {
     kLockXadd = 5, kLockBts = 6, kLockBtr = 7, kLockBtc = 8,
-    kLockStripAlu = 9, kLockStripCmpxchg = 10, kLockStripXchg = 11
+    kLockStripAlu = 9, kLockStripCmpxchg = 10, kLockStripXchg = 11,
+    kLockInc = 12, kLockDec = 13
 };
 constexpr int kLockMarkerMin = kLockXadd;
-constexpr int kLockMarkerMax = kLockStripXchg;
+constexpr int kLockMarkerMax = kLockDec;
 
 // id → 串指令族 (nullopt = 非串指令)。MOVSD 双形态由调用方按操作数形状区分。
 std::optional<int> string_family_of(x86_insn id) {
@@ -1546,10 +1554,13 @@ TranslateResult translate_string_op(const cs_insn& ci, const cs_x86& x, ir::Arch
 //         单指令直执行 — 硬件原子性保真, D1 折条妥协不适用本指令)
 //       bts/btr/btc × dst=Mem × (src=Reg | src=Imm 0..255) (InterlockedBitTest*
 //         真产物 = imm8 形式, D3) → Op::Mov 载体 + src2=kLockBts/Btr/Btc
-//   - 其余 lock 组合 (reg-dst / lock inc/dec/not/neg / 不可锁助记符 /
-//     lock+rep 串=undefined / 66 16 位操作数 / 67 地址宽) 照旧拒 → C1 gate。
-//     lock inc/dec 是合法编码但不在派活单族面 (MSVC _InterlockedIncrement
-//     真产物, 频率实证于报告 §F — 残余登记, 未来单)。
+//       inc/dec × dst=Mem (S32/S64)                            → translate_unary
+//         本体折条 + 标记 (MIT-423 G4b; D1 零新 VmOp — _InterlockedIncrement/
+//         Decrement 真产物实测为 lock xadd +1 走 Xadd 硬件原子通路, 裸
+//         lock inc/dec 无 MSVC 产物, 折条撕裂窗口同 ALU 族)
+//   - 其余 lock 组合 (reg-dst / lock not/neg (D2: 合法编码但无 MSVC 产物,
+//     gate) / 不可锁助记符 / lock+rep 串=undefined / 66 16 位操作数 / 67
+//     地址宽) 照旧拒 → C1 gate。
 //
 // IR 编码 (ir::Insn 冻结契约, 零碰撞):
 //   - 本体 op 族: op 不变 + src2=imm(kLockStrip*) — 普通 alu/cmpxchg/xchg 的
@@ -1669,8 +1680,33 @@ TranslateResult translate_lock_op(const cs_insn& ci, const cs_x86& x, ir::Arch a
         out.updates_flags = true;  // 仅 CF 有定义 (SDM), setcc5 捕 host CPU 真值
         return ok(out);
     }
+    case X86_INS_INC: case X86_INS_DEC: {
+        // MIT-423 (G4b): lock inc/dec [m] — 本体通路折条 (D1: 零新 VmOp,
+        // translate_unary mem 拆条 Load+Inc/Dec+Store, 撕裂窗口同 ALU 族;
+        // _InterlockedIncrement/Decrement 真产物实测是 lock xadd +1 → 走
+        // 419 已有 Xadd 硬件原子通路, 裸 lock inc/dec 仅手写/第三方形态,
+        // 无 MSVC 产物 — probe 实测 2026-08-30, 见报告 B.3)。
+        // mem-dst 唯一合法形状 (lock 必须作用内存操作数; reg-dst `lock inc
+        // ecx` capstone 实测拒解码 → skipped_ranges 通道, 形状检查防御收口)。
+        // 宽度 S32/S64 (S8 FE /0 编码合法但 MSVC 无产物 — 无 InterlockedInc8
+        // intrinsic, 保守 gate; S16 66 前缀入口已拒)。
+        if (x.op_count != 1 || x.operands[0].type != X86_OP_MEM)
+            return unsupported(ci.address, ci.size);
+        const Size sz = data_size(x.operands, x.op_count, arch);
+        if (sz != Size::S32 && sz != Size::S64)
+            return unsupported(ci.address, ci.size);  // S8/S16 gate (B.2 pin)
+        auto r = translate_unary(ci, x0, arch,
+                                 ci.id == X86_INS_INC ? Op::Inc : Op::Dec,
+                                 /*sets_flags=*/true);
+        if (r.status != TranslateStatus::Ok) return r;
+        r.insn.src2 = Operand::imm_(ci.id == X86_INS_INC ? kLockInc : kLockDec);
+        return ok(r.insn);
+    }
     default:
-        // lock mov/inc/dec/not/neg/rep 组合等白名单外 → 照旧 gate。
+        // lock not/neg (SDM 合法编码 F7 /2、/3, capstone 实测 id=511/509 可
+        // 解到此 default — D2 裁决: 无 MSVC 产物 (无 InterlockedNot/Neg
+        // intrinsic), 继续 gate, GAPS 残余精确化) / lock mov/lock nop/rep
+        // 组合等白名单外 → 照旧 gate。
         // (capstone 对 F0 89 18 lock mov / F0 90 lock nop 直接拒解码 → 无
         // detail → 上游 skipped_ranges 通道; 到不了本函数的组合由形状检查拒)
         return unsupported(ci.address, ci.size);

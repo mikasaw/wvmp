@@ -1220,13 +1220,11 @@ TEST_F(LifterTranslate, SkippedInstructions) {
     EXPECT_EQ(translate_bytes(x64, cpuid, ir::Arch::X64).status,
               lifter::TranslateStatus::Unsupported);
 
-    // F0 FF 00: lock inc [rax] —— lock 族白名单外 (MSVC _InterlockedIncrement
-    // 真产物, 派活单族面外 → §F 残余登记, 照旧 gate)
-    const wvmp::u8 lock_inc[] = {0xF0, 0xFF, 0x00};
-    EXPECT_EQ(translate_bytes(x64, lock_inc, ir::Arch::X64).status,
-              lifter::TranslateStatus::Unsupported);
+    // (MIT-423 G4b 前: lock inc [rax] 曾在此断言 Unsupported — 白名单已收
+    // 入面, 正例迁移至 LockIncDecLifted。)
 
-    // F0 F6 10: lock not byte ptr [rax] —— 不可锁助记符 (D2 砍面)
+    // F0 F6 10: lock not byte ptr [rax] —— D2 裁决 gate (编码合法, 无 MSVC
+    // 产物; F7 /2 dword 形同此 — LockIncDecNegative 覆盖)
     const wvmp::u8 lock_not[] = {0xF0, 0xF6, 0x10};
     EXPECT_EQ(translate_bytes(x64, lock_not, ir::Arch::X64).status,
               lifter::TranslateStatus::Unsupported);
@@ -1402,6 +1400,121 @@ TEST_F(LifterTranslate, LockOpsLifted) {
     ASSERT_EQ(r15.status, lifter::TranslateStatus::Ok);
     EXPECT_EQ(r15.insn.size, ir::Size::S64);
     EXPECT_EQ(r15.insn.op, ir::Op::Cmpxchg);
+}
+
+// MIT-423 (G4b): lock inc/dec 白名单 — 本体通路折条 (D1: 零新 VmOp)。
+// 标记域 12..13 (kLockInc/kLockDec) — 载体域对账见 translate_lock_op 枚举
+// 注释 (src2=imm 任意值写入点全仓仅 translate_imul, Inc/Dec 唯一构造点
+// translate_unary 不写 src2)。
+TEST_F(LifterTranslate, LockIncDecLifted) {
+    // ① F0 FF 00: lock inc [rax] — Op::Inc + dst=Mem + src2=imm(12) + flags
+    const wvmp::u8 lock_inc[] = {0xF0, 0xFF, 0x00};
+    auto r = translate_bytes(x64, lock_inc, ir::Arch::X64);
+    ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r.insn.op, ir::Op::Inc);
+    EXPECT_EQ(r.insn.size, ir::Size::S32);
+    EXPECT_TRUE(r.insn.updates_flags);
+    ASSERT_EQ(r.insn.dst.kind, ir::Operand::Kind::Mem);
+    EXPECT_EQ(r.skipped_ranges.size(), 0u);
+    ASSERT_EQ(r.insn.src2.kind, ir::Operand::Kind::Imm);
+    EXPECT_EQ(r.insn.src2.imm, 12);  // kLockInc
+
+    // ② F0 48 FF 00: lock inc [rax] REX.W — S64 (_InterlockedIncrement64
+    //    真产物形态先验 — 实测 MSVC 产 lock xadd, 本形态属手写/第三方面)
+    const wvmp::u8 lock_inc64[] = {0xF0, 0x48, 0xFF, 0x00};
+    auto r2 = translate_bytes(x64, lock_inc64, ir::Arch::X64);
+    ASSERT_EQ(r2.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r2.insn.op, ir::Op::Inc);
+    EXPECT_EQ(r2.insn.size, ir::Size::S64);
+    ASSERT_EQ(r2.insn.src2.kind, ir::Operand::Kind::Imm);
+    EXPECT_EQ(r2.insn.src2.imm, 12);
+
+    // ③ F0 FF 08: lock dec [rax] — Op::Dec + src2=imm(13)
+    const wvmp::u8 lock_dec[] = {0xF0, 0xFF, 0x08};
+    auto r3 = translate_bytes(x64, lock_dec, ir::Arch::X64);
+    ASSERT_EQ(r3.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r3.insn.op, ir::Op::Dec);
+    EXPECT_EQ(r3.insn.size, ir::Size::S32);
+    EXPECT_TRUE(r3.insn.updates_flags);
+    ASSERT_EQ(r3.insn.src2.kind, ir::Operand::Kind::Imm);
+    EXPECT_EQ(r3.insn.src2.imm, 13);  // kLockDec
+
+    // ④ F0 48 FF 08: lock dec [rax] REX.W — S64
+    const wvmp::u8 lock_dec64[] = {0xF0, 0x48, 0xFF, 0x08};
+    auto r4 = translate_bytes(x64, lock_dec64, ir::Arch::X64);
+    ASSERT_EQ(r4.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r4.insn.op, ir::Op::Dec);
+    EXPECT_EQ(r4.insn.size, ir::Size::S64);
+    EXPECT_EQ(r4.insn.src2.imm, 13);
+
+    // ⑤ F0 FF 05 34 12 00 00: lock inc [rip+0x1234] — rip 目标 (64 位全局
+    //    计数器惯用形态)
+    const wvmp::u8 lock_inc_rip[] = {0xF0, 0xFF, 0x05, 0x34, 0x12, 0x00, 0x00};
+    auto r5 = translate_bytes(x64, lock_inc_rip, ir::Arch::X64);
+    ASSERT_EQ(r5.status, lifter::TranslateStatus::Ok);
+    ASSERT_EQ(r5.insn.dst.kind, ir::Operand::Kind::Mem);
+    EXPECT_EQ(r5.insn.dst.mem.base, ir::Reg::Rip);
+    EXPECT_EQ(r5.insn.src2.imm, 12);
+
+    // ⑥ F0 FF 40 05: lock inc [rax+5] (disp8) — 常规非 rip 内存
+    const wvmp::u8 lock_inc_disp[] = {0xF0, 0xFF, 0x40, 0x05};
+    auto r6 = translate_bytes(x64, lock_inc_disp, ir::Arch::X64);
+    ASSERT_EQ(r6.status, lifter::TranslateStatus::Ok);
+    ASSERT_EQ(r6.insn.dst.kind, ir::Operand::Kind::Mem);
+    EXPECT_EQ(r6.insn.dst.mem.base, ir::Reg::Rax);
+    EXPECT_EQ(r6.insn.dst.mem.disp, 5);
+}
+
+// MIT-423 (G4b): lock inc/dec 负例 + src2 载体域对账证据。
+TEST_F(LifterTranslate, LockIncDecNegative) {
+    // ① F0 FE 01: lock inc byte ptr [rcx] — S8 编码合法 (capstone 可解,
+    //    probe 实测 id=230) 但白名单 pin S32/S64 (MSVC 无字节宽 Interlocked
+    //    Increment 产物) → Unsupported + skipped_ranges (C1 gate)
+    const wvmp::u8 lock_inc_s8[] = {0xF0, 0xFE, 0x01};
+    auto r = translate_bytes(x64, lock_inc_s8, ir::Arch::X64, 0x1000);
+    ASSERT_EQ(r.status, lifter::TranslateStatus::Unsupported);
+    ASSERT_EQ(r.skipped_ranges.size(), 1u);
+    EXPECT_EQ(r.skipped_ranges[0].first, 0x1000u);
+    EXPECT_EQ(r.skipped_ranges[0].second, 3u);
+
+    // ② 66 F0 FF 01: lock inc word ptr [rcx] — 66 组合前缀 (prefix[0]=66,
+    //    bytes[0]=66) → D4 拒
+    const wvmp::u8 lock_inc_s16[] = {0x66, 0xF0, 0xFF, 0x01};
+    auto r2 = translate_bytes(x64, lock_inc_s16, ir::Arch::X64);
+    ASSERT_EQ(r2.status, lifter::TranslateStatus::Unsupported);
+
+    // ③ F0 F7 11 / F0 F7 19: lock not/neg dword [rcx] — SDM 合法编码
+    //    (capstone 实测 id=511/509 可解到 translate_lock_op default), D2
+    //    裁决: 无 MSVC 产物 (无 InterlockedNot/Neg intrinsic) → gate
+    const wvmp::u8 lock_not[] = {0xF0, 0xF7, 0x11};
+    auto r3 = translate_bytes(x64, lock_not, ir::Arch::X64, 0x2000);
+    ASSERT_EQ(r3.status, lifter::TranslateStatus::Unsupported);
+    ASSERT_EQ(r3.skipped_ranges.size(), 1u);
+    const wvmp::u8 lock_neg[] = {0xF0, 0xF7, 0x19};
+    auto r4 = translate_bytes(x64, lock_neg, ir::Arch::X64, 0x3000);
+    ASSERT_EQ(r4.status, lifter::TranslateStatus::Unsupported);
+
+    // ④ F0 FF C1: lock inc ecx (reg-dst) — 非法编码, capstone 拒解码
+    //    (probe 实测 DECODE FAIL) → 无 detail → skipped_ranges 通道
+    const wvmp::u8 lock_inc_ecx[] = {0xF0, 0xFF, 0xC1};
+    EXPECT_EQ(decode_first(x64, lock_inc_ecx), nullptr);
+
+    // ⑤ FF C1: plain inc ecx (reg-dst, 无 F0) — 本体通路照常, **src2 恒空**
+    //    (kind=None; 载体域对账证据: translate_unary 不写 src2, Operand
+    //    默认 kind=None — is_lock_carrier_op 加 Inc/Dec 无碰撞面的依据)
+    const wvmp::u8 inc_ecx[] = {0xFF, 0xC1};
+    auto r5 = translate_bytes(x64, inc_ecx, ir::Arch::X64);
+    ASSERT_EQ(r5.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r5.insn.op, ir::Op::Inc);
+    EXPECT_EQ(r5.insn.src2.kind, ir::Operand::Kind::None);
+
+    // ⑥ FF 00: plain inc [rax] (无 lock) — 同本体通路, src2 空 (不发
+    //    lock-strip note 的对偶面)
+    const wvmp::u8 inc_mem[] = {0xFF, 0x00};
+    auto r6 = translate_bytes(x64, inc_mem, ir::Arch::X64);
+    ASSERT_EQ(r6.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r6.insn.op, ir::Op::Inc);
+    EXPECT_EQ(r6.insn.src2.kind, ir::Operand::Kind::None);
 }
 
 // MIT-249 follow-up (issue-09): TranslateResult.skipped_ranges 在 status != Ok

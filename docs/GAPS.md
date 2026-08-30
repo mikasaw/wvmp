@@ -298,49 +298,74 @@ RDI/RSI 指向比较元素**之后**、RCX 已含终止迭代的递减（strlen
 `lea rax,[rdi-1]` 惯用法同证）——展开的早退出口同样推进指针减计数，
 flags 恢复为末次比较值。
 
-## G4 lock 前缀原子族 (MIT-419 收口, strip-and-execute + D1 原子性边界显式声明)
+## G4 lock 前缀原子族 (MIT-419 收口 + MIT-423 G4b inc/dec 补齐, strip-and-execute + D1 原子性边界显式声明)
 
-**状态 (2026-08-30, main 51c2870 后): lock 前缀原子指令族已入面**——lifter
+**状态 (2026-08-30, MIT-423 后): lock 前缀原子指令族全谱入面**——lifter
 F0 前缀闸按白名单三元组放行 (add/adc/sub/sbb/and/or/xor × mem-dst + cmpxchg/
-xchg/xadd mem 形式 + bts/btr/btc mem 形式, D4 仅 F0 独前缀 +REX), strip-and-
-execute 折条 (ALU 族零新 VmOp) 或单 VmOp 直执行 (Xadd/Bts/Btr/Btc 新 handler
-内 native lock 指令 — **硬件原子性保真**)。multiseed 37 样本 × 5 = 185/185,
-wvmpTest 14/14 + 双跑保持。
+xchg/xadd mem 形式 + bts/btr/btc mem 形式 + **inc/dec × mem-dst S32/S64
+(MIT-423 G4b)**, D4 仅 F0 独前缀 +REX), strip-and-execute 折条 (ALU 族 +
+inc/dec 零新 VmOp) 或单 VmOp 直执行 (Xadd/Bts/Btr/Btc 新 handler 内 native
+lock 指令 — **硬件原子性保真**)。multiseed 38 样本 × 5 = **190/190**,
+wvmpTest 14/14 + 双跑 103/103 diff 0 保持。
 
 **支持面**：`lock {add,adc,sub,sbb,and,or,xor} [m], r/imm`（本体折条）、
 `lock cmpxchg [m], r`（折条）、`lock xchg [m], r` 与**裸 `xchg [m], r`**
 （InterlockedExchange 真产物，xchg 访存隐式锁；折条）、`lock xadd [m], r`
 （单 VmOp::Xadd，handler 内 native lock xadd 一条指令完成读改写，原子性
 保真）、`lock {bts,btr,btc} [m], r/imm8`（单 VmOp，handler 内 native lock
-指令直执行）。宽度 S8/S32/S64（bts 系 S32/S64，无字节形式）；rip-relative
-目标全支持（emit_address + LeaRva 通道；64 位全局 Interlocked* 真产物形态
-实证）。C++ Interlocked* intrinsic 真产物形态（/Od 实证 2026-08-30）：
-ExchangeAdd→lock xadd（返回值使用）/lock add imm（未用）、And/Or/Xor→
-lock and/or/xor [m],imm、Exchange→裸 xchg [m],r、CompareExchange→lock
-cmpxchg [m],r——全部入面。
+指令直执行）、**`lock {inc,dec} [m]` S32/S64（MIT-423 G4b，本体折条
+Load→Inc/Dec→Store，标记域 12..13）**。宽度 S8/S32/S64（bts 系与 inc/dec
+S32/S64，inc/dec 字节形式 gate 见残余）；rip-relative 目标全支持（emit_address
++ LeaRva 通道；64 位全局 Interlocked* 真产物形态实证）。C++ Interlocked*
+intrinsic 真产物形态（cl v145 14.51 实测 2026-08-30，/O2 与 /Od 双档 /FAcs
+实证）：ExchangeAdd/Increment/Decrement(+64)→**lock xadd [m],±1 内联展开**
+（_InterlockedIncrement 不产裸 lock inc —— 派活单 §A.3 "f0 ff 06" 先验被
+实测推翻；真产物走 Xadd 硬件原子通路）、And/Or/Xor→lock and/or/xor [m],imm、
+Exchange→裸 xchg [m],r、CompareExchange→lock cmpxchg [m],r——全部入面。
+裸 lock inc/dec 形态属手写/第三方汇编（折条覆盖）。
 
 **D1 原子性语义边界（项目主拍板，显式登记，非静默）**：
 - **多线程并发原子性不保证**：VM 单线程解释器内 Load→op→Store 折条序列
   不被自身打断 → VM 线程视角原子性成立；但宿主进程其他原生线程并发 RMW
-  同一地址时，折条路径存在撕裂竞态窗口（lock 前缀被 strip）。xadd/bts/
-  btr/btc 单 VmOp 路径由 handler 内 native lock 指令直执行，硬件原子性
-  保真，不在本边界内。
+  同一地址时，折条路径存在撕裂竞态窗口（lock 前缀被 strip）。折条族 =
+  ALU 族 + **inc/dec (G4b)**。inc/dec 折条 D1 论证（MIT-423 B.3）：真产物
+  _InterlockedIncrement/Decrement 实测走 lock xadd ±1（Xadd 硬件原子通路
+  覆盖），裸 lock inc/dec 无编译器产物 → 撕裂窗口暴露面限手写/第三方代码，
+  与 ALU 折条同类；VM 内折条 inc/dec 复用 build_incdec 既有 CF 保留语义
+  （旧 VM CF 保存→native inc/dec→ZF/OF/SF/PF 捕获→CF 回填），SDM
+  "inc/dec 不写 CF" 逐位成立（样本 CF 探针 add→CF=1→lock inc→jc 全 VM
+  往返实证）。xadd/bts/btr/btc 单 VmOp 路径由 handler 内 native lock 指令
+  直执行，硬件原子性保真，不在本边界内。
 - lock 的 MFENCE 全序附带语义（store-buffer 全序）在 VM 内不建模（单线程
   等价；多线程见上）。
-- 行为承诺：**结果值/旧值返回/flags（cmpxchg 后 je 惯用法）在单线程 VM
-  内与原生逐位一致**——回归样本 `wvmp_atomic_ops_sample`（C++ Interlocked*
-  真产物 + MASM 全谱 8 函数真虚拟化 + 11 条 lock-strip note + 2 负例 gate）
-  钉死；双跑 byte-exact。
+- 行为承诺：**结果值/旧值返回/flags（cmpxchg 后 je 惯用法、inc/dec 后 jcc
+  循环计数惯用法）在单线程 VM 内与原生逐位一致**——回归样本
+  `wvmp_atomic_ops_sample` + `wvmp_atomic_incdec_sample`（dec r8d;jnz ×7
+  循环 + CF 双探针，8 函数真虚拟化）钉死；双跑 byte-exact。
+
+**src2=imm 载体域对账记录（MIT-423 B.1，419 铁律第 4 次教训固化）**：
+lock 标记域现为 5..13（5..8=Mov 载体 xadd/bts/btr/btc，9..11=本体
+ALU/Cmpxchg/Xchg，12..13=本体 Inc/Dec）；string family 0..4 分域。
+全仓 src2=imm 任意值写入点仅 translate_imul 3-op 形式一处（op=Imul 不入
+is_lock_carrier_op → 12/13 同 7 不误拦，回归用例
+ImulThreeOpImmAtNewMarkerValuesNotIntercepted / ImulThreeOpImmInLockMarkerRange
+NotIntercepted 双锁）；Inc/Dec 唯一构造点 translate_unary 不写 src2
+（Operand 默认 kind=None, operand.hpp:6），加载体面无碰撞。
 
 **残余（越界即 C1 gate 兜底，保持原生）**：
-- `lock inc/dec [m]`——合法编码且 MSVC _InterlockedIncrement/_Interlocked-
-  Decrement 真产物（probe 实测 CRT 内高频出现），但不在 MIT-419 派活单族面
-  （D2 族面清单外），残余登记：未来单（新 VmOp+handler 或折叠 Inc/Dec 折条，
-  工作量半天级）；
+- `lock inc/dec byte ptr [m]`（S8，FE /0 编码合法、capstone 可解 id=230）
+  —— 白名单 pin S32/S64（MSVC 无字节宽 InterlockedIncrement 产物，无
+  _InterlockedIncrement8 intrinsic），gate 保守收面（MIT-423 B.2）；
 - 16 位操作数（66 F0 组合前缀，D4 砍面）、67 地址宽、段覆盖、组合前缀；
-- `lock not/neg`（D2 砍面）、`lock mov`/`lock nop`（不可锁助记符，capstone
-  拒解码 → skipped → gate；原生执行 #UD，禁入可执行路径，回归样本仅日志
-  断言）；`F0 F3 A4`（lock rep movsb，415 字节级扫描拒，原生 #UD）；
+- `lock not/neg`（**MIT-423 D2 裁决 gate**：SDM 合法编码 F7 /2、/3，
+  capstone id=511/509 可解至 translate_lock_op default；无 MSVC 产物——
+  无 InterlockedNot/Neg intrinsic，仅手写/第三方形态；native 执行实测
+  合法（probe rc=7/8），gate 后原生运行行为保真，样本可调用负例钉死）；
+- `lock mov`/`lock nop`（不可锁助记符，capstone 拒解码 → skipped → gate；
+  原生执行 #UD，禁入可执行路径，回归样本仅日志断言）；`F0 F3 A4`（lock
+  rep movsb，415 字节级扫描拒，原生 #UD）；
+- `lock inc/dec reg`（reg-dst 非法编码，capstone 拒解码 → skipped → gate；
+  原生 #UD，样本负例只取地址不调用）；
 - 多字节 lock 前缀（F0 F0 xx）capstone 折叠为单 F0 正常放行（语义不变）；
 - 无锁 bts/btr/btc reg 形式（非 Interlocked 语义，_bittestandset 系低频，
   未入面，照旧 gate）。

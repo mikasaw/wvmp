@@ -1222,7 +1222,8 @@ TEST(Translate, StringOpEmitsDfAssumptionNote) {
 // ==================== MIT-419 (G4): lock 前缀原子族 ====================
 //
 // src2 标记分域 (与 lifter translate_lock_op 对账): 5..8 = Op::Mov 载体族
-// (xadd/bts/btr/btc), 9..11 = 本体 op 族 (alu/cmpxchg/xchg)。统一挂点在
+// (xadd/bts/btr/btc), 9..11 = 本体 op 族 (alu/cmpxchg/xchg), 12..13 = 本体
+// op 族 (inc/dec — MIT-423 G4b)。统一挂点在
 // run() 入口: 先发 lock-strip note ("lock-strip @" 前缀与 backend 过滤
 // 白名单对账, 413 纪律) 再按族派发。
 
@@ -1393,6 +1394,90 @@ TEST(Translate, ImulThreeOpImmInLockMarkerRangeNotIntercepted) {
     expect_is(d.insns[1], VmOp::Imul, OpKind::Reg, kRax, OpKind::Reg, s18, 0, kS64);
     expect_is(d.insns[2], VmOp::Jmp, OpKind::None, 0, OpKind::None, 0, 1, kS64);
     expect_is(d.insns[3], VmOp::Halt, OpKind::None, 0, OpKind::None, 0, 0, 0);
+}
+
+// ==================== MIT-423 (G4b): lock inc/dec 载体 ====================
+
+TEST(Translate, LockIncFoldsLikePlainUnaryMem) {
+    // lock inc [rax] (kLockInc=12): 先发 lock-strip note, 再派发回本体
+    // translate_unary mem 拆条 — Mov acc,rax; Load s,[acc]; Inc s; Store
+    // [acc],s (D1: 零新 VmOp, 与普通 mem-dst inc 同折条)。
+    const ir::MemOperand mem{ir::Reg::Rax, ir::Reg::Flags, 0, 0};
+    ir::Insn i = I(ir::Op::Inc, ir::Size::S32);
+    i.dst = ir::Operand::mem_(mem);
+    i.src2 = ir::Operand::imm_(12);  // kLockInc
+    i.updates_flags = true;
+    std::vector<std::string> notes;
+    const Decoded d = one_insn_n(i, &notes);
+    ASSERT_EQ(d.insns.size(), static_cast<size_t>(6));  // Mov+Load+Inc+Store+Jmp+Halt
+    const u8 s18 = isa::kScratchFirst;
+    expect_is(d.insns[0], VmOp::Mov, OpKind::Reg, s18, OpKind::Reg, kRax, 0, kS64);
+    expect_is(d.insns[1], VmOp::Load, OpKind::Reg, s18 + 1, OpKind::Reg, s18, 0, kS32);
+    expect_is(d.insns[2], VmOp::Inc, OpKind::Reg, s18 + 1, OpKind::None, 0, 0, kS32);
+    expect_is(d.insns[3], VmOp::Store, OpKind::Reg, s18, OpKind::Reg, s18 + 1, 0, kS32);
+    expect_is(d.insns[4], VmOp::Jmp, OpKind::None, 0, OpKind::None, 0, 1, kS64);
+    expect_is(d.insns[5], VmOp::Halt, OpKind::None, 0, OpKind::None, 0, 0, 0);
+    ASSERT_EQ(notes.size(), 1u);
+    EXPECT_NE(notes[0].find("lock-strip @ 0x401000"), std::string::npos);
+    EXPECT_NE(notes[0].find("inc"), std::string::npos);
+    EXPECT_NE(notes[0].find("strip-and-execute"), std::string::npos);
+}
+
+TEST(Translate, LockDecRipTargetFoldsViaRvaChannel) {
+    // lock dec qword ptr [rip+0x20] (kLockDec=13): rip 目标经 emit_address
+    // 出 RVA, LoadRva/StoreRva 同通道 (与普通 mem-dst dec 拆条一致)。
+    const ir::MemOperand mem{ir::Reg::Rip, ir::Reg::Flags, 0, 0x20};
+    ir::Insn i = I(ir::Op::Dec, ir::Size::S64);
+    i.dst = ir::Operand::mem_(mem);
+    i.src2 = ir::Operand::imm_(13);  // kLockDec
+    i.updates_flags = true;
+    std::vector<std::string> notes;
+    const Decoded d = one_insn_n(i, &notes);
+    // Mov acc,(next_ip+0x20) [next_ip = fn.end_rva = 0x3000] → LoadRva →
+    // Dec → StoreRva → Jmp → Halt = 6 条。
+    ASSERT_EQ(d.insns.size(), static_cast<size_t>(6));
+    const u8 s18 = isa::kScratchFirst;
+    expect_is(d.insns[0], VmOp::Mov, OpKind::Reg, s18, OpKind::Imm, 0, 0x3020, kS64);
+    expect_is(d.insns[1], VmOp::LoadRva, OpKind::Reg, s18 + 1, OpKind::Reg, s18, 0, kS64);
+    expect_is(d.insns[2], VmOp::Dec, OpKind::Reg, s18 + 1, OpKind::None, 0, 0, kS64);
+    expect_is(d.insns[3], VmOp::StoreRva, OpKind::Reg, s18, OpKind::Reg, s18 + 1, 0, kS64);
+    ASSERT_EQ(notes.size(), 1u);
+    EXPECT_NE(notes[0].find("lock-strip @ 0x401000"), std::string::npos);
+    EXPECT_NE(notes[0].find("dec"), std::string::npos);
+}
+
+TEST(Translate, PlainIncDecMemNoNote) {
+    // 对偶面: 普通 (无 lock) inc/dec [m] 走同一 translate_unary 折条但
+    // **不发 lock-strip note** (src2.kind=None 不满足拦截条件 — 与 lifter
+    // 侧 LockIncDecNegative ⑤⑥ 对账)。
+    const ir::MemOperand mem{ir::Reg::Rax, ir::Reg::Flags, 0, 0};
+    ir::Insn i = I(ir::Op::Dec, ir::Size::S32);
+    i.dst = ir::Operand::mem_(mem);
+    i.updates_flags = true;
+    const Decoded d = one_insn(i);  // one_insn 断言 notes 空
+    ASSERT_EQ(d.insns.size(), static_cast<size_t>(6));
+    const u8 s18 = isa::kScratchFirst;
+    expect_is(d.insns[2], VmOp::Dec, OpKind::Reg, s18 + 1, OpKind::None, 0, 0, kS32);
+}
+
+TEST(Translate, ImulThreeOpImmAtNewMarkerValuesNotIntercepted) {
+    // MIT-423 回归固化: 标记域扩到 12..13 (kLockInc/kLockDec) 后, imul
+    // 3-op imm 的 12/13 立即数 (合法乘数, 可由编译器真实产出) 不得误拦 —
+    // 419 的 op 限定对账面延伸到新值域 (第 4 次载体域教训的固化用例)。
+    for (const i64 v : {12, 13}) {
+        ir::Insn i = I(ir::Op::Imul, ir::Size::S64);
+        i.dst = ir::Operand::reg_(ir::Reg::Rax);
+        i.src = ir::Operand::reg_(ir::Reg::Rax);
+        i.src2 = ir::Operand::imm_(v);  // 恰在新 lock 标记域 (12..13)
+        const Decoded d = one_insn(i);  // 断言 notes 空 (未被 lock 拦截)
+        ASSERT_EQ(d.insns.size(), static_cast<size_t>(4));  // Mov+Mov+Imul+Jmp+Halt
+        const u8 s18 = isa::kScratchFirst;
+        expect_is(d.insns[0], VmOp::Mov, OpKind::Reg, s18, OpKind::Imm, 0,
+                  static_cast<u32>(v), kS64);
+        expect_is(d.insns[1], VmOp::Imul, OpKind::Reg, kRax, OpKind::Reg, s18, 0, kS64);
+        expect_is(d.insns[2], VmOp::Jmp, OpKind::None, 0, OpKind::None, 0, 1, kS64);
+        expect_is(d.insns[3], VmOp::Halt, OpKind::None, 0, OpKind::None, 0, 0, 0);
+    }
 }
 
 } // namespace

@@ -62,23 +62,31 @@ void add_note(std::vector<std::string>& notes, u64 addr, std::string_view what) 
 }
 
 // MIT-419 (G4): lock 族 src2 标记 — 与 lifter (x86_translate.cpp
-// translate_lock_op) 的枚举分域严格对账 (5..11; string family 0..4 不相干):
+// translate_lock_op) 的枚举分域严格对账 (5..13; string family 0..4 不相干):
 //   5..8: Op::Mov 载体族 (xadd/bts/btr/btc — ir::Op 冻结契约不可增枚举,
 //         沿用 G3 串指令 "Op::Mov + src2=imm(family)" 载体先例)
 //   9..11: 本体 op 族 (ALU/Cmpxchg/Xchg — 标记仅声明"曾带 lock", 发 note 用)
+//   12..13: 本体 op 族 (Inc/Dec — MIT-423 G4b; 本体折条通路 translate_unary
+//         mem 拆条既有, 发 note 后派发回本体)
 enum : int { kLockXadd = 5, kLockBts = 6, kLockBtr = 7, kLockBtc = 8,
-             kLockStripAlu = 9, kLockStripCmpxchg = 10, kLockStripXchg = 11 };
+             kLockStripAlu = 9, kLockStripCmpxchg = 10, kLockStripXchg = 11,
+             kLockInc = 12, kLockDec = 13 };
 [[nodiscard]] bool is_lock_marker(i64 v) {
-    return v >= kLockXadd && v <= kLockStripXchg;
+    return v >= kLockXadd && v <= kLockDec;
 }
 // lock 标记只可能骑在下列 op 上 (lifter 约定) — **必须 op 限定**:
 // imul 3-op imm 形式也用 src2=imm 且立即数任意 (exitnative 样本实证
 // imul rax,[rsp+0x40],7 → src2=imm(7) 恰落在标记域, 无条件拦截会误伤)。
+// MIT-423 (G4b) 域扩 12..13 对账: Inc/Dec 加入载体面 — 其唯一构造点 lifter
+// translate_unary 不写 src2 (Operand 默认 kind=None, operand.hpp; 拦截条件
+// src2.kind==Imm 不可能为真); Imul 仍排除在外 (12/13 同 7 一样是合法 imul
+// 立即数 — 回归用例 ImulThreeOpImmAtNewMarkerValuesNotIntercepted 锁死)。
 [[nodiscard]] bool is_lock_carrier_op(ir::Op op) {
     switch (op) {
     case ir::Op::Mov: case ir::Op::Add: case ir::Op::Sub: case ir::Op::Adc:
     case ir::Op::Sbb: case ir::Op::And: case ir::Op::Or: case ir::Op::Xor:
     case ir::Op::Cmpxchg: case ir::Op::Xchg:
+    case ir::Op::Inc: case ir::Op::Dec:
         return true;
     default:
         return false;
@@ -782,7 +790,7 @@ struct Translator {
             const auto it = next_ip_of_->find(current_rva);
             if (it != next_ip_of_->end()) next_ip = it->second;
         }
-        // MIT-419 (G4): lock 族挂点 — lifter 用 src2=imm(kLockXadd..kLockStripXchg)
+        // MIT-419 (G4): lock 族挂点 — lifter 用 src2=imm(kLockXadd..kLockDec)
         // 标记 (与 string-op 的 src2=imm(0..4) 分域零碰撞)。统一在 run() 入口
         // 拦截: 先发 lock-strip note (D1 边界披露, 413 纪律 — "lock-strip @"
         // 前缀进 backend 过滤白名单, 不触发 gate), 再按族派发本体翻译。
@@ -1066,7 +1074,7 @@ struct Translator {
     // ---- MIT-419 (G4): lock 前缀原子族 strip-and-execute ----
     //
     // lifter 编码约定 (x86_translate.cpp translate_lock_op 对账):
-    //   src2=imm(kLockXadd..kLockStripXchg, 5..11) 标记 (string family 0..4
+    //   src2=imm(kLockXadd..kLockDec, 5..13) 标记 (string family 0..4
     //   分域零碰撞)。run() 入口已拦截 (先发 lock-strip note 再按族派发),
     //   本函数 = 族派发本体:
     //     - kLockStripAlu      (Op::Add/Sub/Adc/Sbb/And/Or/Xor + dst=Mem):
@@ -1083,6 +1091,10 @@ struct Translator {
     //     - kLockBts/Btr/Btc  (Op::Mov 载体 + dst=Mem + src=Reg/Imm8): emit
     //        VmOp::Bts/Btr/Btc 一条 (a=地址槽; b_kind=Reg 位号槽 或 Imm aux=
     //        imm8) — handler 内 native lock bts [addr], reg 直执行
+    //     - kLockInc/Dec       (Op::Inc/Dec + dst=Mem, MIT-423 G4b): 本体折条
+    //        translate_unary mem 拆条 (Load/Rva + Inc/Dec + Store/Rva) — 零新
+    //        VmOp, 撕裂窗口同 ALU 族 (D1; CF 保真由 build_incdec 既有 CF 保留
+    //        语义逐位对齐 SDM "inc/dec 不写 CF")
     //   note 前缀 "lock-strip @" 与 backend 过滤白名单对账 (413 纪律:
     //   regvm_backend.cpp 过滤白名单, 命中不触发 C1 gate)。
     bool translate_lock_family(Emitter& em, Scratch& sc, const ir::Insn& in,
@@ -1095,6 +1107,8 @@ struct Translator {
                           : m == kLockStripAlu ? "alu"
                           : m == kLockStripCmpxchg ? "cmpxchg"
                           : m == kLockStripXchg ? "xchg"
+                          : m == kLockInc      ? "inc"
+                          : m == kLockDec      ? "dec"
                                                 : "?";
         // D1 边界披露 (GAPS G4 节): strip-and-execute, 多线程并发原子性不
         // 保证 (折条路径); MFENCE 全序不建模。xadd/bts 系单 VmOp 直执行
@@ -1120,6 +1134,13 @@ struct Translator {
         case kLockBtr:
         case kLockBtc:
             return translate_lock_bit(em, sc, in, m, current_rva, next_ip);
+        case kLockInc:
+        case kLockDec:
+            // MIT-423 (G4b): 本体折条 — translate_unary mem 拆条既有零改动
+            // (emit_address + Load/Rva + Inc/Dec + Store/Rva; D1 零新 VmOp,
+            // 撕裂窗口同 ALU 族披露段; _InterlockedIncrement 真产物 = lock
+            // xadd +1 走 419 Xadd 硬件原子通路, 裸 lock inc/dec 无 MSVC 产物)。
+            return translate_unary(em, sc, in, current_rva, next_ip);
         default:
             return skip(in, "lock family 标记非法，建议 gate", nullptr);
         }

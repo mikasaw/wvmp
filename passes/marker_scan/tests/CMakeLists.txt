@@ -851,3 +851,26 @@ target_compile_options(wvmp_atomic_ops_sample PRIVATE
 target_link_options(wvmp_atomic_ops_sample PRIVATE
     $<$<CXX_COMPILER_ID:MSVC>:/INCREMENTAL:NO>
 )
+
+# MIT-423 (G4b): lock inc/dec 原子补齐端到端主样本——MASM 直写裸 lock
+# inc/dec 全谱 (dword/qword 双宽、rip-relative 目标、dec r8d; jnz 循环计数
+# 惯用法、add→CF→lock inc→jc CF 保真探针 — SDM: inc/dec 不写 CF), 本体折条
+# 真虚拟化 (D1: 零新 VmOp, Load→Inc/Dec→Store, lock-strip note 披露)。
+# C++ 侧 _InterlockedIncrement/Decrement 真产物区域 (#33 实测: cl v145 产
+# lock xadd ±1 内联展开, 真产物走 419 Xadd 硬件原子通路, 不产裸 lock inc/
+# dec — 派活单 §A.3 先验被实测推翻)。负例: lock not (SDM 合法但无 MSVC
+# 产物, D2 裁决 gate — **可调用**, gate 行为保真正证) + lock inc ecx
+# (reg-dst 非法编码, db 直发, capstone 拒解码 → gate, 原生 #UD 禁调用)。
+# REQUIRE_REAL: 7 个 MASM 正例 + cpp_incdec_region 真虚拟化 (stub ≥1)。
+add_executable(wvmp_atomic_incdec_sample
+    wvmp_atomic_incdec_sample_main.cpp
+    wvmp_atomic_incdec_sample_asm.asm
+)
+target_link_libraries(wvmp_atomic_incdec_sample PRIVATE wvmp::sdk)
+target_compile_options(wvmp_atomic_incdec_sample PRIVATE
+    $<$<AND:$<CXX_COMPILER_ID:MSVC>,$<COMPILE_LANGUAGE:C,CXX>>:/Od;/Ob0;/utf-8>
+    $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-O0>
+)
+target_link_options(wvmp_atomic_incdec_sample PRIVATE
+    $<$<CXX_COMPILER_ID:MSVC>:/INCREMENTAL:NO>
+)
