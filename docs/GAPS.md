@@ -224,15 +224,51 @@
   约 0.002%）且与砍面 movdqa 共生（/Od intrinsic probe 实测 paddq 必伴随
   movdqa 溢出）→ 支持面不可达，砍面留档按频率单开（**movdqa/movdqu 一半
   已由 MIT-428/G1d 翻转——paddq/psubq 本体仍砍面**，本体翻转需重测频率
-  与 G1d 通路叠加）；pmovmskb（66 0F D7）/ pcmpeq/pcmpgt 系（SSE 整数
-  比较族）/ punpckldq/punpcklqdq（66 0F 62/6C 交织语义，D4 裁决非纯拷贝
-  不入拷贝通路）；AVX/VEX 残余面（档A 已收口
+  与 G1d 通路叠加）；SIMD 尾族三行——分层 gate 定稿（MIT-GZ B.1，2026-08-31；频率数据与
+  裁决出处 = `.multica/mit-G9r-triage.md` §1/§1.4，MIT-432）：pmovmskb
+  （66 0F D7；CRT/ML 域密度 0.015–0.055%，经典 exe 与客户态新抽 14 exe
+  全零）/ pcmpeq/pcmpgt 系（SSE 整数比较族；同上分层分布，语料计数见
+  432 §1.1 表）/ punpckldq/punpcklqdq（66 0F 62/6C 交织语义，D4 裁决
+  非纯拷贝不入拷贝通路；SIMD 域最高密度族 0.06–0.074%，但粒度分裂
+  d/q 88–100% hash/安全域 vs b/w 73% codec 域，全族按单粒度折条必漏
+  一半形态）——三族全部维持文档化 gate（零逃逸 byte-identical 兜底
+  实证不变）；lqdq/hqdq 按 MIT-GZ D1 拍板 = gate 文档化不折（客户态
+  零命中 + 纯 intrinsic 溢出形态，S 级预算让位 M3）；AVX/VEX 残余面（档A 已收口
   38 id V-pair，精确残余见下节 G6a——VEX-GP BMI/ymm/FMA/加密/EVEX
   保持 gate）。
   （string movsd 双形态已由 MIT-415 收口，见 G3 节；
   x87 已拆出独立小节，见下节 "x87 (永久 gate, R3 裁决)"——不是简单"不支持
   兜底"，而是有独立频率数据与行为承诺的裁决面。）
 - 注意与重定位/ASLR 的配合：RVA + image_base 在运行时还原，不依赖静态 VA。
+
+## 指令族支持矩阵（阶段总览，MIT-GZ 收口定稿 2026-08-31）
+
+> 读者五分钟全景：什么被保护、什么保持原生、为什么。每行一个可点名的
+> triage/裁定出处；数字全部回溯权威源（权威基线 multiseed 48 样本 × 5 =
+> 240/240、kVmOpMax=97、跳表余量 30，main `df3c2f1`）。“支持” = 编译器
+> 自然产物真虚拟化（byte-identical 验收）；“gate” = 文档化不保护（越界即
+> C1 gate 整函数原生保持，零逃逸实证）。
+
+| 指令族 | 状态 | 裁决/实现要点 | 出处 |
+|---|---|---|---|
+| GP 算术/逻辑/移位/位技巧（含 div/idiv、movzx/movsx、popcnt/lzcnt/tzcnt、shift/rot 全谱） | ✅ 支持 | C2 handler 真执行语义电池 + 万条 fuzz；rol/ror flags partial-preserve（SDM：只写 CF/OF） | MIT-351~355 / MIT-404 / C2 收口 / MIT-433 (P1) |
+| 浮点 SSE 全族（add/sub/mul/div/mov/位运算/比较/andnps，标量+packed+mem 形） | ✅ 支持 | XmmLoad/XmmStore mem 通路；ctx.xmm 读回影子样本 | MIT-371~376 / MIT-408 / MIT-411 / MIT-425 |
+| SSE2 整数位运算档①（pand/por/pxor/pandn）+ GP↔xmm 桥（movd/movq）+ 对齐传送（movdqa/movdqu） | ✅ 支持 | 档② paddq/psubq 本体砍面（实测 16/854k ≈ 0.002%）；桥双编码逐位对齐 | MIT-425 / MIT-427 (G1c) / MIT-428 (G1d) |
+| VEX.128 档A（38 id V-pair 三地址折叠） | ✅ 支持 | 零新 VmOp、零新 handler，复用 translate_sse_* 通路 | MIT-426 (G6a) |
+| BMI1/2 六条（andn/bzhi/rorx/shlx/sarx/shrx） | ✅ 支持 | andn/bzhi 零新 VmOp 折条 + flagless 载体域 22；bzhi 边界 idx≥N = 原值不变+CF=1（probe 实测修正） | MIT-434 (G8a) / 432 §2 |
+| lock 前缀原子族（ALU 族折条 + xadd/cmpxchg/bts 系 + inc/dec） | ✅ 支持 | strip-and-execute，硬件原子性保真；D1 多线程并发边界登记 | MIT-419 / MIT-423 (G4/G4b) |
+| 串指令 rep {movs,stos,scas,cmps,lods} | ✅ 支持 | 前缀闸放行 + 微程序展开；DF=0 假定 note 披露 | MIT-415 (G3) |
+| 跳转表（jmp reg / jmp [mem]） | ✅ 支持（受限模板） | 防御常数双编码（MSVC ja / GCC jae）；无防御表永久 gate | MIT-409 / MIT-413 (G2) |
+| callgate FP 参数/返回值通路（xmm0..3 入参 + xmm0 返回） | ✅ 支持 | 修复静默坏壳首例；callee 专用栈窗口 | MIT-417 (P0) / MIT-406 |
+| x87 全族（D8-DF） | ⛔ 永久 gate（文档化不保护） | x64 MSVC 世界频率 ≈0（0.0000–0.0032%）；含 x87 标记函数整函数原生 byte-identical | MIT-416 / MIT-418 (G5r/R3)，`.multica/mit-G5r-triage.md` |
+| SIMD 尾族三行（pmovmskb / pcmpeq/pcmpgt / punpck 系） | ⛔ gate（分层定稿） | 频率分层：客户态新抽 14 exe 全零 vs SIMD/CRT 域 punpck 0.06–0.074% / pmovmskb 0.015–0.055% 密度；punpck 粒度分裂 d/q 88–100% hash/安全域 vs b/w 73% codec 域；lqdq/hqdq D1 拍板 gate 不折 | MIT-432 §1/§1.4（`.multica/mit-G9r-triage.md`）+ MIT-GZ D1 |
+| G8b 三条（mulx/pdep/pext）+ blsr 族四条（blsr/blsi/blsmsk/bextr） | ⛔ gate（挂账/永久） | mulx/pdep/pext = G8b 档 native 直执行 + CPUID gate 基建挂账，mulx CF Zen5 实测不写 vs SDM 厂商分叉待决；blsr 族 27 文件语料 0 永久 gate | MIT-432 §2/§6.4 + MIT-GZ B.1 |
+| ymm / EVEX / FMA / 加密（AES 等） | ⛔ gate（档B） | xmm 跟踪区 kCtxSize 0x1C8 冻结面；档B 立项即触发跳表扩容评估 | MIT-424 (档B) |
+| x86 (PE32) 平台 | 🔧 显式硬拒绝 | 已剥离出本阶段 → 独立里程碑“多目标平台”（计划后续另立） | MIT-412 / MIT-414 (G7p2) + MIT-GZ D3 |
+| 16-bit 目标 | ⛔ 不可行 | PE 格式白名单只收 0x014C/0x8664 | MIT-412（GAPS C5 交叉引用） |
+
+> 观察清单与挂账联动见 `docs/STATUS.md`「指令虚拟化阶段（M2.5-G）收口」节；
+> 本矩阵为定稿口径，逐族实现细节以上文各 G/C 节与 `.multica/` triage 为准。
 
 ## G1d SSE2 对齐传送 movdqa/movdqu（MIT-428 收口：零新 VmOp 折叠 + 427 桥溢出负例翻转）
 
@@ -277,7 +313,9 @@ VEX 双形式）。multiseed 46 样本 × 5 = **230/230**。
 **残余（精确登记，防误当漏项）**：punpckldq/punpcklqdq（66 0F 62/6C，
 交织语义非纯拷贝——D4 裁决，427 桥样本 cpp_movdqa_neg 由此保持 gate）/
 pmovmskb（66 0F D7）/ pcmpeq/pcmpgt 系 / paddq/psubq 本体（66 0F D4/FB
-砍面）+ G8-BMI + 档B ymm + EVEX 全谱——照旧 C1 gate。
+砍面）+ G8b 三条 mulx/pdep/pext（G8b 档：native 直执行 + CPUID gate 基建，
+  mulx 含 Zen5/Intel CF 厂商分叉待决——432 §2.1 判定②）+ blsr 族四条
+  blsr/blsi/blsmsk/bextr（语料 0 永久 gate——432 §6.4） + 档B ymm + EVEX 全谱——照旧 C1 gate。
 
 ## G6a VEX.128 档A（MIT-426 收口：38 id V-pair 三地址折叠，零新 VmOp）
 
@@ -432,10 +470,16 @@ v145 MSVC x86 默认 /arch:SSE2（cl /help 实测），显式 /arch:IA32 才涌�
   ST 栈模型成本量化）留档 `.multica/mit-G5r-triage.md` §4/§5，若未来 G7 x86
   P1 立项且走 IA32，IA32 浮点档口重开、蓝图直接生效；
 - **R2（32 位目标捆绑）随 G7 P1 立项时评估**，不单独投；
-- **跳表 128→256 扩容** = G7/x87 未来前置（kTableEntries=128；kVmOpMax=95
-  即 96 项已用（0 哨兵 + 1..95），MIT-425/G1b 后实测 vm_op.hpp——mul 族
-  4 op + Andnps 顶格预算 95，余量 32；x87 全族 ~80 新 VmOp 会把 128 撑爆，
-  拆单蓝图预埋，见 triage §6 #2）；
+- **跳表 128→256 扩容** = x87/ymm 未来前置（kTableEntries=128；现
+  kVmOpMax=97（MIT-427），98 项已用（0 哨兵 + 1..97）、余量 30——历史：
+  MIT-425/G1b 后曾为 95（96 项、余量 32）；G9r §3.3 重算：x87 L0 ~80 op
+  → 98+80=178 > 128 溢出（唯一必然触发者），ymm 档B 群 20–30 op → 128
+  恰好临界（实质触发者），BMI G8a flagless +4 / G8b +3 → ≤102 不触发；
+  扩容成本 S 级实锤（G9r §3.2 spike：128→256 单行改，build 408/408、
+  ctest 16/16、multiseed 230/230，码体 +1032B/壳、PE 文件 +1024B）；
+  触发条件 = 任一批次使 kVmOpMax+1 ≥ 128，届时作为该批次前置 commit 随单
+  落地（先行合入、独立可回滚），不独立立波——432 §3.4；x87 全族 ~80 新
+  VmOp 会把 128 撑爆，拆单蓝图预埋，见 triage §6 #2）；
 - **callgate FP 参数/返回值修复** = x87 任何路线的前置依赖（P0，独立派单
   MIT-417，当前 SSE 世界即中招，见 triage §6 #1）；
 - 16-bit 目标不可行（交叉引用 C5 节，PE 格式白名单只收 0x014C/0x8664）。
@@ -501,6 +545,10 @@ rc=0 输出≈输入，用户以为受保护）与**产坏壳**（手造连续�
   .pdata → find_function_end_rva 退 nullopt → 保守 gate 兜底，行为差异非缺陷。
 - **CLI 无 arch 表达面**（triage §8 #7）：config 无 arch 字段、无 --help 子命令，
   32 位全支持需配置面扩口（P1 G7x-7）。
+
+> **里程碑归属（MIT-GZ D3，2026-08-31）**：x86 (PE32) 目标支持已由项目主
+> 拍板剥离出指令虚拟化阶段，独立里程碑“**多目标平台**”（计划后续另立，
+> 见 `docs/STATUS.md` 阶段宣告节）；本节内容按 MIT-412/414 收口原样保留。
 
 ## G3 串指令族 rep movs/stos/scas/cmps/lods（MIT-415 收口）
 

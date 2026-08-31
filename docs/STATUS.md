@@ -213,6 +213,10 @@ C3 区域内 call、C4 rip-relative、C5 x86 扫描不可用。
 
 - flags 跨指令污染：待 M3 活跃性分析消除。
 - flags 部分写入面：rot 族已修（MIT-433 flags_tail_partial，SDM: ROL/ROR 只写 CF/OF）；G8a flagless 族（rorx/shlx/sarx/shrx 全不写 flags）已由 MIT-434 以 translator 层 GetFlags/SetFlags 包裹接入（零新 VmOp、asmgen 零改动）；bzhi 边界语义（idx≥N = 原值不变+CF=1，probe 修正 432 预判）已全对齐（GAPS G8a 节）。
+- BMI 残余：G8a done（MIT-434，andn/bzhi 零新 VmOp 折条 + rorx/shlx/
+  sarx/shrx flagless 变体）；**G8b 挂账**（mulx/pdep/pext native 直执行 +
+  CPUID gate 基建，mulx CF 厂商分叉 Zen5 实测不写 vs SDM 择一披露——
+  432 §2.1 判定②）；blsr/blsi/blsmsk/bextr 语料 0 永久 gate（432 §6.4）。
 
 - marker_scan：x86 锚点未支持（GAPS C5；32 位输入已在 pe_loader 显式硬拒绝，
 
@@ -237,4 +241,47 @@ C3 区域内 call、C4 rip-relative、C5 x86 扫描不可用。
 CI 实跑 E2E + Release 构建矩阵 → pe_loader 畸形输入 fuzz →
 
 保护后 PE 在全新环境运行验证 → 覆盖率报告。
+
+## 指令虚拟化阶段（M2.5-G）收口（2026-08-31）
+
+> 口径注：本节为指令虚拟化阶段的唯一现行权威口径。本文中部「正确性缺口 /
+> M3 待办」等节为 M2 时代存档口径（append-only 审计史原则，不回改），现行
+> 缺口状态以 `docs/GAPS.md`（含指令族支持矩阵）与本节为准；仓根
+> `WVmp_HANDOVER_2026-08-28.md` 为 2026-08-28 历史交接件，同样不回改。
+
+**阶段定义（项目主 D2 拍板）**：MSVC x64 目标 · 编译器自然产物全覆盖 +
+gate 边界文档化——不承诺“全部 x86-64 指令”（那是 ymm/EVEX/x87 的伪承诺）。
+
+**完成定义三要素**：
+1. **编译器自然产物全形态入面实测**：G 线 13 张能力单全收口——G1(411)、
+   G2(413)、G3(415)、G4(419/423)、G5r(416/417/418)、G6a(426)、
+   G7r/G7p2(412/414)、G1b(425)、G1c(427)、G1d(428)、G9r(432)、P1(433)、
+   G8a(434)；覆盖 /Od+/O2 双档编译器直出形态（424/432 实测口径）。
+2. **gate 残余全部数据裁决 + 零逃逸**：不支持面逐族带频率/语料数据与裁定
+   出处（GAPS「指令族支持矩阵」；尾族/G8b 定稿引
+   `.multica/mit-G9r-triage.md` §1/§2/§6.4）；全谱 gate 实证
+   byte-identical 零逃逸（424 §3 / 432 §2.4 E2E 证据链）。
+3. **权威基线 + 条款史**：main `df3c2f1` 基线 = build 0 错 0 警 / ctest
+   16/16（基线含 regvm_backend_tests）/ multiseed 48 样本 × 5 = **240/240**
+   （REQUIRE_REAL=1）/ wvmpTest 14/14；kVmOpMax=97（跳表余量 30）；硬条款
+   （命名分支 / main 未动 / tracked 零脏 / 切回 main / ff-safe / ≥30 分钟 /
+   时间对账）连续满分史九连（至 MIT-434，main `df3c2f1`），本收口单
+   （MIT-GZ，分支 `mit-gz-phase-close`）按同条款交付，合入即十连收官。
+
+**两挂账（明确不在本阶段内）**：
+1. **x86 (PE32) 目标支持** → 独立里程碑「**多目标平台**」（项目主
+   2026-08-31 拍板，计划后续另立；GAPS C5 节仅加指针不改写）。
+2. **档B ymm / x87 L0 / 跳表 128→256 扩容** → 观察清单挂起，触发条件
+   （432 §3.4 阈值文本转录）：
+   - 客户产物抽样出现 BMI/尾族（pmovmskb/pcmpeq/punpck）标记区域命中 →
+     按族提单（G8a 模式小批开；lqdq/hqdq 客户态命中 → 随尾族单开）；
+   - x87 L0 或 ymm 立项 → 触发跳表扩容前置 commit（任何使 kVmOpMax+1 ≥ 128
+     的 op 批次，其实施单必须内置扩容前置 commit：先行合入、独立可回滚、
+     不单独立波。x87 L0 ~80 op = 唯一必然触发者；ymm 档B 20–30 op = 临界
+     触发者；G8b +3 → ≤102 不触发）；
+   - xmm8-15 / kCtxSize（0x1C8）冻结面议题 → 归入档B（ymm）包随立项处理。
+   观察清单挂起期间扩容单无限期挂起（G8a flagless/折条路线已证不触发）。
+
+**M3（MIT-410 插件池：crypt / mutate / anti_debug / integrity_crc /
+import_protect）恢复为主推线。**
 
