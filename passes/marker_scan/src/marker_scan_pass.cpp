@@ -90,9 +90,19 @@ void MarkerScanPass::run(ProtectionContext& ctx) {
         return;
     }
 
+    // 0) PeImage 提前取出：x86 (machine=0x014C) 走双段 magic 识别（X1a）。
+    const PeImage* pe = ctx.find_slot<PeImage>(kPeImage);
+    const bool is_x86 = pe != nullptr && pe->machine == kMachineX86;
+
     // 1) 定位两个桩函数体的 magic（各应恰好 1 处；缺失/多处只告警并继续）。
-    const auto begin_hits = ms::find_all(image, ms::kBeginPattern);
-    const auto end_hits = ms::find_all(image, ms::kEndPattern);
+    //    x64：imm64 连续 8 字节 needle。x86（X1a）：SDK 桩把 magic 拆成两条
+    //    imm32（/O1 /O2 lo→hi 紧邻、/Od hi→lo 间隔 3B，实测形态见
+    //    scan_core.hpp），用双段识别；PeImage 缺失（泳道单测直接构造
+    //    context）沿用 x64 路径，行为不变。
+    const auto begin_hits = is_x86 ? ms::find_all_x86(image, ms::kBeginPatternX86)
+                                   : ms::find_all(image, ms::kBeginPattern);
+    const auto end_hits = is_x86 ? ms::find_all_x86(image, ms::kEndPatternX86)
+                                 : ms::find_all(image, ms::kEndPattern);
     if (begin_hits.empty())
         ctx.diag.report(Severity::Warning, "marker_scan",
                         "begin 桩 magic 未找到（SDK 未链接进目标？）");
@@ -151,7 +161,6 @@ void MarkerScanPass::run(ProtectionContext& ctx) {
     // 5) 每对区域生成一个 FunctionRegion（M1：文件偏移 → RVA 统一换算）。
     //    PeImage 缺失时（如泳道单测直接构造 context）退化为保持文件偏移并
     //    记 Note，不失败。
-    const PeImage* pe = ctx.find_slot<PeImage>(kPeImage);
     if (pe == nullptr)
         ctx.diag.report(Severity::Note, "marker_scan",
                         "PeImage 模型缺失（pe_loader 未运行？），区域保持文件偏移");
@@ -174,9 +183,9 @@ void MarkerScanPass::run(ProtectionContext& ctx) {
         ir::FunctionRegion fr;
         // TODO(P7-names): 从 begin 调用点的 lea/rcx 引用解析字符串名；v1 用地址。
         fr.name = "(marker@0x" + hex_off(r.begin_off) + ")";
-        // TODO(P7-x86): x86 目标上 magic 会拆成两条 imm32（不连续），v1 仅 x64。
-        // MIT-414 (G7p2 B.3): arch 从 PeImage.machine 推导（P1 x86 铺路）；
-        // x64 路径恒 X64；PeImage 缺失（泳道单测直接构造 context）沿用 X64。
+        // X1a：x86 双段锚点已由步骤 1 的 is_x86 分支消费；区域 E8 回溯链
+        // 双架构同形（x86 call rel32 与 x64 编码一致，实测）。arch 推导自
+        // PeImage.machine（MIT-414 引入）；PeImage 缺失（泳道单测）沿用 X64。
         fr.arch = (pe != nullptr && pe->machine == kMachineX86) ? ir::Arch::X86
                                                                 : ir::Arch::X64;
         fr.begin_rva = to_rva(r.begin_off, "begin", fr.name);

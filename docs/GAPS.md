@@ -550,6 +550,12 @@ rc=0 输出≈输入，用户以为受保护）与**产坏壳**（手造连续�
 > 拍板剥离出指令虚拟化阶段，独立里程碑“**多目标平台**”（计划后续另立，
 > 见 `docs/STATUS.md` 阶段宣告节）；本节内容按 MIT-412/414 收口原样保留。
 
+> **X1a 增补（MIT-437，2026-09-01）**：x86 扫描面已就位（X1a，marker_scan
+> 双段 magic 识别 + `fr.arch` X86 落位 + SDK x86 产物位），管道路径保持
+> rc=2 硬拒原样，虚拟化消费由后续单接力；实测形态与判据见
+> `passes/marker_scan/include/wvmp/passes/marker_scan/scan_core.hpp` 双段
+> 注释（上列旧主张 1 的"不连续"实证即本单收口对象）。
+
 ## G3 串指令族 rep movs/stos/scas/cmps/lods（MIT-415 收口）
 
 **状态（2026-08-29，main 92928e0 后）：rep/repnz 串指令已入面**——lifter 前缀闸

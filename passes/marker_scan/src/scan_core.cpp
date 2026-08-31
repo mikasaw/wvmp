@@ -16,6 +16,37 @@ std::vector<size_t> find_all(std::span<const u8> hay, std::span<const u8> needle
     return hits;
 }
 
+std::vector<size_t> find_all_x86(std::span<const u8> hay, const X86DualMagic& m) {
+    std::vector<size_t> hits;
+    const auto lo_hits = find_all(hay, m.lo);
+    const auto hi_hits = find_all(hay, m.hi);
+    // 第二半起点窗口：[首半 + 4, 首半 + 4 + kX86MaxHalfGap]（不重叠共现）。
+    // 两个独立方向各扫一遍：lo→hi（/O1 /O2 形）与 hi→lo（/Od 形）。同一
+    // 物化只可能命中一个方向（第二半必须在第一半之后），不会重复计数；
+    // lo4 ≠ hi4（"WVMP" vs "BEG1"/"END1"），两方向产出的锚点偏移必不相同。
+    const size_t second_last = 4 + kX86MaxHalfGap;
+    for (const size_t lo : lo_hits) {
+        for (const size_t hi : hi_hits) {
+            if (hi > lo + second_last) break; // hi_hits 升序，其后更远
+            if (hi >= lo + 4) {
+                hits.push_back(lo);
+                break; // 窗内取首个共现 hi 即可，一处物化至多一个锚点
+            }
+        }
+    }
+    for (const size_t hi : hi_hits) {
+        for (const size_t lo : lo_hits) {
+            if (lo > hi + second_last) break;
+            if (lo >= hi + 4) {
+                hits.push_back(hi);
+                break;
+            }
+        }
+    }
+    std::sort(hits.begin(), hits.end());
+    return hits;
+}
+
 std::vector<CallRef> scan_calls(std::span<const u8> code, size_t base_off) {
     std::vector<CallRef> calls;
     if (code.size() < 5) return calls;

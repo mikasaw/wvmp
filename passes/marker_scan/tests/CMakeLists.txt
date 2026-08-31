@@ -41,6 +41,28 @@ wvmp_target_warnings(wvmp_marker_scan_tests)
 
 add_test(NAME marker_scan COMMAND wvmp_marker_scan_tests)
 
+# —— X1a (MIT-437): ml.exe 手编 x86 标记样本（真产物 fixture）——
+# 32 位交叉构建（ml.exe + /MACHINE:X86），走 build_x86_marker_sample.bat；
+# 环境无 vcvarsamd64_x86.bat 时降级跳过（对应 fixture 测试 #ifdef 关闭）。
+# 与 scripts/build.bat 同源约定：本机唯一 VS 目录硬编码。
+set(WVMP_VS_DIR "C:/Program Files/Microsoft Visual Studio/18/Insiders")
+if(WIN32 AND MSVC AND EXISTS "${WVMP_VS_DIR}/VC/Auxiliary/Build/vcvarsamd64_x86.bat")
+    set(WVMP_X86_MARKER_EXE "${CMAKE_CURRENT_BINARY_DIR}/x86_marker_sample.exe")
+    add_custom_command(
+        OUTPUT "${WVMP_X86_MARKER_EXE}"
+        COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/build_x86_marker_sample.bat" "${WVMP_X86_MARKER_EXE}"
+        DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/x86_marker_sample.asm"
+                "${CMAKE_CURRENT_SOURCE_DIR}/x86_marker_main.c"
+                "${CMAKE_CURRENT_SOURCE_DIR}/build_x86_marker_sample.bat"
+        COMMENT "x86 marker 样本交叉构建 (X1a: ml.exe + /MACHINE:X86)"
+        VERBATIM)
+    add_custom_target(wvmp_x86_marker_sample ALL DEPENDS "${WVMP_X86_MARKER_EXE}")
+    add_dependencies(wvmp_marker_scan_tests wvmp_x86_marker_sample)
+    target_compile_definitions(wvmp_marker_scan_tests PRIVATE
+        WVMP_X86_MARKER_SAMPLE_EXE="${WVMP_X86_MARKER_EXE}"
+    )
+endif()
+
 # M2-4：端到端虚拟化样例（区域仅含白名单指令）。
 add_executable(wvmp_virt_sample virtual_sample_main.cpp)
 target_link_libraries(wvmp_virt_sample PRIVATE wvmp::sdk)
