@@ -785,17 +785,20 @@ void run_semantic_battery(const vm::RuntimeImage& image, const std::string& dump
     }
 
     // ---- (l) Rol/Ror：循环移位、CF=循环移出位、count=0 no-op、S32/S64 全循环 ----
-    // Rol/Ror 语义要点（Intel SDM Vol. 2 ROL/ROR, felixcloutier.com/x86/rol/ror）：
+    // Rol/Ror 语义要点（Intel SDM Vol. 2 ROL/ROR, felixcloutier.com/x86/rol/ror；
+    // MIT-433 (MIT-P1) 注释修正——旧文 "SF/ZF/PF 按结果" 系把 SHL/SHR/SAR 组
+    // 语义误安到 ROL/ROR 头上的 SDM 误读）：
     //   - 循环移位：无 CF_in 概念（单条指令内闭环）
     //   - CF = 循环移出位 (looped-out bit)
     //   - OF: count==1 时 (CF XOR result MSB) [ROL] / (result bit[N-1] XOR
     //         result bit[N-2]) [ROR]; count>1 时 undefined
-    //   - SF/ZF/PF = 按结果
+    //   - SF/ZF/PF = **unaffected**（保留 ctx 旧值——handler 走
+    //     flags_tail_partial 装配；保留面由 RotFlagsPartialPreserve 矩阵钉死）
     // 任意 count>=32 (S32) / count>=64 (S64) 都按 x86 规范被 AND 0x1F/0x3F 掩。
     // count=0 整条 no-op（值/flags 都不变）。
     // 本测试段聚焦循环移位的**值**正确性 + count=0 路径 + count=1 OF 边界。
-    // 完整 flags 语义（含 SF/ZF/PF 多位组合 + CF 边带验证）由 RolFuzzTenThousand
-    // / RorFuzzTenThousand 5 万条 fuzz 承担, 每条都核对 CF=循环移出位 + value。
+    // CF=循环移出位 + value 的批量验证由 RolFuzzTenThousand / RorFuzzTenThousand
+    // 5 万条 fuzz 承担（fuzz 只核对 CF+value，不依赖 ZF/SF/PF 写入面）。
     {
         // (l.1) ROL S32 by 1：0x80000001 → 0x00000003
         std::vector<u8> s;
@@ -1937,6 +1940,191 @@ TEST(Interpreter, RorClFuzzTenThousand) {
                     << " val=" << std::hex << value32 << " cnt=" << std::dec << count;
             }
             ASSERT_EQ(ctx.pc, 5u) << "RorCl test stream halts at instruction 5";
+        }
+    }
+}
+
+// =============================================================================
+// MIT-433 (MIT-P1): rol/ror flags partial-preserve 真执行矩阵
+// =============================================================================
+// SDM Vol.2 ROL/ROR：只写 CF/OF（OF 仅 count==1 有定义），ZF/SF/PF
+// **unaffected**。修复前 handler 复用 build_shift 全量装配，把宿主内部状态
+// （zero5 的 xor → ZF=1/SF=0/PF=1）覆写进 guest flags（MIT-432 §6.1 项目主
+// 独立复现：native ror 后 setz=0，packed=1）。
+//
+// 矩阵（12 组，分叉面钉死，前态 flags 基线按 SDM 语义构造，exact 断言）：
+//   组 1-6   rol/ror × {ZF,SF,PF} 保留断言——结果分别为 0/负/低字节奇偶
+//            三态构造 × 前态基线置反（修复前恒 FAIL，修复后 PASS）；
+//   组 7-9   shl/shr/sar 对照——三位**按结果写**是正确语义，前态置反证明
+//            结果确被覆写（本单不得波及；非 rot handler 字节码零扰动由
+//            派单 D3 packed-sha 逐字节对账兜底）；
+//   组 10    count=0：值与全部五 flags 不动（rol/ror 各一，全 5 位基线）；
+//   组 11    count>1：ZF/SF/PF 仍保留 + CF 正确（OF undefined，掩码剔除）；
+//   组 12    RolCl/RorCl 同面（cl 计数路径共享 build_shift 块体 + partial 尾）。
+// 5 seed 寄存器随机化全部通过（flags_ 物理落位无关性）。
+TEST(Interpreter, RotFlagsPartialPreserve) {
+    alignas(16) std::array<u8, 0x10000> scratch{};
+    for (u64 seed : {1ull, 2ull, 3ull, 4ull, 5ull}) {
+        wvmp::Rng rng(seed);
+        const auto result = rt::generate_runtime(rng);
+        RwxImage rwx(result.image.code);
+        const auto entry = rwx.entry();
+        // imm 计数变体：mov v0=value → SetFlags(v2=pre) → op → GetFlags(v3) → halt。
+        auto run_imm = [&](isa::VmOp op, u32 value, u32 count, u64 pre) {
+            std::vector<u8> s;
+            isa::append_insn(s, mov_imm(0, value, ir::Size::S32));
+            isa::append_insn(s, mov_imm(2, static_cast<u32>(pre)));
+            isa::append_insn(s, isa::make_insn(isa::VmOp::SetFlags,
+                                               isa::OpKind::Reg, 2, isa::OpKind::None, 0));
+            isa::append_insn(s, bin_imm(op, 0, count, ir::Size::S32));
+            isa::append_insn(s, isa::make_insn(isa::VmOp::GetFlags,
+                                               isa::OpKind::Reg, 3, isa::OpKind::None, 0));
+            isa::append_insn(s, halt());
+            return run_stream(entry, s, scratch.data());
+        };
+        // cl 计数变体（计数写 RCX 槽 v1，S64 全宽）。
+        auto run_cl = [&](isa::VmOp op, u32 value, u32 count, u64 pre) {
+            std::vector<u8> s;
+            isa::append_insn(s, mov_imm(0, value));
+            isa::append_insn(s, mov_imm(1, count));
+            isa::append_insn(s, mov_imm(2, static_cast<u32>(pre)));
+            isa::append_insn(s, isa::make_insn(isa::VmOp::SetFlags,
+                                               isa::OpKind::Reg, 2, isa::OpKind::None, 0));
+            isa::append_insn(s, cl_shift(op, 0, ir::Size::S64));
+            isa::append_insn(s, isa::make_insn(isa::VmOp::GetFlags,
+                                               isa::OpKind::Reg, 3, isa::OpKind::None, 0));
+            isa::append_insn(s, halt());
+            return run_stream(entry, s, scratch.data());
+        };
+        const u64 noflags = 0;
+
+        // ---- 组 1-3: rol 保留面（S32, count=1, exact）----
+        // 组1 ZF：V=0 rol 1 → 结果仍 0，native ZF 保留前态 0（非按结果置 1）；
+        //         修复前宿主 xor 污染 → ZF=1。OF=MSB(res)^CF=0，CF=MSB(V)=0。
+        {
+            const auto ctx = run_imm(isa::VmOp::Rol, 0x00000000u, 1, noflags);
+            EXPECT_EQ(ctx.regs[0], 0x00000000u) << "rol ZF value seed=" << seed;
+            EXPECT_EQ(ctx.regs[3] & isa::kFlagsMask, noflags)
+                << "组1 rol ZF 保留（结果 0 但 ZF 不得置位）seed=" << seed;
+        }
+        // 组2 SF：V=0x40000000 rol 1 → 0x80000000（负结果），前态 SF=1 保留
+        //         （非按结果清 0）；CF=MSB(V)=0，OF=MSB(res)^CF=1。
+        {
+            const auto ctx = run_imm(isa::VmOp::Rol, 0x40000000u, 1, isa::kFlagSF);
+            EXPECT_EQ(ctx.regs[0], 0x80000000u) << "rol SF value seed=" << seed;
+            EXPECT_EQ(ctx.regs[3] & isa::kFlagsMask,
+                      u64(isa::kFlagSF | isa::kFlagOF))
+                << "组2 rol SF 保留（负结果但 SF 保留前态 1）seed=" << seed;
+        }
+        // 组3 PF：V=0x00000001 rol 1 → 0x00000002（低字节 1 位 = 奇校验，
+        //         "按结果算 PF" 也会得 0——隔离"保留前态"与"宿主捕获"的分叉）；
+        //         前态 CF=1 证明 rol 仍真实写 CF（MSB(V)=0 覆写前态）。
+        {
+            const auto ctx = run_imm(isa::VmOp::Rol, 0x00000001u, 1, isa::kFlagCF);
+            EXPECT_EQ(ctx.regs[0], 0x00000002u) << "rol PF value seed=" << seed;
+            EXPECT_EQ(ctx.regs[3] & isa::kFlagsMask, noflags)
+                << "组3 rol PF 保留 + CF 覆写验证 seed=" << seed;
+        }
+        // ---- 组 4-6: ror 保留面（S32, count=1, exact）----
+        // 组4 ZF：V=0 ror 1 → 0。CF=LSB(V)=0，OF=bit63(res)^bit62(res)=0。
+        {
+            const auto ctx = run_imm(isa::VmOp::Ror, 0x00000000u, 1, noflags);
+            EXPECT_EQ(ctx.regs[0], 0x00000000u) << "ror ZF value seed=" << seed;
+            EXPECT_EQ(ctx.regs[3] & isa::kFlagsMask, noflags)
+                << "组4 ror ZF 保留 seed=" << seed;
+        }
+        // 组5 SF：V=0x00000001 ror 1 → 0x80000000（负结果），前态 SF=1 保留；
+        //         CF=LSB(V)=1，OF=bit63(res)^bit62(res)=1^0=1。
+        {
+            const auto ctx = run_imm(isa::VmOp::Ror, 0x00000001u, 1, isa::kFlagSF);
+            EXPECT_EQ(ctx.regs[0], 0x80000000u) << "ror SF value seed=" << seed;
+            EXPECT_EQ(ctx.regs[3] & isa::kFlagsMask,
+                      u64(isa::kFlagSF | isa::kFlagCF | isa::kFlagOF))
+                << "组5 ror SF 保留（负结果但 SF 保留前态 1）seed=" << seed;
+        }
+        // 组6 PF：V=0x00000002 ror 1 → 0x00000001（低字节奇校验），前态 CF=1
+        //         被 ror 真实写 CF=LSB(V)=0 覆写；PF 保留前态 0（修复前=1）。
+        {
+            const auto ctx = run_imm(isa::VmOp::Ror, 0x00000002u, 1, isa::kFlagCF);
+            EXPECT_EQ(ctx.regs[0], 0x00000001u) << "ror PF value seed=" << seed;
+            EXPECT_EQ(ctx.regs[3] & isa::kFlagsMask, noflags)
+                << "组6 ror PF 保留 + CF 覆写验证 seed=" << seed;
+        }
+        // ---- 组 7-9: shl/shr/sar 对照——按结果写三位是正确语义（exact）----
+        // 组7 shl：前态 ZF=1，结果 0x2 非零 → ZF 必须被**写 0**（若被误保
+        //          留则 ZF=1 → FAIL）。CF=bit31(V)=0，OF=MSB(res)^CF=0，
+        //          PF(0x02)=奇=0。
+        {
+            const auto ctx = run_imm(isa::VmOp::Shl, 0x00000001u, 1, isa::kFlagZF);
+            EXPECT_EQ(ctx.regs[0], 0x00000002u) << "shl value seed=" << seed;
+            EXPECT_EQ(ctx.regs[3] & isa::kFlagsMask, noflags)
+                << "组7 shl 写 ZF 对照（结果覆写前态）seed=" << seed;
+        }
+        // 组8 shr：前态 SF=1，V=0xC0000000 shr 1 → 0x60000000 → SF=0 **写入**
+        //          （逻辑右移高位补 0，count>=1 时结果 MSB 恒 0；若被误保留
+        //          则 SF=1 → FAIL）。CF=bit0(V)=0，OF(count1)=MSB(V)=1，
+        //          PF(0x00)=偶=1。
+        {
+            const auto ctx = run_imm(isa::VmOp::Shr, 0xC0000000u, 1, isa::kFlagSF);
+            EXPECT_EQ(ctx.regs[0], 0x60000000u) << "shr value seed=" << seed;
+            EXPECT_EQ(ctx.regs[3] & isa::kFlagsMask,
+                      u64(isa::kFlagOF | isa::kFlagPF))
+                << "组8 shr 写 SF 对照（前态 1 被结果覆写为 0）seed=" << seed;
+        }
+        // 组9 sar：前态全 0，V=1 sar 1 → 0 → ZF=1 写入。CF=bit0(V)=1，
+        //          OF(count1)=0，PF(0x00)=偶=1。
+        {
+            const auto ctx = run_imm(isa::VmOp::Sar, 0x00000001u, 1, noflags);
+            EXPECT_EQ(ctx.regs[0], 0x00000000u) << "sar value seed=" << seed;
+            EXPECT_EQ(ctx.regs[3] & isa::kFlagsMask,
+                      u64(isa::kFlagZF | isa::kFlagCF | isa::kFlagPF))
+                << "组9 sar 写 ZF 对照 seed=" << seed;
+        }
+        // ---- 组 10: count=0 值/全 5 flags 不动（含 CF/OF 不写）----
+        {
+            const auto ctx = run_imm(isa::VmOp::Rol, 0x12345u, 0,
+                                     isa::kFlagZF | isa::kFlagSF | isa::kFlagOF);
+            EXPECT_EQ(ctx.regs[0], 0x12345u) << "rol count0 value seed=" << seed;
+            EXPECT_EQ(ctx.regs[3] & isa::kFlagsMask,
+                      u64(isa::kFlagZF | isa::kFlagSF | isa::kFlagOF))
+                << "组10 rol count=0 全保留 seed=" << seed;
+            const auto ctx2 = run_imm(isa::VmOp::Ror, 0x12345u, 0,
+                                      isa::kFlagCF | isa::kFlagSF | isa::kFlagPF);
+            EXPECT_EQ(ctx2.regs[0], 0x12345u) << "ror count0 value seed=" << seed;
+            EXPECT_EQ(ctx2.regs[3] & isa::kFlagsMask,
+                      u64(isa::kFlagCF | isa::kFlagSF | isa::kFlagPF))
+                << "组10 ror count=0 全保留 seed=" << seed;
+        }
+        // ---- 组 11: count>1——ZF/SF/PF 仍保留 + CF 正确（OF undefined 剔除）----
+        {
+            const auto ctx = run_imm(isa::VmOp::Rol, 0x00000001u, 3,
+                                     isa::kFlagZF | isa::kFlagPF);
+            EXPECT_EQ(ctx.regs[0], 0x00000008u) << "rol count3 value seed=" << seed;
+            // CF = bit(32-3) of V = 0；保留 ZF|PF，SF 前态 0 保留。
+            const u64 keep = isa::kFlagZF | isa::kFlagSF | isa::kFlagPF | isa::kFlagCF;
+            EXPECT_EQ(ctx.regs[3] & keep, u64(isa::kFlagZF | isa::kFlagPF))
+                << "组11 rol count>1 保留 + CF seed=" << seed;
+            const auto ctx2 = run_imm(isa::VmOp::Ror, 0x00000008u, 3,
+                                      isa::kFlagSF | isa::kFlagPF);
+            EXPECT_EQ(ctx2.regs[0], 0x00000001u) << "ror count3 value seed=" << seed;
+            // CF = bit(count-1) of V = bit2(0x8) = 0。
+            EXPECT_EQ(ctx2.regs[3] & keep, u64(isa::kFlagSF | isa::kFlagPF))
+                << "组11 ror count>1 保留 + CF seed=" << seed;
+        }
+        // ---- 组 12: RolCl/RorCl 同面（S64 全宽，cl 计数路径 + partial 尾）----
+        {
+            const auto ctx = run_cl(isa::VmOp::RolCl, 0x40000000u, 1, isa::kFlagSF);
+            EXPECT_EQ(ctx.regs[0], 0x80000000u) << "rolcl value seed=" << seed;
+            // S64: CF=bit63(V)=0，OF=MSB(res bit63)^CF=0^0=0，SF 保留前态 1。
+            EXPECT_EQ(ctx.regs[3] & isa::kFlagsMask, u64(isa::kFlagSF))
+                << "组12 rolcl SF 保留 seed=" << seed;
+            const auto ctx2 = run_cl(isa::VmOp::RorCl, 0x00000001u, 1, isa::kFlagSF);
+            // S64 全宽: 1 ror 1 → 0x8000000000000000（非 32 位 0x80000000）。
+            EXPECT_EQ(ctx2.regs[0], 0x8000000000000000ull) << "rorcl value seed=" << seed;
+            // CF=bit0(V)=1，OF=bit63(res)^bit62(res)=1^0=1，SF 保留前态 1。
+            EXPECT_EQ(ctx2.regs[3] & isa::kFlagsMask,
+                      u64(isa::kFlagSF | isa::kFlagCF | isa::kFlagOF))
+                << "组12 rorcl SF 保留 seed=" << seed;
         }
     }
 }

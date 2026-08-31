@@ -542,6 +542,10 @@ public:
     // flags 装配 + 同步 v17 + 前进 + 回 dispatch。
     // 标准：T6=ZF T3=CF(0/1) T4=OF T7=SF T9=PF。
     // cf_preset：Inc/Dec 变体——T3 已是旧 CF 的 bit1 值（保留语义），不再移位。
+    // MIT-433 (MIT-P1)：本函数是"五标志全量装配"通路——适用于按结果写全部
+    // 五位的指令族（add/sub/and/or/xor/test/cmp/neg/sar/shl/shr/adc/sbb/
+    // cmpxchg/ucomis…）。只写部分标志的指令族不得走此全量装配（会把 guest
+    // 应保留的位覆写成 handler 内部宿主状态），见 flags_tail_partial。
     std::string flags_tail(u64 dispatch, bool cf_preset) const {
         std::string o;
         o += std::string("    mov ") + r64(flags_) + ", " + r64(t_[6]) + "\n";
@@ -553,6 +557,40 @@ public:
         o += std::string("    or ") + r64(flags_) + ", " + r64(t_[7]) + "\n";
         o += std::string("    shl ") + r64(t_[9]) + ", 4\n";
         o += std::string("    or ") + r64(flags_) + ", " + r64(t_[9]) + "\n";
+        o += std::string("    mov qword ptr [") + r64(ctx_) + " + 0x98], " + r64(flags_) + "\n";
+        o += advance(dispatch);
+        return o;
+    }
+
+    // MIT-433 (MIT-P1) flags partial-preserve 装配：Inc/Dec cf_preset 先例
+    // （"保留位不经 setcc5、直接从 ctx 旧值搬运合并"）的三位推广版。
+    //
+    // 语义依据（Intel SDM Vol. 2 ROL/ROR；MIT-432 G9r §6.1 本案）：
+    //   ROL/ROR 只写 CF（循环移出位）与 OF（仅 count==1 有定义，count>1 时
+    //   SDM 标 undefined——宿主 CPU 仍写一个值，seto 照捕，与 SDM 不冲突）；
+    //   ZF/SF/PF **unaffected**——guest 视角必须原样保留。
+    //
+    // 为何不能复用 flags_tail：handler 内部 zero5() 的 `xor r,r` 已把宿主
+    // ZF/SF/PF 打成 1/0/1，setcc5 捕到的是宿主 handler 内部状态，与 guest
+    // 语义无关（MIT-432 复现：native ror 后 setz 应得 0，packed 得 1）。
+    //
+    // 实现：flags_ 寄存器 = ctx+0x98 的活镜像（vm_entry 载入、flags_tail/
+    // SetFlags 同步、callgate 跨 native call 后重载——不变量），故旧值直接
+    // `and flags_, 0x19`（ZF=bit0|SF=bit3|PF=bit4）原位保留，CF/OF 照旧由
+    // T3/T4 移位或入；T6/T7/T9（setcc5 捕得的宿主垃圾）不再消费。比全量
+    // 装配省 4 条（无 T6 装载与 T7/T9 两次移位或入）。
+    //
+    // G8a 接口预留（本单只留声明，不实现，G8a §C D2 依赖本单合入）：
+    // flagless 变体（rorx/shlx/sarx/shrx 等 BMI2 族，全不写 flags）的接入点
+    // = 本函数的"保留掩码 + 部分或入"骨架——届时把 CF/OF 也并入保留掩码
+    // （掩码 0x1F 全保留、零 or 入、zero5/setcc5 整段省略），零新 VmOp。
+    std::string flags_tail_partial(u64 dispatch) const {
+        std::string o;
+        o += std::string("    and ") + r64(flags_) + ", " + imm(0x19) + "\n";
+        o += std::string("    shl ") + r64(t_[3]) + ", 1\n";
+        o += std::string("    or ") + r64(flags_) + ", " + r64(t_[3]) + "\n";
+        o += std::string("    shl ") + r64(t_[4]) + ", 2\n";
+        o += std::string("    or ") + r64(flags_) + ", " + r64(t_[4]) + "\n";
         o += std::string("    mov qword ptr [") + r64(ctx_) + " + 0x98], " + r64(flags_) + "\n";
         o += advance(dispatch);
         return o;
@@ -703,8 +741,13 @@ public:
                flags_tail(dispatch, true);
     }
 
-    // Shl/Shr（计数=cl；掩码后计数 0 → 整条 no-op 不动 flags；本机掩码规则）。
-    std::string build_shift(const char* native, u64 dispatch) const {
+    // Shl/Shr/Sar（计数=cl；掩码后计数 0 → 整条 no-op 不动 flags；本机掩码
+    // 规则）。shl/shr/sar 按结果写全部五标志 → flags_tail 全量装配。
+    // MIT-433 (MIT-P1)：rol/ror 与本族解耦——尾部换 flags_tail_partial
+    // （ZF/SF/PF 从 ctx 旧值保留，见该函数注）。块体逐字节同构（load/count
+    // 掩码/zero5/native/setcc5/writeback/计数 0 出口全部一致），仅 tail 一处
+    // 分叉，shl/shr/sar 生成字节码不受影响（D3 sha 逐字节对账保证）。
+    std::string build_shift(const char* native, u64 dispatch, bool partial_flags = false) const {
         const std::string tag = std::string(native) + std::to_string(seq());
         const std::string adv_lbl = "adv_" + tag;
         const std::string tail_lbl = "ftail_" + tag;
@@ -735,7 +778,8 @@ public:
         }
         std::string out = decode_prelude() + size_chain(blocks, tag);
         out += adv_lbl + ":\n" + advance(dispatch);   // 计数 0 出口
-        out += tail_lbl + ":\n" + flags_tail(dispatch, false);
+        out += tail_lbl + ":\n" +
+               (partial_flags ? flags_tail_partial(dispatch) : flags_tail(dispatch, false));
         return out;
     }
 
@@ -2490,24 +2534,30 @@ public:
     // count=0 走 adv_lbl 不动值/flags（与 shr/shl 一致）。
     std::string build_sar(u64 d) const { return build_shift("sar", d); }
 
-    // Rol/Ror 复用 build_shift：与 build_sar 同理, 仅 native op 不同。x86
-    // rol/ror 与 shl/shr 的语义差异仅在循环性, 无 CF_in 概念（单条指令内
-    // 闭环, 不接受跨指令 carry——与 adc/sbb 的 CF_in 完全不同）。flags 全量
-    // 由 setcc5 捕 host CPU 真值, 与 Intel SDM Vol. 2 ROL/ROR 一一对应:
-    //   CF  = 循环移出位 (looped-out bit; 即从循环另一端被踢出的那一位,
-    //         不同于 shr 的"末位 carry", 是闭环的对端位)
-    //   OF  = 仅 count==1 时按结果最高两位异或 (bit[N-1] XOR bit[N-2]);
-    //         count>1 时 undefined (Intel SDM 标 undefined), host CPU 仍写
-    //         一个值, setcc5 照样捕获——与 SDM "undefined" 一致
-    //   SF  = 结果 MSB
-    //   ZF  = 结果 == 0
-    //   PF  = 结果低 8 位偶校验
+    // Rol/Ror（MIT-433 MIT-P1 起与 build_shift 尾部解耦，走 partial 装配）。
+    // x86 rol/ror 与 shl/shr/sar 的语义差异有二：
+    //   1. 循环性：无 CF_in 概念（单条指令内闭环, 不接受跨指令 carry——与
+    //      adc/sbb 的 CF_in 完全不同）。
+    //   2. **flags 写入面（本单修的缺口）**：SDM Vol. 2 ROL/ROR 只写
+    //        CF  = 循环移出位 (looped-out bit; 即从循环另一端被踢出的那一位,
+    //            不同于 shr 的"末位 carry", 是闭环的对端位)
+    //        OF  = 仅 count==1 时有定义 (ROL: MSB(result) XOR CF;
+    //              ROR: result 最高两位异或), count>1 时 undefined
+    //              (宿主 CPU 仍写一个值, setcc5 照捕——与 SDM 一致)
+    //      **ZF/SF/PF unaffected**——guest 视角必须从 ctx 旧值原样保留。
+    //      旧实现（本单前）把 SHL/SHR/SAR 组的"SF/ZF/PF 按结果"语义误安到
+    //      ROL/ROR 头上（SDM 误读），且 flags_tail 全量装配把 zero5 的宿主
+    //      内部 ZF/SF/PF（xor 致 1/0/1）覆写进 guest flags——MIT-432 §6.1
+    //      项目主独立复现：native ror 后 setz=0，packed=1（旋转结果非零、
+    //      ZF 应保留 0）。修复 = flags_tail_partial（本文件 flags_tail 注）。
     // 关键 catch：build_shift 不能直接复用于 build_adc/build_sbb（zero5 清
     // 宿主 CF 导致 CF_in 丢失）；反之 build_adc/build_sbb 不能复用 build_shift
-    //（CF_in 路径不对）。Rol/Ror 走 build_shift 是对称的——它们无 CF_in 概念。
-    // count=0 走 adv_lbl 不动值/flags（与 shr/shl/sar 一致；x86 原生语义）。
-    std::string build_rol(u64 d) const { return build_shift("rol", d); }
-    std::string build_ror(u64 d) const { return build_shift("ror", d); }
+    //（CF_in 路径不对）。Rol/Ror 的 CF 是纯输出（无 CF_in 概念），块体
+    // （load/count 掩码/zero5/native/setcc5/writeback）与 shift 同构安全。
+    // count=0 走 adv_lbl 不动值/flags（SDM: count&31 == 0 时 flags 不受影响，
+    // 与 shl/shr/sar 一致；rol/ror 的 adv 出口本就不写 flags，无需分叉）。
+    std::string build_rol(u64 d) const { return build_shift("rol", d, true); }
+    std::string build_ror(u64 d) const { return build_shift("ror", d, true); }
 
     // MIT-301 cl 变体 shift: D3 /5 形式，计数源自 RCX 低 8 位（cl）而非 aux。
     // 翻译器对 src.kind=Reg 的 shift 发射新 VmOp (ShlCl/ShrCl/SarCl/RolCl/
@@ -2516,11 +2566,13 @@ public:
     //   - 与 imm 变体共享同一段汇编，唯一差异是 VmOp 编号让 dispatch 跳此处
     //   - 五个 cl 变体仅 native op 字符串不同 ("shl"/"shr"/"sar"/"rol"/"ror")
     // 独立 VmOp 编码让字节码语义显式、asm_dump 可读、与 imm 变体严格区分。
+    // MIT-433: rolcl/rorcl 与 imm 形同面——native ROL/ROR 的 flags 写入面
+    // 与计数来源无关，同样走 flags_tail_partial（与 build_rol/build_ror 对齐）。
     std::string build_shl_cl(u64 d) const { return build_shift("shl", d); }
     std::string build_shr_cl(u64 d) const { return build_shift("shr", d); }
     std::string build_sar_cl(u64 d) const { return build_shift("sar", d); }
-    std::string build_rol_cl(u64 d) const { return build_shift("rol", d); }
-    std::string build_ror_cl(u64 d) const { return build_shift("ror", d); }
+    std::string build_rol_cl(u64 d) const { return build_shift("rol", d, true); }
+    std::string build_ror_cl(u64 d) const { return build_shift("ror", d, true); }
 
     // MIT-307 Movsxd (Reg-Reg): dst = sign_ext_32(src)。
     // 用 native movsxd 一次完成 32→64 符号扩展：把 src VM 槽当 dword ptr

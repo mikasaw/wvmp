@@ -95,6 +95,40 @@
 
 **验收**：每个新 op 的真执行电池用例绿；含 sar/adc/sbb 循环的 E2E 样本 PASS。
 
+**MIT-433 (P1) 收口：rol/ror flags 语义分叉（G9r triage §6.1，2026-08-31）**
+
+- **缺口（MIT-432 项目主独立复现认定，406 铁律）**：`build_rol/build_ror`
+  复用 `build_shift` 全量 `flags_tail` 装配，而 SDM Vol.2 ROL/ROR **只写
+  CF/OF、ZF/SF/PF unaffected**——zero5 的 `xor r,r` 宿主污染（ZF=1/SF=0/PF=1）
+  被 setcc5 捕获后覆写 guest 应保留位。实测：native `ror eax,1` 后 `setz`=0，
+  packed=1（旋转结果非零、ZF 应保留前态 0）。230/230 基线全绿是**盲区**
+  （无"rotate 后消费 ZF/SF/PF"形态），非无缺口。
+- **修复 = flags_tail_partial partial-preserve 装配**（Inc/Dec cf_preset
+  先例的三位推广）：CF/OF 照旧 setcc5 捕获装配，ZF/SF/PF 三位从 ctx+0x98
+  旧值（经 flags_ 活镜像）`and 0x19` 原位保留；rol/ror/rolcl/rorcl 四
+  handler 换 partial 尾（其余 handler 生成字节码零扰动——asmgen dump 逐
+  case 对账：91/95 handler 体逐字节相同，差异恰为 4 个 rot handler 尾部；
+  非 rot 样本 packed 差异 = 内嵌解释器镜像尺寸 -48 字节 @seed12345（4 rot
+  尾部变短的纯位置效应，跳表 delta 全为该值的整数倍），bytecode/stub 零变）。
+- **注释同步修正**：asmgen.cpp ROL/ROR 段旧文"SF/ZF/PF 按结果"系把
+  SHL/SHR/SAR 组语义误安到 ROL/ROR 头上的 SDM 误读，已按实义重写并引本案。
+- **测试面**：`RotFlagsPartialPreserve` 12 组矩阵（rol/ror × {ZF,SF,PF}
+  保留 + shl/shr/sar 全量写对照 + count=0 全 5 位不动 + count>1 保留 +
+  RolCl/RorCl 同面，5 seed 随机分配）；样本 `wvmp_flags_rol_sample`
+  （p432 复现样本转正：自含 MASM marker 桩，ror/rol ZF + rol SF + ror PF
+  消费区 + shl 对照，消费值经区内 Store 落盘——427 披露①观察纪律；
+  修复前旧 CLI 双跑 stdout 分叉必 FAIL，修复后 byte-exact）。
+- **G8a 前置**：flags_tail_partial 的"保留掩码 + 部分或入"骨架即 flagless
+  变体（rorx/shlx/sarx/shrx，全不写 flags）的接入点声明（asmgen.cpp 接口
+  文本已留；G8a 只需把 CF/OF 并入保留掩码，零新 VmOp，本单不实现）。
+- **D4 OF 语义保留**：count==1 defined（seto 捕真值）、count>1 undefined
+  （捕 host 值与 SDM 不冲突）——现状保留，未顺手改。
+
+**样本集设计纪律（盲区教训，后续样本设计必读）**：样本的观察面必须覆盖
+"指令写入面 × 消费形态"矩阵——指令写了哪些 flags，就要有对应的 setcc/jcc
+消费探针；写入面没有被消费，行为对拍就观察不到分叉（rol/ror 在 230/230
+全绿下仍带三级分叉缺口即本教训的实例）。
+
 ## C3 区域内 call 支持（callgate；整数 + FP 参数/返回值，MIT-417 起）
 
 **现状（MIT-417 改写，旧文 "翻译器直接 skip" 为 pre-M2-9 遗留，作废）**

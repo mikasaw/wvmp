@@ -1045,3 +1045,22 @@ target_compile_options(wvmp_aligned_mov_xmm_readback_sample PRIVATE
 target_link_options(wvmp_aligned_mov_xmm_readback_sample PRIVATE
     $<$<CXX_COMPILER_ID:MSVC>:/INCREMENTAL:NO>
 )
+
+# MIT-433 (MIT-P1): rol/ror flags partial-preserve 主样本 — %TEMP%\p432
+# 复现样本转正 (MIT-432 §6.1, 自含 MASM marker 桩形保留, 不链 wvmp::sdk)。
+# 5 区全部"前态构造 → rotate → setcc 消费 → 区内 Store 落盘"(427 披露①
+# 观察纪律): ror ZF / rol ZF (修复前分叉=1, native=0) / shl ZF 对照
+# (按结果写, 双侧一致) / rol SF (前态 1 保留, 修复前=0) / ror PF (前态 0
+# 保留, 修复前=1)。修复前 stdout 分叉必 FAIL, 修复后 byte-exact。
+enable_language(ASM_MASM)
+add_executable(wvmp_flags_rol_sample
+    wvmp_flags_rol_sample_main.cpp
+    wvmp_flags_rol_sample_asm.asm
+)
+target_compile_options(wvmp_flags_rol_sample PRIVATE
+    $<$<AND:$<CXX_COMPILER_ID:MSVC>,$<COMPILE_LANGUAGE:C,CXX>>:/Od;/Ob0;/utf-8>
+    $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-O0>
+)
+target_link_options(wvmp_flags_rol_sample PRIVATE
+    $<$<CXX_COMPILER_ID:MSVC>:/INCREMENTAL:NO>
+)

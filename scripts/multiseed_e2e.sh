@@ -102,6 +102,11 @@
 #     66 0F D4 → R2 档② 砍面留 G1c, 照旧 gate 行为 byte-exact) +
 #     wvmp_sse_fin_xmm_readback_sample (13 探针 ctx.xmm 8 槽全量读回影子
 #     样本)。单边新增 2 样本 → 40 × 5 = 200 runs。
+#   - MIT-433 (P1): extend to wvmp_flags_rol_sample (rol/ror flags
+#     partial-preserve 主样本: p432 复现样本转正, 自含 MASM marker 桩,
+#     5 区 = ror/rol ZF + rol SF + ror PF 消费 + shl 对照, 区内 Store
+#     落盘; 修复前 stdout 分叉必 FAIL, 修复后 byte-exact)。
+#     单边新增 1 样本 → 47 × 5 = 235 runs。
 #   - MIT-306: REQUIRE_REAL=1 校验日志含 "已生成 N 个入口 stub" 防止 C1 gate
 #     兜底被误判 PASS（仅 byte-exact 不够, C1 gate 函数被跳过仍能输出相同
 #     stdout+rc）。与 multiseed_e2e_real.sh 配套使用。
@@ -238,6 +243,12 @@ samples=(
     # 单边新增 2 样本 → 46 × 5 = 230 runs。
     "build/passes/marker_scan/tests/wvmp_aligned_mov_sample.exe"
     "build/passes/marker_scan/tests/wvmp_aligned_mov_xmm_readback_sample.exe"
+    # MIT-433 (P1): rol/ror flags partial-preserve 主样本 — p432 复现样本
+    # 转正 (自含 MASM marker 桩, 5 区 setcc 消费 + 区内 Store 落盘):
+    # ror/rol ZF + rol SF + ror PF 消费面 (修复前 stdout 分叉必 FAIL) +
+    # shl 对照。修复前反证用旧 CLI (0ac661a 同产物) 双跑观察分叉值。
+    # 单边新增 1 样本 → 47 × 5 = 235 runs。
+    "build/passes/marker_scan/tests/wvmp_flags_rol_sample.exe"
 )
 
 # Seeds: 1 (small), 12345 (default), 99999 (large), 0xDEADBEEF (magic), 0xCAFEBABE (magic).
