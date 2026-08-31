@@ -252,6 +252,7 @@
 | 指令族 | 状态 | 裁决/实现要点 | 出处 |
 |---|---|---|---|
 | GP 算术/逻辑/移位/位技巧（含 div/idiv、movzx/movsx、popcnt/lzcnt/tzcnt、shift/rot 全谱） | ✅ 支持 | C2 handler 真执行语义电池 + 万条 fuzz；rol/ror flags partial-preserve（SDM：只写 CF/OF） | MIT-351~355 / MIT-404 / C2 收口 / MIT-433 (P1) |
+| 区域内 ret / ret imm16（C3/C2 iw，清栈返回） | ✅ 支持（MIT-438 起） | D2 (i) aux 载 imm 零新 VmOp；出口 = handler 内清栈返回（终态物理 rsp := guest rsp，不走 HALT 通道）；imm=0 ≡ ret；`retf` 不在面 gate | MIT-438 (X1b) |
 | 浮点 SSE 全族（add/sub/mul/div/mov/位运算/比较/andnps，标量+packed+mem 形） | ✅ 支持 | XmmLoad/XmmStore mem 通路；ctx.xmm 读回影子样本 | MIT-371~376 / MIT-408 / MIT-411 / MIT-425 |
 | SSE2 整数位运算档①（pand/por/pxor/pandn）+ GP↔xmm 桥（movd/movq）+ 对齐传送（movdqa/movdqu） | ✅ 支持 | 档② paddq/psubq 本体砍面（实测 16/854k ≈ 0.002%）；桥双编码逐位对齐 | MIT-425 / MIT-427 (G1c) / MIT-428 (G1d) |
 | VEX.128 档A（38 id V-pair 三地址折叠） | ✅ 支持 | 零新 VmOp、零新 handler，复用 translate_sse_* 通路 | MIT-426 (G6a) |
@@ -434,6 +435,102 @@ shlx cnt-in-reg、sarx mem、shrx 独立；1 负例区 7 指令各自 gate note 
 原生保持）+ translator/lifter/runtime 三层单测矩阵（载体派发与碰撞回归、
 D4 双 andn 串扰钉、真执行语义电池 6 case × 5 seed 期望值 = probe 逐位）。
 multiseed 48 样本 × 5 = **240/240**（REQUIRE_REAL 同）。
+
+## Ret imm16 清栈返回（MIT-438 收口：x64 现网同类地雷兼修，D2 选型 (i) 零新 VmOp）
+
+**状态（2026-09-01，分支 `mit-x1b-ret-imm16` 基于 main 2dad6ff）**：X0 triage
+§A.1 升级定性的机制链收口——lifter 双 arch 共享 `translate_ret` 已把 imm 放进
+IR.src（x86_translate.cpp `translate_ret`，`ret imm16` 含 66 前缀形实测钉死），
+但 translator 丢弃 in.src（aux 蒸发），且 runtime 跳表**无 Ret handler**（表项
+指向 Halt）——区域内含 ret 的函数翻译成功零告警、运行时停机走 stub 终态出口：
+返回地址不弹、清栈丢失、控制流落错。**不止 x86 战役需要：`ret imm16`（C2 iw）
+在 x64 也是合法编码**（手写/第三方汇编可现），属现网 x64 既有正确性缺口——
+433「230/230 全绿 ≠ 通路已验」**样本集盲区教训第二例**（现样本集无任何区域内
+ret 形态；X0 §7：msvbvm60 82% of ret = imm16 形，x86 stdcall 被调方清栈主形）。
+
+**语义（SDM Vol.2 RET.Near imm16）**：ret_addr = [v4]；v4 += 8 + imm（imm 按
+字节数加 rsp，无符号零扩展，x64 同）；imm=0 ≡ plain ret（D3 边界）；上界
+0xFFFF（C2 iw 编码域）。病态形（清栈量越过返回地址槽/越帧）SDM 定义为普通
+加法——VM 跟随 native 语义不加 gate（D3 钉：handler 恒加 imm）。`retf`
+（16 位远返回）不在面：语料未现，遇之白名单外 C1 gate 兜底（文档一句，D3）。
+
+**实现（D2 选型 (i)：闲置参数槽，零新 VmOp / 零跳表扩容 / asmgen 既有 handler
+逐字节零扰动）**：
+
+- translator `case ir::Op::Ret`：in.src（Imm 形）按低 16 位掩码载入 aux（掩码
+  = 编码域忠实行为，capstone 域 0..0xFFFF 不可能越界，防御非法源）；plain ret
+  （src=None）→ aux=0 ≡ plain ret。双 arch 共享此路径（imm 恒按字节加）。
+- runtime `build_ret`（asmgen.cpp 新增）：ret_addr = [v4] → v4' = v4+8+imm →
+  v4' 持久化 ctx+0x30 → **出口不走 stub HALT 通道**（stub 终态恒在 rsp =
+  native_sp 处转移，物理 rsp 无法表达清栈）：handler 内直接完成 stub 终态链
+  （易失寄存器 rax/rcx/rdx/r8-r11 + xmm0-7 写回 → 弃解释器帧 0x210 → pop stub
+  8 push 恢复宿主 callee-saved）→ `mov rsp,[rsp-0x1D8]`（ctx+0x30 读于 rsp
+  变更前）→ `jmp qword ptr [rsp-8]`（[v4'-8] 终态槽 = handler 早期预写的
+  ret_addr，死栈区）——终态物理 rsp = 清栈后 guest rsp，与原生 ret 后 caller
+  视角逐字节一致；终态零活寄存器依赖（ret_addr/v4' 先落盘，写回/pop 可任意
+  覆盖暂存）。出口机制沿用 ExitNative「handler 内直接退出」先例，差异 = 终态
+  物理 rsp 是 guest rsp 而非 entry rsp（stdcall 清栈正是本 op 的意义）。
+- pop 宽度：x64 = 8（本单实测面）；x86 = 4 由 IR size 字段携带（cond_or_size
+  已含 S32/S64），handler 分叉属 X4 asmgen 参数化面（纸面级披露，§F.1）。
+- 继承既有边界：guest 未配平 push 的区域会把 push 写进 stub 保存区（ExitNative
+  同款「区域含未配平 push」登记面），本 handler 不新增防线；[v4'-8] 终态槽与
+  EXIT_SLOT（native_sp-0x288）重叠仅在 v4' < native_sp 的病态形出现。
+- #33 对账（派单 §E）：本 op 此前无 handler（跳表指向 Halt），无既有 aux 读
+  路径可冲突；X0 §3.1 所指「pop-ret-addr 的 handler」即本函数（此前不存在）。
+
+**回归**：
+
+- 样本 `wvmp_retimm_sample`：3 区 x64 `ret N` 直写真编码（10h / 0(C3 形，MASM
+  将 `ret 0` 优化为 C3——plain-ret 形态亦走本 handler aux=0 通路)/ 90h；良构
+  caller 的清栈量 ≡0 mod 16，qword 参数 + 16 对齐垫并入 N，imm=8 档由 runtime
+  电池覆盖）+ caller 侧平衡探针/返回值断言（区1 = 2 轮调用链 + 栈参数消费，
+  每轮各自复分配参数槽——上轮 ret 已清，不复分配即 call 点错对齐，本单调参
+  实测过的真陷阱）。修复前旧 CLI（main 2dad6ff，ret 路径 = f7a865c）保护零
+  告警（3 stub 照常生成，无任何 gate note）→ packed 崩溃 rc=139（3/3 确定性，
+  stdout 空）→ 修复后 byte-exact PASS（433 同款反证纪律）。
+- 单测三层：translator `RetImm*` 4 矩阵（imm 进 aux / x86 S32 形派发 / imm=0
+  与 0xFFFF 边界 / 16 位掩码）；lifter `RetImm16LiftIntoSrc`（x64 C2 / 66 C2
+  前缀形 / x86 C2 双 arch lift 进 IR.src 回归钉——X2 重构防回退）；
+  runtime 语义电池 g2 段：stub 帧同构自汇编 driver + guest continuation 镜像，
+  4 imm 档（0/8/0x88/0xFFFF）× {终态 rsp = v4+8+imm、rax/rdx/xmm0 写回、gc
+  命中} RWX 真执行。
+- multiseed 48→49 样本 × 5 = **245 runs**（REQUIRE_REAL 同）。
+- kVmOpMax=97 不动；冻结契约零触碰（runtime.hpp / backend.hpp / callgate /
+  kCtxSize / 载体域 0..22 零 diff）；asmgen 仅新增 build_ret + 2 派生常量
+  （static_assert 钉 0x210/0x1D8）+ handler 表 1 行。
+
+## x86 支持面：SEH/FS 段寻址显式 gate（MIT-438 B.4 收口，🔴2）——「x86 战役已知 gate 清单」首块
+
+**现状实测（派单 §A.3；vendored capstone 5.0.6 + lifter 判据直读，单测钉死）**：
+
+- seg_fs 语料（X0 §7）：Delphi 0.68% / vmwarecui 1.7%；`mov reg,[fs:0]` =
+  SEH TEB 惯用法（FS:[0] = SEH 链头）。
+- **capstone x86 32 位模对 `64 8B 05 ...`（mov eax, fs:[disp32]）的报法**：
+  段覆盖前缀字节落 **prefix[1]**（G3 串指令 probe 同款布局：prefix[0]=rep/
+  lock、prefix[1]=段覆盖、prefix[2]=66、prefix[3]=67）；mem 操作数的段寄存器
+  报在 **mem.segment** 字段（X86_REG_FS），**不占 mem.base**（base =
+  X86_REG_INVALID）。x64 64 位 SIB 无基址形（`64 8B 04 25 ...`）与 GS 前缀
+  （65）同面。单测 `SehFsSegmentOverrideGate` 逐字段断言钉死（换 capstone
+  版本报法漂移即红）。
+- **lifter 判据链**：`translate_insn` 入口闸 `prefix[0]!=0 || prefix[1]!=0 →
+  unsupported`（段覆盖在入口统一拒）→ skipped_ranges 入 LiftMetadata → C1
+  整函数原生保持。mem_operand 的 base=Flags 哨兵路径天然看不到 FS
+  （map_reg(X86_REG_FS)=nullopt 已由 LifterRegMap 钉）——**不存在「FS 被
+  静默当 flat disp 处理」的旁路**。
+- **「扫得到 ≠ 放得进」零逃逸同构**：扫描层（marker_scan）能定位含 FS 的
+  区域（X1a 起含 x86 双段锚点形），lift 层显式 gate → 整函数原生
+  byte-identical，与 418 x87 / 424 档B gate 同构。
+- **callgate callee 自装 SEH 无碍情形**（两情形文本区分）：区域内 call 的
+  native callee（callgate 通路）在原生栈上自装/撤销 SEH（fs:[0] 链操作）完全
+  无碍——callgate 是真 native 执行、不经 lift；本 gate 只拦**区域指令流内**
+  的 fs/gs 段寻址（VM 无段基址模型；Win64 平坦模型中 FS/GS 是唯一非 flat 段）。
+
+**x86 战役已知 gate 清单（首块，为 X 波后续单立模板；每行 = 扫得到但显式
+gate，整函数原生 byte-identical 零逃逸）**：
+
+| # | 形态 | gate 层 | 依据/出处 |
+|---|---|---|---|
+| G1 | 段覆盖前缀（64/65/26/2E/36/3E = prefix[1]）——FS:[0] SEH 链 / GS TLS 访问 | lifter 入口闸 unsupported → skipped_ranges | MIT-438 B.4；单测 SehFsSegmentOverrideGate（x86 32 位模 + x64 SIB 形 + GS 前缀三形） |
 
 ## x87 (永久 gate, R3 裁决) —— 文档化不保护
 

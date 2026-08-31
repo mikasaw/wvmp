@@ -26,6 +26,7 @@ add_executable(wvmp_cli
 target_link_libraries(wvmp_cli PRIVATE
     wvmp_cli_core
     "$<LINK_LIBRARY:WHOLE_ARCHIVE,wvmp_passes_all>"
+    wvmp::pe_loader_includes   # MIT-438 B.5: target_arch.hpp（arch 声明槽）
     wvmp::tomlplusplus
     wvmp::framework
 )

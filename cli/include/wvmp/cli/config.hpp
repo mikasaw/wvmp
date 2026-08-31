@@ -20,9 +20,17 @@ struct PassConfig {
     std::string name;
 };
 
+// MIT-438 (X1b) B.5: 目标架构声明（TOML `arch` 字段，可省略 = auto）。
+// 值域与 passes/pe_loader/include/wvmp/passes/pe_loader/target_arch.hpp 的
+// 槽常量 (kTargetArch*) 逐一对账（CLI 经穷举 switch 映射，防漂移）：
+//   auto = machine 推导（现状行为不变）；x64 = 与 0x8664 不符 → rc=2 显式拒；
+//   x86  = 匹配 0x014C 亦 rc=2（x86 通行未解禁，D1 = X4 收口单拍板）。
+enum class ArchOpt : wvmp::u8 { Auto = 0, X64 = 1, X86 = 2 };
+
 struct WvmpConfig {
     std::string input, output;
     wvmp::u64 seed = 0;
+    ArchOpt arch = ArchOpt::Auto;   // B.5: 缺省 auto = 现状行为不变
     std::vector<PassConfig> passes; // 配置顺序（Pipeline 会按 Phase 稳定排序）
 };
 

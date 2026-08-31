@@ -256,6 +256,12 @@ samples=(
     # pext/blsr/bextr/blsi/blsmsk) 函数级 gate 可调用 byte-exact。
     # 单边新增 1 样本 → 48 × 5 = 240 runs。
     "build/passes/marker_scan/tests/wvmp_bmi_sample.exe"
+    # MIT-438 (X1b): ret imm16 清栈语义主样本 — 3 区 x64 ret N 直写真编码
+    # (8/0/88h, 区域末条 = ret N) + caller 平衡探针/返回值断言; 修复前旧 CLI
+    # 反证 stdout 分叉必 FAIL (VmOp::Ret 原无 handler → Halt), 修复后
+    # byte-exact (REQUIRE_REAL 3 stub 真虚拟化)。
+    # 单边新增 1 样本 → 49 × 5 = 245 runs。
+    "build/passes/marker_scan/tests/wvmp_retimm_sample.exe"
 )
 
 # Seeds: 1 (small), 12345 (default), 99999 (large), 0xDEADBEEF (magic), 0xCAFEBABE (magic).

@@ -309,6 +309,20 @@ static_assert(kHostRspDepth == 0x250, "host_rsp depth regressed");
 constexpr u64 kExitSlotFromHostRsp = kExitSlotDepth - kHostRspDepth;  // 0x288-0x250 = 0x38
 static_assert(kExitSlotFromHostRsp == 0x38, "exit slot must sit 0x38 below host_rsp");
 
+// MIT-438 (X1b)：Ret 清栈返回出口的两组派生常量（build_ret 专用，见函数注释）。
+//
+//   kRetFrameDiscard：handler 入口（rsp = ns - kHostRspDepth）一次性弃掉的
+//     解释器帧——entry 8 push + call rt_entry 返回地址 + ctx 区。解释器 8 push
+//     与 stub 8 push 的值冗余（stub 在 call 前不触碰 callee-saved），跳过弹弃
+//     由 stub 的 8 pop 统一恢复，故不是 7 次单独 pop。
+//   kRetGuestRspFromNs：终态 `mov rsp,[rsp-...]` 的偏移 = ns 到 ctx+0x30
+//     （guest rsp 槽）。stub 8 pop 之后 rsp = ns，该读取发生于 rsp 变更前。
+constexpr u64 kRetFrameDiscard =
+    kCalleeSavedPushBytes + kCallRetBytes + kCtxSize;  // 0x40+0x8+0x1C8 = 0x210
+static_assert(kRetFrameDiscard == 0x210, "ret exit frame discard regressed");
+constexpr u64 kRetGuestRspFromNs = kCalleeSavedPushBytes + kCtxSize - 0x30;  // 0x1D8
+static_assert(kRetGuestRspFromNs == 0x1D8, "ret exit guest-rsp slot offset regressed");
+
 // ---------------------------------------------------------------------------
 // 生成器主体。
 // ---------------------------------------------------------------------------
@@ -1142,6 +1156,78 @@ public:
         o += "    ret\n";
         o += adv_lbl + ":\n";
         o += advance(dispatch);  // 条件不满足 → 继续 VM
+        return o;
+    }
+
+    // MIT-438 (X1b)：Ret 清栈返回——pop 返回地址 + rsp += imm 后**退出 VM 直接
+    // 返回 guest caller**（x86/x64 双 arch 共享语义；x64 现网 ret imm16 合法编码
+    // 的既有正确性缺口收口，X0 §7/派活单 §A.1）。
+    //
+    // 语义（SDM Vol.2 RET.Near imm16）：ret_addr = [v4]；v4 += 8 + imm（imm 为
+    // 字节数，无符号零扩展——translator 已按 0xFFFF 掩码；imm=0 ≡ plain ret，
+    // D3 边界）。退出口径对齐 ExitNative 的"handler 内直接退出"先例（不回
+    // stub HALT 段、不写 EXIT_SLOT），差异 = 终态物理 rsp 不是 entry rsp 而是
+    // **清栈后的 guest rsp**——stdcall 被调方清栈是本 op 的全部意义。
+    //
+    // 出口机制（为何不能走 stub HALT 通道）：stub 终态 `jmp [rsp-kExitSlotDepth]`
+    // 恒在 rsp = native_sp 处转移，物理 rsp 无法表达清栈。故 handler 自行完成
+    // stub HALT 段的全部工作（易失寄存器 + xmm 写回、宿主 callee-saved 恢复）
+    // 后把物理 rsp 调到 guest 视角：
+    //   1) ret_addr 与 v4' 先落盘：ret_addr → [v4'-8]（终态 jmp 槽，在终态
+    //      rsp 下方的死栈区），v4' → ctx+0x30（guest rsp 持久化）——此后 T0/T1
+    //      可被写回/pop 任意覆盖，终态零活寄存器依赖；
+    //   2) `add rsp, kRetFrameDiscard`（0x210：解释器 8 push + call 返回地址 +
+    //      ctx 区）——解释器 8 push 的值与 stub 8 push 冗余（stub 在 call 前不
+    //      改 callee-saved），跳过弹弃、由 stub 的 8 个 pop 统一恢复宿主值；
+    //   3) pop stub 的 8 push（rbx,rbp,rdi,rsi,r12-r15 固定 push 序的逆序，
+    //      与 stub_gen 尾部同款）→ rsp = native_sp；
+    //   4) `mov rsp,[rsp-0x1D8]`（= ctx+0x30，读取发生于 rsp 变更前）→ 物理rsp
+    //      := v4'；`jmp qword ptr [rsp-8]` → ret_addr（[v4'-8] 槽），rsp 保持
+    //      v4'——与原生 ret 后的 caller 视角逐字节一致。
+    //
+    // ⚠️ 继承既有边界（ExitNative 同款披露）：guest 未配平 push 的区域会把
+    // 物理 rsp 带到 stub 帧之下（push 写 [v4-8] 本就覆盖 stub 保存区），属
+    // "区域含未配平 push"登记面（asmgen 文件头 ExitNative 注释），本 handler
+    // 不新增防线；[v4'-8] 终态槽写在清栈后 rsp 之下（Win64 死栈区），与
+    // EXIT_SLOT（native_sp-0x288）重叠仅在 v4' < native_sp 的病态形出现。
+    //
+    // #33 对账（派活单 §E）：本 op 此前**无 handler**（跳表项指向 Halt，文件头
+    // handler 清单注释），无既有 aux 读路径可冲突；X0 §3.1 所指 "pop-ret-addr
+    // 的 handler" 即本函数（此前不存在，由本单实现）。
+    std::string build_ret(u64 /*dispatch*/) const {
+        std::string o = decode_prelude();   // T5 = aux = imm（零扩展）
+        // 1) 栈语义：ret_addr = [v4]；v4' = v4 + 8 + imm；ret_addr → [v4'-8]。
+        o += std::string("    mov ") + r64(t_[0]) + ", qword ptr [" + r64(ctx_) +
+             " + 0x30]\n";
+        o += std::string("    mov ") + r64(t_[1]) + ", qword ptr [" + r64(t_[0]) + "]\n";
+        o += std::string("    add ") + r64(t_[0]) + ", " + imm(8) + "\n";
+        o += std::string("    add ") + r64(t_[0]) + ", " + r64(t_[5]) + "\n";
+        o += std::string("    mov qword ptr [") + r64(ctx_) + " + 0x30], " +
+             r64(t_[0]) + "\n";                          // guest rsp 持久化（ctx+0x30）
+        o += std::string("    sub ") + r64(t_[0]) + ", " + imm(8) + "\n";
+        o += std::string("    mov qword ptr [") + r64(t_[0]) + "], " + r64(t_[1]) + "\n";
+        // 2) 易失寄存器写回（stub HALT 写回链同款：rax/rcx/rdx/r8-r11 ← ctx）。
+        {
+            const u64 slots[] = {0x10, 0x18, 0x20, 0x50, 0x58, 0x60, 0x68};
+            const char* regs[] = {"rax", "rcx", "rdx", "r8", "r9", "r10", "r11"};
+            for (int i = 0; i < 7; ++i)
+                o += std::string("    mov ") + regs[i] + ", qword ptr [" + r64(ctx_) +
+                     " + " + hex(slots[i]) + "]\n";
+        }
+        // 3) xmm0-7 写回（stub 同款，kCtxXmmBase + N*16）。
+        for (int i = 0; i < 8; ++i)
+            o += std::string("    movups xmm") + std::to_string(i) + ", [" + r64(ctx_) +
+                 " + " + hex(kCtxXmmBase + u64(i) * 16) + "]\n";
+        // 4) 弃解释器帧（8 push + call 返回地址 + ctx 区）→ rsp = ns-0x40。
+        o += std::string("    add rsp, ") + hex(kRetFrameDiscard) + "\n";
+        // 5) 恢复宿主 callee-saved（stub push 序 rbx,rbp,rdi,rsi,r12-r15 的逆序，
+        //    与 stub_gen 尾部逐字对齐）。
+        o += "    pop r15\n pop r14\n pop r13\n pop r12\n";
+        o += "    pop rsi\n pop rdi\n pop rbp\n pop rbx\n";
+        // 6) 终态：物理 rsp := v4'（读 ctx+0x30 于 rsp 变更前），间接跳 [v4'-8]。
+        o += std::string("    mov rsp, qword ptr [rsp - ") +
+             hex(kRetGuestRspFromNs) + "]\n";
+        o += "    jmp qword ptr [rsp - 8]\n";
         return o;
     }
 
@@ -3328,10 +3414,11 @@ RuntimeGenResult generate_runtime(wvmp::Rng& rng) {
         ks.assemble(g.build_dispatch(kDummyTableOff), dispatch_addr, "dispatch pass1");
     const u64 dispatch_size = dispatch1.size();
 
-    // —— handler 清单（v1 覆盖集；Call/Ret 的表项指向
-    //    Halt——遇到即停机，语义保守且不越界。Sar 在 MIT-244 已接管。
-    //    Adc 在 MIT-245 已接管；Sbb 在 MIT-246 已接管；Rol/Ror 在 MIT-247 已接管。
-    //    CallGate 在 MIT-249 已接管。）——
+    // —— handler 清单（v1 覆盖集；Call 的表项指向
+    //    Halt——遇到即停机，语义保守且不越界（call 由 CallGate 接管）。
+    //    Sar 在 MIT-244 已接管。Adc 在 MIT-245 已接管；Sbb 在 MIT-246 已接管；
+    //    Rol/Ror 在 MIT-247 已接管。CallGate 在 MIT-249 已接管。
+    //    Ret 在 MIT-438 已接管（清栈返回，见 build_ret 注释）。）——
     std::vector<HandlerDef> handlers = {
         {int(VmOp::Mov), "mov", &AsmGen::build_mov},
         {int(VmOp::Lea), "lea", &AsmGen::build_mov},
@@ -3440,6 +3527,8 @@ RuntimeGenResult generate_runtime(wvmp::Rng& rng) {
         {int(VmOp::LeaRva), "learva", &AsmGen::build_lea_rva},
         {int(VmOp::Push), "push", &AsmGen::build_push},
         {int(VmOp::Pop), "pop", &AsmGen::build_pop},
+        // MIT-438 (X1b): ret imm16 清栈返回（aux 载 imm，D2 选型 (i) 零新 VmOp）。
+        {int(VmOp::Ret), "ret", &AsmGen::build_ret},
         {int(VmOp::Jmp), "jmp", &AsmGen::build_jmp},
         {int(VmOp::Jcc), "jcc", &AsmGen::build_jcc},
         {int(VmOp::Nop), "nop", &AsmGen::build_nop},

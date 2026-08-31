@@ -142,6 +142,23 @@ ConfigResult parse_config(const std::filesystem::path& file) {
         result.value.seed = 0;
     }
 
+    // arch：可省略（默认 auto）；字符串枚举，非法值显式失败（MIT-438 B.5）。
+    if (const toml::node* arch_node = tbl.get("arch")) {
+        auto arch = arch_node->value<std::string>();
+        if (!arch)
+            return fail("config 字段 'arch' 必须是字符串（auto/x64/x86）");
+        if (*arch == "auto")
+            result.value.arch = ArchOpt::Auto;
+        else if (*arch == "x64")
+            result.value.arch = ArchOpt::X64;
+        else if (*arch == "x86")
+            result.value.arch = ArchOpt::X86;
+        else
+            return fail("config 字段 'arch' 非法值 '" + *arch + "'（允许: auto/x64/x86）");
+    } else {
+        result.value.arch = ArchOpt::Auto;
+    }
+
     // passes：可省略或为空（空管道合法）；若存在必须是 [[passes]] 数组，
     // 每个表必填非空 'name'（名字是否真实存在由 Pipeline::from_names 校验）。
     if (const toml::node* passes_node = tbl.get("passes")) {

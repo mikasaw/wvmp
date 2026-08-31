@@ -884,7 +884,16 @@ struct Translator {
         case ir::Op::Push: ok = translate_push(em, in); break;
         case ir::Op::Pop: ok = translate_pop(em, in); break;
         case ir::Op::Ret:
-            em.emit(VmOp::Ret, OpKind::None, 0, OpKind::None, 0, 0,
+            // MIT-438 (X1b): ret imm16 清栈语义——lifter 已把 imm 放进 in.src
+            // (Imm 形, x86_translate.cpp translate_ret)，此处经 aux 槽传给运行时
+            // (D2 选型 (i)：闲置参数槽，零新 VmOp)。imm = pop 返回地址后对 rsp
+            // 追加的字节数 (SDM C2 iw, 0..0xFFFF, 无符号不加宽)；plain ret
+            // in.src 为 None → aux=0，语义 ≡ ret (D3 边界)。x86/x64 双 arch
+            // 共享此路径（imm 恒按字节数加 rsp；pop 宽度差异属 X4 asmgen 参数化面）。
+            em.emit(VmOp::Ret, OpKind::None, 0, OpKind::None, 0,
+                    in.src.kind == ir::Operand::Kind::Imm
+                        ? static_cast<u32>(static_cast<u64>(in.src.imm) & 0xFFFFu)
+                        : 0u,
                     isa::size_field(in.size));
             break;
         case ir::Op::Jmp:

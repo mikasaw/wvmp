@@ -316,6 +316,74 @@ TEST(Translate, RetTerminatorNeedsNoFallthrough) {
     expect_is(d.insns[3], VmOp::Halt, OpKind::None, 0, OpKind::None, 0, 0, 0);
 }
 
+// MIT-438 (X1b) B.3: ret imm16 清栈语义 — translator 层派发矩阵。
+// lifter 已把 imm 放进 IR.src（x86/x64 双 arch 共享 translate_ret），translator
+// 经 aux 槽传运行时（D2 选型 (i)），imm=0 ≡ plain ret。双 arch = S64（x64
+// pointer 宽）与 S32（x86 pointer 宽）两个 size 形态同路径。
+namespace {
+ir::Insn ret_imm(i64 v, ir::Size sz) {
+    ir::Insn i = I(ir::Op::Ret, sz);
+    i.src = ir::Operand::imm_(v);
+    return i;
+}
+}  // namespace
+
+TEST(Translate, RetImmCarriedInAux) {
+    // x64 形（S64）：ret 8 → aux=8，其余槽同 plain ret。
+    const auto r = wvmp::regvm::translator::translate_function(fn_of({
+        blk(0x1000, {ret_imm(8, ir::Size::S64)}),
+    }));
+    EXPECT_TRUE(r.notes.empty());
+    const Decoded d = decode_program(r.program);
+    ASSERT_EQ(d.insns.size(), static_cast<size_t>(2));  // Ret + 尾部 Halt
+    expect_is(d.insns[0], VmOp::Ret, OpKind::None, 0, OpKind::None, 0, 8, kS64);
+    expect_is(d.insns[1], VmOp::Halt, OpKind::None, 0, OpKind::None, 0, 0, 0);
+}
+
+TEST(Translate, RetImmX86ShapeS32Dispatch) {
+    // x86 形（S32，pointer_size(X86)）：ret 0x1234 → aux 同值。imm 恒按字节
+    // 加 rsp（SDM C2 iw），arch 差异仅在 pop 宽度（X4 asmgen 参数化面）。
+    const auto r = wvmp::regvm::translator::translate_function(fn_of({
+        blk(0x1000, {ret_imm(0x1234, ir::Size::S32)}),
+    }));
+    EXPECT_TRUE(r.notes.empty());
+    const Decoded d = decode_program(r.program);
+    ASSERT_EQ(d.insns.size(), static_cast<size_t>(2));
+    expect_is(d.insns[0], VmOp::Ret, OpKind::None, 0, OpKind::None, 0, 0x1234, kS32);
+}
+
+TEST(Translate, RetImmZeroAndMaxBoundary) {
+    // D3 边界：imm=0 ≡ plain ret（aux=0）；imm=0xFFFF（C2 iw 上界）全宽保留。
+    {
+        const auto r = wvmp::regvm::translator::translate_function(fn_of({
+            blk(0x1000, {ret_imm(0, ir::Size::S64)}),
+        }));
+        const Decoded d = decode_program(r.program);
+        ASSERT_EQ(d.insns.size(), static_cast<size_t>(2));
+        expect_is(d.insns[0], VmOp::Ret, OpKind::None, 0, OpKind::None, 0, 0, kS64);
+    }
+    {
+        const auto r = wvmp::regvm::translator::translate_function(fn_of({
+            blk(0x1000, {ret_imm(0xFFFF, ir::Size::S64)}),
+        }));
+        const Decoded d = decode_program(r.program);
+        ASSERT_EQ(d.insns.size(), static_cast<size_t>(2));
+        expect_is(d.insns[0], VmOp::Ret, OpKind::None, 0, OpKind::None, 0, 0xFFFF, kS64);
+    }
+}
+
+TEST(Translate, RetImmMaskedToImm16Width) {
+    // 防御性掩码：编码域只有 imm16（C2 iw），>0xFFFF 的 IR.src（不可能由
+    // capstone 产生）按 16 位掩码保留低 16 位——与硬件编码域行为一致
+    // （运行时加幅永不超 SDM 定义域）。
+    const auto r = wvmp::regvm::translator::translate_function(fn_of({
+        blk(0x1000, {ret_imm(0x1'2345, ir::Size::S64)}),
+    }));
+    const Decoded d = decode_program(r.program);
+    ASSERT_EQ(d.insns.size(), static_cast<size_t>(2));
+    expect_is(d.insns[0], VmOp::Ret, OpKind::None, 0, OpKind::None, 0, 0x2345, kS64);
+}
+
 TEST(Translate, BackwardJccEncodesNegativeRelAsU32) {
     // 自回跳：cmp rcx,0 ; jne 本块起点 -> aux = 0 - 1 = -1（补码 0xFFFFFFFF）。
     const auto r = wvmp::regvm::translator::translate_function(fn_of({blk(0x1000, {

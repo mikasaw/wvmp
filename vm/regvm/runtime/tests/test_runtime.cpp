@@ -470,6 +470,107 @@ void run_semantic_battery(const vm::RuntimeImage& image, const std::string& dump
         EXPECT_EQ(ctx.pc, 2u);           // Halt 写回停机指令序号
     }
 
+    // ---- (g2) MIT-438 (X1b): Ret 清栈返回 RWX 真执行语义矩阵 ----
+    //
+    // Ret handler 出口不走 stub HALT 通道（易失写回 + 帧弃 + 物理 rsp :=
+    // guest 清栈后 rsp + 间接跳 [v4'-8]，见 build_ret 注释），单靠
+    // entry(&ctx) 直调驱动不了完整出口——用自汇编 driver 复刻 stub 帧纪律
+    // （8 push + sub kCtxSize + call 解释器，与 stub_gen 逐层同构），并用
+    // guest continuation（gc）镜像收口：handler 把控制流交给 gc（gc 地址 =
+    // 预写在 [v4] 的 guest 返回地址），gc 把终态 rsp / 写回寄存器落盘后借
+    // driver 入口记录的测试返回地址槽跳回测试。
+    //
+    // 矩阵（4 imm 档 × 5 断言）：imm=0（D3 边界：≡ plain ret）/ 8（stdcall
+    // 形）/ 0x88（>imm8 幅度）/ 0xFFFF（C2 iw 上界，SDM "按字节数加 rsp"
+    // 跟随 native——D3 病态形 = rsp 加幅越过返回地址槽，VM 与 native 同行为）。
+    {
+        // gc：观察终态（r15 = &results，由 ret 出口的 stub 8 pop 恢复）。
+        // 全部寄存器相对寻址，无标签无 rip（keystone [rip+label] 不可信，
+        // stub_gen dummy 回填同因）。
+        const std::string gc_asm =
+            "mov [r15], rsp\n"               // +0x00 终态 rsp（期望 v4'）
+            "mov qword ptr [r15+8], 1\n"     // +0x08 命中标记
+            "mov [r15+0x18], rax\n"          // +0x18 出口 rax 写回（期望 VM 终值）
+            "mov [r15+0x20], rdx\n"          // +0x20 出口 rdx 写回
+            "movq [r15+0x28], xmm0\n"        // +0x28 出口 xmm0 写回
+            "mov rsp, [r15+0x10]\n"          // +0x10 driver 记录的测试返回槽
+            "ret\n";                          // → 回测试
+        RwxImage gc(assemble_or_throw(gc_asm));
+
+        // driver：复刻 stub 帧（8 push rbx..r15 + sub kCtxSize + call），
+        // 预置 ctx（bytecode/pc/v0/v2/xmm0/v4 与 [v4]=gc），调解释器后 ud2
+        // （Ret 流出口不回 driver——到达 ud2 即出口机制坏，reached=0 显形）。
+        const std::string driver_asm =
+            "mov r10, rcx\n"                 // rt_entry 暂存（参数1）
+            "lea r11, [rsp]\n"               // 测试返回地址槽（任何 push 前）
+            "mov [r9+0x10], r11\n"           // results.ret_slot (+0x10)
+            "mov r15, r9\n"                  // &results → r15（出口 pop 恢复 → gc 可见）
+            "push rbx\n push rbp\n push rdi\n push rsi\n"
+            "push r12\n push r13\n push r14\n push r15\n"
+            "sub rsp, 0x1C8\n"               // ctx 区（kCtxSize，与 stub 同帧型）
+            "mov [rsp], rdx\n"               // ctx.bytecode (+0x00)
+            "mov qword ptr [rsp+8], 0\n"     // ctx.pc = 0 (+0x08)
+            "mov qword ptr [rsp+0x10], 0x1234\n"       // regs[v0/rax] 预置
+            "mov rax, 0xAAAAAAAAAAAAAAAA\n"
+            "mov [rsp+0x20], rax\n"          // regs[v2/rdx] 预置（槽 = 0x10+2*8）
+            "mov rax, 0x1122334455667788\n"
+            "movq xmm0, rax\n"
+            "movups [rsp+0x140], xmm0\n"     // ctx.xmm[0] 预置 (kCtxXmmBase)
+            "mov rax, [r9+0x30]\n"           // guest_buf (+0x30)
+            "add rax, 0x20\n"                // v4 = guest_buf + 0x20
+            "mov [rax], r8\n"                // [v4] = gc_entry（guest 返回地址）
+            "mov [rsp+0x30], rax\n"          // regs[v4/rsp] = v4
+            "mov rcx, rsp\n"                 // Win64 第一参数 = ctx
+            "call r10\n"
+            "ud2\n";                          // 不可达（Ret 出口不返回）
+        RwxImage drv_img(assemble_or_throw(driver_asm));
+
+        struct RetResults {
+            u64 cont_rsp;    // +0x00 gc 观察到的 rsp
+            u64 reached;     // +0x08
+            u64 ret_slot;    // +0x10
+            u64 gc_rax;      // +0x18
+            u64 gc_rdx;      // +0x20
+            u64 gc_xmm0;     // +0x28
+            u64 guest_buf;   // +0x30 guest 栈缓冲指针（driver 读）
+        };
+        // guest 栈缓冲独立堆分配：imm=0xFFFF 档的 v4'（+8+0xFFFF）必须落在
+        // 可写 committed 区（[v4'-8] 终态槽写入同域）。0x20000 覆盖上界档。
+        std::vector<u8> guest(0x20000, 0xCC);
+        RetResults res{};
+        res.guest_buf = reinterpret_cast<u64>(guest.data());
+
+        using DriverFn = void (*)(u64 /*rt_entry*/, u64 /*stream*/, u64 /*gc*/,
+                                  RetResults* /*r9 → r15*/);
+        const auto drv = reinterpret_cast<DriverFn>(drv_img.entry());
+        const u64 v4 = res.guest_buf + 0x20;
+
+        for (const u32 imm : {u32(0), u32(8), u32(0x88), u32(0xFFFF)}) {
+            std::vector<u8> s;
+            isa::append_insn(s, mov_imm(0, 0x55));  // guest 改写 v0 → 出口写回应见 0x55
+            isa::append_insn(s, isa::make_insn(isa::VmOp::Ret, isa::OpKind::None, 0,
+                                               isa::OpKind::None, 0, imm,
+                                               isa::size_field(ir::Size::S64)));
+            res.reached = 0;
+            res.cont_rsp = 0;
+            res.gc_rax = 0;
+            res.gc_rdx = 0;
+            res.gc_xmm0 = 0;
+            drv(reinterpret_cast<u64>(rwx.entry()),
+                reinterpret_cast<u64>(s.data()), reinterpret_cast<u64>(gc.entry()), &res);
+
+            EXPECT_EQ(res.reached, 1u) << "ret imm=" << imm << ": gc 未命中（出口机制断链）";
+            // 物理 rsp = v4 + 8 + imm（SDM：pop 返回地址后 rsp 按字节数加 imm；
+            // imm=0 档 ≡ plain ret 的 D3 边界）。
+            EXPECT_EQ(res.cont_rsp, v4 + 8 + imm) << "ret imm=" << imm << ": 终态 rsp";
+            // 易失写回三件套：rax = VM 终值（非预置 0x1234——写回必须读
+            // 执行后的 ctx），rdx = 预置原样，xmm0 = 预置原样。
+            EXPECT_EQ(res.gc_rax, 0x55u) << "ret imm=" << imm << ": rax 写回";
+            EXPECT_EQ(res.gc_rdx, 0xAAAAAAAAAAAAAAAAull) << "ret imm=" << imm << ": rdx 写回";
+            EXPECT_EQ(res.gc_xmm0, 0x1122334455667788ull) << "ret imm=" << imm << ": xmm0 写回";
+        }
+    }
+
     // ---- (i) Sar：算术右移、符号扩展、CF 末位移出、count=0 no-op ----
     // Sar 语义要点（x86）：
     //   - 算术右移：高位补符号位

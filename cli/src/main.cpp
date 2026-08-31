@@ -17,6 +17,7 @@
 #include "wvmp/framework/pass.hpp"
 #include "wvmp/framework/phase.hpp"
 #include "wvmp/framework/pipeline.hpp"
+#include "wvmp/passes/pe_loader/target_arch.hpp"
 
 #include <cstdio>
 #include <exception>
@@ -124,6 +125,17 @@ int cmd_protect(const wvmp::cli::ArgsResult& args) {
     ctx.output_path = output;
     ctx.seed = config.seed;
     ctx.rng.reseed(config.seed);
+    // MIT-438 (X1b) B.5: arch 声明 → pe_loader 校验挂点。穷举 switch 映射
+    // 到 pe_loader target_arch.hpp 的槽常量（新增枚举值时编译期缺 case 警告，
+    // 防两处定义面漂移）。
+    ctx.slot<wvmp::u8>(wvmp::passes::kTargetArchDecl) = [](wvmp::cli::ArchOpt a) {
+        switch (a) {
+        case wvmp::cli::ArchOpt::Auto: return wvmp::passes::kTargetArchAuto;
+        case wvmp::cli::ArchOpt::X64: return wvmp::passes::kTargetArchX64;
+        case wvmp::cli::ArchOpt::X86: return wvmp::passes::kTargetArchX86;
+        }
+        return wvmp::passes::kTargetArchAuto;
+    }(config.arch);
 
     try {
         pipeline.run(ctx);

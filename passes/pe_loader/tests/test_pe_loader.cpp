@@ -5,6 +5,7 @@
 
 #include "wvmp/passes/pe_loader/pe_image.hpp"
 #include "wvmp/passes/pe_loader/pe_loader_pass.hpp"
+#include "wvmp/passes/pe_loader/target_arch.hpp"
 
 #include "wvmp/framework/context.hpp"
 #include "wvmp/framework/keys.hpp"
@@ -284,6 +285,67 @@ TEST(PeLoaderPass, RejectsX86InputWithHardError) {
             d.message.find("32 位目标 (x86) 未支持 (GAPS C5)") != std::string::npos)
             saw_gate = true;
     EXPECT_TRUE(saw_gate);
+}
+
+// MIT-438 (X1b) B.5: CLI arch 声明校验挂点——X64 声明与目标不符 → rc=2 显式
+// 拒（x86 machine 上消息区分于 C5 文本）；X64 声明 + x64 machine → 正常路径；
+// X86 声明（匹配亦未解禁 D1 / 声明不符）→ rc=2；无声明 → 现状行为不变。
+TEST(PeLoaderPass, TargetArchDeclGate) {
+    // X64 声明 + x64 machine → 正常通过（槽写入后常规路径零回踩）。
+    {
+        ProtectionContext ctx;
+        ctx.input_path = write_temp("decl_x64_ok.exe", build_minimal_pe(true, kMachineX64));
+        ctx.slot<wvmp::u8>(wvmp::passes::kTargetArchDecl) = wvmp::passes::kTargetArchX64;
+        wvmp::passes::PeLoaderPass pass;
+        EXPECT_NO_THROW(pass.run(ctx));
+        EXPECT_FALSE(ctx.diag.has_errors());
+        EXPECT_TRUE(ctx.has_slot(wvmp::passes::kImageMeta));
+    }
+    // X64 声明 + x86 machine → 声明不符显式拒（消息 ≠ C5 文本）。
+    {
+        ProtectionContext ctx;
+        ctx.input_path = write_temp("decl_x64_mismatch.exe",
+                                    build_minimal_pe(false, kMachineX86));
+        ctx.slot<wvmp::u8>(wvmp::passes::kTargetArchDecl) = wvmp::passes::kTargetArchX64;
+        wvmp::passes::PeLoaderPass pass;
+        EXPECT_THROW(pass.run(ctx), std::runtime_error);
+        EXPECT_TRUE(ctx.diag.has_errors());
+        EXPECT_FALSE(ctx.has_slot(wvmp::passes::kImageMeta));
+        bool saw_mismatch = false;
+        for (const auto& d : ctx.diag.items())
+            if (d.severity == wvmp::Severity::Error &&
+                d.message.find("config arch=x64 与目标") != std::string::npos)
+                saw_mismatch = true;
+        EXPECT_TRUE(saw_mismatch);
+    }
+    // X86 声明 + x86 machine（匹配）：x86 通行未解禁 (D1) → 显式拒。
+    {
+        ProtectionContext ctx;
+        ctx.input_path = write_temp("decl_x86_matched.exe",
+                                    build_minimal_pe(false, kMachineX86));
+        ctx.slot<wvmp::u8>(wvmp::passes::kTargetArchDecl) = wvmp::passes::kTargetArchX86;
+        wvmp::passes::PeLoaderPass pass;
+        EXPECT_THROW(pass.run(ctx), std::runtime_error);
+        EXPECT_TRUE(ctx.diag.has_errors());
+        EXPECT_FALSE(ctx.has_slot(wvmp::passes::kImageMeta));
+        bool saw_closed = false;
+        for (const auto& d : ctx.diag.items())
+            if (d.severity == wvmp::Severity::Error &&
+                d.message.find("config arch=x86") != std::string::npos)
+                saw_closed = true;
+        EXPECT_TRUE(saw_closed);
+    }
+    // X86 声明 + x64 machine → 声明不符显式拒。
+    {
+        ProtectionContext ctx;
+        ctx.input_path = write_temp("decl_x86_mismatch.exe",
+                                    build_minimal_pe(true, kMachineX64));
+        ctx.slot<wvmp::u8>(wvmp::passes::kTargetArchDecl) = wvmp::passes::kTargetArchX86;
+        wvmp::passes::PeLoaderPass pass;
+        EXPECT_THROW(pass.run(ctx), std::runtime_error);
+        EXPECT_TRUE(ctx.diag.has_errors());
+        EXPECT_FALSE(ctx.has_slot(wvmp::passes::kImageMeta));
+    }
 }
 
 TEST(PeLoaderPass, MissingInputFileFails) {

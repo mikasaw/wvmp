@@ -106,6 +106,84 @@ TEST_F(LifterTranslate, MovImmToReg) {
     EXPECT_EQ(r.insn.addr, 0u);
 }
 
+// MIT-438 (X1b) B.3: ret imm16 lift 值进 IR.src 的回归钉（X0 §A.1 机制链首环，
+// X0 §7 msvbvm60 82% of ret 的 stdcall 清栈主形）。双 arch 共享 translate_ret；
+// 66 前缀形（66 C2 iw，16 位操作数宽）imm 亦须入 IR——X2 重构若回退此处断言
+// 即红。translator 侧派发矩阵见 test_translator RetImm* 用例。
+TEST_F(LifterTranslate, RetImm16LiftIntoSrc) {
+    // x64: C2 08 00 = ret 8 → src=Imm(8), size=S64（pointer 宽）
+    const wvmp::u8 b64[] = {0xC2, 0x08, 0x00};
+    auto r = translate_bytes(x64, b64, ir::Arch::X64);
+    ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r.insn.op, ir::Op::Ret);
+    EXPECT_EQ(r.insn.size, ir::Size::S64);
+    EXPECT_FALSE(r.insn.updates_flags);
+    ASSERT_EQ(r.insn.src.kind, ir::Operand::Kind::Imm);
+    EXPECT_EQ(r.insn.src.imm, 8);
+    EXPECT_EQ(r.skipped_ranges.size(), 0u);
+
+    // x64: 66 C2 34 12 = 66 前缀形 ret imm16（手写/第三方汇编形态，派活单 §B.3）
+    const wvmp::u8 b66[] = {0x66, 0xC2, 0x34, 0x12};
+    auto r66 = translate_bytes(x64, b66, ir::Arch::X64);
+    ASSERT_EQ(r66.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r66.insn.op, ir::Op::Ret);
+    ASSERT_EQ(r66.insn.src.kind, ir::Operand::Kind::Imm);
+    EXPECT_EQ(r66.insn.src.imm, 0x1234);
+    EXPECT_EQ(r66.skipped_ranges.size(), 0u);
+
+    // x86 (CS_MODE_32): C2 08 00 = ret 8 → src=Imm(8), size=S32
+    const wvmp::u8 b86[] = {0xC2, 0x08, 0x00};
+    auto r86 = translate_bytes(x86, b86, ir::Arch::X86);
+    ASSERT_EQ(r86.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r86.insn.op, ir::Op::Ret);
+    EXPECT_EQ(r86.insn.size, ir::Size::S32);
+    ASSERT_EQ(r86.insn.src.kind, ir::Operand::Kind::Imm);
+    EXPECT_EQ(r86.insn.src.imm, 8);
+}
+
+// MIT-438 (X1b) B.4: FS 段寻址显式 gate —— "扫得到≠放得进"（X0 §7 seg_fs
+// 语料 0.32%，SEH TEB 惯用法 `mov eax, fs:[0]`）。
+//
+// capstone 5.0.6 现状报法（实测钉死，字段断言即 probe）：段覆盖前缀字节落在
+// prefix[1]（G3 串指令 probe 同款布局：prefix[0]=rep/lock、prefix[1]=段、
+// prefix[2]=66、prefix[3]=67）；mem 操作数的段寄存器报在 mem.segment 字段
+// （x86 32 位模与 x64 SIB 无基址形一致），mem.base 不承接段寄存器——故
+// mem_operand 的 Flags 哨兵路径天然看不到 FS（map_reg(X86_REG_FS)=nullopt
+// 已由 LifterRegMap 钉）。
+//
+// gate 链 = translate_insn 入口 `prefix[1]!=0 → unsupported`（x86_translate.cpp
+// 入口闸）→ skipped_ranges 入 LiftMetadata → C1 整函数原生，零逃逸；callgate
+// callee 自装 SEH 在原生栈上执行不受影响（文本见 GAPS x86 支持面节）。
+TEST_F(LifterTranslate, SehFsSegmentOverrideGate) {
+    // x86 32 位模: 64 8B 05 78 56 34 12 = mov eax, fs:[0x12345678]
+    const wvmp::u8 b[] = {0x64, 0x8B, 0x05, 0x78, 0x56, 0x34, 0x12};
+    const cs_insn* ci = decode_first(x86, b);
+    ASSERT_NE(ci, nullptr);
+    const auto& x = ci->detail->x86;
+    EXPECT_EQ(ci->id, X86_INS_MOV);
+    EXPECT_EQ(x.prefix[1], 0x64);   // 段覆盖 = prefix[1]（布局 probe 钉死）
+    ASSERT_EQ(x.op_count, 2);
+    EXPECT_EQ(x.operands[1].type, X86_OP_MEM);
+    EXPECT_EQ(x.operands[1].mem.base, X86_REG_INVALID);      // 段不占 base 侧
+    EXPECT_EQ(x.operands[1].mem.segment, X86_REG_FS);        // 段寄存器落 segment 字段
+    auto r = lifter::translate_insn(*ci, ir::Arch::X86);
+    EXPECT_EQ(r.status, lifter::TranslateStatus::Unsupported);
+    ASSERT_EQ(r.skipped_ranges.size(), 1u);   // C1 gate 的 IR 缺字节证据
+    EXPECT_EQ(r.skipped_ranges[0].first, 0u);
+    EXPECT_EQ(r.skipped_ranges[0].second, ci->size);
+
+    // x64: 64 8B 04 25 78 56 34 12 = mov eax, fs:[0x12345678]（64 位 SIB 无基址形）
+    const wvmp::u8 b64[] = {0x64, 0x8B, 0x04, 0x25, 0x78, 0x56, 0x34, 0x12};
+    auto r64 = translate_bytes(x64, b64, ir::Arch::X64);
+    EXPECT_EQ(r64.status, lifter::TranslateStatus::Unsupported);
+    ASSERT_EQ(r64.skipped_ranges.size(), 1u);
+
+    // GS 同面（x64 TLS 惯用法 65 前缀）：65 48 8B 04 25 ... = mov rax, gs:[..]
+    const wvmp::u8 bgs[] = {0x65, 0x48, 0x8B, 0x04, 0x25, 0x78, 0x56, 0x34, 0x12};
+    auto rgs = translate_bytes(x64, bgs, ir::Arch::X64);
+    EXPECT_EQ(rgs.status, lifter::TranslateStatus::Unsupported);
+}
+
 // MIT-249 关联修复: movabs（mov reg, imm64）必须被 lifter 接住——否则区域内
 // 含 imm64 load 会被静默跳过、且 C1 gate 只看翻译器 notes 不看 lifter notes，
 // 函数仍被虚拟化，原区域 movabs 字节被 stub_link 覆写后字节码缺一块、行为错。

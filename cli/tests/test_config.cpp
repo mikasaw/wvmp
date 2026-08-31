@@ -245,4 +245,48 @@ TEST(ConfigParse, PassesWrongShape) {
     EXPECT_TRUE(contains(result.error, "passes")) << result.error;
 }
 
+// MIT-438 (X1b) B.5: arch 字段解析——可省略（= Auto 现状行为）/ 三合法值 /
+// 非法值与错型显式失败。值域与 pe_loader target_arch.hpp 的 kTargetArch*
+// 常量对账（映射面的漂移由 main.cpp 穷举 switch + 本侧对账注释钉）。
+TEST(ConfigParse, ArchOptionalDefaultsToAuto) {
+    const TempToml toml("input = \"a.exe\"\noutput = \"b.exe\"\n");
+    const auto result = wvmp::cli::parse_config(toml.path());
+    ASSERT_TRUE(result.ok) << result.error;
+    EXPECT_EQ(result.value.arch, wvmp::cli::ArchOpt::Auto);
+}
+
+TEST(ConfigParse, ArchThreeLegalValues) {
+    struct Case {
+        const char* text;
+        wvmp::cli::ArchOpt expect;
+    };
+    const Case cases[] = {
+        {"auto", wvmp::cli::ArchOpt::Auto},
+        {"x64", wvmp::cli::ArchOpt::X64},
+        {"x86", wvmp::cli::ArchOpt::X86},
+    };
+    for (const Case& c : cases) {
+        const std::string toml_text = std::string("input = \"a.exe\"\noutput = \"b.exe\"\narch = \"") +
+                                      c.text + "\"\n";
+        const TempToml toml(toml_text);
+        const auto result = wvmp::cli::parse_config(toml.path());
+        ASSERT_TRUE(result.ok) << c.text << ": " << result.error;
+        EXPECT_EQ(result.value.arch, c.expect) << c.text;
+    }
+}
+
+TEST(ConfigParse, ArchIllegalValueRejected) {
+    const TempToml toml("input = \"a.exe\"\noutput = \"b.exe\"\narch = \"arm64\"\n");
+    const auto result = wvmp::cli::parse_config(toml.path());
+    EXPECT_FALSE(result.ok);
+    EXPECT_TRUE(contains(result.error, "arch")) << result.error;
+}
+
+TEST(ConfigParse, ArchWrongTypeRejected) {
+    const TempToml toml("input = \"a.exe\"\noutput = \"b.exe\"\narch = 64\n");
+    const auto result = wvmp::cli::parse_config(toml.path());
+    EXPECT_FALSE(result.ok);
+    EXPECT_TRUE(contains(result.error, "arch")) << result.error;
+}
+
 } // namespace

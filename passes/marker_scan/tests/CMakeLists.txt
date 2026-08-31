@@ -1103,3 +1103,21 @@ target_compile_options(wvmp_bmi_sample PRIVATE
 target_link_options(wvmp_bmi_sample PRIVATE
     $<$<CXX_COMPILER_ID:MSVC>:/INCREMENTAL:NO>
 )
+
+# MIT-438 (X1b): ret imm16 清栈语义主样本 — 3 区 x64 ret N 直写真编码
+# (MASM 手编, 8/0/88h; 区域末条 = ret N, 本单前跳表无 Ret handler 指向
+# Halt) + caller 侧平衡探针/返回值断言 (native 手编)。修复前旧 CLI
+# (main f7a865c) 反证: VmOp::Ret → Halt → 死分隔符续跑 → stdout 分叉必
+# FAIL; 修复后 byte-exact。自含 MASM marker 桩 (433 同款)。
+# multiseed 48→49 (245 runs)。
+add_executable(wvmp_retimm_sample
+    wvmp_retimm_sample_main.cpp
+    wvmp_retimm_sample_asm.asm
+)
+target_compile_options(wvmp_retimm_sample PRIVATE
+    $<$<AND:$<CXX_COMPILER_ID:MSVC>,$<COMPILE_LANGUAGE:C,CXX>>:/Od;/Ob0;/utf-8>
+    $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-O0>
+)
+target_link_options(wvmp_retimm_sample PRIVATE
+    $<$<CXX_COMPILER_ID:MSVC>:/INCREMENTAL:NO>
+)
