@@ -2489,13 +2489,26 @@ TEST_F(LifterTranslate, VexVpadddGate) {
     EXPECT_EQ(r.status, lifter::TranslateStatus::Unsupported);
 }
 
-TEST_F(LifterTranslate, VexRorxGate) {
-    // C4 E3 7B F0 C1 03: rorx eax, ecx, 3 — BMI GP 域 VEX id (G8 独立缺口,
-    // triage §6.2 "VEX-GP 不在 SIMD 档A 内") → 现状 gate 保持。(字节经
-    // vendored capstone probe 实测 — SDM 手算 mmmmm 档位差 1, 以 probe 为准。)
+TEST_F(LifterTranslate, VexRorxNowFolded) {
+    // MIT-434 (G8a): 426 时代的 gate 负例随 BMI 入面**翻转正例** (425 §B.4
+    // 先例): C4 E3 7B F0 C1 03 = rorx eax, ecx, 3 — flagless 载体
+    // (Op::Ror, src=Imm(3), src2=Imm(kFlagless=22), updates_flags=false;
+    // 五位 flags 全不写 = SDM/probe)。字节经 vendored capstone probe 实测。
     const wvmp::u8 b[] = {0xC4, 0xE3, 0x7B, 0xF0, 0xC1, 0x03};
     auto r = translate_bytes(x64, b, ir::Arch::X64);
-    EXPECT_EQ(r.status, lifter::TranslateStatus::Unsupported);
+    ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r.insn.op, ir::Op::Ror);
+    EXPECT_EQ(r.insn.size, ir::Size::S32);
+    EXPECT_FALSE(r.insn.updates_flags);
+    ASSERT_EQ(r.insn.dst.kind, ir::Operand::Kind::Reg);
+    EXPECT_EQ(static_cast<int>(r.insn.dst.reg), 0);            // eax
+    ASSERT_EQ(r.insn.src.kind, ir::Operand::Kind::Imm);
+    EXPECT_EQ(r.insn.src.imm, 3);                              // count 骑 src
+    ASSERT_EQ(r.insn.src2.kind, ir::Operand::Kind::Imm);
+    EXPECT_EQ(r.insn.src2.imm, 22);                            // kFlagless
+    // dst=eax ≠ value=ecx → 前置 [Mov eax, ecx]
+    ASSERT_EQ(r.extra.size(), static_cast<size_t>(1));
+    EXPECT_EQ(r.extra[0].op, ir::Op::Mov);
 }
 
 TEST_F(LifterTranslate, VexFmaGate) {
@@ -2972,6 +2985,239 @@ TEST_F(LifterTranslate, VexVmovdqaVmovdquMirror) {
     const wvmp::u8 evex64[] = {0x62, 0xF1, 0xFD, 0x08, 0x6F, 0xC1};
     EXPECT_EQ(translate_bytes(x64, evex64, ir::Arch::X64).status,
               lifter::TranslateStatus::Unsupported);
+}
+
+// =============================================================================
+// MIT-434 (G8a): BMI1/2 折条款目 — andn/bzhi 零新 VmOp 折条 + rorx/shlx/
+// sarx/shrx flagless 变体。全部字节 = probe_forms.obj ml64 v145 编码 +
+// vendored capstone 5.0.7 反汇编双验 (2026-08-31)。
+// =============================================================================
+
+TEST_F(LifterTranslate, BmiAndnThreeAddressForms) {
+    // andn 三操作数映射 (probe: op[1]=NOT 项 reg-only, op[2]=AND 项 r/m 可 mem):
+    // C4 62 78 F2 C1 = andn r8d, eax, ecx — dst≠s1≠s2 → [Mov; Not] extra +
+    // (And, r8, ecx) 主 insn。
+    {
+        const wvmp::u8 b[] = {0xC4, 0x62, 0x78, 0xF2, 0xC1};
+        auto r = translate_bytes(x64, b, ir::Arch::X64);
+        ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+        EXPECT_EQ(r.insn.op, ir::Op::And);
+        EXPECT_EQ(r.insn.size, ir::Size::S32);
+        EXPECT_TRUE(r.insn.updates_flags);
+        ASSERT_EQ(static_cast<int>(r.insn.dst.reg), 8);
+        ASSERT_EQ(r.insn.src.kind, ir::Operand::Kind::Reg);
+        EXPECT_EQ(static_cast<int>(r.insn.src.reg), 1);   // ecx (AND 项, Rcx=1)
+        ASSERT_EQ(r.extra.size(), static_cast<size_t>(2));
+        EXPECT_EQ(r.extra[0].op, ir::Op::Mov);            // [Mov r8, rax]
+        EXPECT_EQ(r.extra[1].op, ir::Op::Not);            // [Not r8]
+    }
+    // d==s1: andn eax, eax, ecx — C4 E2 78 F2 C1 (ml64 t2.asm 编码实测) →
+    // [Not eax] + And(eax, ecx)
+    {
+        const wvmp::u8 b[] = {0xC4, 0xE2, 0x78, 0xF2, 0xC1};
+        auto r = translate_bytes(x64, b, ir::Arch::X64);
+        ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+        EXPECT_EQ(r.insn.op, ir::Op::And);
+        ASSERT_EQ(static_cast<int>(r.insn.dst.reg), 0);        // eax
+        ASSERT_EQ(r.extra.size(), static_cast<size_t>(1));
+        EXPECT_EQ(r.extra[0].op, ir::Op::Not);
+    }
+    // d==s2: andn eax, ecx, eax — C4 E2 70 F2 C0 (ml64 实测) → 载体
+    // (Op::And, eax, src=ecx(NOT 项), src2=eax(AND 项)), extra 空。
+    {
+        const wvmp::u8 b[] = {0xC4, 0xE2, 0x70, 0xF2, 0xC0};
+        auto r = translate_bytes(x64, b, ir::Arch::X64);
+        ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+        EXPECT_EQ(r.insn.op, ir::Op::And);
+        ASSERT_EQ(r.insn.src2.kind, ir::Operand::Kind::Reg);   // 载体判据
+        EXPECT_EQ(static_cast<int>(r.insn.src2.reg), 0);       // eax (AND 项)
+        EXPECT_EQ(static_cast<int>(r.insn.src.reg), 1);        // ecx (NOT 项)
+        EXPECT_TRUE(r.extra.empty());
+    }
+    // S64 形: C4 62 F8 F2 C1 = andn r8, rax, rcx
+    {
+        const wvmp::u8 b[] = {0xC4, 0x62, 0xF8, 0xF2, 0xC1};
+        auto r = translate_bytes(x64, b, ir::Arch::X64);
+        ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+        EXPECT_EQ(r.insn.size, ir::Size::S64);
+    }
+    // s2=mem: C4 62 78 F2 44 24 30 = andn r8d, eax, [rsp+30h] — 主 And 直带
+    // mem src (alu-binop src_mem 通道), extra = [Mov; Not]
+    {
+        const wvmp::u8 b[] = {0xC4, 0x62, 0x78, 0xF2, 0x44, 0x24, 0x30};
+        auto r = translate_bytes(x64, b, ir::Arch::X64);
+        ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+        ASSERT_EQ(r.insn.src.kind, ir::Operand::Kind::Mem);
+        ASSERT_EQ(r.extra.size(), static_cast<size_t>(2));
+    }
+}
+
+TEST_F(LifterTranslate, BmiBzhiCarrierAllForms) {
+    // bzhi: op[1]=value (r/m 可 mem), op[2]=index (reg-only) — 恒走载体
+    // (Op::Sub, src2=Reg(index)); mask 需独占临时 + 边界 clamp/CF 补丁。
+    // C4 62 70 F5 C0 = bzhi r8d, eax, ecx
+    {
+        const wvmp::u8 b[] = {0xC4, 0x62, 0x70, 0xF5, 0xC0};
+        auto r = translate_bytes(x64, b, ir::Arch::X64);
+        ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+        EXPECT_EQ(r.insn.op, ir::Op::Sub);                     // 载体
+        EXPECT_EQ(r.insn.size, ir::Size::S32);
+        EXPECT_TRUE(r.insn.updates_flags);
+        ASSERT_EQ(static_cast<int>(r.insn.dst.reg), 8);
+        ASSERT_EQ(r.insn.src.kind, ir::Operand::Kind::Reg);    // value=eax
+        ASSERT_EQ(r.insn.src2.kind, ir::Operand::Kind::Reg);   // index=ecx
+        EXPECT_EQ(static_cast<int>(r.insn.src2.reg), 1);
+        EXPECT_TRUE(r.extra.empty());
+    }
+    // mem value: C4 62 70 F5 44 24 30 = bzhi r8d, [rsp+30h], ecx (probe 收)
+    {
+        const wvmp::u8 b[] = {0xC4, 0x62, 0x70, 0xF5, 0x44, 0x24, 0x30};
+        auto r = translate_bytes(x64, b, ir::Arch::X64);
+        ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+        ASSERT_EQ(r.insn.src.kind, ir::Operand::Kind::Mem);
+    }
+    // S64: C4 62 F0 F5 C0 = bzhi r8, rax, rcx
+    {
+        const wvmp::u8 b[] = {0xC4, 0x62, 0xF0, 0xF5, 0xC0};
+        auto r = translate_bytes(x64, b, ir::Arch::X64);
+        ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+        EXPECT_EQ(r.insn.size, ir::Size::S64);
+    }
+}
+
+TEST_F(LifterTranslate, BmiFlaglessShiftFamily) {
+    // rorx/shlx/sarx/shrx — flagless 载体 (src2=Imm(22)), updates_flags=false
+    // (五位全不写, probe raw 0x247 全程)。count 骑 src: Imm=rorx / Reg=shlx 族。
+    {
+        const wvmp::u8 rorx[] = {0xC4, 0x63, 0x7B, 0xF0, 0xC1, 0x07};
+        auto r = translate_bytes(x64, rorx, ir::Arch::X64);
+        ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+        EXPECT_EQ(r.insn.op, ir::Op::Ror);
+        EXPECT_FALSE(r.insn.updates_flags);
+        ASSERT_EQ(r.insn.src.kind, ir::Operand::Kind::Imm);
+        EXPECT_EQ(r.insn.src.imm, 7);
+        ASSERT_EQ(r.insn.src2.kind, ir::Operand::Kind::Imm);
+        EXPECT_EQ(r.insn.src2.imm, 22);                    // kFlagless
+        ASSERT_EQ(r.extra.size(), static_cast<size_t>(1)); // d≠value → Mov
+        EXPECT_EQ(r.extra[0].op, ir::Op::Mov);
+    }
+    {
+        // C4 62 71 F7 C0 = shlx r8d, eax, ecx — cnt 骑 src=Reg (B.4)
+        const wvmp::u8 shlx[] = {0xC4, 0x62, 0x71, 0xF7, 0xC0};
+        auto r = translate_bytes(x64, shlx, ir::Arch::X64);
+        ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+        EXPECT_EQ(r.insn.op, ir::Op::Shl);
+        EXPECT_FALSE(r.insn.updates_flags);
+        ASSERT_EQ(r.insn.src.kind, ir::Operand::Kind::Reg);
+        EXPECT_EQ(static_cast<int>(r.insn.src.reg), 1);    // ecx (cnt-in-reg)
+        ASSERT_EQ(r.insn.src2.kind, ir::Operand::Kind::Imm);
+        EXPECT_EQ(r.insn.src2.imm, 22);
+        ASSERT_EQ(r.extra.size(), static_cast<size_t>(1));
+    }
+    {
+        // C4 62 72 F7 C0 = sarx r8d, eax, ecx
+        const wvmp::u8 sarx[] = {0xC4, 0x62, 0x72, 0xF7, 0xC0};
+        auto r = translate_bytes(x64, sarx, ir::Arch::X64);
+        ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+        EXPECT_EQ(r.insn.op, ir::Op::Sar);
+        EXPECT_FALSE(r.insn.updates_flags);
+        ASSERT_EQ(r.insn.src2.kind, ir::Operand::Kind::Imm);
+        EXPECT_EQ(r.insn.src2.imm, 22);
+    }
+    {
+        // C4 62 73 F7 C0 = shrx r8d, eax, ecx
+        const wvmp::u8 shrx[] = {0xC4, 0x62, 0x73, 0xF7, 0xC0};
+        auto r = translate_bytes(x64, shrx, ir::Arch::X64);
+        ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+        EXPECT_EQ(r.insn.op, ir::Op::Shr);
+        EXPECT_FALSE(r.insn.updates_flags);
+    }
+    {
+        // mem value: C4 63 7B F0 44 24 30 07 = rorx r8d, [rsp+30h], 7 (probe 收)
+        const wvmp::u8 rorxm[] = {0xC4, 0x63, 0x7B, 0xF0, 0x44, 0x24, 0x30, 0x07};
+        auto r = translate_bytes(x64, rorxm, ir::Arch::X64);
+        ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+        ASSERT_EQ(r.extra.size(), static_cast<size_t>(1));
+        EXPECT_EQ(r.extra[0].op, ir::Op::Load);            // mem → Load 通路
+    }
+    {
+        // S64: C4 63 FB F0 C1 07 = rorx r8, rax, 7
+        const wvmp::u8 rorx64[] = {0xC4, 0x63, 0xFB, 0xF0, 0xC1, 0x07};
+        auto r = translate_bytes(x64, rorx64, ir::Arch::X64);
+        ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+        EXPECT_EQ(r.insn.size, ir::Size::S64);
+    }
+}
+
+TEST_F(LifterTranslate, BmiNativeRorImmNotIntercepted) {
+    // 陷阱② 回归钉: 原生 ror/shl 的 count 走 **src** (Imm/CL), src2 恒 None
+    // → `ror eax,24` 不误拦 (is_bmi_flagless_marker 判据 = src2 存在性)。
+    // C1 C8 18 = ror eax, 24
+    {
+        const wvmp::u8 b[] = {0xC1, 0xC8, 0x18};
+        auto r = translate_bytes(x64, b, ir::Arch::X64);
+        ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+        EXPECT_EQ(r.insn.op, ir::Op::Ror);
+        EXPECT_TRUE(r.insn.updates_flags);                 // 原生 ror 写全量 (P1 partial)
+        ASSERT_EQ(r.insn.src.kind, ir::Operand::Kind::Imm);
+        EXPECT_EQ(r.insn.src.imm, 24);
+        EXPECT_EQ(r.insn.src2.kind, ir::Operand::Kind::None);  // 无载体
+    }
+    // D3 C8 = ror eax, cl — count=Reg(Rcx) 形同样不撞载体
+    {
+        const wvmp::u8 b[] = {0xD3, 0xC8};
+        auto r = translate_bytes(x64, b, ir::Arch::X64);
+        ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+        EXPECT_EQ(r.insn.op, ir::Op::Ror);
+        ASSERT_EQ(r.insn.src.kind, ir::Operand::Kind::Reg);
+        EXPECT_EQ(r.insn.src2.kind, ir::Operand::Kind::None);
+    }
+    // 原生 and 与 22/任意值: 83 E0 16 = and eax, 22 — src2=None (ALU imm 在 src)
+    {
+        const wvmp::u8 b[] = {0x83, 0xE0, 0x16};
+        auto r = translate_bytes(x64, b, ir::Arch::X64);
+        ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+        EXPECT_EQ(r.insn.op, ir::Op::And);
+        EXPECT_EQ(r.insn.src2.kind, ir::Operand::Kind::None);
+    }
+}
+
+TEST_F(LifterTranslate, BmiAndnAndnpsNoCrossTalk) {
+    // D4: andn (BMI, id 412) 与 andnps (SSE, id 414) 双正例并存零串扰 —
+    // id 分裂 (432 亲验) 使 lifter case 层互染不可能。
+    {
+        const wvmp::u8 b[] = {0xC4, 0x62, 0x78, 0xF2, 0xC1};   // andn r8d, eax, ecx
+        auto r = translate_bytes(x64, b, ir::Arch::X64);
+        ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+        EXPECT_EQ(r.insn.op, ir::Op::And);                     // GP 域
+        EXPECT_EQ(r.insn.size, ir::Size::S32);
+    }
+    {
+        const wvmp::u8 b[] = {0x0F, 0x55, 0xC8};               // andnps xmm1, xmm0
+        auto r = translate_bytes(x64, b, ir::Arch::X64);
+        ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+        EXPECT_EQ(r.insn.op, ir::Op::Andps);                   // SSE 域
+        EXPECT_EQ(r.insn.size, ir::Size::S64);
+    }
+}
+
+TEST_F(LifterTranslate, BmiNegativeFamilyStillGated) {
+    // 负例族 (D2 裁决: G8b/文档化 gate) 照旧 default → Unsupported:
+    // mulx C4 62 33 F6 C0 / pdep C4 62 33 F5 C0 / pext C4 62 32 F5 C0 /
+    // blsr C4 E2 38 F3 C8 / bextr C4 62 70 F7 C0 / blsi C4 E2 38 F3 D8 /
+    // blsmsk C4 E2 38 F3 D0 — 字节 probe 实测 (probe_forms.obj)。
+    const wvmp::u8 mulx[]   = {0xC4, 0x62, 0x33, 0xF6, 0xC0};
+    const wvmp::u8 pdep[]   = {0xC4, 0x62, 0x33, 0xF5, 0xC0};
+    const wvmp::u8 pext[]   = {0xC4, 0x62, 0x32, 0xF5, 0xC0};
+    const wvmp::u8 blsr[]   = {0xC4, 0xE2, 0x38, 0xF3, 0xC8};
+    const wvmp::u8 bextr[]  = {0xC4, 0x62, 0x70, 0xF7, 0xC0};
+    const wvmp::u8 blsi[]   = {0xC4, 0xE2, 0x38, 0xF3, 0xD8};
+    const wvmp::u8 blsmsk[] = {0xC4, 0xE2, 0x38, 0xF3, 0xD0};
+    const std::span<const wvmp::u8> negs[] = {mulx, pdep, pext, blsr, bextr, blsi, blsmsk};
+    for (const auto& b : negs) {
+        auto r = translate_bytes(x64, b, ir::Arch::X64);
+        EXPECT_EQ(r.status, lifter::TranslateStatus::Unsupported);
+    }
 }
 
 } // namespace

@@ -2293,6 +2293,205 @@ std::optional<ir::Cond> map_cmovcc_cond(x86_insn id) {
     }
 }
 
+// ==================== MIT-434 (G8a): BMI1/2 折条款目 ====================
+//
+// src2 载体域 (与 translator.cpp is_bmi_flagless_marker / andn / bzhi 载体
+// 分支严格对账; string 0..4 / lock 5..13 / sse mul+andn 14..18 / bridge
+// 19..21 分区连续, 下一可用自 22 起):
+//   22 kFlagless: (Op::{Shl,Shr,Sar,Rol,Ror}, src2=Imm(22)) = rorx/shlx/
+//                 sarx/shrx flagless 载体。原生 ror/shl 的 count 走 **src**
+//                 (Imm/CL, translate_shift), src2 恒 None → `ror eax,24`
+//                 不误拦 (陷阱② 的值域碰撞被 kind 判据绕开: 判据是 src2
+//                 的存在性, 不是 src 的立即数值); translator 展开为
+//                 GetFlags/SetFlags 包裹 (D1 (i) 变体, 零新 VmOp, asmgen
+//                 零改动)。
+//   另两域骑真操作数 (andn/bzhi 三操作数, imm 标记无槽可占), 判据 =
+//   src2.kind≠None 骑在"全仓从不写 src2"的 op 上 (写入点全仓审计 = 零,
+//   imul 3-op 只写 Op::Imul, 419 §B.1 同款审计):
+//   (Op::And, src2={Reg}) = andn: src = NOT 项 (vvvv, reg-only — ml64 实测
+//                 `andn r8d,[m],r` 拒), src2 = AND 项 (r/m 可 mem,
+//                 `andn r8d, r, [m]` 实测收; d==s2 载体形恒 reg);
+//   (Op::Sub, src2={Reg}) = bzhi: src = value (r/m 可 mem, `bzhi r8d,[m],r`
+//                 实测收), src2 = index (vvvv reg-only)。
+enum : int { kFlagless = 22 };
+
+// ---- andn (BMI1, VEX.NDS.LZ.0F38.F2): dst = ~s1 & s2 ----
+// 操作数映射 (probe 实测 2026-08-31, ml64 v145 + capstone 5.0.7 双验):
+//   op[0]=dst(reg) / op[1]=NOT 项(reg-only) / op[2]=AND 项(reg 或 mem)。
+// flags (Zen5 probe raw 0x286): CF=0 / OF=0 / ZF,SF,PF 按结果 — 与
+// Op::Not(无 flags) + Op::And 尾行(AND 全集) 折叠逐位对齐, 零特判。
+// 三态折叠 (d==s2 需 ~s1 独占临时 → 唯一进 translator 载体的形态):
+//   d==s1: [Not(d); And(d, s2)]            — 2 IR 纯 lifter 折叠 (extra+main)
+//   d 独立: [Mov(d, s1); Not(d); And(d, s2)] — 3 IR; s2=mem 时主 And 直带
+//          mem src (既有 alu-binop src_mem 通道, emit_load 折条)
+//   d==s2: (Op::And, d, src=s1, src2=s2) 载体 → translator
+//          [Mov(s0, s1); Not(s0); And(d, s0)] (scratch v18..v23)
+TranslateResult translate_andn(const cs_insn& ci, const cs_x86& x, ir::Arch arch) {
+    if (x.op_count != 3) return unsupported(ci.address, ci.size);
+    auto d = to_operand(x.operands[0]);
+    auto s1 = to_operand(x.operands[1]);
+    auto s2 = to_operand(x.operands[2]);
+    if (!d || !s1 || !s2) return unsupported(ci.address, ci.size);
+    if (d->kind != Operand::Kind::Reg || s1->kind != Operand::Kind::Reg)
+        return unsupported(ci.address, ci.size);  // dst/NOT 项 reg-only (probe)
+    if (s2->kind != Operand::Kind::Reg && s2->kind != Operand::Kind::Mem)
+        return unsupported(ci.address, ci.size);
+    const ir::Size sz = data_size(x.operands, x.op_count, arch);
+    if (sz != ir::Size::S32 && sz != ir::Size::S64)
+        return unsupported(ci.address, ci.size);  // BMI 无 S8/S16 形
+    const bool d_eq_s1 = (d->kind == Operand::Kind::Reg && s1->kind == Operand::Kind::Reg &&
+                          d->reg == s1->reg);
+    const bool d_eq_s2 = (d->kind == Operand::Kind::Reg && s2->kind == Operand::Kind::Reg &&
+                          d->reg == s2->reg);
+
+    ir::Insn main_insn;
+    main_insn.addr = ci.address;
+    main_insn.size = sz;
+    main_insn.dst = *d;
+    main_insn.updates_flags = true;
+    std::vector<ir::Insn> pre;
+
+    if (d_eq_s2) {
+        // 载体形: (Op::And, d, src=s1, src2=s2) — ~s1 需独占临时
+        // (d 槽持有 AND 项, 前置 Mov/Not 会先摧毁它)。
+        main_insn.op = Op::And;
+        main_insn.src = *s1;
+        main_insn.src2 = *s2;
+        return ok(main_insn);
+    }
+    // 纯 IR 折叠: extra = [可选 Mov; Not], main = And(d, s2)
+    if (!d_eq_s1) {
+        // d 独立: 先拷 NOT 项到 dst (保护 s1 — 原生 andn 不写 s1)
+        ir::Insn mv;
+        mv.op = Op::Mov;
+        mv.addr = ci.address;
+        mv.size = sz;
+        mv.dst = *d;
+        mv.src = *s1;
+        mv.updates_flags = false;
+        pre.push_back(mv);
+    }
+    ir::Insn nt;
+    nt.op = Op::Not;
+    nt.addr = ci.address;
+    nt.size = sz;
+    nt.dst = *d;
+    nt.updates_flags = false;
+    pre.push_back(nt);
+    main_insn.op = Op::And;
+    main_insn.src = *s2;
+    TranslateResult r = ok(main_insn);
+    r.extra = std::move(pre);
+    return r;
+}
+
+// ---- bzhi (BMI1, VEX.NDS.LZ.0F38.F7): dst = value & ((1<<idx)-1) ----
+// 操作数映射 (probe 实测): op[0]=dst(reg) / op[1]=value (r/m 可 mem,
+// `bzhi r8d,[m],r` 收) / op[2]=index (reg-only)。
+// 边界语义 (Zen5 probe, 纠正 432 §2.1 预判):
+//   - index 用 SRC2[7:0] (0x105 → 5, 高位垃圾忽略);
+//   - index=0 → 结果 0 ((1<<0)-1=0, 与 shift 的 count=0 no-op 不同);
+//   - index≥N → **结果 = value 原值不变 + CF=1** (非"结果 0"; ZF/SF/PF 按
+//     结果, OF=0)。
+// 恒走载体 (mask 需独占临时 + 边界 clamp/CF 补丁, 无纯 IR 折叠形):
+// (Op::Sub, dst, src=value, src2=Reg(index)), translator 展开 (见该函数注)。
+TranslateResult translate_bzhi(const cs_insn& ci, const cs_x86& x, ir::Arch arch) {
+    if (x.op_count != 3) return unsupported(ci.address, ci.size);
+    auto d = to_operand(x.operands[0]);
+    auto v = to_operand(x.operands[1]);
+    auto ix = to_operand(x.operands[2]);
+    if (!d || !v || !ix) return unsupported(ci.address, ci.size);
+    if (d->kind != Operand::Kind::Reg || ix->kind != Operand::Kind::Reg)
+        return unsupported(ci.address, ci.size);
+    if (v->kind != Operand::Kind::Reg && v->kind != Operand::Kind::Mem)
+        return unsupported(ci.address, ci.size);
+    const ir::Size sz = data_size(x.operands, x.op_count, arch);
+    if (sz != ir::Size::S32 && sz != ir::Size::S64)
+        return unsupported(ci.address, ci.size);
+    ir::Insn out;
+    out.op = Op::Sub;  // 载体 (src2=Reg(index) 判据, 见域注)
+    out.addr = ci.address;
+    out.size = sz;
+    out.dst = *d;
+    out.src = *v;
+    out.src2 = *ix;
+    out.updates_flags = true;
+    return ok(out);
+}
+
+// ---- rorx/shlx/sarx/shrx (BMI2) flagless 变体 ----
+// 操作数映射 (probe 实测): op[0]=dst(reg) / op[1]=value (r/m 可 mem) /
+// op[2]=count (rorx=imm8 / shlx 族=reg-only)。count 掩码 & (N-1) (rorx 32→0、
+// 193→1 实测; shlx 0x105 → 5, 低字节语义与 VM 既有 cl 掩码通路一致);
+// **五位 flags 全不受影响** (probe raw 0x247 全程, count=0 同 — 与原生
+// ror/shl "按结果写全量" 分叉, 正是 P1 机制要抹平的面)。
+// IR: [可选 Mov/Load(d, value)] + 主 insn:
+//   rorx:       (Op::Ror, d, src=Imm(count), src2=Imm(kFlagless))
+//               — count 骑 src (与原生 ror-imm 同形)
+//   shlx/sarx/  (Op::{Shl,Sar,Shr}, d, src=Reg(cnt), src2=Imm(kFlagless))
+//   shrx:         — cnt 骑 src (与原生 shl-cl 的 Reg 形同构); translator
+//                   展开为 [GetFlags(s); VmOp(d, Reg cnt); SetFlags(s)],
+//                   build_shift 的 b=Reg 通用计数通路 (T7 任意槽, B.4)
+TranslateResult translate_bmi_shift(const cs_insn& ci, const cs_x86& x, ir::Arch arch, Op op) {
+    if (x.op_count != 3) return unsupported(ci.address, ci.size);
+    auto d = to_operand(x.operands[0]);
+    auto v = to_operand(x.operands[1]);
+    if (!d || !v) return unsupported(ci.address, ci.size);
+    if (d->kind != Operand::Kind::Reg) return unsupported(ci.address, ci.size);
+    if (v->kind != Operand::Kind::Reg && v->kind != Operand::Kind::Mem)
+        return unsupported(ci.address, ci.size);
+    const ir::Size sz = data_size(x.operands, x.op_count, arch);
+    if (sz != ir::Size::S32 && sz != ir::Size::S64)
+        return unsupported(ci.address, ci.size);
+
+    // 前置: value ≠ dst 时先装载 (reg=Mov / mem=Load, 408/248 通道)
+    std::vector<ir::Insn> pre;
+    if (v->kind == Operand::Kind::Reg) {
+        if (v->reg == d->reg) {
+            // d==value: 直走 (dst 覆写 = 原生三地址语义)
+        } else {
+            ir::Insn mv;
+            mv.op = Op::Mov;
+            mv.addr = ci.address;
+            mv.size = sz;
+            mv.dst = *d;
+            mv.src = *v;
+            mv.updates_flags = false;
+            pre.push_back(mv);
+        }
+    } else {
+        ir::Insn ld;
+        ld.op = Op::Load;
+        ld.addr = ci.address;
+        ld.size = sz;
+        ld.dst = *d;
+        ld.src = *v;
+        ld.updates_flags = false;
+        pre.push_back(ld);
+    }
+
+    ir::Insn main_insn;
+    main_insn.op = op;
+    main_insn.addr = ci.address;
+    main_insn.size = sz;
+    main_insn.dst = *d;
+    main_insn.src2 = Operand::imm_(kFlagless);  // flagless 载体 (判据见域注)
+    main_insn.updates_flags = false;            // 五位全不写 (probe)
+    if (op == Op::Ror) {
+        // rorx: count = imm8 (op[2]); 恒 Imm (probe n=['r','r','i'])
+        if (x.operands[2].type != X86_OP_IMM) return unsupported(ci.address, ci.size);
+        main_insn.src = Operand::imm_(static_cast<i64>(x.operands[2].imm));
+    } else {
+        // shlx/sarx/shrx: count = reg (op[2], vvvv reg-only)
+        auto cnt = to_operand(x.operands[2]);
+        if (!cnt || cnt->kind != Operand::Kind::Reg) return unsupported(ci.address, ci.size);
+        main_insn.src = *cnt;
+    }
+    TranslateResult r = ok(main_insn);
+    r.extra = std::move(pre);
+    return r;
+}
+
 TranslateResult translate_insn(const cs_insn& ci, ir::Arch arch) {
     if (ci.detail == nullptr) return unsupported(ci.address, ci.size);
     const cs_x86& x = ci.detail->x86;
@@ -2568,6 +2767,19 @@ TranslateResult translate_insn(const cs_insn& ci, ir::Arch arch) {
     case X86_INS_CMOVP: case X86_INS_CMOVNP: case X86_INS_CMOVL: case X86_INS_CMOVLE:
     case X86_INS_CMOVG: case X86_INS_CMOVGE: case X86_INS_CMOVO: case X86_INS_CMOVNO:
         return translate_cmovcc(ci, x, arch);
+    // MIT-434 (G8a): BMI1/2 折条款目 — andn/bzhi 零新 VmOp 折条 + rorx/shlx/
+    // sarx/shrx flagless 变体 (D1 (i) 变体: translator 层 GetFlags/SetFlags
+    // 包裹, asmgen 零改动)。操作数映射/flags 语义/边界行为全部 probe 实测
+    // (见各 translate 函数注与 .multica 方案简述); 载体域判据见 kFlagless
+    // 域注。VEX 前缀 (C4/C5) 被 capstone 吸收进 id (426 同纪律), 不经入口
+    // 前缀闸直达本 case。mulx/pdep/pext/blsr/blsi/blsmsk/bextr 族不入面 →
+    // default 照旧 C1 gate (G8b / 文档化 gate 裁决, 432 §6.4)。
+    case X86_INS_ANDN: return translate_andn(ci, x, arch);
+    case X86_INS_BZHI: return translate_bzhi(ci, x, arch);
+    case X86_INS_RORX: return translate_bmi_shift(ci, x, arch, Op::Ror);
+    case X86_INS_SHLX: return translate_bmi_shift(ci, x, arch, Op::Shl);
+    case X86_INS_SARX: return translate_bmi_shift(ci, x, arch, Op::Sar);
+    case X86_INS_SHRX: return translate_bmi_shift(ci, x, arch, Op::Shr);
     // MIT-341: cmpxchg r/m, r (0F B0/B1+rm, mod=11 REG-REG / mod=00 MEM-REG).
     // capstone 用单一 X86_INS_CMPXCHG 涵盖 S8 (0F B0) 和 S16/S32/S64 (0F B1)
     // 全部形式, size 由 ModR/M 与 REX.W 决定. size 取 data_size() 自动识别.

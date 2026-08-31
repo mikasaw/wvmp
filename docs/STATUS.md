@@ -51,6 +51,8 @@
 
 | **MIT-433 P1 rol/ror flags partial-preserve** | ✅ | （本批次） | G9r triage §6.1 现网正确性缺口收口（MIT-432 项目主独立复现：native ror 后 setz=0、packed=1）：SDM Vol.2 ROL/ROR 只写 CF/OF、ZF/SF/PF unaffected，而 build_rol/build_ror(+rolcl/rorcl) 复用 build_shift 全量装配把 zero5 宿主污染（xor 致 ZF=1/SF=0/PF=1）覆写 guest flags。修复 = 新 flags_tail_partial partial-preserve 装配（Inc/Dec cf_preset 先例三位推广）：CF/OF 照旧 setcc5 捕获，ZF/SF/PF 从 ctx+0x98 旧值 and 0x19 原位保留；kVmOpMax=97 不动、VmOp 零增、非 rot handler 字节码零扰动（asmgen dump 逐 case 对账 91/95 体逐字节相同，差异恰 4 rot 尾部；非 rot 样本 packed 差异 = 解释器镜像 -48B @seed12345 纯位置效应）；asmgen.cpp ROL/ROR 段 SDM 误读注释（旧文 SF/ZF/PF 按结果）按实义重写；样本 wvmp_flags_rol_sample（p432 复现样本转正，自含 MASM marker 桩，ror/rol ZF + rol SF + ror PF 消费 + shl 对照，区内 Store 落盘观察；旧 CLI 反证 stdout 分叉必 FAIL → 分支 byte-exact PASS，5 stub 真虚拟化）；单测 RotFlagsPartialPreserve 12 组（rol/ror×{ZF,SF,PF} 保留 + shl/shr/sar 对照 + count=0 全不动 + count>1 + RolCl/RorCl 同面）× 5 seed；multiseed 47×5=**235/235**（REQUIRE_REAL 同）、ctest 16/16、wvmpTest 14/14 + jump-table@0xDD84 + ExitNative 17 + note 面逐字节原样 + 双跑 103/103、静态扫描/dump 门 PASS；G8a flagless（rorx/shlx/sarx/shrx）接入点接口文本已留 flags_tail_partial（本单不实现） |
 
+| **MIT-434 G8a BMI 折条款目** | ✅ | （本批次） | andn/bzhi 零新 VmOp 折条 + rorx/shlx/sarx/shrx flagless 变体（G9r §2.5 蓝图，P1 机制首客户，main cdc218d 基线）：**零新 VmOp（kVmOpMax=97 不动）、零新 handler（asmgen.cpp 逐字节零 diff）、零冻结契约触碰**。D1 选型 = (i) 变体 translator 层 GetFlags/SetFlags 包裹（G3 微程序先例；(i) 原案触碰 build_shift 触 P1 红线不可行、(ii) +4 VmOp 对照后弃——零 enum/零 handler/零 asmgen 风险占优，字节码 +2 word/指令披露）；载体 = src2.kind≠None 骑"从不写 src2 的 op"（shift+Imm(22)=flagless / And+Reg=andn d==s2 / Sub+Reg=bzhi；`ror eax,24` 不误拦——count 在 src、判据是 kind 非值域，陷阱②绕开；全域对账 419 B.1 同款 + 单测样本双钉）；probe 修正三事实（Zen5+ml64+capstone 双验）：**bzhi 边界 idx≥N = 原值不变+CF=1（推翻 432 §2.1 "结果 0/CF=0" 预判，折条 mask-clamp+CF 补丁五位全对齐）**、idx=0→结果 0、andn 的 r/m 在第三操作数（AND 项）NOT 项 reg-only / bzhi·rorx·shlx 族 r/m=value 在第二——SDM 记法直读会反，以 ml64 逐形双验为准；andn flags = Op::And 尾行全集（probe 0x286）；bzhi 微程序 16-17 op（低频面膨胀披露）；andn d==s1/d 独立纯 IR 折叠零 translator 成本；负例 mulx/pdep/pext/blsr/blsi/blsmsk/bextr 照旧 C1 gate（G8b 后置）；426 时代 VexRorxGate 负例翻转正例（425 §B.4 先例）；样本 wvmp_bmi_sample（16 正例区 = 16 stub 真虚拟化 + flags 消费探针区内 Store 落盘 + 1 负例区 7 指令 gate note 零逃逸）+ 三层单测（lifter 148 / translator 60 / runtime 语义电池期望值 = probe 逐位 × 5 seed）；multiseed 48×5=**240/240**（REQUIRE_REAL 同）、ctest 16/16、dump 门 handler 集合恒等 + static 门 PASS |
+
 ## M2 交付明细
 
 
@@ -210,7 +212,7 @@ C3 区域内 call、C4 rip-relative、C5 x86 扫描不可用。
 - call / rip-relative 走 gate 回退路径（native 执行）——gate 本身未实现，见 GAPS C3/C4。
 
 - flags 跨指令污染：待 M3 活跃性分析消除。
-- flags 部分写入面：rot 族已修（MIT-433 flags_tail_partial，SDM: ROL/ROR 只写 CF/OF）；G8a flagless 族（rorx/shlx/sarx/shrx 全不写 flags）待接入——partial 骨架接口已留（asmgen.cpp），零新 VmOp。
+- flags 部分写入面：rot 族已修（MIT-433 flags_tail_partial，SDM: ROL/ROR 只写 CF/OF）；G8a flagless 族（rorx/shlx/sarx/shrx 全不写 flags）已由 MIT-434 以 translator 层 GetFlags/SetFlags 包裹接入（零新 VmOp、asmgen 零改动）；bzhi 边界语义（idx≥N = 原值不变+CF=1，probe 修正 432 预判）已全对齐（GAPS G8a 节）。
 
 - marker_scan：x86 锚点未支持（GAPS C5；32 位输入已在 pe_loader 显式硬拒绝，
 

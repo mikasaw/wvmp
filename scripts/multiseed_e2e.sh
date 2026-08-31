@@ -249,6 +249,13 @@ samples=(
     # shl 对照。修复前反证用旧 CLI (0ac661a 同产物) 双跑观察分叉值。
     # 单边新增 1 样本 → 47 × 5 = 235 runs。
     "build/passes/marker_scan/tests/wvmp_flags_rol_sample.exe"
+    # MIT-434 (G8a): BMI 折条款目主样本 — 16 正例区 (andn/bzhi/rorx/shlx/
+    # sarx/shrx × {d==s1, d==s2, d 独立, mem src} + flags 消费探针 setcc →
+    # 区内 Store 落盘; bzhi 边界 idx=N 原值+CF=1 probe 修正面; rorx 五位
+    # 保留 setz/setc/sets/setp) 真虚拟化 (16 stub) + 1 负例区 (mulx/pdep/
+    # pext/blsr/bextr/blsi/blsmsk) 函数级 gate 可调用 byte-exact。
+    # 单边新增 1 样本 → 48 × 5 = 240 runs。
+    "build/passes/marker_scan/tests/wvmp_bmi_sample.exe"
 )
 
 # Seeds: 1 (small), 12345 (default), 99999 (large), 0xDEADBEEF (magic), 0xCAFEBABE (magic).

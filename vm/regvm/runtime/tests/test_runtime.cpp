@@ -3361,4 +3361,277 @@ TEST(Interpreter, LeaRvaSemantics) {
             << " got 0x" << ctx.regs[7] << " expected 0x42";
     }
 }
+
+// ==================== MIT-434 (G8a): BMI 折条真执行语义电池 ====================
+//
+// 与 translator 展开逐 op 同构的手搭字节码, 在真 RWX 解释器上执行 —
+// 期望值全部来自 Zen5 原生 probe (probe_exec.exe, 2026-08-31):
+//   rorx/shlx/sarx/shrx: 五位 flags 全保留 (raw 0x247 全程, count=0 同);
+//   andn: CF=0/OF=0/ZF,SF,PF 按结果 (raw 0x286);
+//   bzhi: idx 用 [7:0] (0x105→5); idx=0 → 结果 0; **idx≥N → 原值不变 +
+//         CF=1** (raw 0x287, 纠正 432 §2.1 "结果 0" 预判); OF=0 恒。
+TEST(Interpreter, BmiFlaglessWrapPreservesAllFlags) {
+    alignas(16) std::array<u8, 0x10000> scratch{};
+    for (u64 seed : {1ull, 2ull, 3ull, 4ull, 5ull}) {
+        wvmp::Rng rng(seed);
+        const auto result = rt::generate_runtime(rng);
+        RwxImage rwx(result.image.code);
+        const auto entry = rwx.entry();
+        const u64 all5 = isa::kFlagsMask;
+        const u8 sz64 = isa::size_field(ir::Size::S64);
+        // flagless 包裹 (translator 同构): GetFlags(s=18) → shift → SetFlags(18)。
+        // 预置五位全 1 (最严苛: 任何一位被覆写即 FAIL)。
+        auto run_wrap = [&](isa::VmOp op, u8 dst, isa::OpKind b_kind, u8 rb, u32 aux,
+                            ir::Size sz, u64 value) {
+            std::vector<u8> s;
+            isa::append_insn(s, mov_imm(dst, static_cast<u32>(value)));
+            isa::append_insn(s, mov_imm(2, static_cast<u32>(all5)));  // 五位预置
+            isa::append_insn(s, isa::make_insn(isa::VmOp::SetFlags, isa::OpKind::Reg, 2,
+                                               isa::OpKind::None, 0, 0));
+            isa::append_insn(s, isa::make_insn(isa::VmOp::GetFlags, isa::OpKind::Reg, 18,
+                                               isa::OpKind::None, 0, 0, sz64));
+            isa::append_insn(s, isa::make_insn(op, isa::OpKind::Reg, dst, b_kind, rb, aux,
+                                               isa::size_field(sz)));
+            isa::append_insn(s, isa::make_insn(isa::VmOp::SetFlags, isa::OpKind::Reg, 18,
+                                               isa::OpKind::None, 0, 0, sz64));
+            isa::append_insn(s, isa::make_insn(isa::VmOp::GetFlags, isa::OpKind::Reg, 3,
+                                               isa::OpKind::None, 0, 0, sz64));
+            isa::append_insn(s, halt());
+            return run_stream(entry, s, scratch.data());
+        };
+        // rorx 形: Ror v0, Imm(7) S32 — 0xF0F0F0F0 ror 7 = 0x1E1E1E1E
+        {
+            const auto ctx = run_wrap(isa::VmOp::Ror, 0, isa::OpKind::Imm, 0, 7,
+                                      ir::Size::S32, 0xF0F0F0F0ull);
+            EXPECT_EQ(ctx.regs[0], 0xE1E1E1E1ull) << "rorx value seed=" << seed;
+            EXPECT_EQ(ctx.regs[3] & isa::kFlagsMask, all5)
+                << "rorx 五位全保留 seed=" << seed;
+        }
+        // rorx count=0 形: 32&31=0 → 值不动 + 五位保留 (A.4 差异形)
+        {
+            const auto ctx = run_wrap(isa::VmOp::Ror, 0, isa::OpKind::Imm, 0, 32,
+                                      ir::Size::S32, 0x80000001ull);
+            EXPECT_EQ(ctx.regs[0], 0x80000001ull) << "rorx cnt0 value seed=" << seed;
+            EXPECT_EQ(ctx.regs[3] & isa::kFlagsMask, all5) << "rorx cnt0 flags seed=" << seed;
+        }
+        // shlx 形: Shl v0, Reg(v1=cnt) S64 — cnt=0x45 (69&63=5) → 1<<5=0x20;
+        // cnt-in-reg 通路 = build_shift T7 任意槽 (B.4)。
+        {
+            std::vector<u8> s;
+            isa::append_insn(s, mov_imm(1, 0x45));            // v1 = cnt
+            isa::append_insn(s, mov_imm(0, 0x1));             // v0 = value
+            isa::append_insn(s, mov_imm(2, static_cast<u32>(all5)));
+            isa::append_insn(s, isa::make_insn(isa::VmOp::SetFlags, isa::OpKind::Reg, 2,
+                                               isa::OpKind::None, 0, 0));
+            isa::append_insn(s, isa::make_insn(isa::VmOp::GetFlags, isa::OpKind::Reg, 18,
+                                               isa::OpKind::None, 0, 0, sz64));
+            isa::append_insn(s, isa::make_insn(isa::VmOp::Shl, isa::OpKind::Reg, 0,
+                                               isa::OpKind::Reg, 1, 0,
+                                               isa::size_field(ir::Size::S64)));
+            isa::append_insn(s, isa::make_insn(isa::VmOp::SetFlags, isa::OpKind::Reg, 18,
+                                               isa::OpKind::None, 0, 0, sz64));
+            isa::append_insn(s, isa::make_insn(isa::VmOp::GetFlags, isa::OpKind::Reg, 3,
+                                               isa::OpKind::None, 0, 0, sz64));
+            isa::append_insn(s, halt());
+            const auto ctx = run_stream(entry, s, scratch.data());
+            EXPECT_EQ(ctx.regs[0], 0x20ull) << "shlx value seed=" << seed;
+            EXPECT_EQ(ctx.regs[3] & isa::kFlagsMask, all5) << "shlx flags seed=" << seed;
+        }
+        // sarx/shrx 形: Sar/Shr v0, Reg(v1=4) S32 — 0xF0000000 sar/shr 4
+        {
+            for (auto [op, want] : {std::pair{isa::VmOp::Sar, 0xFF000000ull},
+                                    {isa::VmOp::Shr, 0x0F000000ull}}) {
+                std::vector<u8> s;
+                isa::append_insn(s, mov_imm(1, 4));
+                isa::append_insn(s, mov_imm(0, 0xF0000000u));
+                isa::append_insn(s, mov_imm(2, static_cast<u32>(all5)));
+                isa::append_insn(s, isa::make_insn(isa::VmOp::SetFlags, isa::OpKind::Reg, 2,
+                                                   isa::OpKind::None, 0, 0));
+                isa::append_insn(s, isa::make_insn(isa::VmOp::GetFlags, isa::OpKind::Reg, 18,
+                                                   isa::OpKind::None, 0, 0, sz64));
+                isa::append_insn(s, isa::make_insn(op, isa::OpKind::Reg, 0,
+                                                   isa::OpKind::Reg, 1, 0,
+                                                   isa::size_field(ir::Size::S32)));
+                isa::append_insn(s, isa::make_insn(isa::VmOp::SetFlags, isa::OpKind::Reg, 18,
+                                                   isa::OpKind::None, 0, 0, sz64));
+                isa::append_insn(s, isa::make_insn(isa::VmOp::GetFlags, isa::OpKind::Reg, 3,
+                                                   isa::OpKind::None, 0, 0, sz64));
+                isa::append_insn(s, halt());
+                const auto ctx = run_stream(entry, s, scratch.data());
+                EXPECT_EQ(ctx.regs[0], want) << "sarx/shrx value seed=" << seed;
+                EXPECT_EQ(ctx.regs[3] & isa::kFlagsMask, all5)
+                    << "sarx/shrx flags seed=" << seed;
+            }
+        }
+    }
+}
+
+TEST(Interpreter, BmiBzhiMicroProgramSemantics) {
+    // bzhi 展开微程序 (translator 同构 16 op, d==value 形) 边界矩阵 —
+    // 期望值 = probe 实测。
+    alignas(16) std::array<u8, 0x10000> scratch{};
+    for (u64 seed : {1ull, 2ull, 3ull, 4ull, 5ull}) {
+        wvmp::Rng rng(seed);
+        const auto result = rt::generate_runtime(rng);
+        RwxImage rwx(result.image.code);
+        const auto entry = rwx.entry();
+        const u8 sz64 = isa::size_field(ir::Size::S64);
+        const u8 s_m = 18, s_c = 19, s_i = 20;  // scratch 槽 (translator 同序)
+        // run(dst=v0, value, idx, size, pre) — d==value 形 (无前置 Mov)。
+        auto run_bzhi = [&](u64 value, u64 idx, ir::Size sz, u64 pre) {
+            const u8 szf = isa::size_field(sz);
+            const u32 n = (sz == ir::Size::S32) ? 32u : 64u;
+            std::vector<u8> s;
+            if (sz == ir::Size::S64)
+                mov_imm64_into(s, 0, 23, value);
+            else
+                isa::append_insn(s, mov_imm(0, static_cast<u32>(value), sz));
+            isa::append_insn(s, mov_imm(1, static_cast<u32>(idx)));       // v1 = idx (S64 槽)
+            isa::append_insn(s, mov_imm(2, static_cast<u32>(pre)));
+            isa::append_insn(s, isa::make_insn(isa::VmOp::SetFlags, isa::OpKind::Reg, 2,
+                                               isa::OpKind::None, 0, 0));
+            isa::append_insn(s, isa::make_insn(isa::VmOp::Mov, isa::OpKind::Reg, s_m,
+                                               isa::OpKind::Imm, 0, 1, szf));
+            isa::append_insn(s, isa::make_insn(isa::VmOp::Shl, isa::OpKind::Reg, s_m,
+                                               isa::OpKind::Reg, 1, 0, szf));
+            isa::append_insn(s, isa::make_insn(isa::VmOp::Sub, isa::OpKind::Reg, s_m,
+                                               isa::OpKind::Imm, 0, 1, szf));
+            isa::append_insn(s, isa::make_insn(isa::VmOp::Mov, isa::OpKind::Reg, s_c,
+                                               isa::OpKind::Imm, 0, 0, sz64));
+            isa::append_insn(s, isa::make_insn(isa::VmOp::Sub, isa::OpKind::Reg, s_c,
+                                               isa::OpKind::Imm, 0, 1, sz64));
+            isa::append_insn(s, isa::make_insn(isa::VmOp::Movzx, isa::OpKind::Reg, s_i,
+                                               isa::OpKind::Reg, 1, 0, sz64));
+            isa::append_insn(s, isa::make_insn(isa::VmOp::Cmp, isa::OpKind::Reg, s_i,
+                                               isa::OpKind::Imm, 0, n, szf));
+            isa::append_insn(s, isa::make_insn(isa::VmOp::Cmovcc, isa::OpKind::Reg, s_m,
+                                               isa::OpKind::Reg, s_c,
+                                               static_cast<u32>(ir::Cond::Ae) << 28, szf));
+            isa::append_insn(s, isa::make_insn(isa::VmOp::And, isa::OpKind::Reg, 0,
+                                               isa::OpKind::Reg, s_m, 0, szf));
+            isa::append_insn(s, isa::make_insn(isa::VmOp::GetFlags, isa::OpKind::Reg, s_m,
+                                               isa::OpKind::None, 0, 0, sz64));
+            isa::append_insn(s, isa::make_insn(isa::VmOp::Cmp, isa::OpKind::Reg, s_i,
+                                               isa::OpKind::Imm, 0, n, szf));
+            isa::append_insn(s, isa::make_insn(isa::VmOp::Sbb, isa::OpKind::Reg, s_c,
+                                               isa::OpKind::Reg, s_c, 0, sz64));
+            isa::append_insn(s, isa::make_insn(isa::VmOp::Not, isa::OpKind::Reg, s_c,
+                                               isa::OpKind::None, 0, 0, sz64));
+            isa::append_insn(s, isa::make_insn(isa::VmOp::And, isa::OpKind::Reg, s_c,
+                                               isa::OpKind::Imm, 0, 2, sz64));
+            isa::append_insn(s, isa::make_insn(isa::VmOp::Or, isa::OpKind::Reg, s_m,
+                                               isa::OpKind::Reg, s_c, 0, sz64));
+            isa::append_insn(s, isa::make_insn(isa::VmOp::SetFlags, isa::OpKind::Reg, s_m,
+                                               isa::OpKind::None, 0, 0, sz64));
+            isa::append_insn(s, isa::make_insn(isa::VmOp::GetFlags, isa::OpKind::Reg, 3,
+                                               isa::OpKind::None, 0, 0, sz64));
+            isa::append_insn(s, halt());
+            return run_stream(entry, s, scratch.data());
+        };
+        const u64 pre = isa::kFlagCF | isa::kFlagZF | isa::kFlagPF;  // probe 基线三位
+        // A 正常 idx=5: 0xFFFFFFFF → 0x1F; flags = 0 (ZF0 CF0 SF0 PF0 — probe 0x202)
+        {
+            const auto ctx = run_bzhi(0xFFFFFFFFull, 5, ir::Size::S32, pre);
+            EXPECT_EQ(ctx.regs[0], 0x1Full) << "bzhi normal value seed=" << seed;
+            EXPECT_EQ(ctx.regs[3] & isa::kFlagsMask, 0u) << "bzhi normal flags seed=" << seed;
+        }
+        // B idx=0: 结果 0 (mask=(1<<0)-1=0, 与 shift 的 no-op 不同); ZF=1 PF=1
+        {
+            const auto ctx = run_bzhi(0xFFFFFFFFull, 0, ir::Size::S32, pre);
+            EXPECT_EQ(ctx.regs[0], 0ull) << "bzhi idx0 value seed=" << seed;
+            EXPECT_EQ(ctx.regs[3] & isa::kFlagsMask,
+                      u64(isa::kFlagZF | isa::kFlagPF))
+                << "bzhi idx0 flags seed=" << seed;
+        }
+        // C 边界 idx=32 (S32): **原值不变 + CF=1** (probe 0x287; ZF=0 SF=1 PF=1)
+        {
+            const auto ctx = run_bzhi(0xFFFFFFFFull, 32, ir::Size::S32, pre);
+            EXPECT_EQ(ctx.regs[0], 0xFFFFFFFFull) << "bzhi bd32 value seed=" << seed;
+            EXPECT_EQ(ctx.regs[3] & isa::kFlagsMask,
+                      u64(isa::kFlagCF | isa::kFlagSF | isa::kFlagPF))
+                << "bzhi bd32 flags (原值+CF=1, 非'结果 0') seed=" << seed;
+        }
+        // D 边界 idx=64 (S64): 原值不变 + CF=1
+        {
+            const auto ctx = run_bzhi(0xF0F0F0F0F0F0F0F0ull, 64, ir::Size::S64,
+                                      isa::kFlagCF | isa::kFlagZF | isa::kFlagPF);
+            EXPECT_EQ(ctx.regs[0], 0xF0F0F0F0F0F0F0F0ull) << "bzhi bd64 value seed=" << seed;
+            EXPECT_EQ(ctx.regs[3] & isa::kFlagsMask,
+                      u64(isa::kFlagCF | isa::kFlagSF | isa::kFlagPF))
+                << "bzhi bd64 flags seed=" << seed;
+        }
+        // E idx=255 (S64): 边界 → 原值 + CF=1
+        {
+            const auto ctx = run_bzhi(0x123456789ABCDEF0ull, 255, ir::Size::S64,
+                                      isa::kFlagCF | isa::kFlagZF | isa::kFlagPF);
+            EXPECT_EQ(ctx.regs[0], 0x123456789ABCDEF0ull) << "bzhi bdff value seed=" << seed;
+            // 输入 MSB=0 → SF=0 (与 case C 的 0xFFFFFFFF 输入 SF=1 相区分)
+            EXPECT_EQ(ctx.regs[3] & isa::kFlagsMask,
+                      u64(isa::kFlagCF | isa::kFlagPF))
+                << "bzhi bdff flags seed=" << seed;
+        }
+        // F 高位垃圾 idx 槽 = 0x105: idx 用 [7:0]=5 (SRC2[7:0] 语义)
+        {
+            const auto ctx = run_bzhi(0xFFFFFFFFull, 0x105, ir::Size::S32, pre);
+            EXPECT_EQ(ctx.regs[0], 0x1Full) << "bzhi high value seed=" << seed;
+            EXPECT_EQ(ctx.regs[3] & isa::kFlagsMask, 0u) << "bzhi high flags seed=" << seed;
+        }
+    }
+}
+
+TEST(Interpreter, BmiAndnCarrierExpansionSemantics) {
+    // andn d==s2 载体展开 (translator 同构 3 op): [Mov(s0,s1); Not(s0); And(d,s0)]
+    // — d==s2 形: d 槽持有 AND 项。flags 期望 = Op::And 尾行 (CF0/OF0/ZF,SF,PF
+    // 按结果) = 原生 andn 全集 (probe raw 0x286)。
+    alignas(16) std::array<u8, 0x10000> scratch{};
+    for (u64 seed : {1ull, 2ull, 3ull, 4ull, 5ull}) {
+        wvmp::Rng rng(seed);
+        const auto result = rt::generate_runtime(rng);
+        RwxImage rwx(result.image.code);
+        const auto entry = rwx.entry();
+        const u8 sz = isa::size_field(ir::Size::S32);
+        const u8 sz64 = isa::size_field(ir::Size::S64);
+        const u8 s0 = 18;
+        auto run_andn = [&](u32 d_init, u32 s1, u64 pre) {
+            std::vector<u8> s;
+            isa::append_insn(s, mov_imm(0, d_init));          // v0 = d == AND 项
+            isa::append_insn(s, mov_imm(1, s1));              // v1 = NOT 项
+            isa::append_insn(s, mov_imm(2, static_cast<u32>(pre)));
+            isa::append_insn(s, isa::make_insn(isa::VmOp::SetFlags, isa::OpKind::Reg, 2,
+                                               isa::OpKind::None, 0, 0));
+            isa::append_insn(s, isa::make_insn(isa::VmOp::Mov, isa::OpKind::Reg, s0,
+                                               isa::OpKind::Reg, 1, 0, sz));
+            isa::append_insn(s, isa::make_insn(isa::VmOp::Not, isa::OpKind::Reg, s0,
+                                               isa::OpKind::None, 0, 0, sz));
+            isa::append_insn(s, isa::make_insn(isa::VmOp::And, isa::OpKind::Reg, 0,
+                                               isa::OpKind::Reg, s0, 0, sz));
+            isa::append_insn(s, isa::make_insn(isa::VmOp::GetFlags, isa::OpKind::Reg, 3,
+                                               isa::OpKind::None, 0, 0, sz64));
+            isa::append_insn(s, halt());
+            return run_stream(entry, s, scratch.data());
+        };
+        const u64 pre = isa::kFlagCF | isa::kFlagZF | isa::kFlagPF;
+        // probe 同参: ~0x0F0F0F0F & 0xF0F0F0F0 = 0xF0F0F0F0; CF0 ZF0 SF1 PF1
+        {
+            const auto ctx = run_andn(0xF0F0F0F0u, 0x0F0F0F0Fu, pre);
+            EXPECT_EQ(ctx.regs[0], 0xF0F0F0F0ull) << "andn value seed=" << seed;
+            EXPECT_EQ(ctx.regs[3] & isa::kFlagsMask,
+                      u64(isa::kFlagSF | isa::kFlagPF))
+                << "andn flags (CF 清零 + 按结果) seed=" << seed;
+        }
+        // d==s1==s2: ~d & d = 0 → ZF1 PF1
+        {
+            const auto ctx = run_andn(0xA5A5A5A5u, 0xA5A5A5A5u, pre);
+            EXPECT_EQ(ctx.regs[0], 0ull) << "andn zero value seed=" << seed;
+            EXPECT_EQ(ctx.regs[3] & isa::kFlagsMask,
+                      u64(isa::kFlagZF | isa::kFlagPF))
+                << "andn zero flags seed=" << seed;
+        }
+        // NOT 项保留验证: andn 后 v1 (s1 槽) 原样 — 原生 andn 不写 s1
+        {
+            const auto ctx = run_andn(0xF0F0F0F0u, 0x0F0F0F0Fu, pre);
+            EXPECT_EQ(ctx.regs[1], 0x0F0F0F0Full) << "andn s1 preserved seed=" << seed;
+        }
+    }
+}
 } // namespace

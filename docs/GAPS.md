@@ -333,6 +333,70 @@ shlx/pdep/bzhi）不在 SIMD 档A 内**——VEX id 但 GP 域，独立缺口（
 标量高位语义 / D4 拷贝 / vpxor 清零 / mem load）。multiseed 42 样本 × 5 =
 **210/210**。
 
+## G8a BMI1/2 折条款目（MIT-434 收口：andn/bzhi 零新 VmOp + rorx/shlx/sarx/shrx flagless）
+
+**状态（2026-08-31，main cdc218d 基线，分支 mit-g8a-bmi-fold）**：G6a 范围外
+①（VEX-GP BMI）按 G9r §2.5 蓝图入面——**零新 VmOp（kVmOpMax=97 不动）、
+零新 handler（asmgen.cpp 逐字节零改动，P1 红线"新增函数允许"以零 diff 兑
+现）、零冻结契约触碰**。D1 选型 = (i) 变体：lifter 载体标记 → translator
+层展开（(ii) +4 VmOp 方案实测对照后弃，见下）。
+
+**载体域对账（419 D1 铁律，陷阱②选型）**：判据 = **src2.kind≠None 骑在
+"全仓从不写 src2"的 op 上**（andn/bzhi 三操作数、imm 标记无槽可占，src2
+骑真操作数；Imm(22) 骑 shift 族）：
+- `(Op::{Shl,Shr,Sar,Rol,Ror}, src2=Imm(22)=kFlagless)` = rorx/shlx/sarx/
+  shrx——原生 shift 的 count 走 **src**（Imm/CL），src2 恒 None，陷阱②
+  担心的"count 值域撞标记域"被 kind 判据绕开（`ror eax,24` 不误拦，单测
+  + 样本双钉）；
+- `(Op::And, src2=Reg)` = andn d==s2 载体形（src=NOT 项 reg-only、
+  src2=AND 项）；`(Op::Sub, src2=Reg)` = bzhi（src=value r/m 可 mem、
+  src2=Reg(index)）。全仓 src2 写入点审计（425 §B.1 同款）：imul 3-op
+  （op=Imul）/ string 0..4 / lock 5..13 / SSE mul 14..17 / andnps 18 /
+  bridge 19..21 / 本域——op+kind 双限定下零碰撞；域 22 与 0..21 连续零重叠。
+
+**probe 实测修正（Zen5 + ml64 v145 + capstone 5.0.7，2026-08-31）**：
+- **🔴 bzhi 边界（index≥N）：结果 = value 原值不变 + CF=1**（G9r §2.1
+  "CF=0" 仅对 index<N 成立；"index≥op_size→结果 0" 预判被推翻——0xFFFFFFFF
+  idx=32 → 0xFFFFFFFF、ZF=0、CF=1）。折条含 mask-clamp（Cmovcc 到 -1）+
+  CF 补丁（Sbb/Not/And/Or/SetFlags），值+五位 flags 全对齐含边界；
+- bzhi index=0 → 结果 0（(1<<0)-1=0，与 shift count=0 no-op 不同）；index
+  用 SRC2[7:0]（0x105→5，高位垃圾忽略，Movzx 钉入微程序）；
+- **操作数 mem-ability 反转**：andn 的 r/m 在**第三**操作数（AND 项，
+  `andn r8d, eax, [m]` 收 / `andn r8d, [m], ecx` ml64 拒），NOT 项 vvvv
+  reg-only；bzhi/rorx/shlx/sarx/shrx 的 r/m 在**第二**（value 可 mem），
+  第三项（bzhi index / shlx 族 cnt）reg-only——SDM "ANDN r32a, r/m32,
+  r32b" 记法直读会得出相反结论，以 ml64 逐形双验为准；
+- rorx/shlx/sarx/shrx 五位 flags 全不受影响（raw 0x247 全程，count=0 同、
+  count 掩码 &N-1 与 cl 通路一致）。
+
+**折条结构（D1 两路实测对照后选 (i) 变体）**：
+- (i) 原案"同 op 双尾分叉 handler"需触碰 build_shift 函数体 → P1 红线
+  违规，不可行；落地 = translator 层 `[GetFlags(s); 既有 shift VmOp;
+  SetFlags(s)]` 包裹（G3 串指令 GetFlags s0/SetFlags s0 同款先例；
+  build_setflags 同步 flags_ 活镜像不变量）——既有 handler 原样复用，
+  cost = 每指令 +2 word 字节码 / +2 dispatch（§F.1 预判可接受）；
+- (ii) +4 VmOp（97→101）+4 新 handler：省 2 word/2 dispatch，但付 enum
+  扩张 + 4 个安全敏感 handler 面 + dump 门集合变化；本单选 (i)，G8b 若
+  需要可再议；
+- andn：d==s1 → `[Not; And]` 2 IR；d 独立 → `[Mov; Not; And]` 3 IR
+  （纯 lifter 折叠零 translator 成本）；d==s2 → 载体 → translator
+  `[Mov(s0,s1); Not(s0); And(d,s0)]`（scratch，C4b 先例）；s2=mem 主 And
+  直带 mem src（alu-binop src_mem 通道）——flags = 尾行 And 全集
+  （CF=0/OF=0/ZF,SF,PF 按结果 = 原生 andn 逐位，probe 0x286）；
+- bzhi：恒走载体，d==value 16 op / d≠value 17 op 微程序（低频面，
+  §F.1 字节码膨胀披露）；
+- 负例族 mulx/pdep/pext/blsr/blsi/blsmsk/bextr 照旧 default → C1 gate
+  （G8b native 直执行 + CPUID gate 后置；blsr 语料 0 文档化 gate 维持，
+  432 §6.4）。
+
+**样本**：`wvmp_bmi_sample`（16 正例区真虚拟化 = 16 stub：andn×4 含
+d==s2 载体形与 mem AND 项形 / bzhi×5 含 mem value、边界 idx=32 原值+CF=1、
+idx=0 结果 0 / rorx×4 含 mem value 与全五位保留 setz/setc/sets/setp 四探针 /
+shlx cnt-in-reg、sarx mem、shrx 独立；1 负例区 7 指令各自 gate note 整函数
+原生保持）+ translator/lifter/runtime 三层单测矩阵（载体派发与碰撞回归、
+D4 双 andn 串扰钉、真执行语义电池 6 case × 5 seed 期望值 = probe 逐位）。
+multiseed 48 样本 × 5 = **240/240**（REQUIRE_REAL 同）。
+
 ## x87 (永久 gate, R3 裁决) —— 文档化不保护
 
 **状态（2026-08-30，MIT-416/G5r triage 实测 + MIT-418/R3 收口）：x87 全族

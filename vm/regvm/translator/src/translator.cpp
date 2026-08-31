@@ -140,6 +140,35 @@ enum : int { kBridgeFromGp = 19, kBridgeToGp = 20, kBridgeFromXmm = 21 };
     return v >= kBridgeFromGp && v <= kBridgeFromXmm;
 }
 
+// MIT-434 (G8a): BMI 载体判据 — 与 lifter (x86_translate.cpp kFlagless 域注)
+// 严格对账。判据 = src2.kind≠None 骑在"全仓从不写 src2"的 op 上
+// (andn/bzhi 三操作数, imm 标记无槽可占, src2 骑真操作数):
+//   - (Op::{Shl,Shr,Sar,Rol,Ror}, src2=Imm(22)=kFlagless) = rorx/shlx/sarx/
+//     shrx flagless 载体 — 原生 shift 的 count 走 **src** (Imm/CL,
+//     translate_shift), src2 恒 None → `ror eax,24` 不误拦 (陷阱② 的
+//     "count 值域撞标记域"被 kind 判据绕开);
+//   - (Op::And, src2=Reg) = andn d==s2 载体形: src=NOT 项 (reg-only),
+//     src2=AND 项;
+//   - (Op::Sub, src2=Reg) = bzhi: src=value (r/m), src2=Reg(index)。
+// 全仓 src2 写入点审计 (419 §B.1 同款): imul 3-op (op=Imul, 立即数任意) /
+// string (op=Mov, imm 0..4) / lock (op 载体族, imm 5..13) / SSE mul (op=Mul,
+// 14..17) / andnps (op=Andps, 18) / bridge (op=Movss, 19..21) / 本域
+// (And|Sub 仅 src2=Reg; shift 仅 src2=Imm(22)) — op+kind 双限定下零碰撞;
+// 域 22 与 0..21 分区连续零重叠。
+enum : int { kBmiFlagless = 22 };
+[[nodiscard]] bool is_bmi_flagless_marker(i64 v) {
+    return v == kBmiFlagless;
+}
+[[nodiscard]] bool is_bmi_shift_op(ir::Op op) {
+    switch (op) {
+    case ir::Op::Shl: case ir::Op::Shr: case ir::Op::Sar:
+    case ir::Op::Rol: case ir::Op::Ror:
+        return true;
+    default:
+        return false;
+    }
+}
+
 // ==================== MIT-409 + MIT-413 (G2): 跳转表特化 ====================
 //
 // 识别模式 = 受限模板匹配（D1 决策，派活单 §A.2 实测模板 + G2 三参数
@@ -968,6 +997,22 @@ struct Translator {
                 // (translate_cmpxchg 内部展开; 隐式 acc 字段不入 IR, 由 handler
                 // 硬编码 regs[Rax] 槽位 + IR.size 决定宽度)。
                 ok = translate_cmpxchg(em, sc, in, current_rva, next_ip);
+            } else if (in.op == ir::Op::And && in.src2.kind == ir::Operand::Kind::Reg) {
+                // MIT-434 (G8a): andn d==s2 载体 dispatch — (Op::And, src2=Reg)
+                // 判据 (全仓 src2 写入点审计零碰撞, 见 is_bmi_* 域注)。
+                // **必须先于通用 alu binop 分支** (And 常规路径不读 src2,
+                // 载体会被吞掉展开成普通 And)。
+                ok = translate_andn_carrier(em, sc, in);
+            } else if (in.op == ir::Op::Sub && in.src2.kind == ir::Operand::Kind::Reg) {
+                // MIT-434 (G8a): bzhi 载体 dispatch — (Op::Sub, src2=Reg(index))
+                // 判据; 同上先于通用分支。
+                ok = translate_bzhi_carrier(em, sc, in, current_rva, next_ip);
+            } else if (is_bmi_shift_op(in.op) && in.src2.kind == ir::Operand::Kind::Imm &&
+                       is_bmi_flagless_marker(in.src2.imm)) {
+                // MIT-434 (G8a): rorx/shlx/sarx/shrx flagless 载体 dispatch —
+                // (Op::{Shl..Ror}, src2=Imm(22)) 判据; 原生 shift count 走 src,
+                // src2 恒 None → `ror eax,24` 不误拦。同上先于通用分支。
+                ok = translate_flagless_shift(em, sc, in);
             } else if (is_alu_binop(in.op)) {
                 ok = translate_alu_binop(em, sc, in, current_rva, next_ip);
             } else if (is_unary(in.op)) {
@@ -1547,6 +1592,132 @@ struct Translator {
     }
 
     // ---- 运算 ----
+
+    // ---- MIT-434 (G8a): BMI1/2 折条展开 (零新 VmOp, D1 (i) 变体) ----
+
+    // andn d==s2 载体形展开: dst = ~s1 & s2 (d==s2: dst 槽持有 AND 项,
+    // ~s1 需独占临时 — C4b v18..v23 scratch 先例)。probe 实测 (2026-08-31):
+    // 操作数映射 op[1]=NOT 项 (reg-only) / op[2]=AND 项; flags = Op::And
+    // 全集 (CF=0/OF=0/ZF,SF,PF 按结果) — 尾行 And 天然对齐, 零特判。
+    //   [Mov(s0, s1); Not(s0); And(d, s0)]
+    // 载体约定: lifter 仅在 d==s2 形发射本载体 (d==s1 / d 独立走纯 IR 折叠,
+    // 不经 translator)。d==s1 经此路径 = And(d, ~d) = 0, 非原生语义 —
+    // 生产者唯一性由 lifter 分支保证 (单测钉死)。
+    bool translate_andn_carrier(Emitter& em, Scratch& sc, const ir::Insn& in) {
+        if (in.dst.kind != ir::Operand::Kind::Reg ||
+            in.src.kind != ir::Operand::Kind::Reg ||
+            in.src2.kind != ir::Operand::Kind::Reg)
+            return skip(in, "andn 载体操作数形态未支持", nullptr);
+        const u8 d = isa::vm_reg_of(in.dst.reg);
+        const u8 s1 = isa::vm_reg_of(in.src.reg);
+        const u8 s2 = isa::vm_reg_of(in.src2.reg);
+        const u8 sz = isa::size_field(in.size);
+        (void)s2;  // d==s2: dst 槽即 AND 项 (载体约定, 见上)
+        const u8 s0 = sc.take();
+        em.emit_rr(VmOp::Mov, s0, s1, sz);
+        em.emit(VmOp::Not, OpKind::Reg, s0, OpKind::None, 0, 0, sz);
+        em.emit_rr(VmOp::And, d, s0, sz);
+        return true;
+    }
+
+    // bzhi 展开: dst = value & ((1<<idx)-1)。
+    // 边界语义 (Zen5 probe 2026-08-31, 纠正 432 §2.1 "结果 0" 预判):
+    //   - idx 用 SRC2[7:0] (0x105→5); idx=0 → 结果 0; OF=0 恒;
+    //   - idx≥N → **结果 = value 原值不变 + CF=1**, ZF/SF/PF 按结果。
+    // 展开 (N = 32/64 按 size; s_m=mask, s_c=clamp 源, s_i=idx 低 8 位):
+    //   Mov(s_m,1); Shl(s_m, Reg idx); Sub(s_m,1)     ; mask (idx<N 域内正确;
+    //     Shl 的 cl 掩码 &N-1 恰好 idx=0 时保持 1 → Sub → 0 = 原生 idx=0 语义)
+    //   Mov(s_c,0); Sub(s_c,1)                        ; s_c = -1 (边界 clamp 源)
+    //   Movzx(s_i, Reg idx, S8→S64)                   ; idx &= 0xFF (SRC2[7:0])
+    //   Cmp(s_i, N); Cmovae(s_m, s_c)                 ; idx≥N → mask = -1
+    //   [Mov/Load(d, value) — d≠value 时]             ; value 装载
+    //   And(d, s_m)                                   ; 结果 + F(CF=0,ZF/SF/PF 按结果)
+    //   GetFlags(s_f); Cmp(s_i, N); Sbb(s_x,s_x); Not(s_x); And(s_x,2);
+    //     Or(s_f,s_x); SetFlags(s_f)                  ; 边界 CF=1 补丁 (probe
+    //                                                 ; raw 0x287), 其余位不动
+    // flags 净效果: 尾行 And 的 F 在边界被 Or 上 CF 位 — 五位全对齐含边界。
+    // scratch 预算: 3 (+mem value 时 emit_load 用 acc+tmp 2) = 5 ≤ 6。
+    bool translate_bzhi_carrier(Emitter& em, Scratch& sc, const ir::Insn& in,
+                                u64 current_rva, u64 next_ip) {
+        if (in.dst.kind != ir::Operand::Kind::Reg ||
+            in.src2.kind != ir::Operand::Kind::Reg)
+            return skip(in, "bzhi 载体操作数形态未支持", nullptr);
+        if (in.src.kind != ir::Operand::Kind::Reg && in.src.kind != ir::Operand::Kind::Mem)
+            return skip(in, "bzhi 载体操作数形态未支持", nullptr);
+        if (in.size != ir::Size::S32 && in.size != ir::Size::S64)
+            return skip(in, "bzhi 位宽未支持", nullptr);
+        const u8 d = isa::vm_reg_of(in.dst.reg);
+        const u8 ix = isa::vm_reg_of(in.src2.reg);
+        const u8 sz = isa::size_field(in.size);
+        const u8 sz64 = isa::size_field(ir::Size::S64);
+        const u32 n = (in.size == ir::Size::S32) ? 32u : 64u;
+
+        const u8 s_m = sc.take();
+        const u8 s_c = sc.take();
+        const u8 s_i = sc.take();
+        em.emit_ri(VmOp::Mov, s_m, 1, sz);
+        em.emit_rr(VmOp::Shl, s_m, ix, sz);
+        em.emit_ri(VmOp::Sub, s_m, 1, sz);
+        em.emit_ri(VmOp::Mov, s_c, 0, sz64);
+        em.emit_ri(VmOp::Sub, s_c, 1, sz64);
+        em.emit(VmOp::Movzx, OpKind::Reg, s_i, OpKind::Reg, ix, 0, sz64);
+        em.emit_ri(VmOp::Cmp, s_i, n, sz);
+        const u32 cond_aux = static_cast<u32>(ir::Cond::Ae) << 28;
+        em.emit(VmOp::Cmovcc, OpKind::Reg, s_m, OpKind::Reg, s_c, cond_aux, sz);
+
+        if (in.src.kind == ir::Operand::Kind::Reg) {
+            const u8 v = isa::vm_reg_of(in.src.reg);
+            if (v != d)
+                em.emit_rr(VmOp::Mov, d, v, sz);
+        } else {
+            const u8 v = emit_load(em, sc, in.src.mem, in.size, current_rva, next_ip);
+            if (v != d)
+                em.emit_rr(VmOp::Mov, d, v, sz);
+        }
+        em.emit_rr(VmOp::And, d, s_m, sz);
+
+        // 边界 CF 补丁: s_m 已死 → 复用作 s_f
+        em.emit(VmOp::GetFlags, OpKind::Reg, s_m, OpKind::None, 0, 0, sz64);
+        em.emit_ri(VmOp::Cmp, s_i, n, sz);            // CF=1 iff idx8 < N
+        em.emit_rr(VmOp::Sbb, s_c, s_c, sz64);        // s_c = -CF
+        em.emit(VmOp::Not, OpKind::Reg, s_c, OpKind::None, 0, 0, sz64);  // 边界→-1
+        em.emit_ri(VmOp::And, s_c, 2, sz64);          // 边界→CF 位 (bit1)
+        em.emit_rr(VmOp::Or, s_m, s_c, sz64);
+        em.emit(VmOp::SetFlags, OpKind::Reg, s_m, OpKind::None, 0, 0, sz64);
+        return true;
+    }
+
+    // rorx/shlx/sarx/shrx flagless 展开 (D1 (i) 变体): 五位 flags 全不写
+    // (probe raw 0x247 全程, count=0 同)。G3 串指令 GetFlags s0/SetFlags s0
+    // 包裹先例 — 中段既有 shift handler 的全量 flags 装配 (build_shift)
+    // 被包裹抹平, 净效果 = 原样保留; build_setflags 同步 flags_ 活镜像
+    // (asmgen 不变量), asmgen.cpp 零改动。
+    //   [GetFlags(s); VmOp(d, b=src); SetFlags(s)]
+    // count 骑 src: Imm=rorx (b=Imm aux, cl 掩码 &N-1 与原生 rorx 一致) /
+    // Reg=shlx 族 (b=Reg, build_shift T7 通用槽读 — B.4 cnt-in-reg 通路)。
+    bool translate_flagless_shift(Emitter& em, Scratch& sc, const ir::Insn& in) {
+        VmOp vop{};
+        if (!vm_op_of(in.op, vop))
+            return skip(in, "未支持的操作码", nullptr);
+        if (in.dst.kind != ir::Operand::Kind::Reg)
+            return skip(in, "flagless shift 操作数形态未支持", nullptr);
+        const u8 d = isa::vm_reg_of(in.dst.reg);
+        const u8 sz = isa::size_field(in.size);
+        const u8 sz64 = isa::size_field(ir::Size::S64);
+        const u8 s = sc.take();
+        em.emit(VmOp::GetFlags, OpKind::Reg, s, OpKind::None, 0, 0, sz64);
+        if (in.src.kind == ir::Operand::Kind::Reg) {
+            em.emit_rr(vop, d, isa::vm_reg_of(in.src.reg), sz);
+        } else if (in.src.kind == ir::Operand::Kind::Imm) {
+            if (!fits_aux(in.src.imm))
+                return skip(in, "flagless shift 计数越界", nullptr);
+            em.emit_ri(vop, d, static_cast<u32>(static_cast<u64>(in.src.imm)), sz);
+        } else {
+            return skip(in, "flagless shift 操作数形态未支持", nullptr);
+        }
+        em.emit(VmOp::SetFlags, OpKind::Reg, s, OpKind::None, 0, 0, sz64);
+        return true;
+    }
 
     bool translate_alu_binop(Emitter& em, Scratch& sc, const ir::Insn& in,
                              u64 current_rva, u64 next_ip) {

@@ -1619,4 +1619,126 @@ TEST(Translate, AndnMemSourceFoldsXmmLoad) {
     expect_is(d.insns[3], VmOp::Andnps, OpKind::Reg, kXmm0, OpKind::Reg, acc + 1, 0, kS64);
 }
 
+// ==================== MIT-434 (G8a): BMI 折条 dispatch ====================
+
+TEST(Translate, BmiAndnCarrierExpandsMovNotAnd) {
+    // andn d==s2 载体: (Op::And, dst=eax, src=ecx(NOT 项), src2=Reg(eax)=AND 项)
+    // → [Mov(s0, ecx); Not(s0); And(eax, s0)] — ~NOT 项 需独占临时。
+    ir::Insn i = I(ir::Op::And, ir::Size::S32);
+    i.dst = ir::Operand::reg_(ir::Reg::Rax);
+    i.src = ir::Operand::reg_(ir::Reg::Rcx);
+    i.src2 = ir::Operand::reg_(ir::Reg::Rax);
+    const Decoded d = one_insn(i);
+    ASSERT_EQ(d.insns.size(), static_cast<size_t>(5)); // 3 展开 + Jmp+1 + Halt
+    const u8 s0 = isa::kScratchFirst;
+    expect_is(d.insns[0], VmOp::Mov, OpKind::Reg, s0, OpKind::Reg, kRcx, 0, kS32);
+    expect_is(d.insns[1], VmOp::Not, OpKind::Reg, s0, OpKind::None, 0, 0, kS32);
+    expect_is(d.insns[2], VmOp::And, OpKind::Reg, kRax, OpKind::Reg, s0, 0, kS32);
+}
+
+TEST(Translate, BmiPlainAndSubUnaffectedByCarrierKind) {
+    // 载体判据 = src2.kind≠None — 常规 And/Sub (src2 空) 照旧单条展开
+    // (全仓 src2 写入点审计的回归钉)。
+    {
+        const Decoded d = one_insn(alu(ir::Op::And, ir::Operand::reg_(ir::Reg::Rax),
+                                       ir::Operand::reg_(ir::Reg::Rcx), ir::Size::S32));
+        ASSERT_EQ(d.insns.size(), static_cast<size_t>(3));
+        expect_is(d.insns[0], VmOp::And, OpKind::Reg, kRax, OpKind::Reg, kRcx, 0, kS32);
+    }
+    {
+        const Decoded d = one_insn(alu(ir::Op::Sub, ir::Operand::reg_(ir::Reg::Rax),
+                                       ir::Operand::reg_(ir::Reg::Rcx), ir::Size::S32));
+        ASSERT_EQ(d.insns.size(), static_cast<size_t>(3));
+        expect_is(d.insns[0], VmOp::Sub, OpKind::Reg, kRax, OpKind::Reg, kRcx, 0, kS32);
+    }
+}
+
+TEST(Translate, BmiBzhiCarrierExpandsFullSequence) {
+    // bzhi 载体: (Op::Sub, dst=eax, src=Reg(ebx)=value, src2=Reg(ecx)=index)
+    // → mask + clamp(-1) + And + 边界 CF 补丁 (probe raw 0x287) — 16 op。
+    ir::Insn i = I(ir::Op::Sub, ir::Size::S32);
+    i.dst = ir::Operand::reg_(ir::Reg::Rax);
+    i.src = ir::Operand::reg_(ir::Reg::Rbx);
+    i.src2 = ir::Operand::reg_(ir::Reg::Rcx);
+    const Decoded d = one_insn(i);
+    ASSERT_EQ(d.insns.size(), static_cast<size_t>(19)); // 17 展开 + Jmp+1 + Halt
+    const u8 s_m = isa::kScratchFirst, s_c = s_m + 1, s_i = s_m + 2;
+    const u32 ae28 = static_cast<u32>(ir::Cond::Ae) << 28;
+    expect_is(d.insns[0], VmOp::Mov, OpKind::Reg, s_m, OpKind::Imm, 0, 1, kS32);
+    expect_is(d.insns[1], VmOp::Shl, OpKind::Reg, s_m, OpKind::Reg, kRcx, 0, kS32);
+    expect_is(d.insns[2], VmOp::Sub, OpKind::Reg, s_m, OpKind::Imm, 0, 1, kS32);
+    expect_is(d.insns[3], VmOp::Mov, OpKind::Reg, s_c, OpKind::Imm, 0, 0, kS64);
+    expect_is(d.insns[4], VmOp::Sub, OpKind::Reg, s_c, OpKind::Imm, 0, 1, kS64);
+    expect_is(d.insns[5], VmOp::Movzx, OpKind::Reg, s_i, OpKind::Reg, kRcx, 0, kS64);
+    expect_is(d.insns[6], VmOp::Cmp, OpKind::Reg, s_i, OpKind::Imm, 0, 32, kS32);
+    expect_is(d.insns[7], VmOp::Cmovcc, OpKind::Reg, s_m, OpKind::Reg, s_c, ae28, kS32);
+    expect_is(d.insns[8], VmOp::Mov, OpKind::Reg, kRax, OpKind::Reg, kRbx, 0, kS32);
+    expect_is(d.insns[9], VmOp::And, OpKind::Reg, kRax, OpKind::Reg, s_m, 0, kS32);
+    expect_is(d.insns[10], VmOp::GetFlags, OpKind::Reg, s_m, OpKind::None, 0, 0, kS64);
+    expect_is(d.insns[11], VmOp::Cmp, OpKind::Reg, s_i, OpKind::Imm, 0, 32, kS32);
+    expect_is(d.insns[12], VmOp::Sbb, OpKind::Reg, s_c, OpKind::Reg, s_c, 0, kS64);
+    expect_is(d.insns[13], VmOp::Not, OpKind::Reg, s_c, OpKind::None, 0, 0, kS64);
+    expect_is(d.insns[14], VmOp::And, OpKind::Reg, s_c, OpKind::Imm, 0, 2, kS64);
+    expect_is(d.insns[15], VmOp::Or, OpKind::Reg, s_m, OpKind::Reg, s_c, 0, kS64);
+    expect_is(d.insns[16], VmOp::SetFlags, OpKind::Reg, s_m, OpKind::None, 0, 0, kS64);
+}
+
+TEST(Translate, BmiBzhiDstEqualsValueSkipsPreload) {
+    // d==value: 无前置 Mov (And(d, mask) 直读 dst 槽)。
+    ir::Insn i = I(ir::Op::Sub, ir::Size::S64);
+    i.dst = ir::Operand::reg_(ir::Reg::Rax);
+    i.src = ir::Operand::reg_(ir::Reg::Rax);
+    i.src2 = ir::Operand::reg_(ir::Reg::Rcx);
+    const Decoded d = one_insn(i);
+    ASSERT_EQ(d.insns.size(), static_cast<size_t>(18));
+    expect_is(d.insns[8], VmOp::And, OpKind::Reg, kRax, OpKind::Reg,
+              isa::kScratchFirst, 0, kS64);   // 无 [9]=Mov → And 直落
+    expect_is(d.insns[7], VmOp::Cmovcc, OpKind::Reg, isa::kScratchFirst,
+              OpKind::Reg, isa::kScratchFirst + 1, static_cast<u32>(ir::Cond::Ae) << 28,
+              kS64);
+}
+
+TEST(Translate, BmiFlaglessShiftWrapPreservesFlags) {
+    // rorx 载体: (Op::Ror, dst=eax, src=Imm(7)=count, src2=Imm(22)=kFlagless)
+    // → [GetFlags(s); Ror(eax, Imm 7); SetFlags(s)] — build_shift 全量装配
+    // 被包裹抹平, 净效果 = 五位原样保留 (D1 (i) 变体, asmgen 零改动)。
+    ir::Insn i = I(ir::Op::Ror, ir::Size::S32);
+    i.dst = ir::Operand::reg_(ir::Reg::Rax);
+    i.src = ir::Operand::imm_(7);
+    i.src2 = ir::Operand::imm_(22);
+    const Decoded d = one_insn(i);
+    ASSERT_EQ(d.insns.size(), static_cast<size_t>(5));
+    const u8 s = isa::kScratchFirst;
+    expect_is(d.insns[0], VmOp::GetFlags, OpKind::Reg, s, OpKind::None, 0, 0, kS64);
+    expect_is(d.insns[1], VmOp::Ror, OpKind::Reg, kRax, OpKind::Imm, 0, 7, kS32);
+    expect_is(d.insns[2], VmOp::SetFlags, OpKind::Reg, s, OpKind::None, 0, 0, kS64);
+}
+
+TEST(Translate, BmiFlaglessShlxCountInRegChannel) {
+    // shlx 载体: (Op::Shl, dst=eax, src=Reg(ecx)=cnt, src2=Imm(22)) —
+    // b=Reg 通用计数通路 (build_shift T7 任意槽, B.4)。
+    ir::Insn i = I(ir::Op::Shl, ir::Size::S64);
+    i.dst = ir::Operand::reg_(ir::Reg::Rax);
+    i.src = ir::Operand::reg_(ir::Reg::Rcx);
+    i.src2 = ir::Operand::imm_(22);
+    const Decoded d = one_insn(i);
+    ASSERT_EQ(d.insns.size(), static_cast<size_t>(5));
+    const u8 s = isa::kScratchFirst;
+    expect_is(d.insns[0], VmOp::GetFlags, OpKind::Reg, s, OpKind::None, 0, 0, kS64);
+    expect_is(d.insns[1], VmOp::Shl, OpKind::Reg, kRax, OpKind::Reg, kRcx, 0, kS64);
+    expect_is(d.insns[2], VmOp::SetFlags, OpKind::Reg, s, OpKind::None, 0, 0, kS64);
+}
+
+TEST(Translate, BmiNativeShiftImmNotIntercepted) {
+    // 陷阱② 回归钉 (translator 侧): 原生 ror eax,24 → (Op::Ror, src=Imm(24),
+    // src2=None) — 无载体 → 单条 Ror (count=0 出口/flags 全量 = P1 面,
+    // 逐字节不变)。
+    ir::Insn i = I(ir::Op::Ror, ir::Size::S32);
+    i.dst = ir::Operand::reg_(ir::Reg::Rax);
+    i.src = ir::Operand::imm_(24);
+    const Decoded d = one_insn(i);
+    ASSERT_EQ(d.insns.size(), static_cast<size_t>(3));
+    expect_is(d.insns[0], VmOp::Ror, OpKind::Reg, kRax, OpKind::Imm, 0, 24, kS32);
+}
+
 } // namespace

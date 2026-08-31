@@ -1064,3 +1064,20 @@ target_compile_options(wvmp_flags_rol_sample PRIVATE
 target_link_options(wvmp_flags_rol_sample PRIVATE
     $<$<CXX_COMPILER_ID:MSVC>:/INCREMENTAL:NO>
 )
+
+# MIT-434 (G8a): BMI 折条款目主样本 — 16 正例区 (andn/bzhi/rorx/shlx/sarx/
+# shrx × {d==s1, d==s2, d 独立, mem src} + flags 消费探针 setcc → 区内 Store
+# 落盘; bzhi 边界 idx=N 原值+CF=1 probe 修正面) 真虚拟化 + 1 负例区
+# (mulx/pdep/pext/blsr/bextr/blsi/blsmsk) 函数级 gate 可调用 byte-exact。
+# 单基本块 (432 §6.3), 自含 MASM marker 桩 (433 同款)。multiseed 47→48。
+add_executable(wvmp_bmi_sample
+    wvmp_bmi_sample_main.cpp
+    wvmp_bmi_sample_asm.asm
+)
+target_compile_options(wvmp_bmi_sample PRIVATE
+    $<$<AND:$<CXX_COMPILER_ID:MSVC>,$<COMPILE_LANGUAGE:C,CXX>>:/Od;/Ob0;/utf-8>
+    $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-O0>
+)
+target_link_options(wvmp_bmi_sample PRIVATE
+    $<$<CXX_COMPILER_ID:MSVC>:/INCREMENTAL:NO>
+)
