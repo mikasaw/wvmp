@@ -4255,6 +4255,116 @@ public:
         return out;
     }
 
+    // x86 Movzx/Movsx（build_movzx/build_movsx 的 32 位版）：dst 恒 32 位
+    // 槽（x86 lifter dst 宽 = pointer_size = S32），aux[0] = src_size 位
+    //（0=S8 / 1=S16 —— MIT-345 编码约定）；native movzx/movsx r32, byte/word
+    // ptr [src 槽] 一次完成截取+扩展，dword 直写 dst 槽（"槽高半字恒 0" 不
+    // 变量维持）。无 flags、无尺寸链（x64 版 qword 写回对应面的 32 位形）。
+    std::string build_extend_x86(const char* native, u64 dispatch) const {
+        const std::string tag = std::string(native) + std::to_string(seq());
+        const std::string l_sz8 = tag + "_sz8";
+        const std::string l_done = tag + "_done";
+        std::string o = decode_prelude_x86();
+        o += std::string("    mov ") + r32x(t_[2]) + ", " + xf(kX86FAux) + "\n";
+        o += std::string("    and ") + r32x(t_[2]) + ", " + imm(1) + "\n";
+        o += std::string("    cmp ") + r32x(t_[2]) + ", " + imm(1) + "\n";
+        o += "    jne " + l_sz8 + "\n";
+        // S16 源：word ptr 读 src 槽低 16 位。
+        o += std::string("    mov ") + r32x(t_[2]) + ", " + xf(kX86FRegB) + "\n";
+        o += std::string("    ") + native + " " + r32x(t_[0]) + ", word ptr " +
+             xslot(t_[2]) + "\n";
+        o += "    jmp " + l_done + "\n";
+        o += l_sz8 + ":\n";
+        o += std::string("    mov ") + r32x(t_[2]) + ", " + xf(kX86FRegB) + "\n";
+        o += std::string("    ") + native + " " + r32x(t_[0]) + ", byte ptr " +
+             xslot(t_[2]) + "\n";
+        o += l_done + ":\n";
+        o += writeback_x86(2, kX86FRegA, t_[0], t_[1]);
+        o += advance_x86(dispatch);
+        return o;
+    }
+
+    // x86 MovzxMem/MovsxMem（build_movzx_mem/build_movsx_mem 的 32 位版）：
+    // reg_b 槽 = 32 位地址（dword），byte/word ptr 读 + 扩展 → dst 槽。
+    std::string build_extend_mem_x86(const char* native, u64 dispatch) const {
+        const std::string tag = std::string(native) + "m" + std::to_string(seq());
+        const std::string l_sz8 = tag + "_sz8";
+        const std::string l_done = tag + "_done";
+        std::string o = decode_prelude_x86();
+        o += std::string("    mov ") + r32x(t_[2]) + ", " + xf(kX86FAux) + "\n";
+        o += std::string("    and ") + r32x(t_[2]) + ", " + imm(1) + "\n";
+        o += std::string("    cmp ") + r32x(t_[2]) + ", " + imm(1) + "\n";
+        o += "    jne " + l_sz8 + "\n";
+        // S16 源：取地址 → word ptr [addr]。
+        o += std::string("    mov ") + r32x(t_[2]) + ", " + xf(kX86FRegB) + "\n";
+        o += std::string("    mov ") + r32x(t_[1]) + ", dword ptr " + xslot(t_[2]) + "\n";
+        o += std::string("    ") + native + " " + r32x(t_[0]) + ", word ptr [" +
+             r32x(t_[1]) + "]\n";
+        o += "    jmp " + l_done + "\n";
+        o += l_sz8 + ":\n";
+        o += std::string("    mov ") + r32x(t_[2]) + ", " + xf(kX86FRegB) + "\n";
+        o += std::string("    mov ") + r32x(t_[1]) + ", dword ptr " + xslot(t_[2]) + "\n";
+        o += std::string("    ") + native + " " + r32x(t_[0]) + ", byte ptr [" +
+             r32x(t_[1]) + "]\n";
+        o += l_done + ":\n";
+        o += writeback_x86(2, kX86FRegA, t_[0], t_[1]);
+        o += advance_x86(dispatch);
+        return o;
+    }
+
+    // x86 Bswap（build_bswap 的 32 位版，S32 真面）：dword 读 + bswap + dword
+    // 直写。S8/S16 块防御（bswap 无 8/16 位形式，SDM Vol. 2；x86 lifter 亦
+    // 不产）、S64 走链尾防御出口。
+    std::string build_bswap_x86(u64 dispatch) const {
+        const std::string tag = "xbswap" + std::to_string(seq());
+        const std::string tail_lbl = "xtail_" + tag;
+        std::string blocks[3];
+        for (int s = 0; s < 3; ++s) {
+            std::string o;
+            if (s == 2) {
+                o += std::string("    mov ") + r32x(t_[2]) + ", " + xf(kX86FRegA) + "\n";
+                o += std::string("    mov ") + r32x(t_[0]) + ", dword ptr " + xslot(t_[2]) + "\n";
+                o += std::string("    bswap ") + r32x(t_[0]) + "\n";
+                o += std::string("    mov dword ptr ") + xslot(t_[2]) + ", " + r32x(t_[0]) + "\n";
+            }
+            // s=0/1：防御空块（bswap 仅 32/64 位形式）
+            o += "    jmp " + tail_lbl + "\n";
+            blocks[s] = o;
+        }
+        return decode_prelude_x86() + size_chain_x86(blocks, tag, dispatch) +
+               tail_lbl + ":\n" + advance_x86(dispatch);
+    }
+
+    // x86 Xchg（build_xchg 的 32 位版，S32 真面）：双槽 dword 读 + native
+    // xchg r32, r32 + 双槽 dword 写回（槽高位保留语义 = x64 S32 档同款）。
+    // t_[2] 恒作槽索引载体（roll_x86 保证 t_[2] ∉ {t_[0], t_[1]}，读/写四段
+    // 复用零冲突）；t_[0]/t_[1] 为交换值对。S8/S16 块防御（MIT-334 派活单
+    // 限定 S32/S64 面，REG-REG 形 lifter 强制 S32 —— x64 同口径）。
+    std::string build_xchg_x86(u64 dispatch) const {
+        const std::string tag = "xxchg" + std::to_string(seq());
+        const std::string tail_lbl = "xtail_" + tag;
+        std::string blocks[3];
+        for (int s = 0; s < 3; ++s) {
+            std::string o;
+            if (s == 2) {
+                o += std::string("    mov ") + r32x(t_[2]) + ", " + xf(kX86FRegA) + "\n";
+                o += std::string("    mov ") + r32x(t_[0]) + ", dword ptr " + xslot(t_[2]) + "\n";
+                o += std::string("    mov ") + r32x(t_[2]) + ", " + xf(kX86FRegB) + "\n";
+                o += std::string("    mov ") + r32x(t_[1]) + ", dword ptr " + xslot(t_[2]) + "\n";
+                o += std::string("    xchg ") + r32x(t_[0]) + ", " + r32x(t_[1]) + "\n";
+                o += std::string("    mov ") + r32x(t_[2]) + ", " + xf(kX86FRegA) + "\n";
+                o += std::string("    mov dword ptr ") + xslot(t_[2]) + ", " + r32x(t_[0]) + "\n";
+                o += std::string("    mov ") + r32x(t_[2]) + ", " + xf(kX86FRegB) + "\n";
+                o += std::string("    mov dword ptr ") + xslot(t_[2]) + ", " + r32x(t_[1]) + "\n";
+            }
+            // s=0/1：防御空块
+            o += "    jmp " + tail_lbl + "\n";
+            blocks[s] = o;
+        }
+        return decode_prelude_x86() + size_chain_x86(blocks, tag, dispatch) +
+               tail_lbl + ":\n" + advance_x86(dispatch);
+    }
+
     // ---- x86 一元包装（HandlerDef 需要无参差成员函数指针） ----------------
     std::string build_x86_add(u64 d) const { return build_binary_x86("add", d, true); }
     std::string build_x86_sub(u64 d) const { return build_binary_x86("sub", d, true); }
@@ -4293,6 +4403,13 @@ public:
     std::string build_x86_sar_cl(u64 d) const { return build_shift_x86("sar", d); }
     std::string build_x86_rol_cl(u64 d) const { return build_shift_x86("rol", d, true); }
     std::string build_x86_ror_cl(u64 d) const { return build_shift_x86("ror", d, true); }
+    // X3b 批次三：扩展传送 / 字节序 / 交换族。
+    std::string build_x86_movzx(u64 d) const { return build_extend_x86("movzx", d); }
+    std::string build_x86_movzx_mem(u64 d) const { return build_extend_mem_x86("movzx", d); }
+    std::string build_x86_movsx(u64 d) const { return build_extend_x86("movsx", d); }
+    std::string build_x86_movsx_mem(u64 d) const { return build_extend_mem_x86("movsx", d); }
+    std::string build_x86_bswap(u64 d) const { return build_bswap_x86(d); }
+    std::string build_x86_xchg(u64 d) const { return build_xchg_x86(d); }
 
 private:
     Rng& rng_;
@@ -4381,6 +4498,13 @@ RuntimeGenResult generate_runtime_arch(wvmp::Rng& rng, AsmGen::HostArch arch) {
             {int(VmOp::SarCl), "sarcl", &AsmGen::build_x86_sar_cl},
             {int(VmOp::RolCl), "rolcl", &AsmGen::build_x86_rol_cl},
             {int(VmOp::RorCl), "rorcl", &AsmGen::build_x86_ror_cl},
+            // —— X3b (MIT-444) A 档批次三：扩展传送 / 字节序 / 交换族 ——
+            {int(VmOp::Movzx), "movzx", &AsmGen::build_x86_movzx},
+            {int(VmOp::MovzxMem), "movzxmem", &AsmGen::build_x86_movzx_mem},
+            {int(VmOp::Movsx), "movsx", &AsmGen::build_x86_movsx},
+            {int(VmOp::MovsxMem), "movsxmem", &AsmGen::build_x86_movsx_mem},
+            {int(VmOp::Bswap), "bswap", &AsmGen::build_x86_bswap},
+            {int(VmOp::Xchg), "xchg", &AsmGen::build_x86_xchg},
         };
     } else {
         handlers = {

@@ -1154,3 +1154,121 @@ TEST(X86Battery, RolRorFlags) {
         EXPECT_EQ(ctx.regs[5] & isa::kFlagCF, isa::kFlagCF);
     }
 }
+
+// ---------------------------------------------------------------------------
+// (19) X3b 批次三：Movzx/Movsx (+Mem)（aux[0] 源宽位，S8/S16 → S32 扩展）
+// ---------------------------------------------------------------------------
+TEST(X86Battery, ExtendOps) {
+    wvmp::Rng rng(12345);
+    const auto gen = rt::generate_runtime_x86(rng);
+    RwxImage rwx(gen.image.code);
+    const auto entry = rwx.entry();
+
+    auto extend = [](isa::VmOp op, u8 dst, u8 src, u32 src_size) {
+        return isa::make_insn(op, isa::OpKind::Reg, dst, isa::OpKind::Reg, src, src_size,
+                              isa::size_field(ir::Size::S32));
+    };
+
+    // movzx aux=0（byte 源）：0xABCD0080 低字节 0x80 → 0x00000080。
+    {
+        std::vector<u8> s;
+        isa::append_insn(s, mov_imm(1, 0xABCD0080u));                    // 0
+        isa::append_insn(s, extend(isa::VmOp::Movzx, 0, 1, 0));          // 1
+        isa::append_insn(s, halt());                                     // 2
+        const auto ctx = run_stream(entry, s, nullptr);
+        expect_slot32(ctx, 0, 0x80u);
+    }
+    // movzx aux=1（word 源）：0xABCD1234 低字 0x1234 → 0x00001234。
+    {
+        std::vector<u8> s;
+        isa::append_insn(s, mov_imm(1, 0xABCD1234u));                    // 0
+        isa::append_insn(s, extend(isa::VmOp::Movzx, 0, 1, 1));          // 1
+        isa::append_insn(s, halt());                                     // 2
+        const auto ctx = run_stream(entry, s, nullptr);
+        expect_slot32(ctx, 0, 0x1234u);
+    }
+    // movsx aux=0：0x80 → 0xFFFFFF80（符号扩展落满槽 dword）。
+    {
+        std::vector<u8> s;
+        isa::append_insn(s, mov_imm(1, 0x80u));                          // 0
+        isa::append_insn(s, extend(isa::VmOp::Movsx, 0, 1, 0));          // 1
+        isa::append_insn(s, halt());                                     // 2
+        const auto ctx = run_stream(entry, s, nullptr);
+        expect_slot32(ctx, 0, 0xFFFFFF80u);
+    }
+    // movsx aux=1：0x8234 → 0xFFFF8234。
+    {
+        std::vector<u8> s;
+        isa::append_insn(s, mov_imm(1, 0x8234u));                        // 0
+        isa::append_insn(s, extend(isa::VmOp::Movsx, 0, 1, 1));          // 1
+        isa::append_insn(s, halt());                                     // 2
+        const auto ctx = run_stream(entry, s, nullptr);
+        expect_slot32(ctx, 0, 0xFFFF8234u);
+    }
+    // Mem 形：movzxmem/movsxmem —— reg_b = 地址槽（绝对 VA），内存 byte/word 读。
+    {
+        alignas(4) std::array<u8, 0x40> scratch{};
+        scratch.fill(0);
+        scratch[0] = 0x34; scratch[1] = 0x82;   // word @0 = 0x8234（小端）
+        const u32 data_addr = static_cast<u32>(reinterpret_cast<uintptr_t>(scratch.data()));
+        std::vector<u8> s;
+        isa::append_insn(s, mov_imm(1, data_addr));                          // 0
+        isa::append_insn(s, extend(isa::VmOp::MovzxMem, 0, 1, 0));           // 1  byte @0
+        isa::append_insn(s, extend(isa::VmOp::MovsxMem, 2, 1, 1));           // 2  word @0
+        isa::append_insn(s, halt());                                         // 3
+        const auto ctx = run_stream(entry, s, scratch.data());
+        expect_slot32(ctx, 0, 0x34u);
+        expect_slot32(ctx, 2, 0xFFFF8234u);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// (20) X3b 批次三：Bswap/Xchg（S32 真面 + S8/S16 防御 no-op 钉）
+// ---------------------------------------------------------------------------
+TEST(X86Battery, BswapXchg) {
+    wvmp::Rng rng(12345);
+    const auto gen = rt::generate_runtime_x86(rng);
+    RwxImage rwx(gen.image.code);
+    const auto entry = rwx.entry();
+
+    // bswap S32：0x12345678 → 0x78563412。
+    {
+        std::vector<u8> s;
+        isa::append_insn(s, mov_imm(0, 0x12345678u));                        // 0
+        isa::append_insn(s, bin(isa::VmOp::Bswap, 0, 0, ir::Size::S32));     // 1
+        isa::append_insn(s, halt());                                         // 2
+        const auto ctx = run_stream(entry, s, nullptr);
+        expect_slot32(ctx, 0, 0x78563412u);
+    }
+    // bswap S8 防御 no-op：值不变（bswap 无 8 位形式，SDM）。
+    {
+        std::vector<u8> s;
+        isa::append_insn(s, mov_imm(0, 0x12345678u));                        // 0
+        isa::append_insn(s, bin(isa::VmOp::Bswap, 0, 0, ir::Size::S8));      // 1
+        isa::append_insn(s, halt());                                         // 2
+        const auto ctx = run_stream(entry, s, nullptr);
+        expect_slot32(ctx, 0, 0x12345678u);
+    }
+    // xchg S32：双槽互换。
+    {
+        std::vector<u8> s;
+        isa::append_insn(s, mov_imm(0, 0xAAAABBBBu));                        // 0
+        isa::append_insn(s, mov_imm(1, 0xCCCCDDDDu));                        // 1
+        isa::append_insn(s, bin(isa::VmOp::Xchg, 0, 1, ir::Size::S32));      // 2
+        isa::append_insn(s, halt());                                         // 3
+        const auto ctx = run_stream(entry, s, nullptr);
+        expect_slot32(ctx, 0, 0xCCCCDDDDu);
+        expect_slot32(ctx, 1, 0xAAAABBBBu);
+    }
+    // xchg S16 防御 no-op（lifter REG-REG 强制 S32，防御面钉语义）。
+    {
+        std::vector<u8> s;
+        isa::append_insn(s, mov_imm(0, 0xAAAABBBBu));                        // 0
+        isa::append_insn(s, mov_imm(1, 0xCCCCDDDDu));                        // 1
+        isa::append_insn(s, bin(isa::VmOp::Xchg, 0, 1, ir::Size::S16));      // 2
+        isa::append_insn(s, halt());                                         // 3
+        const auto ctx = run_stream(entry, s, nullptr);
+        expect_slot32(ctx, 0, 0xAAAABBBBu);
+        expect_slot32(ctx, 1, 0xCCCCDDDDu);
+    }
+}
