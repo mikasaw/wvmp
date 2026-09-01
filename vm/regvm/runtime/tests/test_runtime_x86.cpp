@@ -1272,3 +1272,141 @@ TEST(X86Battery, BswapXchg) {
         expect_slot32(ctx, 1, 0xCCCCDDDDu);
     }
 }
+
+// ---------------------------------------------------------------------------
+// (21) X3b 批次四：Setcc（16 条件 + reads-only flags 钉）
+// ---------------------------------------------------------------------------
+TEST(X86Battery, SetccCond) {
+    wvmp::Rng rng(12345);
+    const auto gen = rt::generate_runtime_x86(rng);
+    RwxImage rwx(gen.image.code);
+    const auto entry = rwx.entry();
+
+    auto setcc = [](u8 dst, ir::Cond c) {
+        return isa::make_insn(isa::VmOp::Setcc, isa::OpKind::Reg, dst,
+                              isa::OpKind::None, 0, 0, static_cast<u8>(c));
+    };
+
+    // cmp 5,5（相等）→ sete=1；槽高位保留钉（预置 0xA00 → 0xA01）。
+    {
+        std::vector<u8> s;
+        isa::append_insn(s, mov_imm(0, 5));                              // 0
+        isa::append_insn(s, mov_imm(1, 5));                              // 1
+        isa::append_insn(s, bin(isa::VmOp::Cmp, 0, 1, ir::Size::S32));   // 2
+        isa::append_insn(s, mov_imm(2, 0xA00));                          // 3
+        isa::append_insn(s, setcc(2, ir::Cond::E));                      // 4
+        isa::append_insn(s, getflags(4));                                // 5
+        isa::append_insn(s, halt());                                     // 6
+        const auto ctx = run_stream(entry, s, nullptr);
+        expect_slot32(ctx, 2, 0xA01u);
+        EXPECT_EQ(ctx.regs[4] & isa::kFlagZF, isa::kFlagZF);
+    }
+    // cmp 1,2（无符号 below）→ setb=1 / setae=0 / seta=0。
+    {
+        std::vector<u8> s;
+        isa::append_insn(s, mov_imm(0, 1));                              // 0
+        isa::append_insn(s, mov_imm(1, 2));                              // 1
+        isa::append_insn(s, bin(isa::VmOp::Cmp, 0, 1, ir::Size::S32));   // 2
+        isa::append_insn(s, setcc(2, ir::Cond::B));                      // 3
+        isa::append_insn(s, setcc(3, ir::Cond::Ae));                     // 4
+        isa::append_insn(s, setcc(4, ir::Cond::A));                      // 5
+        isa::append_insn(s, halt());                                     // 6
+        const auto ctx = run_stream(entry, s, nullptr);
+        expect_slot32(ctx, 2, 1u);
+        expect_slot32(ctx, 3, 0u);
+        expect_slot32(ctx, 4, 0u);
+    }
+    // 有符号：cmp 0xFFFFFFFD(-3), 1 → setl=1 / setg=0 / sets=1。
+    {
+        std::vector<u8> s;
+        isa::append_insn(s, mov_imm(0, 0xFFFFFFFDu));                    // 0
+        isa::append_insn(s, mov_imm(1, 1));                              // 1
+        isa::append_insn(s, bin(isa::VmOp::Cmp, 0, 1, ir::Size::S32));   // 2
+        isa::append_insn(s, setcc(2, ir::Cond::L));                      // 3
+        isa::append_insn(s, setcc(3, ir::Cond::G));                      // 4
+        isa::append_insn(s, setcc(4, ir::Cond::S));                      // 5
+        isa::append_insn(s, halt());                                     // 6
+        const auto ctx = run_stream(entry, s, nullptr);
+        expect_slot32(ctx, 2, 1u);
+        expect_slot32(ctx, 3, 0u);
+        expect_slot32(ctx, 4, 1u);
+    }
+    // setcc 不改 flags：cmp 后 getflags 两次夹断言（中间隔 setcc）。
+    {
+        std::vector<u8> s;
+        isa::append_insn(s, mov_imm(0, 1));                              // 0
+        isa::append_insn(s, mov_imm(1, 2));                              // 1
+        isa::append_insn(s, bin(isa::VmOp::Cmp, 0, 1, ir::Size::S32));   // 2
+        isa::append_insn(s, getflags(4));                                // 3  flags ①
+        isa::append_insn(s, setcc(2, ir::Cond::B));                      // 4
+        isa::append_insn(s, getflags(5));                                // 5  flags ②
+        isa::append_insn(s, halt());                                     // 6
+        const auto ctx = run_stream(entry, s, nullptr);
+        EXPECT_EQ(ctx.regs[4] & isa::kFlagsMask, ctx.regs[5] & isa::kFlagsMask);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// (22) X3b 批次四：Cmovcc（cond ∈ aux[31..28]，取/不取两路 + flags 不变）
+// ---------------------------------------------------------------------------
+TEST(X86Battery, CmovccCond) {
+    wvmp::Rng rng(12345);
+    const auto gen = rt::generate_runtime_x86(rng);
+    RwxImage rwx(gen.image.code);
+    const auto entry = rwx.entry();
+
+    auto cmovcc = [](u8 dst, u8 src, ir::Cond c) {
+        return isa::make_insn(isa::VmOp::Cmovcc, isa::OpKind::Reg, dst,
+                              isa::OpKind::Reg, src, static_cast<u32>(c) << 28,
+                              isa::size_field(ir::Size::S32));
+    };
+
+    // 取：cmp 非等 → cmovcc(Ne) dst ← src。
+    {
+        std::vector<u8> s;
+        isa::append_insn(s, mov_imm(0, 111));                            // 0
+        isa::append_insn(s, mov_imm(1, 222));                            // 1
+        isa::append_insn(s, mov_imm(2, 7));                              // 2
+        isa::append_insn(s, bin(isa::VmOp::Cmp, 1, 2, ir::Size::S32));   // 3  非等
+        isa::append_insn(s, cmovcc(0, 1, ir::Cond::Ne));                 // 4
+        isa::append_insn(s, halt());                                     // 5
+        const auto ctx = run_stream(entry, s, nullptr);
+        expect_slot32(ctx, 0, 222u);
+    }
+    // 不取：cmp 相等 → cmovcc(Ne) dst 不变。
+    {
+        std::vector<u8> s;
+        isa::append_insn(s, mov_imm(0, 111));                            // 0
+        isa::append_insn(s, mov_imm(1, 222));                            // 1
+        isa::append_insn(s, bin(isa::VmOp::Cmp, 1, 1, ir::Size::S32));   // 2  相等
+        isa::append_insn(s, cmovcc(0, 1, ir::Cond::Ne));                 // 3
+        isa::append_insn(s, halt());                                     // 4
+        const auto ctx = run_stream(entry, s, nullptr);
+        expect_slot32(ctx, 0, 111u);
+    }
+    // 有符号：cmp -3, 1 → cmovcc(L) 取。
+    {
+        std::vector<u8> s;
+        isa::append_insn(s, mov_imm(0, 111));                            // 0
+        isa::append_insn(s, mov_imm(1, 0xFFFFFFFDu));                    // 1
+        isa::append_insn(s, mov_imm(2, 1));                              // 2
+        isa::append_insn(s, bin(isa::VmOp::Cmp, 1, 2, ir::Size::S32));   // 3
+        isa::append_insn(s, cmovcc(0, 1, ir::Cond::L));                  // 4
+        isa::append_insn(s, halt());                                     // 5
+        const auto ctx = run_stream(entry, s, nullptr);
+        expect_slot32(ctx, 0, 0xFFFFFFFDu);
+    }
+    // cmovcc 不改 flags：cmp 后 getflags 两点夹断言。
+    {
+        std::vector<u8> s;
+        isa::append_insn(s, mov_imm(0, 111));                            // 0
+        isa::append_insn(s, mov_imm(1, 222));                            // 1
+        isa::append_insn(s, bin(isa::VmOp::Cmp, 1, 1, ir::Size::S32));   // 2
+        isa::append_insn(s, getflags(4));                                // 3
+        isa::append_insn(s, cmovcc(0, 1, ir::Cond::E));                  // 4（取）
+        isa::append_insn(s, getflags(5));                                // 5
+        isa::append_insn(s, halt());                                     // 6
+        const auto ctx = run_stream(entry, s, nullptr);
+        EXPECT_EQ(ctx.regs[4] & isa::kFlagsMask, ctx.regs[5] & isa::kFlagsMask);
+    }
+}

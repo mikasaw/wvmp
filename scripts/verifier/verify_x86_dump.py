@@ -51,6 +51,8 @@ BATTERY_HANDLERS = {
     "shlcl", "shrcl", "sarcl", "rolcl", "rorcl",
     # X3b (MIT-444) A 档批次三：扩展传送 / 字节序 / 交换族。
     "movzx", "movzxmem", "movsx", "movsxmem", "bswap", "xchg",
+    # X3b (MIT-444) A 档批次四：条件族（reads-flags 面）。
+    "setcc", "cmovcc",
 }
 
 HEADER_RE = re.compile(
