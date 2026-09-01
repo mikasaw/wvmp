@@ -39,11 +39,13 @@ import argparse
 import re
 import sys
 
-# 电池集 handler 名单（asmgen.cpp x86 表 —— 与其同步；X3b 批迁后更新）。
+# 电池集 handler 名单（asmgen.cpp x86 表 —— 与其同步；X3b 批迁随批次更新）。
 BATTERY_HANDLERS = {
     "mov", "lea", "add", "sub", "and", "or", "xor", "cmp", "test",
     "inc", "dec", "load", "store", "jmp", "jcc", "nop", "halt",
     "getflags", "setflags",
+    # X3b (MIT-444) A 档批次一：一元 / 带进借位二元 / 乘法 / 符号扩展。
+    "not", "neg", "adc", "sbb", "imul", "mul", "cdq",
 }
 
 HEADER_RE = re.compile(
