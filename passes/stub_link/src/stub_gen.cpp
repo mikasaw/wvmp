@@ -202,31 +202,41 @@ std::string build_stub_asm_x86(u64 rt_entry_rva, u64 blob_stream_rva,
     //      参与出口槽换算，禁字面量第二份）。push 序固定 ebx→edi。——
     o += "push ebx\n push ebp\n push esi\n push edi\n";
     o += "sub esp, " + hex(kCtxSize) + "\n";
-    // —— ctx 区清零（槽高半字恒 0 不变量的栈帧来源）。eax/ecx/edx 是待预载
-    //      的易失原值，先经 3 个临时 push 捕获（位于 ctx 区之下、出口槽
-    //      [esp-0x80] 之上，pop 后痕迹归零）；edi/ecx/eax 作 rep stosd
-    //      工作寄存器（原值已捕获/已压栈）。cld 防御 DF 残留（Win32 ABI
-    //      DF=0 惯例，1B 保险）。——
-    o += "push eax\n push ecx\n push edx\n";
+    // —— ctx 区清零（槽高半字恒 0 不变量的栈帧来源）。eax/ecx/edx/edi 是
+    //      待预载的原值，先经 4 个临时 push 捕获再恢复（⚠️ edi 必须恢复：
+    //      VmOp::Ret 的直退路径不经 stub 出口 pop，runtime 出口恢复的是
+    //      "进入 runtime 时刻"的 callee-saved——若此处留下碎 edi，guest
+    //      caller 收到坏 edi（x86 E2E 首通实录：stdout 空 + rc=0））；
+    //      rep stosd 以 eax/ecx/edi 为工作寄存器。cld 防御 DF 残留
+    //      （Win32 ABI DF=0 惯例，1B 保险）。——
+    o += "push eax\n push ecx\n push edx\n push edi\n";
     o += "cld\n";
-    o += "lea edi, [esp + " + hex(3 * 4) + "]\n";
+    o += "lea edi, [esp + " + hex(4 * 4) + "]\n";
     o += "mov ecx, " + hex(kCtxSize / 4) + "\n";
     o += "xor eax, eax\n";
     o += "rep stosd\n";
-    o += "pop edx\n pop ecx\n pop eax\n";
+    o += "pop edi\n pop edx\n pop ecx\n pop eax\n";
     // —— 预载宿主 GP 寄存器 → 虚拟寄存器堆（x86 GP = eax..edi 槽 0..7，
     //      dword 写、高半字由清零保证 0）。ebx/ebp/esi/edi 原值从 stub 自己
-    //      的保存区（ctx 区上方 [esp + kCtxSize + 4k]）读回。——
+    //      的保存区读回：压栈序 ebx→edi（ebx 最高址），从 ctx_base 看第 i 个
+    //      push 位于 [esp + kCtxSize + kStubPushBytesX86 - 4*(i+1)]。
+    //      ⚠️ X4 首通实录：偏移若顺序写反，slot5(ebp) 装进原 esi 值，leave/
+    //      ret 面 [ebp-4] 写飞（cdb 铁证 0x7717667C）——偏移必须按"先 push
+    //      在高址"推导，禁拍脑袋顺序。——
     o += "mov [esp + " + hex(kCtxRegs + 0 * 8) + "], eax\n";
     o += "mov [esp + " + hex(kCtxRegs + 1 * 8) + "], ecx\n";
     o += "mov [esp + " + hex(kCtxRegs + 2 * 8) + "], edx\n";
-    o += "mov eax, [esp + " + hex(kCtxSize + 0 * 4) + "]\n";  // 原 ebx
+    o += "mov eax, [esp + " +
+         hex(kCtxSize + kStubPushBytesX86 - 4 * 1) + "]\n";  // 原 ebx（第 1 push）
     o += "mov [esp + " + hex(kCtxRegs + 3 * 8) + "], eax\n";
-    o += "mov eax, [esp + " + hex(kCtxSize + 1 * 4) + "]\n";  // 原 ebp
+    o += "mov eax, [esp + " +
+         hex(kCtxSize + kStubPushBytesX86 - 4 * 2) + "]\n";  // 原 ebp（第 2 push）
     o += "mov [esp + " + hex(kCtxRegs + 5 * 8) + "], eax\n";
-    o += "mov eax, [esp + " + hex(kCtxSize + 2 * 4) + "]\n";  // 原 esi
+    o += "mov eax, [esp + " +
+         hex(kCtxSize + kStubPushBytesX86 - 4 * 3) + "]\n";  // 原 esi（第 3 push）
     o += "mov [esp + " + hex(kCtxRegs + 6 * 8) + "], eax\n";
-    o += "mov eax, [esp + " + hex(kCtxSize + 3 * 4) + "]\n";  // 原 edi
+    o += "mov eax, [esp + " +
+         hex(kCtxSize + kStubPushBytesX86 - 4 * 4) + "]\n";  // 原 edi（第 4 push）
     o += "mov [esp + " + hex(kCtxRegs + 7 * 8) + "], eax\n";
     // v4 = 原始 rsp（区域代码按原函数帧的 rsp 相对寻址）：当前 esp 比原始
     // 值低 kStubPushBytesX86(0x10) + kCtxSize(0x1C8) = 0x1D8，用 lea 还原。

@@ -144,6 +144,10 @@ static u32 __cdecl xcg_probe(void) {
     ++g_xcg_calls;
     return 0x5A5u;
 }
+// MIT-446 (X4) B.1：参数窗读取面 = guest [v4..v4+0xC]（固定 4 dword 预置）。
+// 电池 ctx 的 v4 必须指向真实映射缓冲（旧用例 v4=0 在新协议下读 NULL 页）；
+// 0-arg callee 不读参数，窗口内容无关，esp 由 host_rsp 重基统一回收。
+static alignas(16) u8 g_xcg_stack[0x40];
 isa::VmInsn callgate_rva(u32 rva) {
     return isa::make_insn(isa::VmOp::CallGate, isa::OpKind::None, 0,
                           isa::OpKind::None, 0, rva, 0);
@@ -1972,7 +1976,8 @@ TEST(X86Battery, CallGateRvaFormRealCall) {
     ctx.bytecode = s.data();
     ctx.pc = 0;
     ctx.scratch_mem = kFakeBase;
-    ctx.regs[isa::vm_reg_of(ir::Reg::Rsp)] = 0;
+    ctx.regs[isa::vm_reg_of(ir::Reg::Rsp)] =
+        reinterpret_cast<u64>(g_xcg_stack + 0x30);  // X4 参数窗: v4 = 真实映射栈
     g_xcg_calls = 0;
     rwx.entry()(&ctx);
     EXPECT_EQ(g_xcg_calls, 1u);          // 真调用（ callee 执行）
@@ -1999,7 +2004,8 @@ TEST(X86Battery, CallGateRegFormRealCall) {
     ctx.bytecode = s.data();
     ctx.pc = 0;
     ctx.scratch_mem = 0;
-    ctx.regs[isa::vm_reg_of(ir::Reg::Rsp)] = 0;
+    ctx.regs[isa::vm_reg_of(ir::Reg::Rsp)] =
+        reinterpret_cast<u64>(g_xcg_stack + 0x30);  // X4 参数窗: v4 = 真实映射栈
     g_xcg_calls = 0;
     rwx.entry()(&ctx);
     EXPECT_EQ(g_xcg_calls, 1u);          // 真调用
@@ -2029,7 +2035,8 @@ TEST(X86Battery, CallGateRegFormComputedTarget) {
     ctx.bytecode = s.data();
     ctx.pc = 0;
     ctx.scratch_mem = kFakeBase;
-    ctx.regs[isa::vm_reg_of(ir::Reg::Rsp)] = 0;
+    ctx.regs[isa::vm_reg_of(ir::Reg::Rsp)] =
+        reinterpret_cast<u64>(g_xcg_stack + 0x30);  // X4 参数窗: v4 = 真实映射栈
     g_xcg_calls = 0;
     rwx.entry()(&ctx);
     EXPECT_EQ(g_xcg_calls, 1u);
@@ -2235,4 +2242,91 @@ TEST(X86Battery, RetImm16StackBalance) {
     // 2 个参数槽：被调方清栈（stdcall 形）后 esp 回到压参前原点（栈平衡）。
     EXPECT_EQ(g_xret_land_esp, work_top);
     EXPECT_EQ(ctx.regs[isa::vm_reg_of(ir::Reg::Rsp)], static_cast<u64>(work_top));
+}
+
+// ---------------------------------------------------------------------------
+// (36) MIT-446 (X4) B.2/D5：改形正反用例 —— 3 路尺寸链真块证据 + S64 防御
+//      出口回归防护（"S64 no-op 复辟探测器"的运行时层面）。
+//      正例：S32 tag 的地址算术/esp 步进真生效（值推进 + 内存真写）；
+//      反例：444 时代错形 S64 tag 同形发射 = 链尾顺延 no-op（esp 槽不动、
+//      内存不写）——若未来有人把步进 tag 改回 S64（或 x86 翻译器重新产
+//      S64 VmOp），本断言把"静默空转"变成电池当场炸。
+// ---------------------------------------------------------------------------
+TEST(X86Battery, StepTagS32LiveAndS64NoopGuard) {
+    wvmp::Rng rng(12345);
+    const auto gen = rt::generate_runtime_x86(rng);
+    alignas(4) std::array<u8, 0x40> scratch{};
+    scratch.fill(0);
+    RwxImage rwx(gen.image.code);
+    const auto entry = rwx.entry();
+    const u8 rsp_slot = isa::vm_reg_of(ir::Reg::Rsp);
+    const u32 top = 0x20;   // 用相对偏移做栈指针（scratch 绝对 VA 无需知道）
+    const u32 planted = 0x00C0FFEEu;
+    std::memcpy(scratch.data() + (top - 4), &planted, 4);
+
+    auto run = [&](const std::vector<u8>& s) {
+        rt::VmContext ctx;
+        ctx.bytecode = const_cast<u8*>(s.data());
+        ctx.pc = 0;
+        ctx.scratch_mem = 0;
+        ctx.regs[rsp_slot] = reinterpret_cast<uintptr_t>(scratch.data()) + top;
+        entry(&ctx);
+        return ctx;
+    };
+
+    // 反例（S64 防御 no-op 钉死）：Sub rsp 槽, 4 @ S64 → esp 不推进、内存
+    // 不写；Load [rsp] @ S64 → 同样链尾顺延（dst 槽保持清零值）。
+    {
+        std::vector<u8> s;
+        isa::append_insn(s, bin_imm(isa::VmOp::Sub, rsp_slot, 4, ir::Size::S64));  // 0
+        isa::append_insn(s, isa::make_insn(isa::VmOp::Load, isa::OpKind::Reg, 5,
+                                           isa::OpKind::Reg, rsp_slot, 0,
+                                           isa::size_field(ir::Size::S64)));       // 1
+        isa::append_insn(s, halt());                                              // 2
+        const auto ctx = run(s);
+        EXPECT_EQ(ctx.regs[rsp_slot],
+                  static_cast<u64>(reinterpret_cast<uintptr_t>(scratch.data()) + top))
+            << "S64 tag must stay a defensive no-op (chain-tail), esp unchanged";
+        expect_slot32(ctx, 5, 0);
+    }
+
+    // 正例（S32 真块）：同一 Sub rsp 槽 @ S32 → esp 真推进 4；Load [esp]
+    // @ S32 → 读到栽好的值（地址算术 + 访存全链真块）。
+    {
+        std::vector<u8> s;
+        isa::append_insn(s, bin_imm(isa::VmOp::Sub, rsp_slot, 4, ir::Size::S32));  // 0
+        isa::append_insn(s, isa::make_insn(isa::VmOp::Load, isa::OpKind::Reg, 5,
+                                           isa::OpKind::Reg, rsp_slot, 0,
+                                           isa::size_field(ir::Size::S32)));       // 1
+        isa::append_insn(s, halt());                                              // 2
+        const auto ctx = run(s);
+        EXPECT_EQ(ctx.regs[rsp_slot],
+                  static_cast<u64>(reinterpret_cast<uintptr_t>(scratch.data()) + top - 4))
+            << "S32 tag must take the real size-chain block, esp advances 4B";
+        expect_slot32(ctx, 5, planted);
+    }
+
+    // 正例（S32 地址算术复合形：base 槽拷贝 + 常量加减——emit_address 的
+    // x86 展开形）：Mov v18, rsp 槽值; Add v18, 8; Load v19, [v18]。
+    {
+        std::vector<u8> s;
+        isa::append_insn(s, isa::make_insn(isa::VmOp::Mov, isa::OpKind::Reg, 18,
+                                           isa::OpKind::Reg, rsp_slot, 0,
+                                           isa::size_field(ir::Size::S32)));       // 0
+        isa::append_insn(s, bin_imm(isa::VmOp::Add, 18, 8, ir::Size::S32));        // 1
+        isa::append_insn(s, bin_imm(isa::VmOp::Sub, 18, 4, ir::Size::S32));        // 2
+        isa::append_insn(s, isa::make_insn(isa::VmOp::Load, isa::OpKind::Reg, 19,
+                                           isa::OpKind::Reg, 18, 0,
+                                           isa::size_field(ir::Size::S32)));       // 3
+        isa::append_insn(s, halt());                                              // 4
+        const auto ctx = run(s);
+        expect_slot32(ctx, 18,
+                      static_cast<u32>(reinterpret_cast<uintptr_t>(scratch.data()) + top + 4));
+        expect_slot32(ctx, 19, 0);  // scratch 高位未栽值 → 0（真访存证据）
+        // 栽值到 top+4 再跑一遍，读回验证。
+        const u32 planted2 = 0x13572468u;
+        std::memcpy(scratch.data() + (top + 4), &planted2, 4);
+        const auto ctx2 = run(s);
+        expect_slot32(ctx2, 19, planted2);
+    }
 }

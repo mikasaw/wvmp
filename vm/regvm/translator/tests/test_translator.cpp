@@ -1996,3 +1996,78 @@ TEST(Translate, CallMemNegDispFoldsLoadCallGateRegForm) {
 }
 
 } // namespace
+
+// ==================== MIT-446 (X4) B.2/D5: S64 tag 改形防回归 ====================
+
+ir::Insn push_insn(ir::Reg r, ir::Size sz) {
+    ir::Insn i = I(ir::Op::Push, sz);
+    i.dst = ir::Operand::reg_(r);
+    return i;
+}
+ir::Insn pop_insn(ir::Reg r, ir::Size sz) {
+    ir::Insn i = I(ir::Op::Pop, sz);
+    i.dst = ir::Operand::reg_(r);
+    return i;
+}
+
+TEST(Translate, X86PushPopSingleOpForm) {
+    // B.2 点位①：x86 push/pop → 单 VmOp::Push/Pop（X3b 4B handler，a_kind=
+    // Reg）。若改形回退为 Sub/Add rsp（S64 tag），x86 运行时 3 路尺寸链折
+    // 防御 no-op 静默空转——本用例即 D5 "S64 no-op 复辟探测器" 的翻译层面。
+    ir::FunctionRegion fn = fn_of({
+        blk(0x1000, {push_insn(ir::Reg::Rax, ir::Size::S32),
+                     pop_insn(ir::Reg::Rbx, ir::Size::S32)}),
+    });
+    fn.arch = ir::Arch::X86;
+    const auto r = wvmp::regvm::translator::translate_function(fn);
+    EXPECT_TRUE(r.notes.empty());
+    const Decoded d = decode_program(r.program);
+    ASSERT_EQ(d.insns.size(), static_cast<size_t>(4));  // 2 + Jmp(+1) + Halt
+    expect_is(d.insns[0], VmOp::Push, OpKind::Reg, kRax, OpKind::None, 0, 0, kS32);
+    expect_is(d.insns[1], VmOp::Pop, OpKind::Reg, kRbx, OpKind::None, 0, 0, kS32);
+}
+
+TEST(Translate, X64PushPopLegacyShapeUnchanged) {
+    // D2 恒等铁约束：x64 push/pop 维持 Sub rsp/Load+Add 现形（S64 tag）。
+    const auto r = wvmp::regvm::translator::translate_function(fn_of({
+        blk(0x1000, {push_insn(ir::Reg::Rax, ir::Size::S64),
+                     pop_insn(ir::Reg::Rbx, ir::Size::S64)}),
+    }));
+    EXPECT_TRUE(r.notes.empty());
+    const Decoded d = decode_program(r.program);
+    const u8 rsp = isa::vm_reg_of(ir::Reg::Rsp);
+    ASSERT_EQ(d.insns.size(), static_cast<size_t>(6));  // Sub,Store,Load,Add,Jmp,Halt
+    expect_is(d.insns[0], VmOp::Sub, OpKind::Reg, rsp, OpKind::Imm, 0, 8, kS64);
+    expect_is(d.insns[1], VmOp::Store, OpKind::Reg, rsp, OpKind::Reg, kRax, 0, kS64);
+    expect_is(d.insns[2], VmOp::Load, OpKind::Reg, kRbx, OpKind::Reg, rsp, 0, kS64);
+    expect_is(d.insns[3], VmOp::Add, OpKind::Reg, rsp, OpKind::Imm, 0, 8, kS64);
+}
+
+TEST(Translate, X86AddressArithmeticUsesS32StepTag) {
+    // B.2 点位②：x86 地址算术（base+disp 拼装）走 S32 步进 tag——x86 运行
+    // 时 3 路尺寸链走真块；x64 对照组维持 S64（同函数双 arch 快照钉死）。
+    ir::Insn ld = I(ir::Op::Load, ir::Size::S32);
+    ld.dst = ir::Operand::reg_(ir::Reg::Rax);
+    ld.src = ir::Operand::mem_(m(ir::Reg::Rbx, ir::Reg::Flags, 0, 0x10));
+    ir::FunctionRegion fn86 = fn_of({blk(0x1000, {ld})});
+    fn86.arch = ir::Arch::X86;
+    const auto r86 = wvmp::regvm::translator::translate_function(fn86);
+    EXPECT_TRUE(r86.notes.empty());
+    const Decoded d86 = decode_program(r86.program);
+    ASSERT_EQ(d86.insns.size(), static_cast<size_t>(5));  // Mov,Add,Load,Jmp,Halt
+    expect_is(d86.insns[0], VmOp::Mov, OpKind::Reg, d86.insns[0].reg_a,
+              OpKind::Reg, kRbx, 0, kS32);
+    expect_is(d86.insns[1], VmOp::Add, OpKind::Reg, d86.insns[1].reg_a,
+              OpKind::Imm, 0, 0x10, kS32);
+    expect_is(d86.insns[2], VmOp::Load, OpKind::Reg, kRax, OpKind::Reg,
+              d86.insns[2].reg_b, 0, kS32);
+
+    const auto r64 = wvmp::regvm::translator::translate_function(fn_of({
+        blk(0x1000, {ld})}));
+    const Decoded d64 = decode_program(r64.program);
+    ASSERT_EQ(d64.insns.size(), static_cast<size_t>(5));
+    expect_is(d64.insns[0], VmOp::Mov, OpKind::Reg, d64.insns[0].reg_a,
+              OpKind::Reg, kRbx, 0, kS64);
+    expect_is(d64.insns[1], VmOp::Add, OpKind::Reg, d64.insns[1].reg_a,
+              OpKind::Imm, 0, 0x10, kS64);
+}
