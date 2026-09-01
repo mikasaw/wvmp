@@ -1,6 +1,7 @@
 #include "stub_gen.hpp"
 
 #include "wvmp/regvm/runtime/runtime.hpp"
+#include "wvmp/regvm/runtime/runtime_x86.hpp"
 
 #include <keystone/keystone.h>
 
@@ -36,6 +37,9 @@ using wvmp::regvm::runtime::kCtxXmmBase;
 //   HALT 终态（rsp = ns）                             → [rsp - 0x288]
 // v1 曾在本文件/asmgen 各持字面量并写/读错位——segfault 根因，禁止第二份。
 using wvmp::regvm::runtime::kExitSlotDepth;
+// MIT-446 (X4) B.1：x86 退出槽深度单一来源迁至 runtime_x86.hpp（原 asmgen
+// 匿名 namespace 常量上移），x86 stub 两处消费点据此换算。
+using wvmp::regvm::runtime::kX86ExitSlotDepth;
 
 // 占位 disp32（回填目标 = blob 指令流）：选罕见值便于汇编后定位。
 constexpr u32 kBlobDispDummy = 0xDEAD'0001;
@@ -46,12 +50,29 @@ constexpr u32 kBlobDispDummy = 0xDEAD'0001;
 // 硬编码，属 kCtxSize 漂移同族缺陷，一并派生）。
 constexpr u64 kStubPushBytes = wvmp::regvm::runtime::kCalleeSavedIdx.size() * 8;
 
+// MIT-446 (X4) B.1：x86 callee-saved 面与 mod-16 静态钉（派单 A.2 派生式
+// 纪律）。x86 ABI callee-saved = ebx/ebp/esi/edi 4 个（= asmgen kX86CalleeSaved
+// 同集合），4×4B = 0x10；kX86ExitSlotDepth 的派生式（runtime_x86.hpp）内含
+// 同一 push 面，两处由 static_assert 锁死零漂移。
+constexpr u64 kStubPushBytesX86 = 4 * 4;  // ebx/ebp/esi/edi
+static_assert(kStubPushBytesX86 % 16 == 0, "x86 stub push face must stay 16-aligned");
+static_assert(kX86ExitSlotDepth == kStubPushBytesX86 + kCtxSize + 0x80,
+              "x86 stub push face drifted from kX86ExitSlotDepth derivation");
+static_assert(kCtxSize % 4 == 0, "x86 stub ctx zero-fill must be dword-granular");
+
 // 入口预写相对当前 rsp（= ns - kStubPushBytes - kCtxSize）的槽偏移。
 // 选 0x80：disp8 恰好 -128 可编码（keystone 大负 disp 截断坑规避），且
 // 换算到 native_sp 坐标系恰为 kExitSlotDepth（见 runtime.hpp 注释）。
 constexpr u64 kExitSlotFromStubEntry = kExitSlotDepth - kStubPushBytes - kCtxSize;
+// x86 同构换算（kX86ExitSlotDepth - 0x10 - 0x1C8 = 0x80，disp8 边界同款）。
+constexpr u64 kX86ExitSlotFromStubEntry =
+    kX86ExitSlotDepth - kStubPushBytesX86 - kCtxSize;
+static_assert(kX86ExitSlotFromStubEntry == 0x80,
+              "x86 exit slot entry prewrite must stay disp8-encodable");
 
-std::string build_stub_asm(u64 rt_entry_rva, u64 resume_rva, u64 image_base) {
+// x64 stub 汇编（MIT-446 (X4) B.1 起更名 x64 专形；D2 恒等铁约束：函数体
+// 逐字保留，x64 asm_dump sha ffd47289… 恒等是机器证明项）。
+std::string build_stub_asm_x64(u64 rt_entry_rva, u64 resume_rva, u64 image_base) {
     std::string o;
     o += "push rbx\n push rbp\n push rdi\n push rsi\n";
     o += "push r12\n push r13\n push r14\n push r15\n";
@@ -147,16 +168,119 @@ std::string build_stub_asm(u64 rt_entry_rva, u64 resume_rva, u64 image_base) {
     return o;
 }
 
+// =============================================================================
+// MIT-446 (X4) B.1：x86 (Win32 cdecl) stub 汇编 —— x64 形的 32 位镜像重写。
+//
+// 与 x64 形的逐项差异（交接锚①-④对账）：
+//   1. callee-saved push 面 = 4（ebx/ebp/esi/edi，kStubPushBytesX86=0x10，
+//      与 runtime_x86.hpp kX86ExitSlotDepth 派生式 static_assert 锁死）；
+//   2. ctx 传递 = cdecl 栈参：`push esp; call rt_entry`，runtime_x86 entry
+//      在自身 4 push 后经 [esp+0x14] 读 ctx 指针（443 电池 entry 亲验形）；
+//   3. ctx 区必须先清零（rep stosd）：x86 handler 写回仅触槽低 dword，
+//      "槽高半字恒 0" 不变量依赖 ctx 零初始化（电池 = C++ 零初始化 struct
+//      同款）；eax/ecx/edx 原值先经 3 个临时 push 捕获再恢复后预载；
+//   4. 预载面 = 8 GP 槽（eax..edi，无 r8+）；esp 槽单独经 v4/native_sp；
+//   5. 易失回写表 = eax/ecx/edx 三槽（cdecl 易失面；callee-saved 由出口
+//      pop 恢复原值，绝不从 ctx 回写——区域未含函数 epilogue 时 guest 槽
+//      的 callee-saved 值不可信，回写会破坏原调用方 ABI）；
+//   6. ExitNative/HALT 终态 = jmp dword ptr [esp - kX86ExitSlotDepth]
+//      （4B 槽，X3c epilogue ret 回 stub 后由 stub 消费；槽值 = imm32 VA，
+//      PE32 VA < 4GB——407 v2 RVA/VA 铁律：裸 RVA 进槽 = 野跳）；
+//   7. blob 指针 = image_base + blob_stream_rva 立即数（32 位模式无 rip
+//      寻址，无需 disp32 回填；generate_entry_stub 的 x64 回填面 x86 跳过）；
+//   8. xmm 同步不适用（x86 运行时无 SSE handler，ctx.xmm 面未消费；
+//      Win32 ABI xmm 全易失，callgate callee 副作用不建模）。
+//
+// guest 栈写恒 ≥ ns 规则（442 区1 实证）下，Guest cdecl 栈参数经
+// build_callgate_x86 的固定参数窗预置消费（kX86CallgateArgDwords 协议，
+// stub 帧形 = 锚③不变量 "entry 4 push + kCtxSize"）。
+// =============================================================================
+std::string build_stub_asm_x86(u64 rt_entry_rva, u64 blob_stream_rva,
+                               u64 resume_rva, u64 image_base) {
+    std::string o;
+    // —— 序言：4 callee-saved push + ctx 区（kStubPushBytesX86 + kCtxSize
+    //      参与出口槽换算，禁字面量第二份）。push 序固定 ebx→edi。——
+    o += "push ebx\n push ebp\n push esi\n push edi\n";
+    o += "sub esp, " + hex(kCtxSize) + "\n";
+    // —— ctx 区清零（槽高半字恒 0 不变量的栈帧来源）。eax/ecx/edx 是待预载
+    //      的易失原值，先经 3 个临时 push 捕获（位于 ctx 区之下、出口槽
+    //      [esp-0x80] 之上，pop 后痕迹归零）；edi/ecx/eax 作 rep stosd
+    //      工作寄存器（原值已捕获/已压栈）。cld 防御 DF 残留（Win32 ABI
+    //      DF=0 惯例，1B 保险）。——
+    o += "push eax\n push ecx\n push edx\n";
+    o += "cld\n";
+    o += "lea edi, [esp + " + hex(3 * 4) + "]\n";
+    o += "mov ecx, " + hex(kCtxSize / 4) + "\n";
+    o += "xor eax, eax\n";
+    o += "rep stosd\n";
+    o += "pop edx\n pop ecx\n pop eax\n";
+    // —— 预载宿主 GP 寄存器 → 虚拟寄存器堆（x86 GP = eax..edi 槽 0..7，
+    //      dword 写、高半字由清零保证 0）。ebx/ebp/esi/edi 原值从 stub 自己
+    //      的保存区（ctx 区上方 [esp + kCtxSize + 4k]）读回。——
+    o += "mov [esp + " + hex(kCtxRegs + 0 * 8) + "], eax\n";
+    o += "mov [esp + " + hex(kCtxRegs + 1 * 8) + "], ecx\n";
+    o += "mov [esp + " + hex(kCtxRegs + 2 * 8) + "], edx\n";
+    o += "mov eax, [esp + " + hex(kCtxSize + 0 * 4) + "]\n";  // 原 ebx
+    o += "mov [esp + " + hex(kCtxRegs + 3 * 8) + "], eax\n";
+    o += "mov eax, [esp + " + hex(kCtxSize + 1 * 4) + "]\n";  // 原 ebp
+    o += "mov [esp + " + hex(kCtxRegs + 5 * 8) + "], eax\n";
+    o += "mov eax, [esp + " + hex(kCtxSize + 2 * 4) + "]\n";  // 原 esi
+    o += "mov [esp + " + hex(kCtxRegs + 6 * 8) + "], eax\n";
+    o += "mov eax, [esp + " + hex(kCtxSize + 3 * 4) + "]\n";  // 原 edi
+    o += "mov [esp + " + hex(kCtxRegs + 7 * 8) + "], eax\n";
+    // v4 = 原始 rsp（区域代码按原函数帧的 rsp 相对寻址）：当前 esp 比原始
+    // 值低 kStubPushBytesX86(0x10) + kCtxSize(0x1C8) = 0x1D8，用 lea 还原。
+    // 同一原始 esp 写 native_sp（callgate 窗口锚/ExitNative 槽基准，跨指令
+    // 不变）。eax 原值已在 slot0 保存，可复用。
+    o += "lea eax, [esp + " + hex(kStubPushBytesX86 + kCtxSize) + "]\n";
+    o += "mov [esp + " + hex(kCtxRsp) + "], eax\n";
+    o += "mov [esp + " + hex(kCtxNativeSp) + "], eax\n";
+    // image_base → scratch_mem 槽（PE32 ImageBase 恒 imm32 可编码；Load/
+    // Store/Push/Pop 访存 = RVA + image_base。ASLR 由 pe_writer 清
+    // DYNAMIC_BASE 兜底，槽值不变）。
+    o += "mov dword ptr [esp + " + hex(kCtxScratch) + "], " + hex(image_base) + "\n";
+    // ExitNative 退出槽入口预写：生成期常量 VA = image_base + resume_rva
+    // （407 v2 铁律：裸 RVA 进槽 = 野跳）。槽地址 = [esp - 0x80]
+    // （esp = ns - 0x1D8 → ns - kX86ExitSlotDepth）。
+    o += "mov eax, " + hex(image_base + resume_rva) + "\n";
+    o += "mov [esp - " + hex(kX86ExitSlotFromStubEntry) + "], eax\n";
+    o += "mov dword ptr [esp + 0x8], 0\n";                  // pc = 0（高半字已清零）
+    // blob 指令流指针 = image_base + blob_stream_rva（imm32 VA；32 位模式
+    // 无 rip 寻址，无需 x64 disp32 回填；pe_writer 清 DYNAMIC_BASE 下与
+    // x64 rip-relative 形等价）。
+    o += "mov dword ptr [esp], " + hex(image_base + blob_stream_rva) + "\n";
+    // —— 调共享解释器（cdecl：ctx 指针经栈参，runtime_x86 entry [esp+0x14] 读）。
+    o += "push esp\n";
+    o += "call " + hex(rt_entry_rva) + "\n";
+    // —— HALT/ExitNative 返回：cdecl 调用方清参 + 回写易失寄存器
+    //      （callee-saved 由 pop 恢复原值，见差异 5）。——
+    o += "add esp, " + hex(4) + "\n";
+    o += "mov eax, [esp + " + hex(kCtxRegs + 0 * 8) + "]\n";
+    o += "mov ecx, [esp + " + hex(kCtxRegs + 1 * 8) + "]\n";
+    o += "mov edx, [esp + " + hex(kCtxRegs + 2 * 8) + "]\n";
+    o += "add esp, " + hex(kCtxSize) + "\n";
+    o += "pop edi\n pop esi\n pop ebp\n pop ebx\n";
+    // 终态：esp = entry rsp = native_sp；经 4B 退出槽间接跳（入口已预写
+    // VA(resume_rva)，ExitNative handler 命中时覆写为目标 VA）。Halt 与
+    // ExitNative 两条出口共用此通道（x64 形同构）。
+    o += "jmp dword ptr [esp - " + hex(kX86ExitSlotDepth) + "]\n";
+    return o;
+}
+
 } // namespace
 
 std::vector<u8> generate_entry_stub(u64 stub_rva, u64 blob_stream_rva, u64 rt_entry_rva,
-                                    u64 resume_rva, u64 image_base) {
+                                    u64 resume_rva, u64 image_base, StubArch arch) {
     ks_engine* ks = nullptr;
-    if (ks_open(KS_ARCH_X86, KS_MODE_64, &ks) != KS_ERR_OK)
+    if (ks_open(KS_ARCH_X86, arch == StubArch::X86 ? KS_MODE_32 : KS_MODE_64, &ks) !=
+        KS_ERR_OK)
         throw std::runtime_error("stub_link: ks_open failed");
     ks_option(ks, KS_OPT_SYNTAX, KS_OPT_SYNTAX_INTEL);
 
-    const std::string src = build_stub_asm(rt_entry_rva, resume_rva, image_base);
+    const std::string src =
+        arch == StubArch::X86
+            ? build_stub_asm_x86(rt_entry_rva, blob_stream_rva, resume_rva, image_base)
+            : build_stub_asm_x64(rt_entry_rva, resume_rva, image_base);
     // 调试钩子（排查用）：WVMP_STUB_DUMP=<win 路径> 时落盘汇编文本。
     {
         char* dp = nullptr;
@@ -182,8 +306,10 @@ std::vector<u8> generate_entry_stub(u64 stub_rva, u64 blob_stream_rva, u64 rt_en
         throw std::runtime_error("stub_link: ks_asm failed errno=" + std::to_string(int(err)) +
                                  " stmt#" + std::to_string(count));
 
-    // 回填 blob 指令流的 rip 相对 disp32：定位 dummy 值（LE 序列），计算真实位移。
+    // 回填 blob 指令流的 rip 相对 disp32（x64 形专属——x86 形 blob 指针为
+    // imm32 立即数，无占位）。定位 dummy 值（LE 序列），计算真实位移。
     // lea rax,[rip+disp32] 编码 48 8D 05 xx xx xx xx —— disp 起始在 dummy 处。
+    if (arch == StubArch::X64) {
     const u8 pat[4] = {u8(kBlobDispDummy & 0xFF), u8((kBlobDispDummy >> 8) & 0xFF),
                        u8((kBlobDispDummy >> 16) & 0xFF), u8((kBlobDispDummy >> 24) & 0xFF)};
     size_t found = SIZE_MAX;
@@ -202,6 +328,7 @@ std::vector<u8> generate_entry_stub(u64 stub_rva, u64 blob_stream_rva, u64 rt_en
     const u32 disp_u = static_cast<u32>(disp);
     for (int b = 0; b < 4; ++b)
         code[found + b] = u8((disp_u >> (8 * b)) & 0xFF);
+    }
     return code;
 }
 

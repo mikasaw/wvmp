@@ -6,17 +6,25 @@
 
 namespace wvmp::passes {
 
-// 生成单个被虚拟化函数的入口 stub（x64，位置无关）。
+// MIT-446 (X4) B.1：stub 目标架构。x64 = Win64 现形（逐字节不动，D2 恒等
+// 铁约束）；x86 = Win32 cdecl 形（4 callee-saved push / ctx 经栈参
+// [esp+0x14] 对接 runtime_x86 entry / ExitNative 消费 kX86ExitSlotDepth）。
+// stub_link pass 按 PeImage.machine 派发（machine=0x014C → X86）。
+enum class StubArch { X64, X86 };
+
+// 生成单个被虚拟化函数的入口 stub（位置无关）。
 //
 // stub 运行时职责：
-//   保存 callee-saved → 在栈上构造 VmContext → 预载全部 16 个 GP 虚拟寄存器
+//   保存 callee-saved → 在栈上构造 VmContext → 预载全部 GP 虚拟寄存器
 //   → 调用共享解释器入口 → HALT 返回后回写易失寄存器 → 恢复现场 →
 //   jmp 回原区域 end_rva（恢复执行原 .text 中的 end 标记调用之后流程）。
 //
 // 地址约定（全 RVA 坐标，与镜像基址无关）：
 //   - 以 at=stub_rva 汇编，`call <rt_entry_rva>` / `jmp <resume_rva>` 由
 //     汇编器按相对位移编码（运行时随基址平移自动正确）；
-//   - 唯一 rip 相对引用（blob 指令流指针）用占位 disp32 汇编后回填。
+//   - x64 唯一 rip 相对引用（blob 指令流指针）用占位 disp32 汇编后回填；
+//     x86 无 rip 寻址，blob 指针 = image_base + RVA 立即数（PE32 VA 恒
+//     < 4GB，imm32 可编码；ASLR 由 pe_writer 清 DYNAMIC_BASE 兜底）。
 //
 // image_base（PE optional header 的 ImageBase 字段）写入 VmContext+0x110
 // （即 scratch_mem 槽 = 运行时 Load/Store/Push/Pop 用的内存基址）。rip-relative
@@ -33,6 +41,7 @@ namespace wvmp::passes {
 // #33 §A 假设错 #11，详见 passes/pe_writer/src/pe_writer_pass.cpp 注释）。
 [[nodiscard]] std::vector<u8> generate_entry_stub(u64 stub_rva, u64 blob_stream_rva,
                                                   u64 rt_entry_rva, u64 resume_rva,
-                                                  u64 image_base);
+                                                  u64 image_base,
+                                                  StubArch arch = StubArch::X64);
 
 } // namespace wvmp::passes

@@ -2,13 +2,17 @@
 
 #include "stub_gen.hpp"
 
+#include "wvmp/common/bytes.hpp"
 #include "wvmp/framework/context.hpp"
 #include "wvmp/framework/diagnostics.hpp"
 #include "wvmp/framework/keys.hpp"
 #include "wvmp/framework/registry.hpp"
 #include "wvmp/passes/pe_loader/pe_image.hpp"
 #include "wvmp/passes/virtualize/virtualize_pass.hpp"
+#include "wvmp/regvm/isa/blob.hpp"
+#include "wvmp/regvm/isa/encoding.hpp"
 #include "wvmp/regvm/runtime/runtime.hpp"
+#include "wvmp/regvm/runtime/runtime_x86.hpp"
 #include "wvmp/vm/backend.hpp"
 
 #include <algorithm>
@@ -21,10 +25,40 @@
 namespace wvmp::passes {
 namespace {
 
+namespace isa = wvmp::regvm::isa;
+
 u64 align_up(u64 v, u64 a) { return a == 0 ? v : ((v + a - 1) / a) * a; }
 
 // RWX + 已初始化数据：解释器/字节码/stub 同节共存，v1 不做 W^X 分离。
 constexpr u32 kWvmpChars = 0xE000'0040;
+
+// IMAGE_FILE_MACHINE_I386（x86 32 位目标）。与 pe_loader/marker_scan 同值
+// 独立声明（模块边界，pe_image.cpp 解析白名单为单一语义源）。
+constexpr u16 kMachineX86 = 0x014C;
+
+// MIT-446 (X4)：x86 stub_link 白名单 gate —— blob 头 → 逐条解码指令流，
+// 返回出现在 x86 运行时跳表缺项的 opcode 列表（去重、保序）。空 = 全部可执行。
+// 跳表缺项折叠 Halt 是 C2 类静默错（翻译成功、区域覆写后运行即停），在
+// 覆写 .text 前拦成 C1 类显式 gate（整函数保持原生）。opcode 集合单一来源
+// = asmgen x86_handler_opcodes()（runtime_x86.hpp 契约），禁第二份清单。
+std::vector<int> unsupported_x86_ops(const std::vector<u8>& bytecode) {
+    std::vector<int> bad;
+    wvmp::ByteReader r{bytecode.data(), bytecode.size()};
+    const isa::VmBlob blob = isa::read_blob(r);
+    const std::span<const int> allowed =
+        wvmp::regvm::runtime::x86_handler_opcodes();
+    const size_t n = blob.stream.size() / 8;
+    for (size_t i = 0; i < n; ++i) {
+        u64 word = 0;
+        for (int b = 0; b < 8; ++b)
+            word |= u64(blob.stream[i * 8 + b]) << (8 * b);
+        const int op = int(isa::decode(word).op);
+        if (std::find(allowed.begin(), allowed.end(), op) == allowed.end()) {
+            if (bad.empty() || bad.back() != op) bad.push_back(op);
+        }
+    }
+    return bad;
+}
 
 } // namespace
 
@@ -61,8 +95,13 @@ void StubLinkPass::run(ProtectionContext& ctx) {
         throw std::runtime_error(std::string(name()) + ": pe image model missing");
     }
 
-    // 共享解释器（寄存器分配随机化走 ctx.rng）。
-    const regvm::runtime::RuntimeGenResult rt = regvm::runtime::generate_runtime(ctx.rng);
+    // 共享解释器（寄存器分配随机化走 ctx.rng）。MIT-446 (X4) B.1：按
+    // PeImage.machine 分叉 arch——x86 目标产出 KS_MODE_32 码体
+    // （generate_runtime_x86）+ Win32 cdecl stub；x64 路径逐字节不变。
+    const bool is_x86 = pe->machine == kMachineX86;
+    const regvm::runtime::RuntimeGenResult rt =
+        is_x86 ? regvm::runtime::generate_runtime_x86(ctx.rng)
+               : regvm::runtime::generate_runtime(ctx.rng);
 
     // 新节 RVA：既有节虚拟末端之后按 SectionAlignment 对齐。
     u64 sec_align = pe->section_alignment != 0 ? pe->section_alignment : 0x1000;
@@ -84,6 +123,22 @@ void StubLinkPass::run(ProtectionContext& ctx) {
     std::vector<Patch> patches;
 
     for (const auto& vf : *vfs) {
+        // MIT-446 (X4)：x86 白名单 gate——字节码含 x86 运行时跳表缺项
+        // VmOp（SSE 族 32 / Div / Idiv 等"仍纸面"面）的函数整函数保持原生，
+        // 阻断 C2 类静默错（翻译成功、区域覆写后运行即 Halt）。x64 路径
+        // 不经过本 gate（行为零变化）。
+        if (is_x86) {
+            const std::vector<int> bad = unsupported_x86_ops(vf.program.bytecode);
+            if (!bad.empty()) {
+                std::string ops;
+                for (int op : bad) ops += " " + std::to_string(op);
+                ctx.diag.report(Severity::Note, name(),
+                                "函数 " + vf.name + " 含 x86 运行时未支持的 VmOp" +
+                                    "（opcode:" + ops +
+                                    " ），跳过虚拟化（保持原生，x86 白名单 gate）");
+                continue;
+            }
+        }
         // blob：VmProgram.bytecode 已是 32B 头 + 8xN 流的完整序列化。
         const u64 blob_off = align_up(payload.size(), 8);
         payload.resize(static_cast<size_t>(blob_off), 0);
@@ -100,7 +155,8 @@ void StubLinkPass::run(ProtectionContext& ctx) {
             // `[addr + image_base]`. 翻译期算的 RVA（rip-relative 转绝对）
             // + 此基址 = 实际 VA. ASLR 下基址变化不影响 RVA, 槽值不变.
             stub = generate_entry_stub(stub_rva, blob_stream_rva, rt_entry, vf.end_rva,
-                                       pe->image_base);
+                                       pe->image_base,
+                                       is_x86 ? StubArch::X86 : StubArch::X64);
         } catch (const std::exception& e) {
             ctx.diag.report(Severity::Error, name(),
                             "函数 " + vf.name + " stub 生成失败（保持原生）: " + e.what());

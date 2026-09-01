@@ -250,14 +250,25 @@ constexpr u64 kX86CallgateWindow = 0x1000;  // 4KB callee 窗口
 static_assert(kX86CallgateWindow % 16 == 0,
               "x86 callee window must be 16-aligned to keep the call-site rsp residue unchanged");
 
-// MIT-445 (X3c B.2)：x86 4B 退出槽深度（X0 §3.2-C(4) x86 形）。槽地址 =
-// native_sp - kX86ExitSlotDepth（dword；native_sp = [ctx+0x120]，stub/电池
-// 预置）。x64 同构公式 kExitSlotDepth = stub push + kCtxSize + 0x80 余量，
-// x86 侧 stub push 面 = 4（X4 stub 的 4 callee-saved push 对应面）；余量
-// 0x80 同 x64（disp8 边界纪律）。runtime.hpp 冻结零触碰——本常量 = x86 面
-// 私有（asmgen.cpp 单一来源），X4 stub_gen 读侧对接锚，禁字面量第二份。
-constexpr u64 kX86ExitSlotDepth = 4 * 4 + kCtxSize + 0x80;  // 0x10+0x1C8+0x80 = 0x258
-static_assert(kX86ExitSlotDepth == 0x258, "x86 exit slot depth regressed");
+// MIT-446 (X4) B.1：x86 callgate cdecl 参数窗宽度（dword 计数）。
+// 协议（build_callgate_x86 与 stub_gen 两处同步锚④的落地形态）：
+//   guest 侧 = 区域代码把 cdecl 栈参数写在 [v4 + 4*i]（i=0..N-1，v4 = guest
+//   esp = ctx rsp 槽）——即原生 `push` 反序后的内存形，且全部落在
+//   "guest 栈写恒 ≥ ns" 规则的安全区（v4 起、向上）。真实样本按此约定手编
+//   （prologue 预留 esp 上方 scratch：`mov [esp+k], arg; call f`）。
+//   handler 侧 = call 前从 [v4 + 4*i] 固定预置 kX86CallgateArgDwords 个
+//   dword 到 callee 窗口（i 逆序 push → arg0 落最低），cdecl caller-cleans
+//   语义下多预置无害：0-arg callee 不读参数、esp 由 host_rsp 重基统一回收。
+//   固定宽 = 翻译层无需 arg_count 通路（cond_or_size 维持 0），零协议新面。
+constexpr u64 kX86CallgateArgDwords = 4;
+static_assert(kX86CallgateArgDwords * 4 <= kX86CallgateWindow,
+              "x86 callgate fixed argument window must fit the callee window");
+
+// MIT-445 (X3c B.2)：x86 4B 退出槽深度 —— MIT-446 (X4) 起定义上移
+// runtime_x86.hpp（stub_gen 读侧跨 TU 消费的单一来源）；本文件保留
+// static_assert 防漂移。
+static_assert(kX86ExitSlotDepth == 4 * 4 + kCtxSize + 0x80,
+              "kX86ExitSlotDepth derivation drifted from runtime_x86.hpp");
 
 // MIT-445 (X3c B.3)：Ret x86 出口栈坐标（build_ret_x86 专用派生）。
 // handler 中段把 v4'（清栈后 guest esp）push 到宿主栈暂存——出口时刻
@@ -4790,9 +4801,10 @@ public:
     // 低 dword，槽值 = 绝对 VA，"槽高半字恒 0" 不变量下 dword 读即全值）。
     //
     // x86 协议面与 x64 的结构差异（逐条对账）：
-    //   1) 参数窗：Win32 cdecl 参数走栈，本 handler 不预置任何栈参数
-    //      （v1 = 0-arg；派单 D2 拍板"x86 参数窗不为 X3c 特化，留 stub_gen
-    //      cdecl 对接"——X4 落参数窗时两处同步：本 handler + stub_gen）。
+    //   1) 参数窗：Win32 cdecl 参数走栈——MIT-446 (X4) B.1 落地固定参数窗
+    //      预置（step 2.5，guest [v4+4i] → 窗口，协议见 kX86CallgateArgDwords
+    //      注；445 D2 "不特化" 挂账翻案，build_callgate_x86 与 stub_gen 两处
+    //      同步锚④闭合）。
     //   2) 窗口锚：host_rsp（[ctx+0x128]，entry 落账）自洽，无需 native_sp
     //      预置（x64 用 [ctx+0x120]+kPushCtxDepth 常量回退——stub 帧 ctx 区
     //      固定位移；x86 直接重读 host_rsp，跨 call 稳定语义相同且电池/
@@ -4837,7 +4849,17 @@ public:
         o += std::string("    shl ") + r32x(t_[1]) + ", " + imm(kCallgateAlignShift) + "\n";
         o += std::string("    mov esp, ") + r32x(t_[1]) + "\n";
         o += std::string("    mov dword ptr [") + r32x(t_[1]) + "], 0\n";
-        // step 3: call native（cdecl 0-arg；参数窗 = X4 stub_gen 对接面）
+        // step 2.5: cdecl 参数窗预置（MIT-446 X4 B.1，协议见
+        // kX86CallgateArgDwords 注——guest [v4+4i] 固定 4 dword 逆序 push，
+        // arg0 落最低；多预置在 cdecl caller-cleans + host_rsp 重基下无害）。
+        // t_[1]（窗口已切，值已消费）改载 guest v4；t_[0] = 目标 VA 跨步存活。
+        o += std::string("    mov ") + r32x(t_[1]) + ", dword ptr [" + r32x(ctx_) +
+             " + " + imm(kX86RspSlotOff) + "]\n";
+        for (u64 i = kX86CallgateArgDwords; i-- > 0;) {
+            o += std::string("    push dword ptr [") + r32x(t_[1]) + " + " +
+                 imm(i * 4) + "]\n";
+        }
+        // step 3: call native（cdecl 参数窗已预置；esp 由 step 4 host_rsp 重基回收）
         o += std::string("    call ") + r32x(t_[0]) + "\n";
         // step 4: esp 重基（host_rsp 单一来源，跨 call 稳定）
         o += std::string("    mov esp, dword ptr [") + r32x(ctx_) + " + 0x128]\n";
@@ -5139,6 +5161,84 @@ struct HandlerDef {
     std::string (AsmGen::*build)(u64) const;
 };
 
+// MIT-446 (X4)：x86 handler 表定义提为独立函数 —— generate_runtime_arch 的
+// X86 分支与 x86_handler_opcodes()（stub_link 白名单 gate）共用同一份清单，
+// 表加行两处自动跟随，禁第二份手抄（MIT-B2 单一来源纪律）。
+std::vector<HandlerDef> x86_handler_table() {
+    using isa::VmOp;
+    return {
+        {int(VmOp::Mov), "mov", &AsmGen::build_x86_mov},
+        {int(VmOp::Lea), "lea", &AsmGen::build_x86_mov},
+        {int(VmOp::Add), "add", &AsmGen::build_x86_add},
+        {int(VmOp::Sub), "sub", &AsmGen::build_x86_sub},
+        {int(VmOp::And), "and", &AsmGen::build_x86_and},
+        {int(VmOp::Or), "or", &AsmGen::build_x86_or},
+        {int(VmOp::Xor), "xor", &AsmGen::build_x86_xor},
+        {int(VmOp::Cmp), "cmp", &AsmGen::build_x86_cmp},
+        {int(VmOp::Test), "test", &AsmGen::build_x86_test},
+        {int(VmOp::Inc), "inc", &AsmGen::build_x86_inc},
+        {int(VmOp::Dec), "dec", &AsmGen::build_x86_dec},
+        {int(VmOp::Load), "load", &AsmGen::build_x86_load},
+        {int(VmOp::Store), "store", &AsmGen::build_x86_store},
+        {int(VmOp::Jmp), "jmp", &AsmGen::build_x86_jmp},
+        {int(VmOp::Jcc), "jcc", &AsmGen::build_x86_jcc},
+        {int(VmOp::Nop), "nop", &AsmGen::build_x86_nop},
+        {int(VmOp::Halt), "halt", &AsmGen::build_x86_halt},
+        {int(VmOp::GetFlags), "getflags", &AsmGen::build_x86_getflags},
+        {int(VmOp::SetFlags), "setflags", &AsmGen::build_x86_setflags},
+        // —— X3b (MIT-444) A 档批次一：一元 / 带进借位二元 / 乘法 / 符号扩展 ——
+        {int(VmOp::Not), "not", &AsmGen::build_x86_not},
+        {int(VmOp::Neg), "neg", &AsmGen::build_x86_neg},
+        {int(VmOp::Adc), "adc", &AsmGen::build_x86_adc},
+        {int(VmOp::Sbb), "sbb", &AsmGen::build_x86_sbb},
+        {int(VmOp::Imul), "imul", &AsmGen::build_x86_imul},
+        {int(VmOp::Mul), "mul", &AsmGen::build_x86_mul},
+        {int(VmOp::Cdq), "cdq", &AsmGen::build_x86_cdq},
+        // —— X3b (MIT-444) A 档批次二：移位/旋转族（imm + cl 变体）——
+        {int(VmOp::Shl), "shl", &AsmGen::build_x86_shl},
+        {int(VmOp::Shr), "shr", &AsmGen::build_x86_shr},
+        {int(VmOp::Sar), "sar", &AsmGen::build_x86_sar},
+        {int(VmOp::Rol), "rol", &AsmGen::build_x86_rol},
+        {int(VmOp::Ror), "ror", &AsmGen::build_x86_ror},
+        {int(VmOp::ShlCl), "shlcl", &AsmGen::build_x86_shl_cl},
+        {int(VmOp::ShrCl), "shrcl", &AsmGen::build_x86_shr_cl},
+        {int(VmOp::SarCl), "sarcl", &AsmGen::build_x86_sar_cl},
+        {int(VmOp::RolCl), "rolcl", &AsmGen::build_x86_rol_cl},
+        {int(VmOp::RorCl), "rorcl", &AsmGen::build_x86_ror_cl},
+        // —— X3b (MIT-444) A 档批次三：扩展传送 / 字节序 / 交换族 ——
+        {int(VmOp::Movzx), "movzx", &AsmGen::build_x86_movzx},
+        {int(VmOp::MovzxMem), "movzxmem", &AsmGen::build_x86_movzx_mem},
+        {int(VmOp::Movsx), "movsx", &AsmGen::build_x86_movsx},
+        {int(VmOp::MovsxMem), "movsxmem", &AsmGen::build_x86_movsx_mem},
+        {int(VmOp::Bswap), "bswap", &AsmGen::build_x86_bswap},
+        {int(VmOp::Xchg), "xchg", &AsmGen::build_x86_xchg},
+        // —— X3b (MIT-444) A 档批次四：条件族（reads-flags 面）——
+        {int(VmOp::Setcc), "setcc", &AsmGen::build_x86_setcc},
+        {int(VmOp::Cmovcc), "cmovcc", &AsmGen::build_x86_cmovcc},
+        // —— X3b (MIT-444) A 档批次五：位计数 / 锁原子族 ——
+        {int(VmOp::Popcnt), "popcnt", &AsmGen::build_x86_popcnt},
+        {int(VmOp::Lzcount), "lzcnt", &AsmGen::build_x86_lzcnt},
+        {int(VmOp::Tzcount), "tzcnt", &AsmGen::build_x86_tzcnt},
+        {int(VmOp::Cmpxchg), "cmpxchg", &AsmGen::build_x86_cmpxchg},
+        {int(VmOp::Xadd), "xadd", &AsmGen::build_x86_xadd},
+        {int(VmOp::Bts), "bts", &AsmGen::build_x86_bts},
+        {int(VmOp::Btr), "btr", &AsmGen::build_x86_btr},
+        {int(VmOp::Btc), "btc", &AsmGen::build_x86_btc},
+        // —— X3b (MIT-444) B 档 GP：栈原语（4B 槽裁决）+ RVA 族 ——
+        {int(VmOp::Push), "push", &AsmGen::build_x86_push},
+        {int(VmOp::Pop), "pop", &AsmGen::build_x86_pop},
+        {int(VmOp::LoadRva), "loadrva", &AsmGen::build_x86_loadrva},
+        {int(VmOp::StoreRva), "storeriva", &AsmGen::build_x86_storerva},
+        {int(VmOp::LeaRva), "learva", &AsmGen::build_x86_learva},
+        // —— X3c (MIT-445) 协议面批次一：CallGate reg 值目标 + RVA 双形 ——
+        {int(VmOp::CallGate), "callgate", &AsmGen::build_x86_callgate},
+        // —— X3c (MIT-445) 协议面批次二：ExitNative 4B 退出槽 ——
+        {int(VmOp::ExitNative), "exitnative", &AsmGen::build_x86_exitnative},
+        // —— X3c (MIT-445) 协议面批次三：Ret 4B 清栈返回 ——
+        {int(VmOp::Ret), "ret", &AsmGen::build_x86_ret},
+    };
+}
+
 } // namespace
 
 // MIT-443 (X3a)：双模管线。x64 路径（arch=X64）逐字保留既有序列 —— roll/
@@ -5176,77 +5276,9 @@ RuntimeGenResult generate_runtime_arch(wvmp::Rng& rng, AsmGen::HostArch arch) {
     //    docs/GAPS.md X3b/X3c 节。
     std::vector<HandlerDef> handlers;
     if (arch == AsmGen::HostArch::X86) {
-        handlers = {
-            {int(VmOp::Mov), "mov", &AsmGen::build_x86_mov},
-            {int(VmOp::Lea), "lea", &AsmGen::build_x86_mov},
-            {int(VmOp::Add), "add", &AsmGen::build_x86_add},
-            {int(VmOp::Sub), "sub", &AsmGen::build_x86_sub},
-            {int(VmOp::And), "and", &AsmGen::build_x86_and},
-            {int(VmOp::Or), "or", &AsmGen::build_x86_or},
-            {int(VmOp::Xor), "xor", &AsmGen::build_x86_xor},
-            {int(VmOp::Cmp), "cmp", &AsmGen::build_x86_cmp},
-            {int(VmOp::Test), "test", &AsmGen::build_x86_test},
-            {int(VmOp::Inc), "inc", &AsmGen::build_x86_inc},
-            {int(VmOp::Dec), "dec", &AsmGen::build_x86_dec},
-            {int(VmOp::Load), "load", &AsmGen::build_x86_load},
-            {int(VmOp::Store), "store", &AsmGen::build_x86_store},
-            {int(VmOp::Jmp), "jmp", &AsmGen::build_x86_jmp},
-            {int(VmOp::Jcc), "jcc", &AsmGen::build_x86_jcc},
-            {int(VmOp::Nop), "nop", &AsmGen::build_x86_nop},
-            {int(VmOp::Halt), "halt", &AsmGen::build_x86_halt},
-            {int(VmOp::GetFlags), "getflags", &AsmGen::build_x86_getflags},
-            {int(VmOp::SetFlags), "setflags", &AsmGen::build_x86_setflags},
-            // —— X3b (MIT-444) A 档批次一：一元 / 带进借位二元 / 乘法 / 符号扩展 ——
-            {int(VmOp::Not), "not", &AsmGen::build_x86_not},
-            {int(VmOp::Neg), "neg", &AsmGen::build_x86_neg},
-            {int(VmOp::Adc), "adc", &AsmGen::build_x86_adc},
-            {int(VmOp::Sbb), "sbb", &AsmGen::build_x86_sbb},
-            {int(VmOp::Imul), "imul", &AsmGen::build_x86_imul},
-            {int(VmOp::Mul), "mul", &AsmGen::build_x86_mul},
-            {int(VmOp::Cdq), "cdq", &AsmGen::build_x86_cdq},
-            // —— X3b (MIT-444) A 档批次二：移位/旋转族（imm + cl 变体）——
-            {int(VmOp::Shl), "shl", &AsmGen::build_x86_shl},
-            {int(VmOp::Shr), "shr", &AsmGen::build_x86_shr},
-            {int(VmOp::Sar), "sar", &AsmGen::build_x86_sar},
-            {int(VmOp::Rol), "rol", &AsmGen::build_x86_rol},
-            {int(VmOp::Ror), "ror", &AsmGen::build_x86_ror},
-            {int(VmOp::ShlCl), "shlcl", &AsmGen::build_x86_shl_cl},
-            {int(VmOp::ShrCl), "shrcl", &AsmGen::build_x86_shr_cl},
-            {int(VmOp::SarCl), "sarcl", &AsmGen::build_x86_sar_cl},
-            {int(VmOp::RolCl), "rolcl", &AsmGen::build_x86_rol_cl},
-            {int(VmOp::RorCl), "rorcl", &AsmGen::build_x86_ror_cl},
-            // —— X3b (MIT-444) A 档批次三：扩展传送 / 字节序 / 交换族 ——
-            {int(VmOp::Movzx), "movzx", &AsmGen::build_x86_movzx},
-            {int(VmOp::MovzxMem), "movzxmem", &AsmGen::build_x86_movzx_mem},
-            {int(VmOp::Movsx), "movsx", &AsmGen::build_x86_movsx},
-            {int(VmOp::MovsxMem), "movsxmem", &AsmGen::build_x86_movsx_mem},
-            {int(VmOp::Bswap), "bswap", &AsmGen::build_x86_bswap},
-            {int(VmOp::Xchg), "xchg", &AsmGen::build_x86_xchg},
-            // —— X3b (MIT-444) A 档批次四：条件族（reads-flags 面）——
-            {int(VmOp::Setcc), "setcc", &AsmGen::build_x86_setcc},
-            {int(VmOp::Cmovcc), "cmovcc", &AsmGen::build_x86_cmovcc},
-            // —— X3b (MIT-444) A 档批次五：位计数 / 锁原子族 ——
-            {int(VmOp::Popcnt), "popcnt", &AsmGen::build_x86_popcnt},
-            {int(VmOp::Lzcount), "lzcnt", &AsmGen::build_x86_lzcnt},
-            {int(VmOp::Tzcount), "tzcnt", &AsmGen::build_x86_tzcnt},
-            {int(VmOp::Cmpxchg), "cmpxchg", &AsmGen::build_x86_cmpxchg},
-            {int(VmOp::Xadd), "xadd", &AsmGen::build_x86_xadd},
-            {int(VmOp::Bts), "bts", &AsmGen::build_x86_bts},
-            {int(VmOp::Btr), "btr", &AsmGen::build_x86_btr},
-            {int(VmOp::Btc), "btc", &AsmGen::build_x86_btc},
-            // —— X3b (MIT-444) B 档 GP：栈原语（4B 槽裁决）+ RVA 族 ——
-            {int(VmOp::Push), "push", &AsmGen::build_x86_push},
-            {int(VmOp::Pop), "pop", &AsmGen::build_x86_pop},
-            {int(VmOp::LoadRva), "loadrva", &AsmGen::build_x86_loadrva},
-            {int(VmOp::StoreRva), "storeriva", &AsmGen::build_x86_storerva},
-            {int(VmOp::LeaRva), "learva", &AsmGen::build_x86_learva},
-            // —— X3c (MIT-445) 协议面批次一：CallGate reg 值目标 + RVA 双形 ——
-            {int(VmOp::CallGate), "callgate", &AsmGen::build_x86_callgate},
-            // —— X3c (MIT-445) 协议面批次二：ExitNative 4B 退出槽 ——
-            {int(VmOp::ExitNative), "exitnative", &AsmGen::build_x86_exitnative},
-            // —— X3c (MIT-445) 协议面批次三：Ret 4B 清栈返回 ——
-            {int(VmOp::Ret), "ret", &AsmGen::build_x86_ret},
-        };
+        // MIT-446 (X4)：表定义提为 x86_handler_table()（与 x86_handler_opcodes
+        // 白名单 gate 共用单一来源，本文件上方注）。
+        handlers = x86_handler_table();
     } else {
         handlers = {
         {int(VmOp::Mov), "mov", &AsmGen::build_mov},
@@ -5471,6 +5503,20 @@ RuntimeGenResult generate_runtime(wvmp::Rng& rng) {
 // x86 入口（runtime_x86.hpp，MIT-443 (X3a)）：KS_MODE_32 码体 + 电池集 handler。
 RuntimeGenResult generate_runtime_x86(wvmp::Rng& rng) {
     return generate_runtime_arch(rng, AsmGen::HostArch::X86);
+}
+
+// MIT-446 (X4)：x86 已登记 opcode 清单（runtime_x86.hpp 契约）。单一来源 =
+// x86_handler_table()；函数级 static 保证只构建一次。stub_link 的 x86 白名
+// 单 gate 据此在覆写 .text 前拦截"字节码含跳表缺项 VmOp"的函数（整函数保
+// 持原生），把跳表折叠 Halt 的 C2 类静默错变成 C1 类显式 gate。
+std::span<const int> x86_handler_opcodes() {
+    static const std::vector<int> ops = [] {
+        std::vector<int> v;
+        v.reserve(x86_handler_table().size());
+        for (const HandlerDef& h : x86_handler_table()) v.push_back(h.opcode);
+        return v;
+    }();
+    return ops;
 }
 
 } // namespace wvmp::regvm::runtime

@@ -2,7 +2,23 @@
 #include "wvmp/common/rng.hpp"
 #include "wvmp/regvm/runtime/runtime.hpp"
 
+#include <span>
+
 namespace wvmp::regvm::runtime {
+
+// MIT-445 (X3c B.2) 定义、MIT-446 (X4) 迁移：x86 4B 退出槽深度（X0 §3.2-C(4)
+// x86 形）。槽地址 = native_sp - kX86ExitSlotDepth（dword；native_sp =
+// [ctx+0x120]，stub/电池预置）。x64 同构公式 kExitSlotDepth = stub push +
+// kCtxSize + 0x80 余量，x86 侧 stub push 面 = 4（X4 stub 的 4 callee-saved
+// push 对应面）；余量 0x80 同 x64（disp8 边界纪律）。runtime.hpp 冻结零触碰
+// ——本常量 = x86 面私有单一来源（原定义在 asmgen.cpp 匿名 namespace，X4
+// stub_gen 读侧对接需跨 TU 消费，按 B2 单一来源纪律上移本头；asmgen.cpp 保留
+// static_assert 防漂移）。
+//   stub 入口（esp = ns - 0x10 - kCtxSize）:  mov [esp - 0x80], <VA>
+//   stub HALT 段（esp = ns）:                 jmp dword ptr [esp - 0x258]
+//   ExitNative handler（native_sp 基准）:     [ns - 0x258]
+inline constexpr u64 kX86ExitSlotDepth = 4 * 4 + kCtxSize + 0x80;  // 0x10+0x1C8+0x80 = 0x258
+static_assert(kX86ExitSlotDepth == 0x258, "x86 exit slot depth regressed");
 
 // =============================================================================
 // MIT-443 (X3a)：x86 (KS_MODE_32) 解释器码体生成入口 —— asmgen 双模的 32 位面。
@@ -36,5 +52,12 @@ namespace wvmp::regvm::runtime {
 // 布局/两遍法/随机化机制与 generate_runtime 相同（runtime.hpp 注）；失败抛
 // std::runtime_error。线程安全性：单线程保护管道内使用（Rng 非线程安全）。
 [[nodiscard]] RuntimeGenResult generate_runtime_x86(wvmp::Rng& rng);
+
+// MIT-446 (X4)：x86 运行时跳表已登记的 opcode 集合（= asmgen.cpp x86 handler
+// 表的 opcode 列，单一事实来源——表加行本函数自动跟随，禁第二份手抄清单）。
+// 消费方 = stub_link pass 的 x86 白名单 gate：字节码含集合外 VmOp 的函数整函
+// 数保持原生（跳表缺项折叠 Halt 的 C2 类静默错在覆写 .text 前拦截）。
+// 返回值指向函数级 static 存储，进程期内有效；单线程管道内使用。
+[[nodiscard]] std::span<const int> x86_handler_opcodes();
 
 } // namespace wvmp::regvm::runtime
