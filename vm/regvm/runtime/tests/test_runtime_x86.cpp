@@ -36,6 +36,8 @@
 
 #include <windows.h>
 
+#include <setjmp.h>
+
 #include <array>
 #include <cstdint>
 #include <cstdio>
@@ -2131,4 +2133,106 @@ TEST(X86Battery, ExitNativeCondTakenAndFallthrough) {
         EXPECT_EQ(ctx.pc, 4u);   // ExitNative advance + Halt pc+1
         EXPECT_EQ(ctx.ret_value, 0u);
     }
+}
+
+// ---------------------------------------------------------------------------
+// (34)(35) X3c B.3：Ret 4B 清栈返回真执行断言——handler 出口 jmp 到 guest
+//      返回地址（naked landing 捕获物理 esp/eax 后 longjmp 回测试），栈平衡
+//      与易失写回 (eax) 双断言。guest 栈 = 静态缓冲（零宿主栈碰撞）。
+// ---------------------------------------------------------------------------
+static unsigned long g_xret_stack[64];            // guest 栈缓冲
+static unsigned long g_xret_land_esp = 0;
+static unsigned long g_xret_land_eax = 0;
+static jmp_buf g_xret_env;
+static void xret_guest_land_cpp(void);   // 前置声明（naked asm jmp 目标）
+
+// naked landing：Ret handler `jmp [esp-4]` 进入时物理 esp = v4'（guest 栈），
+// 无 prologue 直接捕获（普通函数 prologue 会先压栈破坏 v4' 观察）。
+static void __declspec(naked) xret_guest_land(void) {
+    __asm {
+        mov g_xret_land_esp, esp
+        mov g_xret_land_eax, eax
+        jmp xret_guest_land_cpp
+    }
+}
+static void xret_guest_land_cpp(void) {
+    longjmp(g_xret_env, 42);
+}
+
+// MSVC: setjmp 与 C++ 对象交互为非可移植面 (/WX C4611)——本文件的 setjmp/
+// longjmp 域内无带析构的 C++ 局部对象（见各用例结构注），显式屏蔽。
+#pragma warning(disable : 4611)
+static isa::VmInsn ret_insn(u32 imm) {
+    return isa::make_insn(isa::VmOp::Ret, isa::OpKind::None, 0,
+                          isa::OpKind::None, 0, imm, isa::size_field(ir::Size::S64));
+}
+static isa::VmInsn push_reg(u8 slot) {
+    return isa::make_insn(isa::VmOp::Push, isa::OpKind::Reg, slot,
+                          isa::OpKind::None, 0, 0, isa::size_field(ir::Size::S32));
+}
+
+TEST(X86Battery, RetPlainStackBalance) {
+    wvmp::Rng rng(12345);
+    const auto gen = rt::generate_runtime_x86(rng);
+    RwxImage rwx(gen.image.code);
+    const u32 guest_top = reinterpret_cast<u32>(g_xret_stack + 48);
+    const u32 land = reinterpret_cast<u32>(&xret_guest_land);
+    std::vector<u8> s;
+    isa::append_insn(s, mov_imm(4, guest_top));                          // 0  v4 = top
+    isa::append_insn(s, mov_imm(5, land));                               // 1  v5 = &land
+    isa::append_insn(s, push_reg(5));                                    // 2  [top-4]=land, v4=top-4
+    isa::append_insn(s, mov_imm(0, 0xBEEF));                             // 3  v0 = 返回值
+    isa::append_insn(s, ret_insn(0));                                    // 4  plain ret
+    rt::VmContext ctx;
+    ctx.bytecode = s.data();
+    ctx.pc = 0;
+    ctx.scratch_mem = 0;
+    ctx.regs[isa::vm_reg_of(ir::Reg::Rsp)] = 0;
+    memset(g_xret_stack, 0, sizeof(g_xret_stack));
+    g_xret_land_esp = 0;
+    g_xret_land_eax = 0;
+    if (setjmp(g_xret_env) == 0) {
+        rwx.entry()(&ctx);
+        FAIL() << "Ret handler did not exit to guest caller";
+    }
+    EXPECT_EQ(g_xret_land_esp, guest_top);   // v4' = top-4+4+0 = top（平衡）
+    EXPECT_EQ(g_xret_land_eax, 0xBEEFu);     // 易失写回 eax ← regs[0]
+    // v4' 持久化 [ctx+0x30]（低 dword；高半字 0 不变量）。
+    EXPECT_EQ(ctx.regs[isa::vm_reg_of(ir::Reg::Rsp)], static_cast<u64>(guest_top));
+}
+
+TEST(X86Battery, RetImm16StackBalance) {
+    wvmp::Rng rng(12345);
+    const auto gen = rt::generate_runtime_x86(rng);
+    RwxImage rwx(gen.image.code);
+    const u32 guest_top = reinterpret_cast<u32>(g_xret_stack + 48);
+    const u32 land = reinterpret_cast<u32>(&xret_guest_land);
+    std::vector<u8> s;
+    // stdcall 栈序：caller 先压参数（高位地址）、`call` 最后压 retaddr
+    // （[v4]）；被调方 `ret 8` 弹 retaddr 后再丢弃 8B 参数 → esp 回到压参前。
+    const u32 work_top = guest_top + 8;                                  // 预留 2 个参数槽
+    isa::append_insn(s, mov_imm(4, work_top));                           // 0  v4 = work_top
+    isa::append_insn(s, mov_imm(5, land));                               // 1
+    isa::append_insn(s, mov_imm(6, 0x77));                               // 2  arg 1
+    isa::append_insn(s, push_reg(6));                                    // 3  [work_top-4]=0x77, v4=work_top-4
+    isa::append_insn(s, mov_imm(6, 0x99));                               // 4  arg 2
+    isa::append_insn(s, push_reg(6));                                    // 5  [work_top-8]=0x99, v4=work_top-8
+    isa::append_insn(s, push_reg(5));                                    // 6  [work_top-0xC]=land, v4=work_top-0xC
+    isa::append_insn(s, ret_insn(8));                                    // 7  ret 8 清栈
+    rt::VmContext ctx;
+    ctx.bytecode = s.data();
+    ctx.pc = 0;
+    ctx.scratch_mem = 0;
+    ctx.regs[isa::vm_reg_of(ir::Reg::Rsp)] = 0;
+    memset(g_xret_stack, 0, sizeof(g_xret_stack));
+    g_xret_land_esp = 0;
+    g_xret_land_eax = 0;
+    if (setjmp(g_xret_env) == 0) {
+        rwx.entry()(&ctx);
+        FAIL() << "Ret handler did not exit to guest caller";
+    }
+    // v4' = (work_top-0xC)+4+8 = work_top = guest_top+8 —— 弹 retaddr + 丢
+    // 2 个参数槽：被调方清栈（stdcall 形）后 esp 回到压参前原点（栈平衡）。
+    EXPECT_EQ(g_xret_land_esp, work_top);
+    EXPECT_EQ(ctx.regs[isa::vm_reg_of(ir::Reg::Rsp)], static_cast<u64>(work_top));
 }

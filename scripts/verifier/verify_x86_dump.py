@@ -12,7 +12,7 @@ Why this gate exists:
        entry 首四条 = push/call/pop/sub（D2 call/pop idiom）；
     3. dispatch 含 and <r>, 0x7f（kTableEntries-1 掩码）+ 间接 jmp（D3 8B
        表项决策的落地证据）；
-    4. 电池集 handler（X3c 批次二起 59）全部在 dump 中登记（跳表缺项折叠 Halt 的
+    4. 电池集 handler（X3c 批次三起 60）全部在 dump 中登记（跳表缺项折叠 Halt 的
        对账面），
        每个登记 handler 的码体反汇编至少含 1 条指令（空 handler 检测）；
     5. 硬条款：立即数十六进制纪律（capstone 显示 0x 口径）与
@@ -58,8 +58,9 @@ BATTERY_HANDLERS = {
     "popcnt", "lzcnt", "tzcnt", "cmpxchg", "xadd", "bts", "btr", "btc",
     # X3b (MIT-444) B 档 GP：栈原语（4B 槽裁决）+ RVA 族。
     "push", "pop", "loadrva", "storeriva", "learva",
-    # X3c (MIT-445) 协议面：CallGate reg 值目标 + RVA 双形 / ExitNative 4B 槽。
-    "callgate", "exitnative",
+    # X3c (MIT-445) 协议面：CallGate reg 值目标 + RVA 双形 / ExitNative 4B 槽
+    # / Ret 4B 清栈返回。
+    "callgate", "exitnative", "ret",
 }
 
 HEADER_RE = re.compile(

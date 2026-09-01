@@ -259,6 +259,17 @@ static_assert(kX86CallgateWindow % 16 == 0,
 constexpr u64 kX86ExitSlotDepth = 4 * 4 + kCtxSize + 0x80;  // 0x10+0x1C8+0x80 = 0x258
 static_assert(kX86ExitSlotDepth == 0x258, "x86 exit slot depth regressed");
 
+// MIT-445 (X3c B.3)：Ret x86 出口栈坐标（build_ret_x86 专用派生）。
+// handler 中段把 v4'（清栈后 guest esp）push 到宿主栈暂存——出口时刻
+// callee-saved 已被 pop 恢复为宿主值，ctx 寄存器不可用（x64 以 [rsp-0x1D8]
+// 栈坐标读 ctx 区同哲学；x86 的 ctx 结构位置不定（电池/未来 stub 布局），
+// 故以"push 暂存 + 终态 esp 相对读"表达）：
+//   终态 esp 前进量 = kX86FrameSize + 4（弃帧 + 顶出 v4' 暂存槽）
+//   v4' 暂存槽相对终态 esp 偏移 = 前进量 + 4 pop（= 0x38，读发生在变更前）
+constexpr u64 kX86RetExitFrameAdvance = kX86FrameSize + 4;
+constexpr u64 kX86RetV4SlotFromExitRsp = kX86RetExitFrameAdvance + 4 * 4;
+static_assert(kX86RetV4SlotFromExitRsp == 0x38, "x86 ret exit rsp coordinates regressed");
+
 // x86 guest rsp 槽偏移（v4 = vm_reg_of(Rsp) = 4 → 4*8+0x10）。8B 槽、值恒 32
 // 位零扩展（"槽高半字恒 0" 不变量）⇒ 槽算术走 dword 低半字（4B 步进裁决，
 // build_push_x86 注）。
@@ -3550,7 +3561,7 @@ public:
 
     // =======================================================================
     // MIT-443 (X3a)：x86 (KS_MODE_32) 码体生成面 —— X3b 起 57 handler
-    //（X3c 批次二后 59：+ CallGate/ExitNative）。
+    //（X3c 批次三后 60：协议面三件套收口）。
     //
     // 与 x64 面的关系：x64 emit 代码一概不经此处（arch 分叉收敛在 KsSession
     // 模式 / roll / build_entry / build_dispatch / handler 表选择五处），x64
@@ -4905,6 +4916,76 @@ public:
         return o;
     }
 
+    // =======================================================================
+    // MIT-445 (X3c B.3)：x86 Ret 清栈返回（4B 栈宽, x64 build_ret 的 32 位
+    // 形, 438 aux 语义 arch 分叉落地）。
+    //
+    // 语义（SDM RET.Near imm16 的 x86 形 + 444 裁决表"零扩展不变量 + dword
+    // 低半字算术"）：ret_addr = dword [v4]；v4' = v4 + 4 + imm（imm 零扩展
+    // u16 字节数——translator 既有 0xFFFF 掩码；dword 回绕 = native esp 语
+    // 义，"槽高半字恒 0" 不变量下 dword 运算等价 64 位槽算术）；ret_addr →
+    // [v4'-4]（终态 jmp 槽 = 清栈后 esp 之下的死栈区）。
+    //
+    // 出口 = 退出 VM 直接返回 guest caller（x64 build_ret"handler 内直接退
+    // 出"先例，不走 Halt/stub 通道）：终态物理 esp := v4'、jmp [v4'-4]——
+    // 与原生 ret imm 后 caller 视角逐位一致。终态零活寄存器依赖：v4' 持久
+    // 化 [ctx+0x30] + 宿主栈 push 暂存（出口坐标见 kX86RetV4SlotFromExitRsp
+    // 注），ret_addr 落死槽（438 x64 [v4'-8] 同款落盘纪律，x86 死槽 4B 宽）。
+    //
+    // 与 x64 的结构差异（逐条对账）：
+    //   1) 4B 栈宽：pop 返回地址 dword 读、esp 步进 4+imm（x64 = 8+imm）；
+    //   2) 易失寄存器写回 = cdecl 面 eax/ecx/edx ← ctx 槽（x64 = Win64 面
+    //      rax/rcx/rdx/r8-r11 七槽）；xmm 写回不适用（x86 面无 SSE handler，
+    //      x87/MMX callee 副作用不建模，D1 恒 gate）；
+    //   3) 弃帧 = add esp,0x24（x64 = add rsp,0x210）；callee-saved pop = 4
+    //      个（x64 = 8 个），序 = entry push 严格逆序（x86_save_order）；
+    //   4) 终态 esp := v4' 宿主栈坐标读（x64 = [rsp-0x1D8] 读 stub 帧 ctx
+    //      区——x86 ctx 结构位置不定，改 push 暂存坐标，见常量注）；
+    //   5) 438"guest 栈写恒 ≥ ns"对账：[v4'-4] 死槽写与 x64 [v4'-8] 同形
+    //      ——清栈后 esp 之下的死栈区写；与 x86 保存区 [ns-4..ns-0x10] 重叠
+    //      仅在 v4' > ns-0x10 的病态形（未配平 ret），同 x64 EXIT_SLOT 重叠
+    //      披露，不新增防线（继承既有边界登记）；电池 guest 栈 = 静态缓冲，
+    //      零碰撞。
+    // =======================================================================
+    std::string build_ret_x86(u64 /*dispatch*/) const {
+        std::string o = decode_prelude_x86();   // aux 帧槽 = imm（零扩展）
+        // 1) 栈语义：ret_addr = dword [v4]；v4' = v4 + 4 + imm；v4' 持久化；
+        //    ret_addr → [v4'-4] 死槽。
+        o += std::string("    mov ") + r32x(t_[0]) + ", dword ptr [" + r32x(ctx_) +
+             " + 0x30]\n";                        // t0 = v4（低 dword, 零扩展不变量）
+        o += std::string("    mov ") + r32x(t_[1]) + ", dword ptr [" + r32x(t_[0]) +
+             "]\n";                               // t1 = ret_addr
+        o += std::string("    add ") + r32x(t_[0]) + ", " + imm(4) + "\n";
+        o += std::string("    add ") + r32x(t_[0]) + ", " + xf(kX86FAux) + "\n";
+        o += std::string("    mov dword ptr [") + r32x(ctx_) + " + 0x30], " +
+             r32x(t_[0]) + "\n";                  // v4' 持久化（低 dword；高半字 0 维持）
+        // 2) v4' 宿主栈暂存（出口坐标, 见 kX86RetV4SlotFromExitRsp 常量注）。
+        //    ⚠️ 必须在死槽指针 (t0 -= 4) 之前 push——push 的必须是 v4' 本体，
+        //    先减后 push 会把死槽地址当 v4' 存入（E2E 实证：esp 终态 = top-4,
+        //    jmp [esp-4] 落 memset 零页 → eip=0）。
+        o += std::string("    push ") + r32x(t_[0]) + "\n";
+        o += std::string("    sub ") + r32x(t_[0]) + ", " + imm(4) + "\n";
+        o += std::string("    mov dword ptr [") + r32x(t_[0]) + "], " + r32x(t_[1]) + "\n";
+        // 3) 易失寄存器写回（cdecl: eax/ecx/edx ← ctx 槽；可覆盖 t0/t1——
+        //    终态已零活寄存器依赖）。
+        o += std::string("    mov eax, dword ptr [") + r32x(ctx_) + " + 0x10]\n";
+        o += std::string("    mov ecx, dword ptr [") + r32x(ctx_) + " + 0x18]\n";
+        o += std::string("    mov edx, dword ptr [") + r32x(ctx_) + " + 0x20]\n";
+        // 4) 弃帧（含暂存槽顶出）+ 恢复宿主 callee-saved（entry push 序严格逆序）。
+        o += std::string("    add esp, ") + imm(kX86RetExitFrameAdvance) + "\n";
+        const auto order = x86_save_order();
+        for (int i = 3; i >= 0; --i)
+            o += std::string("    pop ") + r32x(order[i]) + "\n";
+        // 5) 终态：物理 esp := v4'（宿主栈坐标读, 读发生在 esp 变更前），
+        //    jmp [esp-4] 死槽 → ret_addr（esp 保持 v4' = 原生 ret imm 后态）。
+        o += std::string("    mov esp, dword ptr [esp - ") +
+             hex(kX86RetV4SlotFromExitRsp) + "]\n";
+        o += "    jmp dword ptr [esp - " + imm(4) + "]\n";
+        return o;
+    }
+
+    std::string build_x86_ret(u64 d) const { return build_ret_x86(d); }
+
     std::string build_x86_exitnative(u64 d) const { return build_exitnative_x86(d); }
 
     std::string build_x86_callgate(u64 d) const { return build_callgate_x86(d); }
@@ -5085,14 +5166,14 @@ RuntimeGenResult generate_runtime_arch(wvmp::Rng& rng, AsmGen::HostArch arch) {
     //    Sar 在 MIT-244 已接管。Adc 在 MIT-245 已接管；Sbb 在 MIT-246 已接管；
     //    Rol/Ror 在 MIT-247 已接管。CallGate 在 MIT-249 已接管。
     //    Ret 在 MIT-438 已接管（清栈返回，见 build_ret 注释）。）
-    //    x86 面（MIT-445 (X3c) 批次二后）：59 行 = 电池集 19（X3a）+ A 档
+    //    x86 面（MIT-445 (X3c) 批次三后）：60 行 = 电池集 19（X3a）+ A 档
     //    整数面 29（一元/进借位/乘除扩展/移位旋转/扩展传送/条件/位计数/原子）
     //    + B 档 GP 5（Push/Pop + RVA 族）+ G4 原子 4（Xadd/Bts/Btr/Btc）
-    //    + CallGate（X3c B.1 reg 值目标 + RVA 双形）+ ExitNative（X3c B.2
-    //    4B 退出槽）。
+    //    + 协议面 3（X3c 收口：CallGate reg 值目标 + RVA 双形 / ExitNative
+    //    4B 退出槽 / Ret 4B 清栈返回）。
     //    仍纸面（折叠 Halt，恢复友好）= Div/Idiv（D2 除零折叠）、Movsxd/
-    //    MovsxdMem（x86 不可达）、Ret（X3c 协议面余一）、
-    //    SSE 族 32（X2b/X3c 面）—— 精确清单见 docs/GAPS.md X3b/X3c 节。
+    //    MovsxdMem（x86 不可达）、SSE 族 32（X2b/X3c 面）—— 精确清单见
+    //    docs/GAPS.md X3b/X3c 节。
     std::vector<HandlerDef> handlers;
     if (arch == AsmGen::HostArch::X86) {
         handlers = {
@@ -5163,6 +5244,8 @@ RuntimeGenResult generate_runtime_arch(wvmp::Rng& rng, AsmGen::HostArch arch) {
             {int(VmOp::CallGate), "callgate", &AsmGen::build_x86_callgate},
             // —— X3c (MIT-445) 协议面批次二：ExitNative 4B 退出槽 ——
             {int(VmOp::ExitNative), "exitnative", &AsmGen::build_x86_exitnative},
+            // —— X3c (MIT-445) 协议面批次三：Ret 4B 清栈返回 ——
+            {int(VmOp::Ret), "ret", &AsmGen::build_x86_ret},
         };
     } else {
         handlers = {
