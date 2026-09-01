@@ -55,6 +55,8 @@ BATTERY_HANDLERS = {
     "setcc", "cmovcc",
     # X3b (MIT-444) A 档批次五：位计数 / 锁原子族。
     "popcnt", "lzcnt", "tzcnt", "cmpxchg", "xadd", "bts", "btr", "btc",
+    # X3b (MIT-444) B 档 GP：栈原语（4B 槽裁决）+ RVA 族。
+    "push", "pop", "loadrva", "storeriva", "learva",
 }
 
 HEADER_RE = re.compile(

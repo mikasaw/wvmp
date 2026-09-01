@@ -242,6 +242,13 @@ constexpr u64 kX86FCC     = 0x1C;    // setcc 捕获区：ZF/CF/OF/SF/PF @ +0..+
 constexpr u64 kX86FrameSize = 0x24;  // 0x1C+5=0x21 → 4 对齐取 0x24
 static_assert(kX86FCC + 5 <= kX86FrameSize, "x86 setcc capture area must fit the frame");
 
+// x86 guest rsp 槽偏移（v4 = vm_reg_of(Rsp) = 4 → 4*8+0x10）。8B 槽、值恒 32
+// 位零扩展（"槽高半字恒 0" 不变量）⇒ 槽算术走 dword 低半字（4B 步进裁决，
+// build_push_x86 注）。
+constexpr u64 kX86RspSlotOff = 0x30;
+static_assert(kX86RspSlotOff == static_cast<u64>(isa::vm_reg_of(ir::Reg::Rsp)) * 8 + 0x10,
+              "x86 rsp slot offset must track vm_reg_of(Rsp)");
+
 // 跳转表：dispatch 用 opcode 低 log2(kTableEntries) 位索引；0/越界折叠到
 // Halt=非法停机。
 //
@@ -4642,6 +4649,144 @@ public:
                tail_lbl + ":\n" + flags_tail_x86(false, dispatch);
     }
 
+    // x86 Push（build_push 的 32 位版 —— **4B 槽裁决**的落地形）：
+    //   - guest esp 步进 = 4B（S32 push，x86 栈宽）；
+    //   - ctx 的 rsp 槽 = 8B u64（VM 槽宽，与 arch 无关 —— 442 译注），槽内
+    //     值恒 32 位零扩展（"槽高半字恒 0" 不变量）⇒ 槽算术用 **dword sub**
+    //     等价 64 位 sub 且溢出 = 32 位回绕（native esp 语义）；qword 运算在
+    //     32 位模式不可编码，dword 低半字运算即正确形。
+    //   - 内存写 = dword [esp值]（x86 push 4B）；
+    //   - 源 a_kind 双形（Reg=reg_a 槽 / Imm=aux 槽）。
+    // S8/S16 块防御（translator translate_push 对 ir::Op::Push S16/S8 gate
+    // —— 442 裁决"栈推进 2B 不在 VM 栈模型内"；S64 链尾出口）。零 flags。
+    std::string build_push_x86(u64 dispatch) const {
+        const std::string tag = "xpush" + std::to_string(seq());
+        const std::string tail_lbl = "xtail_" + tag;
+        std::string blocks[3];
+        for (int s = 0; s < 3; ++s) {
+            const std::string stag = tag + "_" + std::to_string(s);
+            std::string o;
+            if (s == 2) {
+                // 1) esp -= 4（dword 槽算术 —— 4B 步进裁决，见上注）。
+                o += std::string("    sub dword ptr [") + r32x(ctx_) + " + " +
+                     imm(kX86RspSlotOff) + "], " + imm(4) + "\n";
+                // 2) 源 → t_[1]（a_kind 双形）。
+                o += std::string("    mov ") + r32x(t_[2]) + ", " + xf(kX86FAKind) + "\n";
+                o += std::string("    cmp ") + r32x(t_[2]) + ", " + imm(1) + "\n";
+                o += "    jne xpimm_" + stag + "\n";
+                o += std::string("    mov ") + r32x(t_[2]) + ", " + xf(kX86FRegA) + "\n";
+                o += std::string("    mov ") + r32x(t_[1]) + ", dword ptr " + xslot(t_[2]) + "\n";
+                o += "    jmp xpgo_" + stag + "\n";
+                o += "xpimm_" + stag + ":\n";
+                o += std::string("    mov ") + r32x(t_[1]) + ", " + xf(kX86FAux) + "\n";
+                o += "xpgo_" + stag + ":\n";
+                // 3) dword [esp值] ← 源。
+                o += std::string("    mov ") + r32x(t_[0]) + ", dword ptr [" + r32x(ctx_) +
+                     " + " + imm(kX86RspSlotOff) + "]\n";
+                o += std::string("    mov dword ptr [") + r32x(t_[0]) + "], " + r32x(t_[1]) + "\n";
+            }
+            // s=0/1：防御空块
+            o += "    jmp " + tail_lbl + "\n";
+            blocks[s] = o;
+        }
+        return decode_prelude_x86() + size_chain_x86(blocks, tag, dispatch) +
+               tail_lbl + ":\n" + advance_x86(dispatch);
+    }
+
+    // x86 Pop（build_pop 的 32 位版）：dword [esp值] → reg_a 槽 + esp += 4
+    // （4B 步进裁决同 build_push_x86 注）。S8/S16/S64 块防御。零 flags。
+    std::string build_pop_x86(u64 dispatch) const {
+        const std::string tag = "xpop" + std::to_string(seq());
+        const std::string tail_lbl = "xtail_" + tag;
+        std::string blocks[3];
+        for (int s = 0; s < 3; ++s) {
+            std::string o;
+            if (s == 2) {
+                o += std::string("    mov ") + r32x(t_[0]) + ", dword ptr [" + r32x(ctx_) +
+                     " + " + imm(kX86RspSlotOff) + "]\n";
+                o += std::string("    mov ") + r32x(t_[1]) + ", dword ptr [" + r32x(t_[0]) +
+                     "]\n";
+                o += std::string("    add dword ptr [") + r32x(ctx_) + " + " +
+                     imm(kX86RspSlotOff) + "], " + imm(4) + "\n";
+                o += std::string("    mov ") + r32x(t_[2]) + ", " + xf(kX86FRegA) + "\n";
+                o += std::string("    mov dword ptr ") + xslot(t_[2]) + ", " + r32x(t_[1]) + "\n";
+            }
+            // s=0/1：防御空块
+            o += "    jmp " + tail_lbl + "\n";
+            blocks[s] = o;
+        }
+        return decode_prelude_x86() + size_chain_x86(blocks, tag, dispatch) +
+               tail_lbl + ":\n" + advance_x86(dispatch);
+    }
+
+    // x86 LoadRva（build_loadrva 的 32 位版）：b 槽 = RVA（u32），+ image_base
+    //（ctx+0x110 scratch_mem 低 dword —— PE32 ImageBase < 2^31 值域，u32 加法
+    // 即 VA，**非 identity**：电池 RvaFamily 以 base≠0 钉死 base+RVA 公式）→
+    // VA 宽度读 → reg_a 槽。三路宽度链（S8/S16/S32）。
+    std::string build_loadrva_x86(u64 dispatch) const {
+        const std::string tag = "xldrva" + std::to_string(seq());
+        const std::string tail_lbl = "xtail_" + tag;
+        std::string blocks[3];
+        for (int s = 0; s < 3; ++s) {
+            std::string o;
+            o += std::string("    mov ") + r32x(t_[2]) + ", " + xf(kX86FRegB) + "\n";
+            o += std::string("    mov ") + r32x(t_[1]) + ", dword ptr " + xslot(t_[2]) + "\n";
+            o += std::string("    add ") + r32x(t_[1]) + ", dword ptr [" + r32x(ctx_) +
+                 " + 0x110]\n";
+            if (s == 2)
+                o += std::string("    mov ") + r32x(t_[0]) + ", dword ptr [" + r32x(t_[1]) +
+                     "]\n";
+            else
+                o += std::string("    movzx ") + r32x(t_[0]) + ", " + mptr(s) + " [" +
+                     r32x(t_[1]) + "]\n";
+            o += writeback_x86(s, kX86FRegA, t_[0], t_[1]);
+            o += "    jmp " + tail_lbl + "\n";
+            blocks[s] = o;
+        }
+        return decode_prelude_x86() + size_chain_x86(blocks, tag, dispatch) +
+               tail_lbl + ":\n" + advance_x86(dispatch);
+    }
+
+    // x86 StoreRva（build_storerva 的 32 位版）：a 槽 = RVA → +image_base →
+    // VA，b 操作数按宽度写 [VA]。三路宽度链。
+    std::string build_storerva_x86(u64 dispatch) const {
+        const std::string tag = "xstrva" + std::to_string(seq());
+        const std::string tail_lbl = "xtail_" + tag;
+        std::string blocks[3];
+        for (int s = 0; s < 3; ++s) {
+            const std::string stag = tag + "_" + std::to_string(s);
+            std::string o;
+            o += std::string("    mov ") + r32x(t_[2]) + ", " + xf(kX86FRegA) + "\n";
+            o += std::string("    mov ") + r32x(t_[1]) + ", dword ptr " + xslot(t_[2]) + "\n";
+            o += std::string("    add ") + r32x(t_[1]) + ", dword ptr [" + r32x(ctx_) +
+                 " + 0x110]\n";
+            o += load_operand_x86(s, kX86FBKind, kX86FRegB, t_[0], "b" + stag);
+            o += std::string("    mov ") + mptr(s) + " [" + r32x(t_[1]) + "], " +
+                 rs(t_[0], s) + "\n";
+            o += "    jmp " + tail_lbl + "\n";
+            blocks[s] = o;
+        }
+        return decode_prelude_x86() + size_chain_x86(blocks, tag, dispatch) +
+               tail_lbl + ":\n" + advance_x86(dispatch);
+    }
+
+    // x86 LeaRva（build_lea_rva 的 32 位版）：a 槽 ← RVA + image_base（不访存
+    // —— M2-8/MIT-322 通路）。无尺寸链（lea 不写子寄存器别名，x64 qword 直写
+    // 的 32 位形 = dword 直写）。
+    std::string build_lea_rva_x86(u64 dispatch) const {
+        const std::string tag = "xlearva" + std::to_string(seq());
+        const std::string tail_lbl = "xtail_" + tag;
+        std::string o = decode_prelude_x86();
+        o += std::string("    mov ") + r32x(t_[2]) + ", " + xf(kX86FRegB) + "\n";
+        o += std::string("    mov ") + r32x(t_[1]) + ", dword ptr " + xslot(t_[2]) + "\n";
+        o += std::string("    add ") + r32x(t_[1]) + ", dword ptr [" + r32x(ctx_) +
+             " + 0x110]\n";
+        o += std::string("    mov ") + r32x(t_[2]) + ", " + xf(kX86FRegA) + "\n";
+        o += std::string("    mov dword ptr ") + xslot(t_[2]) + ", " + r32x(t_[1]) + "\n";
+        o += advance_x86(dispatch);
+        return o;
+    }
+
     // ---- x86 一元包装（HandlerDef 需要无参差成员函数指针） ----------------
     std::string build_x86_add(u64 d) const { return build_binary_x86("add", d, true); }
     std::string build_x86_sub(u64 d) const { return build_binary_x86("sub", d, true); }
@@ -4699,6 +4844,12 @@ public:
     std::string build_x86_bts(u64 d) const { return build_bit_op_x86("bts", d); }
     std::string build_x86_btr(u64 d) const { return build_bit_op_x86("btr", d); }
     std::string build_x86_btc(u64 d) const { return build_bit_op_x86("btc", d); }
+    // X3b 批次六：B 档 GP（栈原语 + RVA 族）。
+    std::string build_x86_push(u64 d) const { return build_push_x86(d); }
+    std::string build_x86_pop(u64 d) const { return build_pop_x86(d); }
+    std::string build_x86_loadrva(u64 d) const { return build_loadrva_x86(d); }
+    std::string build_x86_storerva(u64 d) const { return build_storerva_x86(d); }
+    std::string build_x86_learva(u64 d) const { return build_lea_rva_x86(d); }
 
 private:
     Rng& rng_;
@@ -4806,6 +4957,12 @@ RuntimeGenResult generate_runtime_arch(wvmp::Rng& rng, AsmGen::HostArch arch) {
             {int(VmOp::Bts), "bts", &AsmGen::build_x86_bts},
             {int(VmOp::Btr), "btr", &AsmGen::build_x86_btr},
             {int(VmOp::Btc), "btc", &AsmGen::build_x86_btc},
+            // —— X3b (MIT-444) B 档 GP：栈原语（4B 槽裁决）+ RVA 族 ——
+            {int(VmOp::Push), "push", &AsmGen::build_x86_push},
+            {int(VmOp::Pop), "pop", &AsmGen::build_x86_pop},
+            {int(VmOp::LoadRva), "loadrva", &AsmGen::build_x86_loadrva},
+            {int(VmOp::StoreRva), "storeriva", &AsmGen::build_x86_storerva},
+            {int(VmOp::LeaRva), "learva", &AsmGen::build_x86_learva},
         };
     } else {
         handlers = {
