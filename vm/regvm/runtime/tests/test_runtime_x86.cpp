@@ -1410,3 +1410,219 @@ TEST(X86Battery, CmovccCond) {
         EXPECT_EQ(ctx.regs[4] & isa::kFlagsMask, ctx.regs[5] & isa::kFlagsMask);
     }
 }
+
+// ---------------------------------------------------------------------------
+// (23) X3b 批次五：Popcnt/Lzcnt/Tzcnt（S32 真面 + 源保留纪律 + 0 全库边界）
+// ---------------------------------------------------------------------------
+TEST(X86Battery, BitCountOps) {
+    wvmp::Rng rng(12345);
+    const auto gen = rt::generate_runtime_x86(rng);
+    RwxImage rwx(gen.image.code);
+    const auto entry = rwx.entry();
+
+    auto bitcount = [](isa::VmOp op, u8 dst, u8 src) {
+        return isa::make_insn(op, isa::OpKind::Reg, dst, isa::OpKind::Reg, src, 0,
+                              isa::size_field(ir::Size::S32));
+    };
+
+    // popcnt：0xF0F0F0F0 → 16（src 消耗面：dst ≠ src 时 src 不变语义钉）。
+    {
+        std::vector<u8> s;
+        isa::append_insn(s, mov_imm(1, 0xF0F0F0F0u));                    // 0
+        isa::append_insn(s, bitcount(isa::VmOp::Popcnt, 0, 1));          // 1
+        isa::append_insn(s, halt());                                     // 2
+        const auto ctx = run_stream(entry, s, nullptr);
+        expect_slot32(ctx, 0, 16u);
+        expect_slot32(ctx, 1, 0xF0F0F0F0u);   // dst≠src：src 槽不被触碰
+    }
+    // popcnt 边界：0 → 0；0xFFFFFFFF → 32。
+    {
+        std::vector<u8> s;
+        isa::append_insn(s, mov_imm(1, 0));                              // 0
+        isa::append_insn(s, bitcount(isa::VmOp::Popcnt, 0, 1));          // 1
+        isa::append_insn(s, mov_imm(1, 0xFFFFFFFFu));                    // 2
+        isa::append_insn(s, bitcount(isa::VmOp::Popcnt, 2, 1));          // 3
+        isa::append_insn(s, halt());                                     // 4
+        const auto ctx = run_stream(entry, s, nullptr);
+        expect_slot32(ctx, 0, 0u);
+        expect_slot32(ctx, 2, 32u);
+    }
+    // lzcnt：0x00010000 → 15；0 → 32（BMI1 语义）；0xFFFFFFFF → 0；src 保留。
+    {
+        std::vector<u8> s;
+        isa::append_insn(s, mov_imm(1, 0x00010000u));                    // 0
+        isa::append_insn(s, bitcount(isa::VmOp::Lzcount, 0, 1));         // 1
+        isa::append_insn(s, mov_imm(3, 0));                              // 2
+        isa::append_insn(s, bitcount(isa::VmOp::Lzcount, 2, 3));         // 3
+        isa::append_insn(s, mov_imm(1, 0xFFFFFFFFu));                    // 4
+        isa::append_insn(s, bitcount(isa::VmOp::Lzcount, 2, 1));         // 5
+        isa::append_insn(s, halt());                                     // 6
+        const auto ctx = run_stream(entry, s, nullptr);
+        expect_slot32(ctx, 0, 15u);
+        expect_slot32(ctx, 2, 0u);
+        expect_slot32(ctx, 1, 0xFFFFFFFFu);   // 源保留（pitfall #37 钉）
+    }
+    // tzcnt：0x00010000 → 16；0 → 32（BMI1 语义）；0xFFFFFFF0 → 4；src 保留。
+    {
+        std::vector<u8> s;
+        isa::append_insn(s, mov_imm(1, 0x00010000u));                    // 0
+        isa::append_insn(s, bitcount(isa::VmOp::Tzcount, 0, 1));         // 1
+        isa::append_insn(s, mov_imm(3, 0));                              // 2
+        isa::append_insn(s, bitcount(isa::VmOp::Tzcount, 2, 3));         // 3
+        isa::append_insn(s, mov_imm(1, 0xFFFFFFF0u));                    // 4
+        isa::append_insn(s, bitcount(isa::VmOp::Tzcount, 4, 1));         // 5
+        isa::append_insn(s, halt());                                     // 6
+        const auto ctx = run_stream(entry, s, nullptr);
+        expect_slot32(ctx, 0, 16u);
+        expect_slot32(ctx, 2, 32u);
+        expect_slot32(ctx, 4, 4u);
+        expect_slot32(ctx, 1, 0xFFFFFFF0u);   // 源保留
+    }
+}
+
+// ---------------------------------------------------------------------------
+// (24) X3b 批次五：Cmpxchg（隐式 Rax 累加器，等/不等两路 + S8 形）
+// ---------------------------------------------------------------------------
+TEST(X86Battery, CmpxchgAcc) {
+    wvmp::Rng rng(12345);
+    const auto gen = rt::generate_runtime_x86(rng);
+    RwxImage rwx(gen.image.code);
+    const auto entry = rwx.entry();
+    const u8 rax_slot = isa::vm_reg_of(ir::Reg::Rax);
+
+    // 等路：acc == dst → ZF=1、dst ← src、acc 不变。
+    {
+        std::vector<u8> s;
+        isa::append_insn(s, mov_imm(rax_slot, 0x1234u));                 // 0  acc
+        isa::append_insn(s, mov_imm(1, 0x1234u));                        // 1  dst
+        isa::append_insn(s, mov_imm(2, 0x5678u));                        // 2  src
+        isa::append_insn(s, bin(isa::VmOp::Cmpxchg, 1, 2, ir::Size::S32));  // 3
+        isa::append_insn(s, getflags(4));                                // 4
+        isa::append_insn(s, halt());                                     // 5
+        const auto ctx = run_stream(entry, s, nullptr);
+        expect_slot32(ctx, 1, 0x5678u);       // dst = src
+        expect_slot32(ctx, rax_slot, 0x1234u);   // acc 原样
+        EXPECT_EQ(ctx.regs[4] & isa::kFlagZF, isa::kFlagZF);
+    }
+    // 不等路：acc ≠ dst → ZF=0、acc ← 旧 dst、dst 不变。
+    {
+        std::vector<u8> s;
+        isa::append_insn(s, mov_imm(rax_slot, 5));                       // 0  acc
+        isa::append_insn(s, mov_imm(1, 7));                              // 1  dst
+        isa::append_insn(s, mov_imm(2, 9));                              // 2  src
+        isa::append_insn(s, bin(isa::VmOp::Cmpxchg, 1, 2, ir::Size::S32));  // 3
+        isa::append_insn(s, getflags(4));                                // 4
+        isa::append_insn(s, halt());                                     // 5
+        const auto ctx = run_stream(entry, s, nullptr);
+        expect_slot32(ctx, 1, 7u);            // dst 不变
+        expect_slot32(ctx, rax_slot, 7u);     // acc = 旧 dst
+        EXPECT_EQ(ctx.regs[4] & isa::kFlagZF, 0u);
+    }
+    // S8 形：acc 低字节 == dst 低字节 → ZF=1、dst 低字节 ← src 低字节（保高位）。
+    {
+        std::vector<u8> s;
+        isa::append_insn(s, mov_imm(rax_slot, 0xAB00'33ull));            // 0  acc（低字节 0x33）
+        isa::append_insn(s, mov_imm(1, 0xCD00'33ull));                   // 1  dst（低字节相等）
+        isa::append_insn(s, mov_imm(2, 0x11'44ull));                     // 2  src
+        isa::append_insn(s, bin(isa::VmOp::Cmpxchg, 1, 2, ir::Size::S8));   // 3
+        isa::append_insn(s, halt());                                     // 4
+        const auto ctx = run_stream(entry, s, nullptr);
+        expect_slot32(ctx, 1, 0xCD0044ull);   // dst 低字节 = 0x44，高位保留
+        expect_slot32(ctx, rax_slot, 0xAB0033ull);   // acc 原样
+    }
+}
+
+// ---------------------------------------------------------------------------
+// (25) X3b 批次五：Xadd/Bts/Btr/Btc（lock 原子族真内存 + CF 面）
+// ---------------------------------------------------------------------------
+TEST(X86Battery, XaddBitOps) {
+    wvmp::Rng rng(12345);
+    const auto gen = rt::generate_runtime_x86(rng);
+    alignas(4) std::array<u8, 0x40> scratch{};
+    scratch.fill(0);
+    RwxImage rwx(gen.image.code);
+    const auto entry = rwx.entry();
+    const u32 data_addr = static_cast<u32>(reinterpret_cast<uintptr_t>(scratch.data()));
+
+    auto xadd = [](u8 addr, u8 src, ir::Size s) {
+        return isa::make_insn(isa::VmOp::Xadd, isa::OpKind::Reg, addr,
+                              isa::OpKind::Reg, src, 0, isa::size_field(s));
+    };
+    auto bitop_imm = [](isa::VmOp op, u8 addr, u32 bit) {
+        return isa::make_insn(op, isa::OpKind::Reg, addr, isa::OpKind::Imm, 0, bit,
+                              isa::size_field(ir::Size::S32));
+    };
+    auto bitop_reg = [](isa::VmOp op, u8 addr, u8 bit_slot) {
+        return isa::make_insn(op, isa::OpKind::Reg, addr, isa::OpKind::Reg, bit_slot, 0,
+                              isa::size_field(ir::Size::S32));
+    };
+
+    // xadd S32：[addr]=10、src=5 → [addr]=15、src=10（旧值）；flags=add。
+    {
+        scratch[0] = 10; scratch[1] = 0; scratch[2] = 0; scratch[3] = 0;
+        std::vector<u8> s;
+        isa::append_insn(s, mov_imm(1, data_addr));                      // 0  地址槽
+        isa::append_insn(s, mov_imm(2, 5));                              // 1  src
+        isa::append_insn(s, xadd(1, 2, ir::Size::S32));                  // 2
+        isa::append_insn(s, getflags(3));                                // 3
+        isa::append_insn(s, halt());                                     // 4
+        const auto ctx = run_stream(entry, s, scratch.data());
+        expect_slot32(ctx, 1, data_addr);
+        expect_slot32(ctx, 2, 10u);           // src = 旧值
+        EXPECT_EQ(scratch[0], 15u);           // [addr] = 15
+        EXPECT_EQ(ctx.regs[3] & isa::kFlagZF, 0u);
+        EXPECT_EQ(ctx.regs[3] & isa::kFlagCF, 0u);
+    }
+    // xadd S8 回绕：[addr]=0xFF、src=2 → [addr]=0x01、旧 0xFF；CF=1（8 位进位）。
+    {
+        scratch[0] = 0xFF;
+        std::vector<u8> s;
+        isa::append_insn(s, mov_imm(1, data_addr));                      // 0
+        isa::append_insn(s, mov_imm(2, 2));                              // 1
+        isa::append_insn(s, xadd(1, 2, ir::Size::S8));                   // 2
+        isa::append_insn(s, getflags(3));                                // 3
+        isa::append_insn(s, halt());                                     // 4
+        const auto ctx = run_stream(entry, s, scratch.data());
+        expect_slot32(ctx, 2, 0xFFu);         // 旧值
+        EXPECT_EQ(scratch[0], 1u);
+        EXPECT_EQ(ctx.regs[3] & isa::kFlagCF, isa::kFlagCF);
+    }
+    // bts imm：bit=3 on [addr]=0 → CF=0、[addr]=8；再 bts bit=3 → CF=1、值不变。
+    {
+        scratch[0] = 0;
+        std::vector<u8> s;
+        isa::append_insn(s, mov_imm(1, data_addr));                      // 0
+        isa::append_insn(s, bitop_imm(isa::VmOp::Bts, 1, 3));            // 1
+        isa::append_insn(s, bitop_imm(isa::VmOp::Bts, 1, 3));            // 2（已置 → CF=1）
+        isa::append_insn(s, getflags(3));                                // 3
+        isa::append_insn(s, halt());                                     // 4
+        const auto ctx = run_stream(entry, s, scratch.data());
+        EXPECT_EQ(scratch[0], 8u);
+        EXPECT_EQ(ctx.regs[3] & isa::kFlagCF, isa::kFlagCF);
+    }
+    // btr reg：位号来自 reg_b 槽 → 清位 + CF=1（位原为 1）。
+    {
+        scratch[0] = 0xFF;
+        std::vector<u8> s;
+        isa::append_insn(s, mov_imm(1, data_addr));                      // 0
+        isa::append_insn(s, mov_imm(2, 6));                              // 1  位号槽
+        isa::append_insn(s, bitop_reg(isa::VmOp::Btr, 1, 2));            // 2
+        isa::append_insn(s, getflags(3));                                // 3
+        isa::append_insn(s, halt());                                     // 4
+        const auto ctx = run_stream(entry, s, scratch.data());
+        EXPECT_EQ(scratch[0], 0xFFu & ~0x40u);
+        EXPECT_EQ(ctx.regs[3] & isa::kFlagCF, isa::kFlagCF);
+    }
+    // btc imm：位取反 + CF = 原位值。
+    {
+        scratch[0] = 0x04;   // bit2 = 1
+        std::vector<u8> s;
+        isa::append_insn(s, mov_imm(1, data_addr));                      // 0
+        isa::append_insn(s, bitop_imm(isa::VmOp::Btc, 1, 2));            // 1
+        isa::append_insn(s, getflags(3));                                // 2
+        isa::append_insn(s, halt());                                     // 3
+        const auto ctx = run_stream(entry, s, scratch.data());
+        EXPECT_EQ(scratch[0], 0u);            // bit2 取反 → 0
+        EXPECT_EQ(ctx.regs[3] & isa::kFlagCF, isa::kFlagCF);   // 原位 = 1
+    }
+}

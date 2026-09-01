@@ -4462,6 +4462,186 @@ public:
         return out;
     }
 
+    // x86 Popcnt/Lzcnt/Tzcnt（build_popcnt/build_lzcnt/build_tzcnt 的 32 位
+    // 版，S32 真面）：REG-REG（派活单限定，MEM 拒 → C1 gate），dword 读 src
+    // 槽 → native r32,r32 → dword 写回 dst 槽。lzcnt/tzcnt 源保留纪律
+    //（pitfall #37）平移：src 先存 t_[2]（索引载体消费后空闲）再 native；
+    // popcnt src 被消耗、in-place。S8/S16 块防御（x64 同口径）、S64 链尾
+    // 出口。零 flags（不捕获不装配）。
+    std::string build_bitcount_x86(const char* native, bool preserve_src,
+                                   u64 dispatch) const {
+        const std::string tag = std::string(native) + std::to_string(seq());
+        const std::string tail_lbl = "xtail_" + tag;
+        std::string blocks[3];
+        for (int s = 0; s < 3; ++s) {
+            std::string o;
+            if (s == 2) {
+                o += std::string("    mov ") + r32x(t_[2]) + ", " + xf(kX86FRegB) + "\n";
+                o += std::string("    mov ") + r32x(t_[1]) + ", dword ptr " + xslot(t_[2]) + "\n";
+                if (preserve_src)
+                    o += std::string("    mov ") + r32x(t_[2]) + ", " + r32x(t_[1]) + "\n";
+                o += std::string("    ") + native + " " + rs(t_[1], 2) + ", " +
+                     rs(preserve_src ? t_[2] : t_[1], 2) + "\n";
+                o += std::string("    mov ") + r32x(t_[2]) + ", " + xf(kX86FRegA) + "\n";
+                o += std::string("    mov dword ptr ") + xslot(t_[2]) + ", " + r32x(t_[1]) + "\n";
+            }
+            // s=0/1：防御空块（native 无 8 位形式、16 位 66 面 lifter 不产）
+            o += "    jmp " + tail_lbl + "\n";
+            blocks[s] = o;
+        }
+        return decode_prelude_x86() + size_chain_x86(blocks, tag, dispatch) +
+               tail_lbl + ":\n" + advance_x86(dispatch);
+    }
+
+    // x86 Cmpxchg（build_cmpxchg 的 32 位版，S8/S16/S32 全 native 真面）：
+    // 内存目的形式直打 dst 槽 —— native "cmpxchg <mptr> [ctx + idx*8 + 0x10],
+    // src" 一条完成比较+条件赋值（ZF=1 → dst 槽 ← src；ZF=0 → 累加器 ← 旧
+    // dst），零 dst 值临时。累加器 = 物理 AL/AX/EAX（Rax 槽 = vm_reg_of(Rax)
+    // 直载，槽高半字恒 0 不变量下 dword 直写等价 x64 alias_write）。
+    // **寄存器排布纪律（生成期静态可证）**：物理 EAX 跨 acc 装载存活的两个
+    // 载体 —— 槽索引 t_i 与源值 sreg —— 都从非 eax 临时集合选取（t_[0..3]
+    // 至多一个物理 eax，非 eax 集合 ≥3）；src 经 32 位零扩展读（S8 byte
+    // ptr 读 + movzx 语义），native 按宽度截取。
+    // flags 全量（与 cmp 同语义）→ setcc5_x86 → flags_tail_x86(false)。
+    // Rax 槽写回 = acc 物理寄存器按宽度直存（ZF=0 时 acc=旧 dst 由 native
+    // 写入；ZF=1 时 acc 原值原样写回 —— 幂等）。
+    std::string build_cmpxchg_x86(u64 dispatch) const {
+        const std::string tag = "xcmpxchg" + std::to_string(seq());
+        const std::string tail_lbl = "xtail_" + tag;
+        constexpr int kEaxIdx = 0;  // kPhys[0] = rax/eax —— 累加器物理位
+        const u8 rax_slot = isa::vm_reg_of(ir::Reg::Rax);  // = 0
+        const std::string rax_slot_off = imm(static_cast<u64>(rax_slot) * 8 + 0x10);
+        // 载体选取（生成期静态可证）：
+        //   t_s = {t_[0],t_[1]} 中非 eax 者 —— 恒字节可编码（S8 native 源名
+        //         dl/bl 硬约束，roll_x86 字节可编码集纪律）且跨 acc 装载存活；
+        //   t_i = 非 eax 且 ≠ t_s —— dst 槽索引，跨 acc 装载存活
+        //         （t_[0..3] 至多一个物理 eax ⇒ 非 eax 集合 ≥3，恒有解）；
+        //   t_j = src 索引载体（acc 装载前消费，无存活要求）。
+        const int t_s = t_[0] != kEaxIdx ? t_[0] : t_[1];
+        int t_i = t_[3];
+        for (int t : {t_[0], t_[1], t_[2], t_[3]})
+            if (t != kEaxIdx && t != t_s) { t_i = t; break; }
+        const int t_j = t_[1] != t_i ? t_[1] : t_[0];
+        std::string blocks[3];
+        for (int s = 0; s < 3; ++s) {
+            const std::string stag = tag + "_" + std::to_string(s);
+            std::string o;
+            // 1) src 槽 → t_s（按宽度零扩展读）。
+            o += std::string("    mov ") + r32x(t_j) + ", " + xf(kX86FRegB) + "\n";
+            if (s == 0)
+                o += std::string("    movzx ") + r32x(t_s) + ", byte ptr " + xslot(t_j) + "\n";
+            else
+                o += std::string("    mov ") + r32x(t_s) + ", dword ptr " + xslot(t_j) + "\n";
+            // 2) dst 槽索引 → t_i（跨 acc 装载存活）。
+            o += std::string("    mov ") + r32x(t_i) + ", " + xf(kX86FRegA) + "\n";
+            // 3) 累加器 ← Rax 槽（按宽度；最后装载 —— t_i/t_s ≠ eax 静态保证）。
+            if (s == 0)
+                o += std::string("    mov al, byte ptr [") + r32x(ctx_) + " + " +
+                     rax_slot_off + "]\n";
+            else if (s == 1)
+                o += std::string("    mov ax, word ptr [") + r32x(ctx_) + " + " +
+                     rax_slot_off + "]\n";
+            else
+                o += std::string("    mov eax, dword ptr [") + r32x(ctx_) + " + " +
+                     rax_slot_off + "]\n";
+            // 4) native cmpxchg <mptr> [dst 槽], src —— ZF=1: 槽←src；ZF=0: acc←旧槽。
+            o += std::string("    cmpxchg ") + mptr(s) + " " + xslot(t_i) + ", " +
+                 rs(t_s, s) + "\n";
+            // 5) flags 捕获 + 6) Rax 槽按宽度直写回。
+            o += setcc5_x86();
+            if (s == 0)
+                o += std::string("    mov byte ptr [") + r32x(ctx_) + " + " +
+                     rax_slot_off + "], al\n";
+            else if (s == 1)
+                o += std::string("    mov word ptr [") + r32x(ctx_) + " + " +
+                     rax_slot_off + "], ax\n";
+            else
+                o += std::string("    mov dword ptr [") + r32x(ctx_) + " + " +
+                     rax_slot_off + "], eax\n";
+            o += "    jmp " + tail_lbl + "\n";
+            blocks[s] = o;
+        }
+        return decode_prelude_x86() + size_chain_x86(blocks, tag, dispatch) +
+               tail_lbl + ":\n" + flags_tail_x86(false, dispatch);
+    }
+
+    // x86 Xadd（build_xadd 的 32 位版，S8/S32 真面 + S16 防御）：reg_a 槽 =
+    // guest 绝对 VA（翻译器 emit_address 产物），native "lock xadd <mptr>
+    // [addr], src" 单指令读改写（硬件原子性保真，x64 同口径）—— 旧值回写
+    // reg_b 槽（writeback_x86 帧槽索引 RMW）。flags = add 语义全量。
+    // S16 块防御（66 前缀 lifter 入口拒 —— x64 s=1 同款）。
+    std::string build_xadd_x86(u64 dispatch) const {
+        const std::string tag = "xxadd" + std::to_string(seq());
+        const std::string tail_lbl = "xtail_" + tag;
+        std::string blocks[3];
+        for (int s = 0; s < 3; ++s) {
+            const std::string stag = tag + "_" + std::to_string(s);
+            std::string o;
+            if (s == 1) {
+                // S16 防御（66 前缀入口拒）
+                o += "    jmp " + tail_lbl + "\n";
+                blocks[s] = o;
+                continue;
+            }
+            // 1) guest 地址 → t_[1]；2) src → t_[0]。
+            o += std::string("    mov ") + r32x(t_[2]) + ", " + xf(kX86FRegA) + "\n";
+            o += std::string("    mov ") + r32x(t_[1]) + ", dword ptr " + xslot(t_[2]) + "\n";
+            o += load_operand_x86(s, kX86FBKind, kX86FRegB, t_[0], "b" + stag);
+            // 3) native lock xadd —— [addr] = 旧+src，t_[0] = 旧值。
+            o += std::string("    lock xadd ") + mptr(s) + " [" + r32x(t_[1]) + "], " +
+                 rs(t_[0], s) + "\n";
+            // 4) flags 捕获 + 5) 旧值写回 reg_b 槽（kX86FRegB = reg_b 索引槽
+            //    —— kX86FBKind 是 b_kind 值槽，误用会把旧值写进槽 0/1）。
+            o += setcc5_x86();
+            o += writeback_x86(s, kX86FRegB, t_[0], t_[1]);
+            o += "    jmp " + tail_lbl + "\n";
+            blocks[s] = o;
+        }
+        return decode_prelude_x86() + size_chain_x86(blocks, tag, dispatch) +
+               tail_lbl + ":\n" + flags_tail_x86(false, dispatch);
+    }
+
+    // x86 Bts/Btr/Btc（build_bit_op 的 32 位版，S32 真面）：CF = 位号处的位、
+    // [addr] 位改写，native "lock bts/btr/btc dword ptr [addr], bit" 直执行。
+    // 位号 b_kind 双形（Reg=reg_b 槽 / Imm=aux 帧槽）装载 t_[0] 后统一 reg 形
+    // （keystone 拒 [m], imm8 静态形式 —— x64 416 注同源）；CPU 按操作数宽
+    // 度自动掩码位号。flags 仅 CF 有定义（SDM），setcc5 捕宿主真值装配。
+    // S8/S16 块防御（x64 同口径：G4 派活单 S32/S64 面）。
+    std::string build_bit_op_x86(const char* native, u64 dispatch) const {
+        const std::string tag = std::string(native) + std::to_string(seq());
+        const std::string tail_lbl = "xtail_" + tag;
+        std::string blocks[3];
+        for (int s = 0; s < 3; ++s) {
+            const std::string stag = tag + "_" + std::to_string(s);
+            std::string o;
+            if (s == 2) {
+                // 1) guest 地址 → t_[1]。
+                o += std::string("    mov ") + r32x(t_[2]) + ", " + xf(kX86FRegA) + "\n";
+                o += std::string("    mov ") + r32x(t_[1]) + ", dword ptr " + xslot(t_[2]) + "\n";
+                // 2) 位号 → t_[0]（b_kind 分支：Reg=reg_b 槽 / Imm=aux）。
+                o += std::string("    mov ") + r32x(t_[2]) + ", " + xf(kX86FBKind) + "\n";
+                o += std::string("    cmp ") + r32x(t_[2]) + ", " + imm(1) + "\n";
+                o += "    jne xbimm_" + stag + "\n";
+                o += std::string("    mov ") + r32x(t_[2]) + ", " + xf(kX86FRegB) + "\n";
+                o += std::string("    mov ") + r32x(t_[0]) + ", dword ptr " + xslot(t_[2]) + "\n";
+                o += "    jmp xbdone_" + stag + "\n";
+                o += "xbimm_" + stag + ":\n";
+                o += std::string("    mov ") + r32x(t_[0]) + ", " + xf(kX86FAux) + "\n";
+                o += "xbdone_" + stag + ":\n";
+                // 3) native lock bts/btr/btc [addr], bit（reg 形）。
+                o += std::string("    lock ") + native + " dword ptr [" + r32x(t_[1]) +
+                     "], " + rs(t_[0], 2) + "\n";
+                // 4) flags 捕获（CF）。
+                o += setcc5_x86();
+            }
+            // s=0/1：防御空块
+            o += "    jmp " + tail_lbl + "\n";
+            blocks[s] = o;
+        }
+        return decode_prelude_x86() + size_chain_x86(blocks, tag, dispatch) +
+               tail_lbl + ":\n" + flags_tail_x86(false, dispatch);
+    }
+
     // ---- x86 一元包装（HandlerDef 需要无参差成员函数指针） ----------------
     std::string build_x86_add(u64 d) const { return build_binary_x86("add", d, true); }
     std::string build_x86_sub(u64 d) const { return build_binary_x86("sub", d, true); }
@@ -4510,6 +4690,15 @@ public:
     // X3b 批次四：条件族（reads-flags 面）。
     std::string build_x86_setcc(u64 d) const { return build_setcc_x86(d); }
     std::string build_x86_cmovcc(u64 d) const { return build_cmovcc_x86(d); }
+    // X3b 批次五：位计数 / 锁原子族。
+    std::string build_x86_popcnt(u64 d) const { return build_bitcount_x86("popcnt", false, d); }
+    std::string build_x86_lzcnt(u64 d) const { return build_bitcount_x86("lzcnt", true, d); }
+    std::string build_x86_tzcnt(u64 d) const { return build_bitcount_x86("tzcnt", true, d); }
+    std::string build_x86_cmpxchg(u64 d) const { return build_cmpxchg_x86(d); }
+    std::string build_x86_xadd(u64 d) const { return build_xadd_x86(d); }
+    std::string build_x86_bts(u64 d) const { return build_bit_op_x86("bts", d); }
+    std::string build_x86_btr(u64 d) const { return build_bit_op_x86("btr", d); }
+    std::string build_x86_btc(u64 d) const { return build_bit_op_x86("btc", d); }
 
 private:
     Rng& rng_;
@@ -4608,6 +4797,15 @@ RuntimeGenResult generate_runtime_arch(wvmp::Rng& rng, AsmGen::HostArch arch) {
             // —— X3b (MIT-444) A 档批次四：条件族（reads-flags 面）——
             {int(VmOp::Setcc), "setcc", &AsmGen::build_x86_setcc},
             {int(VmOp::Cmovcc), "cmovcc", &AsmGen::build_x86_cmovcc},
+            // —— X3b (MIT-444) A 档批次五：位计数 / 锁原子族 ——
+            {int(VmOp::Popcnt), "popcnt", &AsmGen::build_x86_popcnt},
+            {int(VmOp::Lzcount), "lzcnt", &AsmGen::build_x86_lzcnt},
+            {int(VmOp::Tzcount), "tzcnt", &AsmGen::build_x86_tzcnt},
+            {int(VmOp::Cmpxchg), "cmpxchg", &AsmGen::build_x86_cmpxchg},
+            {int(VmOp::Xadd), "xadd", &AsmGen::build_x86_xadd},
+            {int(VmOp::Bts), "bts", &AsmGen::build_x86_bts},
+            {int(VmOp::Btr), "btr", &AsmGen::build_x86_btr},
+            {int(VmOp::Btc), "btc", &AsmGen::build_x86_btc},
         };
     } else {
         handlers = {

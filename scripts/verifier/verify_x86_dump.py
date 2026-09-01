@@ -53,6 +53,8 @@ BATTERY_HANDLERS = {
     "movzx", "movzxmem", "movsx", "movsxmem", "bswap", "xchg",
     # X3b (MIT-444) A 档批次四：条件族（reads-flags 面）。
     "setcc", "cmovcc",
+    # X3b (MIT-444) A 档批次五：位计数 / 锁原子族。
+    "popcnt", "lzcnt", "tzcnt", "cmpxchg", "xadd", "bts", "btr", "btc",
 }
 
 HEADER_RE = re.compile(
