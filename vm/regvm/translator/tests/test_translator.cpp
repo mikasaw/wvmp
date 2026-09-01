@@ -433,20 +433,19 @@ TEST(Translate, BlobRoundtripByteExact) {
 
 // ---------------- notes 路径（不失败） ----------------
 
-// MIT-249: 直接 call 现在 emit CallGate（不记 note），所以这条用例改为
-// 验证间接 call（dst=Reg）仍记 note 触发 C1 gate 兜底。直接 call 的发射
-// 见 CallDirectEmitsCallGate。
-TEST(Translate, CallSkippedWithNote) {
+// MIT-249: 直接 call emit CallGate 不记 note（CallDirectEmitsCallGate）。
+// MIT-445 (X3c B.1): 间接 call（dst=Reg）442 D4 停手 skip 翻案 —— emit
+// CallGate reg 形（a_kind=Reg + reg_a=目标槽），零 note 零 gate。
+TEST(Translate, CallIndirectRegEmitsCallGateRegForm) {
     ir::Insn c = I(ir::Op::Call, ir::Size::S64);
-    c.dst = ir::Operand::reg_(ir::Reg::Rax); // 间接 call：目标 RVA 翻译期不可知
+    c.dst = ir::Operand::reg_(ir::Reg::Rax); // 间接 call：目标 = 槽内绝对 VA
     const auto r = wvmp::regvm::translator::translate_function(
         fn_of({blk(0x1000, {c})}));
-    ASSERT_EQ(r.notes.size(), static_cast<size_t>(1));
-    EXPECT_NE(r.notes[0].find("call"), std::string::npos);
-    const Decoded d = decode_program(r.program); // 仍产出合法流（Jmp+1 + Halt）
-    ASSERT_EQ(d.insns.size(), static_cast<size_t>(2));
-    expect_is(d.insns[0], VmOp::Jmp, OpKind::None, 0, OpKind::None, 0, 1, kS64);
-    expect_is(d.insns[1], VmOp::Halt, OpKind::None, 0, OpKind::None, 0, 0, 0);
+    EXPECT_TRUE(r.notes.empty());
+    const Decoded d = decode_program(r.program);
+    ASSERT_EQ(d.insns.size(), static_cast<size_t>(3));  // 1 + Jmp + Halt
+    expect_is(d.insns[0], VmOp::CallGate, OpKind::Reg,
+              isa::vm_reg_of(ir::Reg::Rax), OpKind::None, 0, 0u, 0u);
 }
 
 // ---------------- rip-relative (M2-8 支持：RVA = next_ip + disp) ----------------
@@ -752,30 +751,44 @@ TEST(Translate, CallDirectEmitsCallGate) {
               0x2000u, 0u);
 }
 
-TEST(Translate, CallIndirectRegIsSkipped) {
-    // call rax：dst.kind = Reg，翻译期不可知 → skip + note 触发 C1 gate。
+// MIT-445 (X3c B.1): call [mem] rip 形（IAT thunk 同构）折条 =
+// Mov acc,RVA + LoadRva val←acc + CallGate reg 形。载入槽值 = 表项内容 =
+// 目标函数绝对 VA（handler reg 形不再二次加 base）。
+TEST(Translate, CallMemRipFoldsLoadRvaCallGateRegForm) {
+    // 单块: next_ip = fn.end_rva = 0x3000 → RVA = 0x3000 + 8 = 0x3008
     ir::Insn c = I(ir::Op::Call, ir::Size::S64);
-    c.dst = ir::Operand::reg_(ir::Reg::Rax);
+    c.dst = ir::Operand::mem_(m(ir::Reg::Rip, ir::Reg::Flags, 0, 8));
     const auto r = wvmp::regvm::translator::translate_function(
         fn_of({blk(0x1000, {c})}));
-    ASSERT_FALSE(r.notes.empty());
-    EXPECT_NE(r.notes.front().find("call"), std::string::npos);
-    // notes 触发 C1 gate：virtualize 会放弃该函数虚拟化。
+    EXPECT_TRUE(r.notes.empty());
     const Decoded d = decode_program(r.program);
-    // skip → 仅保留 fallthrough Jmp +1 + Halt
-    ASSERT_EQ(d.insns.size(), static_cast<size_t>(2));
-    expect_is(d.insns[0], VmOp::Jmp, OpKind::None, 0, OpKind::None, 0, 1, kS64);
-    expect_is(d.insns[1], VmOp::Halt, OpKind::None, 0, OpKind::None, 0, 0, 0);
+    ASSERT_EQ(d.insns.size(), static_cast<size_t>(5));  // 3 + Jmp + Halt
+    expect_is(d.insns[0], VmOp::Mov, OpKind::Reg, isa::kScratchFirst,
+              OpKind::Imm, 0, 0x3008u, kS64);
+    expect_is(d.insns[1], VmOp::LoadRva, OpKind::Reg, isa::kScratchFirst + 1,
+              OpKind::Reg, isa::kScratchFirst, 0u, kS64);
+    expect_is(d.insns[2], VmOp::CallGate, OpKind::Reg, isa::kScratchFirst + 1,
+              OpKind::None, 0, 0u, 0u);
 }
 
-TEST(Translate, CallMemIsSkipped) {
-    // call [rbx]：dst.kind = Mem，target 来自内存 → skip + note 触发 C1 gate。
+// MIT-445 (X3c B.1): call [mem] 非 rip 形（call [rbx+0x10]）折条 =
+// Mov acc←rbx + Add acc,disp + Load val←acc + CallGate reg 形。
+TEST(Translate, CallMemBaseFoldsLoadCallGateRegForm) {
     ir::Insn c = I(ir::Op::Call, ir::Size::S64);
-    c.dst = ir::Operand::mem_(m(ir::Reg::Rbx));
+    c.dst = ir::Operand::mem_(m(ir::Reg::Rbx, ir::Reg::Flags, 0, 0x10));
     const auto r = wvmp::regvm::translator::translate_function(
         fn_of({blk(0x1000, {c})}));
-    ASSERT_FALSE(r.notes.empty());
-    EXPECT_NE(r.notes.front().find("call"), std::string::npos);
+    EXPECT_TRUE(r.notes.empty());
+    const Decoded d = decode_program(r.program);
+    ASSERT_EQ(d.insns.size(), static_cast<size_t>(6));  // 4 + Jmp + Halt
+    expect_is(d.insns[0], VmOp::Mov, OpKind::Reg, isa::kScratchFirst,
+              OpKind::Reg, isa::vm_reg_of(ir::Reg::Rbx), 0u, kS64);
+    expect_is(d.insns[1], VmOp::Add, OpKind::Reg, isa::kScratchFirst,
+              OpKind::Imm, 0, 0x10u, kS64);
+    expect_is(d.insns[2], VmOp::Load, OpKind::Reg, isa::kScratchFirst + 1,
+              OpKind::Reg, isa::kScratchFirst, 0u, kS64);
+    expect_is(d.insns[3], VmOp::CallGate, OpKind::Reg, isa::kScratchFirst + 1,
+              OpKind::None, 0, 0u, 0u);
 }
 
 // ---------------- MIT-413 (G2): 跳转表残余形态匹配器 ----------------
@@ -1961,15 +1974,25 @@ TEST(Translate, CwdeFoldTranslateWords) {
     expect_is(d.insns[1], VmOp::Mov, OpKind::Reg, kRax, OpKind::Reg, kRax, 0, kS32);
 }
 
-TEST(Translate, CallMemGateNoteX3) {
-    // ① D4 停手钉: lifter 已 lift (Call dst=Mem), translator gate note 指向
-    // X3 挂账 (CallGate 协议仅吃 aux RVA — asmgen step1 直读)。
+TEST(Translate, CallMemNegDispFoldsLoadCallGateRegForm) {
+    // MIT-445 (X3c B.1) 翻案 442 D4 停手钉（原 CallMemGateNoteX3）:
+    // call [rbp-8]（FF 55 F8, 栈槽函数指针形）折条 = Mov acc←rbp +
+    // Sub acc,|disp|（负 disp 零扩展限制 → 减法等价, pitfall #6）+
+    // Load val←acc + CallGate reg 形。
     ir::Insn c = I(ir::Op::Call, ir::Size::S64);
     c.dst = ir::Operand::mem_(m(ir::Reg::Rbp, ir::Reg::Flags, 0, -8));
     const auto r = wvmp::regvm::translator::translate_function(fn_of({blk(0x1000, {c})}));
-    ASSERT_FALSE(r.notes.empty());
-    EXPECT_NE(r.notes[0].find("call [mem]"), std::string::npos);
-    EXPECT_NE(r.notes[0].find("X3"), std::string::npos);
+    EXPECT_TRUE(r.notes.empty());
+    const Decoded d = decode_program(r.program);
+    ASSERT_EQ(d.insns.size(), static_cast<size_t>(6));  // 4 + Jmp + Halt
+    expect_is(d.insns[0], VmOp::Mov, OpKind::Reg, isa::kScratchFirst,
+              OpKind::Reg, isa::vm_reg_of(ir::Reg::Rbp), 0u, kS64);
+    expect_is(d.insns[1], VmOp::Sub, OpKind::Reg, isa::kScratchFirst,
+              OpKind::Imm, 0, 8u, kS64);
+    expect_is(d.insns[2], VmOp::Load, OpKind::Reg, isa::kScratchFirst + 1,
+              OpKind::Reg, isa::kScratchFirst, 0u, kS64);
+    expect_is(d.insns[3], VmOp::CallGate, OpKind::Reg, isa::kScratchFirst + 1,
+              OpKind::None, 0, 0u, 0u);
 }
 
 } // namespace

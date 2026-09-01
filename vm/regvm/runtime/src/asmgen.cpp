@@ -243,6 +243,22 @@ constexpr u64 kX86FCC     = 0x1C;    // setcc 捕获区：ZF/CF/OF/SF/PF @ +0..+
 constexpr u64 kX86FrameSize = 0x24;  // 0x1C+5=0x21 → 4 对齐取 0x24
 static_assert(kX86FCC + 5 <= kX86FrameSize, "x86 setcc capture area must fit the frame");
 
+// MIT-445 (X3c B.1)：x86 callgate callee 专用窗口（406 x64 同款纪律：16
+// 对齐窗口 + 底部探针写）。窗口锚 = host_rsp（[ctx+0x128]，entry 落账，
+// 自洽无需 native_sp 预置）；call 站位 = 对齐后窗口顶。
+constexpr u64 kX86CallgateWindow = 0x1000;  // 4KB callee 窗口
+static_assert(kX86CallgateWindow % 16 == 0,
+              "x86 callee window must be 16-aligned to keep the call-site rsp residue unchanged");
+
+// MIT-445 (X3c B.2)：x86 4B 退出槽深度（X0 §3.2-C(4) x86 形）。槽地址 =
+// native_sp - kX86ExitSlotDepth（dword；native_sp = [ctx+0x120]，stub/电池
+// 预置）。x64 同构公式 kExitSlotDepth = stub push + kCtxSize + 0x80 余量，
+// x86 侧 stub push 面 = 4（X4 stub 的 4 callee-saved push 对应面）；余量
+// 0x80 同 x64（disp8 边界纪律）。runtime.hpp 冻结零触碰——本常量 = x86 面
+// 私有（asmgen.cpp 单一来源），X4 stub_gen 读侧对接锚，禁字面量第二份。
+constexpr u64 kX86ExitSlotDepth = 4 * 4 + kCtxSize + 0x80;  // 0x10+0x1C8+0x80 = 0x258
+static_assert(kX86ExitSlotDepth == 0x258, "x86 exit slot depth regressed");
+
 // x86 guest rsp 槽偏移（v4 = vm_reg_of(Rsp) = 4 → 4*8+0x10）。8B 槽、值恒 32
 // 位零扩展（"槽高半字恒 0" 不变量）⇒ 槽算术走 dword 低半字（4B 步进裁决，
 // build_push_x86 注）。
@@ -1377,10 +1393,18 @@ public:
     // M2-9 CallGate：VM 字节码遇到 call 时由翻译器发出。
     //
     // 语义（v1：arg_count = 0）：
-    //   - aux = 目标 RVA（u32，零扩展至 u64）
-    //   - cond_or_size = arg_count（v1 必须 0）
-    //   - 运行时：目标 VA = RVA + image_base（scratch_mem），
-    //     调目标函数，callee ret 后 RAX 写回 regs[v0]，dispatch 继续。
+    //   - aux = 目标 RVA（u32，零扩展至 u64）；cond_or_size = arg_count
+    //     （v1 必须 0）。
+    //   - MIT-445 (X3c B.1) reg 值目标形（call reg / call [mem] 折条落地，
+    //     442 D4 停手挂账翻案）：a_kind 判别位双形共用 VmOp::CallGate
+    //     （零新 VmOp，派单 D1 拍板），字节级布局：
+    //       RVA 形（既有）: a_kind=None, reg_a 无义, aux=目标 RVA
+    //                        → VA = aux + image_base([ctx+0x110])
+    //       reg 形（新增）: a_kind=Reg,  reg_a=目标槽(0..31), aux 无义(0)
+    //                        → VA = regs[reg_a]（槽全宽读；VM 槽值 = 绝对
+    //                        VA——IAT 项/函数指针经 Load/LoadRva 装入）
+    //   - 运行时：目标 VA 就位后调目标函数，callee ret 后 RAX 写回
+    //     regs[0]，dispatch 继续。
     //
     // 寄存器/栈语义（核心约束）：
     //   1) 持久寄存器 pc/flags/base 跨 native call 必须保留——随机分配可能让
@@ -1437,7 +1461,36 @@ public:
     //   +0xE8 = regs[27] = callgate 入口的 regs[9]（VM 的 R9）
     std::string build_callgate(u64 dispatch) const {
         std::string o = decode_prelude();
-        // 0) 把 VM 整数参数槽（regs[1]=Rcx, /[2]=Rdx, /[8]=R8, /[9]=R9）
+        // 0) 目标 VA 双形分派（MIT-445 X3c B.1）：a_kind==Reg(T3==1) →
+        //    t0 = regs[reg_a]（绝对 VA，槽全宽读）；否则 t0 = T5(aux RVA) +
+        //    image_base([ctx+0x110])（既有 RVA 形，行为逐位不变）。T3/T4 已
+        //    由 decode_prelude 解出；t_[0] 恒 callee-saved（roll() 约束），
+        //    跨 step 5 物理参数装载存活到 step 6 call。
+        //    ⚠️ 本块必须在参数快照（下一 step）之前：快照用 rax 搬运，而
+        //    T3/T4 (=t_[3]/t_[4]) 是池洗牌寄存器、可能=rax——先读后快照，
+        //    否则 reg 形槽索引/判别位读到快照残渣（E2E 实证：forkface 区2
+        //    cdb 崩点 [rsi+rax*8+0x10]，rax=0x475cc0=快照后 rax 残值）。
+        //    先读还附带防御 reg_a∈24..27 的病态形：快照会覆写 reserved
+        //    24..27 槽，先读保语义（ translator 恒 emit ≤23，双保险）。
+        {
+            // 标签用固定名（不吃 seq()）：seq 号被消费会让后续全部 handler
+            // 的内部标签顺移，x64 dump delta 将扩散到无关 op 的标签文本——
+            // 固定名全码体唯一（x86 面为 xcgrva_/xcghave_ 前缀，不同代际），
+            // 本 handler 每镜像只 emit 一次，无重定义风险。
+            const std::string lbl_rva = "cgrva";
+            const std::string lbl_have = "cghave";
+            o += std::string("    cmp ") + r64(t_[3]) + ", " + imm(1) + "\n";
+            o += "    jne " + lbl_rva + "\n";
+            o += std::string("    mov ") + r64(t_[0]) + ", qword ptr [" + r64(ctx_) +
+                 " + " + r64(t_[4]) + "*8 + 0x10]\n";
+            o += "    jmp " + lbl_have + "\n";
+            o += lbl_rva + ":\n";
+            o += std::string("    mov ") + r64(t_[0]) + ", " + r64(t_[5]) + "\n";
+            o += std::string("    add ") + r64(t_[0]) + ", qword ptr [" + r64(ctx_) +
+                 " + 0x110]\n";
+            o += lbl_have + ":\n";
+        }
+        // 1) 把 VM 整数参数槽（regs[1]=Rcx, /[2]=Rdx, /[8]=R8, /[9]=R9）
         // 先搬到 reserved 槽位，防 callgate 自己的 prelude/pre-call 路径
         // 在 push ctx 之后又读 VmContext 时被外部指令序串改坏——保留独立
         // 通道供后续 load 物理寄存器用。
@@ -1449,10 +1502,6 @@ public:
         o += std::string("    mov qword ptr [") + r64(ctx_) + " + 0xE0], rax\n";
         o += std::string("    mov rax, qword ptr [") + r64(ctx_) + " + 0x50]\n";   // regs[9] (R9)
         o += std::string("    mov qword ptr [") + r64(ctx_) + " + 0xE8], rax\n";
-        // 1) 目标 VA = 目标 RVA (T5, aux) + image_base ([ctx + 0x110])
-        o += std::string("    mov ") + r64(t_[0]) + ", " + r64(t_[5]) + "\n";
-        o += std::string("    add ") + r64(t_[0]) + ", qword ptr [" + r64(ctx_) +
-             " + 0x110]\n";
         // 2) 保存 pc/flags/base 到 VmContext 槽
         o += std::string("    mov qword ptr [") + r64(ctx_) + " + 0x8], " + r64(pc_) + "\n";
         o += std::string("    mov qword ptr [") + r64(ctx_) + " + 0x98], " + r64(flags_) + "\n";
@@ -3500,7 +3549,8 @@ public:
     }
 
     // =======================================================================
-    // MIT-443 (X3a)：x86 (KS_MODE_32) 码体生成面 —— X3b 起 57 handler。
+    // MIT-443 (X3a)：x86 (KS_MODE_32) 码体生成面 —— X3b 起 57 handler
+    //（X3c 批次一后 58：+ CallGate）。
     //
     // 与 x64 面的关系：x64 emit 代码一概不经此处（arch 分叉收敛在 KsSession
     // 模式 / roll / build_entry / build_dispatch / handler 表选择五处），x64
@@ -3567,7 +3617,8 @@ public:
              imm(0x14) + "]\n";
         // 执行帧（常量槽；esp 此后跨指令稳定 —— x86 handler 无动态 push/pop）。
         o += std::string("    sub esp, ") + imm(kX86FrameSize) + "\n";
-        // host_rsp 记账（callgate X3c 预留；槽高半字依赖零初始化不变量）。
+        // host_rsp 记账（callgate X3c B.1 消费：窗口锚 + 调后重基；槽高半
+        // 字依赖零初始化不变量）。
         o += std::string("    mov dword ptr [") + r32x(ctx_) + " + 0x128], esp\n";
         // pc_/flags_ 内存常驻（[ctx+0x8]/[ctx+0x98]），无需寄存器装载；跌入 dispatch。
         return o;
@@ -4720,6 +4771,73 @@ public:
                tail_lbl + ":\n" + advance_x86(dispatch);
     }
 
+    // =======================================================================
+    // MIT-445 (X3c B.1)：x86 CallGate（reg 值目标 + RVA 双形，零新 VmOp）。
+    //
+    // 编码（x64 build_callgate 同协议，a_kind 判别）：RVA 形 a_kind=None +
+    // aux=目标 RVA；reg 形 a_kind=Reg + reg_a=目标槽（→ VA = regs[reg_a]
+    // 低 dword，槽值 = 绝对 VA，"槽高半字恒 0" 不变量下 dword 读即全值）。
+    //
+    // x86 协议面与 x64 的结构差异（逐条对账）：
+    //   1) 参数窗：Win32 cdecl 参数走栈，本 handler 不预置任何栈参数
+    //      （v1 = 0-arg；派单 D2 拍板"x86 参数窗不为 X3c 特化，留 stub_gen
+    //      cdecl 对接"——X4 落参数窗时两处同步：本 handler + stub_gen）。
+    //   2) 窗口锚：host_rsp（[ctx+0x128]，entry 落账）自洽，无需 native_sp
+    //      预置（x64 用 [ctx+0x120]+kPushCtxDepth 常量回退——stub 帧 ctx 区
+    //      固定位移；x86 直接重读 host_rsp，跨 call 稳定语义相同且电池/
+    //      未来 stub 皆零耦合）。窗口 = 对齐(host_rsp - kX86CallgateWindow)，
+    //      探针写消除 guard page 边界（406 同款）；shr/shl 4 对齐
+    //      （kCallgateAlignShift 复用）。
+    //   3) pc/flags 内存常驻（[ctx+0x8]/[ctx+0x98]）：native callee 不识
+    //      ctx → 无需 save/restore（x64 面因 pc_/flags_ 可能落 caller-saved
+    //      寄存器才需步骤 2/9 落盘）。base_/ctx_ 恒 callee-saved（roll_x86
+    //      约束）跨 call 存活；esp 经 host_rsp 重基（step 4）。
+    //   4) 返回值：eax → regs[0] 低 dword（槽高半字清零不变量维持）。guest
+    //      flags 天然存活（内存常驻，native call 不触 ctx）。x87/MMX callee
+    //      副作用不建模（x86 面 D1 恒 gate，无 SSE/x87 handler）。
+    //   5) rsp 纪律：call 前切 esp 到窗口、call 后重读 host_rsp，handler
+    //      出口 esp 恢复原值——"x86 执行帧 esp 跨指令稳定"既有不变量不受扰
+    //      （执行帧槽在窗口上方，callee 栈活动只向下生长，零重叠）。
+    // =======================================================================
+    std::string build_callgate_x86(u64 dispatch) const {
+        // 标签固定名（不吃 seq()，理由同 x64 build_callgate 注）：seq 号被
+        // 消费会让后续 handler 的内部标签顺移，污染 x86 dump 对账口径。
+        const std::string lbl_rva = "xcgrva";
+        const std::string lbl_have = "xcghave";
+        std::string o = decode_prelude_x86();
+        // step 1: 目标 VA 双形分派（a_kind 判别，x64 build_callgate step 1 同构）
+        o += std::string("    mov ") + r32x(t_[0]) + ", " + xf(kX86FAKind) + "\n";
+        o += std::string("    cmp ") + r32x(t_[0]) + ", " + imm(1) + "\n";
+        o += "    jne " + lbl_rva + "\n";
+        o += std::string("    mov ") + r32x(t_[0]) + ", " + xf(kX86FRegA) + "\n";
+        o += std::string("    mov ") + r32x(t_[0]) + ", dword ptr [" + r32x(ctx_) +
+             " + " + r32x(t_[0]) + "*8 + 0x10]\n";
+        o += "    jmp " + lbl_have + "\n";
+        o += lbl_rva + ":\n";
+        o += std::string("    mov ") + r32x(t_[0]) + ", " + xf(kX86FAux) + "\n";
+        o += std::string("    add ") + r32x(t_[0]) + ", dword ptr [" + r32x(ctx_) +
+             " + 0x110]\n";
+        o += lbl_have + ":\n";
+        // step 2: 切 esp → callee 窗口（16 对齐 + 底部探针写）
+        o += std::string("    mov ") + r32x(t_[1]) + ", dword ptr [" + r32x(ctx_) +
+             " + 0x128]\n";
+        o += std::string("    sub ") + r32x(t_[1]) + ", " + imm(kX86CallgateWindow) + "\n";
+        o += std::string("    shr ") + r32x(t_[1]) + ", " + imm(kCallgateAlignShift) + "\n";
+        o += std::string("    shl ") + r32x(t_[1]) + ", " + imm(kCallgateAlignShift) + "\n";
+        o += std::string("    mov esp, ") + r32x(t_[1]) + "\n";
+        o += std::string("    mov dword ptr [") + r32x(t_[1]) + "], 0\n";
+        // step 3: call native（cdecl 0-arg；参数窗 = X4 stub_gen 对接面）
+        o += std::string("    call ") + r32x(t_[0]) + "\n";
+        // step 4: esp 重基（host_rsp 单一来源，跨 call 稳定）
+        o += std::string("    mov esp, dword ptr [") + r32x(ctx_) + " + 0x128]\n";
+        // step 5: 返回值写回 regs[0] 低 dword（槽高半字 0 不变量维持）
+        o += std::string("    mov dword ptr [") + r32x(ctx_) + " + 0x10], eax\n";
+        o += advance_x86(dispatch);
+        return o;
+    }
+
+    std::string build_x86_callgate(u64 d) const { return build_callgate_x86(d); }
+
     // x86 LoadRva（build_loadrva 的 32 位版）：b 槽 = RVA（u32），+ image_base
     //（ctx+0x110 scratch_mem 低 dword —— PE32 ImageBase < 2^31 值域，u32 加法
     // 即 VA，**非 identity**：电池 RvaFamily 以 base≠0 钉死 base+RVA 公式）→
@@ -4896,12 +5014,13 @@ RuntimeGenResult generate_runtime_arch(wvmp::Rng& rng, AsmGen::HostArch arch) {
     //    Sar 在 MIT-244 已接管。Adc 在 MIT-245 已接管；Sbb 在 MIT-246 已接管；
     //    Rol/Ror 在 MIT-247 已接管。CallGate 在 MIT-249 已接管。
     //    Ret 在 MIT-438 已接管（清栈返回，见 build_ret 注释）。）
-    //    x86 面（MIT-444 (X3b) 批迁后）：57 行 = 电池集 19（X3a）+ A 档整数
-    //    面 29（一元/进借位/乘除扩展/移位旋转/扩展传送/条件/位计数/原子）
-    //    + B 档 GP 5（Push/Pop + RVA 族）+ G4 原子 4（Xadd/Bts/Btr/Btc）。
+    //    x86 面（MIT-445 (X3c) 批次一后）：58 行 = 电池集 19（X3a）+ A 档
+    //    整数面 29（一元/进借位/乘除扩展/移位旋转/扩展传送/条件/位计数/原子）
+    //    + B 档 GP 5（Push/Pop + RVA 族）+ G4 原子 4（Xadd/Bts/Btr/Btc）
+    //    + CallGate（X3c B.1 reg 值目标 + RVA 双形）。
     //    仍纸面（折叠 Halt，恢复友好）= Div/Idiv（D2 除零折叠）、Movsxd/
-    //    MovsxdMem（x86 不可达）、CallGate/ExitNative/Ret（X3c 协议面）、
-    //    SSE 族 32（X2b/X3c 面）—— 精确清单见 docs/GAPS.md X3b 节。
+    //    MovsxdMem（x86 不可达）、ExitNative/Ret（X3c 协议面余二）、
+    //    SSE 族 32（X2b/X3c 面）—— 精确清单见 docs/GAPS.md X3b/X3c 节。
     std::vector<HandlerDef> handlers;
     if (arch == AsmGen::HostArch::X86) {
         handlers = {
@@ -4968,6 +5087,8 @@ RuntimeGenResult generate_runtime_arch(wvmp::Rng& rng, AsmGen::HostArch arch) {
             {int(VmOp::LoadRva), "loadrva", &AsmGen::build_x86_loadrva},
             {int(VmOp::StoreRva), "storeriva", &AsmGen::build_x86_storerva},
             {int(VmOp::LeaRva), "learva", &AsmGen::build_x86_learva},
+            // —— X3c (MIT-445) 协议面批次一：CallGate reg 值目标 + RVA 双形 ——
+            {int(VmOp::CallGate), "callgate", &AsmGen::build_x86_callgate},
         };
     } else {
         handlers = {

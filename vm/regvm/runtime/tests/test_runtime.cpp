@@ -1315,6 +1315,33 @@ TEST(Interpreter, CallgateCtxAlwaysCalleeSaved) {
     EXPECT_EQ(ok, total) << "callgate dump 校验失败 " << (total - ok) << "/" << total;
 }
 
+// MIT-445 (X3c B.1): callgate reg 值目标形 — dump 含 a_kind 判别分支
+// (cmp T3,1 / jne / [ctx+T4*8+0x10] 槽读 / 汇合标签)。本变更 = 本单唯一
+// 预期 x64 asm_dump delta（442 D4 停手挂账翻案，forkface callmem/callreg
+// 负例区翻案为真虚拟化的 handler 侧证据）；x86 侧同协议见
+// test_runtime_x86.cpp CallGate* 三用例（真执行）。
+TEST(Interpreter, CallGateRegTargetBranchShape) {
+    auto extract_callgate = [](const std::string& dump) -> std::string {
+        const std::string marker = "handler callgate @ +";
+        const auto pos = dump.find(marker);
+        if (pos == std::string::npos) return {};
+        const auto end_marker = dump.find("; ---- handler", pos + marker.size());
+        const auto end = (end_marker != std::string::npos) ? end_marker : dump.size();
+        return dump.substr(pos, end - pos);
+    };
+    wvmp::Rng rng(12345);
+    const auto result = rt::generate_runtime(rng);
+    const std::string cg = extract_callgate(result.asm_dump);
+    ASSERT_FALSE(cg.empty());
+    // a_kind 判别分支（旧 callgate 段无 cmp）+ RVA 形回退标签（seq() 后缀,
+    // 前缀匹配）+ reg 形目标槽读 `[<ctx_> + <T4>*8 + 0x10]`（旧段无 *8 索
+    // 引寻址）——三标记均为本变更新增, 442 时点 dump 不含。
+    EXPECT_NE(cg.find("    cmp "), std::string::npos);
+    EXPECT_NE(cg.find("cgrva"), std::string::npos);
+    EXPECT_NE(cg.find("cghave"), std::string::npos);
+    EXPECT_NE(cg.find("*8 + 0x10]"), std::string::npos);
+}
+
 // MIT-417 (P0): callgate FP 参数/返回值通路 — 生成码含 4+1 movups 序列断言
 // + 时机。修复前 build_callgate 只搬 RCX/RDX/R8/R9 整数参数、只回写 RAX,
 // 区域内带 double/float 参数的 native 调用 FP 参数断链 → 静默错乱 (g5r_p0)。

@@ -924,7 +924,7 @@ struct Translator {
         case ir::Op::Jmp:
         case ir::Op::Jcc: ok = translate_jump(em, sc, in); break;
         case ir::Op::Call:
-            ok = translate_call(em, in, next_ip);
+            ok = translate_call(em, sc, in, current_rva, next_ip);
             break;
         case ir::Op::Nop:
             em.emit(VmOp::Nop, OpKind::None, 0, OpKind::None, 0, 0,
@@ -1665,38 +1665,37 @@ struct Translator {
         return true;
     }
 
-    // Call（MIT-249 call gate）。
-    //   - 间接 call（dst = Reg，如 call rax）：target RVA 翻译期不可知，
-    //     走 C1 gate 兜底（保持原生），不作为 halt VM 硬错误。
-    //   - 内存间接 call（dst = Mem，如 call [rip+disp]）：target 来自内存
-    //     加载，翻译期同样不可知——保守 skip，C1 gate。
+    // Call（MIT-249 call gate + MIT-445 X3c B.1 reg 值目标收口）。
+    //   - 间接 call（dst = Reg，如 call rax）：MIT-445 起 emit CallGate reg
+    //     形（a_kind=Reg + reg_a=目标槽，handler 从槽读绝对 VA）——442 D4
+    //     停手挂账翻案落地（asmgen build_callgate reg-target 双 arch 通路，
+    //     x64 step 1 分支 + x86 build_callgate_x86 同协议）。
+    //   - 内存间接 call（dst = Mem，含 rip 形 IAT thunk `call [__imp_x]`）：
+    //     折条 = emit_load(目标值 → fresh scratch) + CallGate reg 形。载入
+    //     宽度 = in.size（lifter pointer_size(arch)=S64）；rip 形经 LoadRva
+    //     （b 槽 = RVA，handler 加 image_base 读表项），非 rip 形经 Load
+    //     （b 槽 = 绝对地址）——载入的槽值 = 目标函数绝对 VA，与 reg 形槽
+    //     语义一致（handler 不再二次加 base）。
     //   - 直接 call（dst = Imm，Capstone 解出 E8 + disp32 或 FF /2 imm32）：
     //     in.dst.imm = 绝对目标 RVA（lifter 约定，与 Jcc/Jmp 的 dst.imm
     //     语义一致——Capstone 给的是绝对地址，jcc/jmp 直接当块起点查）。
     //     emit VmOp::CallGate（aux = target RVA, cond_or_size = arg_count）。
-    //   - 目标 RVA 越界（同 rip-relative 越界判定）→ skip 触发 C1 gate。
-    bool translate_call(Emitter& em, const ir::Insn& in, u64 /*next_ip*/) {
-        // MIT-442 (X2a) ①: lifter 已开 call [mem] / call reg 双口 (lift 层面
-        // 翻正), 但折条落地 (Load + Call(reg)) 被 D4 红线拦停 —— 实测 asmgen
-        // build_callgate 目标只吃 T5(=aux, 翻译期 RVA) 不吃 reg 值目标
-        // (asmgen.cpp step1 直读), reg-target 通路 = asmgen 改动 → 归 X3
-        // (派单 §A.2 "零新 VmOp 高置信" 预判被 #33 实测推翻, 报告披露)。
-        // 本两路照旧 skip → C1 整函数原生 byte-identical, gate note 指向
-        // X3 挂账。
-        if (in.dst.kind == ir::Operand::Kind::Reg)
-            return skip(in, "间接 call 目标为运行时值: CallGate 协议仅吃 aux RVA "
-                            "无 reg-target 通路 (asmgen step1 实读), 折条需 asmgen "
-                            "改动归 X3 (MIT-442 D4 停手)", nullptr);
+    //   - 直接 call 目标 RVA 越界（同 rip-relative 越界判定）→ skip 触发
+    //     C1 gate（保守判定不变）。
+    bool translate_call(Emitter& em, Scratch& sc, const ir::Insn& in,
+                        u64 current_rva, u64 next_ip) {
+        if (in.dst.kind == ir::Operand::Kind::Reg) {
+            // reg 形: 槽内值 = 绝对目标 VA（VM GP 槽语义, M2 模型）。
+            const u8 slot = isa::vm_reg_of(in.dst.reg);
+            em.emit(VmOp::CallGate, OpKind::Reg, slot, OpKind::None, 0, 0, 0);
+            return true;
+        }
         if (in.dst.kind == ir::Operand::Kind::Mem) {
-            // MIT-442: note 不走 skip() 的 rip 通用覆写 (否则 rip 形 IAT thunk
-            // 的 D4/X3 披露被吞, 413 纪律 gate note 可审计性) — 文本内自带
-            // rip 形标注。
-            if (in.dst.mem.base == ir::Reg::Rip)
-                return skip(in, "call [mem] (rip 形, IAT thunk 同构) 折条=Load+Call(reg) "
-                                "需 CallGate reg-target 通路, asmgen 改动归 X3 (MIT-442 "
-                                "D4 停手披露)", nullptr);
-            return skip(in, "call [mem] 折条=Load+Call(reg) 需 CallGate reg-target "
-                            "通路, asmgen 改动归 X3 (MIT-442 D4 停手披露)", nullptr);
+            // mem 形折条: 目标值装入 fresh scratch（emit_load 内部自动选
+            // LoadRva/Load 双通路）→ CallGate reg 形。
+            const u8 val = emit_load(em, sc, in.dst.mem, in.size, current_rva, next_ip);
+            em.emit(VmOp::CallGate, OpKind::Reg, val, OpKind::None, 0, 0, 0);
+            return true;
         }
         if (in.dst.kind != ir::Operand::Kind::Imm)
             return skip(in, "call 目标非立即数，未支持", nullptr);

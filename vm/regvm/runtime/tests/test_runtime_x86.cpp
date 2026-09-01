@@ -134,6 +134,23 @@ void expect_slot32(const rt::VmContext& ctx, u8 slot, u32 expect) {
     EXPECT_EQ(ctx.regs[slot], static_cast<u64>(expect)) << "slot=" << int(slot);
 }
 
+// MIT-445 (X3c B.1)：CallGate 电池面。callee = 测试进程内真 native 函数
+// （WOW64 32 位进程，fnptr 即 u32 VA）。g_xcg_calls 递增 = 真调用证据
+// （非纸面/非折叠 Halt）；regs[0] 写回 = 返回值通路断言。
+static unsigned long g_xcg_calls = 0;
+static u32 __cdecl xcg_probe(void) {
+    ++g_xcg_calls;
+    return 0x5A5u;
+}
+isa::VmInsn callgate_rva(u32 rva) {
+    return isa::make_insn(isa::VmOp::CallGate, isa::OpKind::None, 0,
+                          isa::OpKind::None, 0, rva, 0);
+}
+isa::VmInsn callgate_reg(u8 slot) {
+    return isa::make_insn(isa::VmOp::CallGate, isa::OpKind::Reg, slot,
+                          isa::OpKind::None, 0, 0, 0);
+}
+
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -1933,3 +1950,88 @@ TEST(X86Battery, JmpJccFarTarget) {
         EXPECT_EQ(ctx.pc, kFar + 1u);
     }
 }
+
+// ---------------------------------------------------------------------------
+// (29) X3c B.1：CallGate RVA 形真调用（aux + image_base，base≠0 非 identity）
+// ---------------------------------------------------------------------------
+TEST(X86Battery, CallGateRvaFormRealCall) {
+    wvmp::Rng rng(12345);
+    const auto gen = rt::generate_runtime_x86(rng);
+    RwxImage rwx(gen.image.code);
+    // base≠0（RvaFamily 同款纪律）：aux = fnptr - kFakeBase，handler 加
+    // [ctx+0x110] 低 dword 还原 VA —— identity 假设反证。
+    constexpr u64 kFakeBase = 0x400000;
+    const u32 fn_rva = static_cast<u32>(reinterpret_cast<uintptr_t>(&xcg_probe)) -
+                       static_cast<u32>(kFakeBase);
+    std::vector<u8> s;
+    isa::append_insn(s, callgate_rva(fn_rva));                           // 0
+    isa::append_insn(s, halt());                                         // 1
+    rt::VmContext ctx;
+    ctx.bytecode = s.data();
+    ctx.pc = 0;
+    ctx.scratch_mem = kFakeBase;
+    ctx.regs[isa::vm_reg_of(ir::Reg::Rsp)] = 0;
+    g_xcg_calls = 0;
+    rwx.entry()(&ctx);
+    EXPECT_EQ(g_xcg_calls, 1u);          // 真调用（ callee 执行）
+    expect_slot32(ctx, 0, 0x5A5u);       // callee 返回值 → regs[0] 低 dword
+    EXPECT_EQ(ctx.ret_value, 0x5A5u);    // Halt 写回 ret_value = regs[0]
+    EXPECT_EQ(ctx.pc, 2u);               // callgate 后 advance，Halt pc+1
+}
+
+// ---------------------------------------------------------------------------
+// (30) X3c B.1：CallGate reg 形真调用（a_kind=Reg 目标槽 → 绝对 VA 直调）。
+//      x86 协议面核心断言：目标值经 reg 槽传入的 callee 真调用 + esp 跨
+//      handler 稳定 + 返回值写回。
+// ---------------------------------------------------------------------------
+TEST(X86Battery, CallGateRegFormRealCall) {
+    wvmp::Rng rng(12345);
+    const auto gen = rt::generate_runtime_x86(rng);
+    RwxImage rwx(gen.image.code);
+    const u32 fn_abs = static_cast<u32>(reinterpret_cast<uintptr_t>(&xcg_probe));
+    std::vector<u8> s;
+    isa::append_insn(s, mov_imm(1, fn_abs));                             // 0  v1 = 目标 VA
+    isa::append_insn(s, callgate_reg(1));                                // 1  a_kind=Reg, reg_a=1
+    isa::append_insn(s, halt());                                         // 2
+    rt::VmContext ctx;
+    ctx.bytecode = s.data();
+    ctx.pc = 0;
+    ctx.scratch_mem = 0;
+    ctx.regs[isa::vm_reg_of(ir::Reg::Rsp)] = 0;
+    g_xcg_calls = 0;
+    rwx.entry()(&ctx);
+    EXPECT_EQ(g_xcg_calls, 1u);          // 真调用
+    expect_slot32(ctx, 0, 0x5A5u);       // 返回值写回
+    EXPECT_EQ(ctx.pc, 3u);
+}
+
+// ---------------------------------------------------------------------------
+// (31) X3c B.1：CallGate reg 形 + 前序槽算术（目标值 = 运行时算出, 非立即
+//      数直装 —— call [mem] 折条的 Load 语义等价形: 槽间 Mov 加偏移）。
+// ---------------------------------------------------------------------------
+TEST(X86Battery, CallGateRegFormComputedTarget) {
+    wvmp::Rng rng(12345);
+    const auto gen = rt::generate_runtime_x86(rng);
+    RwxImage rwx(gen.image.code);
+    constexpr u64 kFakeBase = 0x400000;
+    const u32 fn_rva = static_cast<u32>(reinterpret_cast<uintptr_t>(&xcg_probe)) -
+                       static_cast<u32>(kFakeBase);
+    std::vector<u8> s;
+    isa::append_insn(s, mov_imm(1, fn_rva));                             // 0  v1 = RVA
+    isa::append_insn(s, isa::make_insn(isa::VmOp::LeaRva, isa::OpKind::Reg, 2,
+                                       isa::OpKind::Reg, 1, 0,
+                                       isa::size_field(ir::Size::S32)));  // 1  v2 = VA
+    isa::append_insn(s, callgate_reg(2));                                // 2  reg 形 v2 槽
+    isa::append_insn(s, halt());                                         // 3
+    rt::VmContext ctx;
+    ctx.bytecode = s.data();
+    ctx.pc = 0;
+    ctx.scratch_mem = kFakeBase;
+    ctx.regs[isa::vm_reg_of(ir::Reg::Rsp)] = 0;
+    g_xcg_calls = 0;
+    rwx.entry()(&ctx);
+    EXPECT_EQ(g_xcg_calls, 1u);
+    expect_slot32(ctx, 0, 0x5A5u);
+    EXPECT_EQ(ctx.pc, 4u);
+}
+

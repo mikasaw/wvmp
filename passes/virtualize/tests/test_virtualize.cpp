@@ -144,15 +144,18 @@ TEST(VirtualizePass, SkipsUnliftedAndWarnsWhenNothingVirtualized) {
 namespace {
 
 // 含一条 call（翻译器必记 note）的函数。
-// MIT-249: 直接 call (dst=Imm) 已 emit CallGate，不再记 note。
-// 用间接 call (dst=Reg) 触发 C1 gate 兜底——目标 RVA 翻译期不可知，
-// 触发 skip note，与原测试意图保持一致。
+// MIT-249: 直接 call (dst=Imm) emit CallGate，不记 note。
+// MIT-445 (X3c B.1): 间接 call (dst=Reg/Mem) 已收口 CallGate reg 值目标形
+// ——不再产 note（442 D4 停手挂账翻案）。C1 note→gate 机制的测试触发器
+// 改用病态形 (dst 无目标)：translate_call 的 "call 目标非立即数" skip 路径
+// 仍然存在，机制测试意图（translate note → virtualize 放弃 → 整函数原生）
+// 保持不变。
 ir::FunctionRegion make_call_function(const std::string& name) {
     ir::FunctionRegion fn = make_sample_function(name);
     ir::Insn call;
     call.op = ir::Op::Call;
     call.size = ir::Size::S64;
-    call.dst = ir::Operand::reg_(ir::Reg::Rax); // 间接 call → skip note → C1 gate
+    call.dst.kind = ir::Operand::Kind::None; // 病态形 → skip note → C1 gate
     call.updates_flags = false;
     fn.blocks.at(0).insns.insert(fn.blocks.at(0).insns.begin(), std::move(call));
     return fn;
