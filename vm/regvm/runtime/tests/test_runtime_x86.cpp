@@ -905,3 +905,252 @@ TEST(X86Battery, CdqSignExt) {
         expect_slot32(ctx, rdx_slot, 0u);
     }
 }
+
+// ---------------------------------------------------------------------------
+// (16) X3b 批次二：Shl/Shr/Sar（imm 形 + 32 位模式计数掩码 0x1F 实测钉）
+// ---------------------------------------------------------------------------
+TEST(X86Battery, ShiftImmMask) {
+    wvmp::Rng rng(12345);
+    const auto gen = rt::generate_runtime_x86(rng);
+    RwxImage rwx(gen.image.code);
+    const auto entry = rwx.entry();
+
+    // shl S32：1 << 4 = 16（CF=0，PF: 0x10 = 1 个 1 → 奇 → PF=0）。
+    {
+        std::vector<u8> s;
+        isa::append_insn(s, mov_imm(0, 1));                              // 0
+        isa::append_insn(s, bin_imm(isa::VmOp::Shl, 0, 4, ir::Size::S32));  // 1
+        isa::append_insn(s, getflags(5));                                // 2
+        isa::append_insn(s, halt());                                     // 3
+        const auto ctx = run_stream(entry, s, nullptr);
+        expect_slot32(ctx, 0, 16u);
+        EXPECT_EQ(ctx.regs[5] & isa::kFlagsMask, 0u);
+    }
+    // **掩码实测钉（0x1F）**：count=0x20（32）→ 计数 0 → 值与 flags 均不变。
+    // 若沿用 x64 S32 档的 0x3F 掩码，计数 32 会漏进 native（内部再掩 0，值
+    // 恰好不变）但 flags 被宿主 and 污染 —— 双断言钉死区分。
+    {
+        std::vector<u8> s;
+        isa::append_insn(s, mov_imm(0, 0xABCD1234u));                    // 0
+        isa::append_insn(s, mov_imm(3, 0x15));                           // 1  flags 已知值
+        isa::append_insn(s, isa::make_insn(isa::VmOp::SetFlags, isa::OpKind::Reg, 3,
+                                           isa::OpKind::None, 0, 0,
+                                           isa::size_field(ir::Size::S32)));  // 2
+        isa::append_insn(s, bin_imm(isa::VmOp::Shl, 0, 0x20, ir::Size::S32));  // 3
+        isa::append_insn(s, getflags(5));                                // 4
+        isa::append_insn(s, halt());                                     // 5
+        const auto ctx = run_stream(entry, s, nullptr);
+        expect_slot32(ctx, 0, 0xABCD1234u);
+        EXPECT_EQ(ctx.regs[5] & isa::kFlagsMask, 0x15u);
+    }
+    // count=0x21（33）→ 33 & 0x1F = 1 → 1 << 1 = 2。
+    {
+        std::vector<u8> s;
+        isa::append_insn(s, mov_imm(0, 1));                              // 0
+        isa::append_insn(s, bin_imm(isa::VmOp::Shl, 0, 0x21, ir::Size::S32));  // 1
+        isa::append_insn(s, halt());                                     // 2
+        const auto ctx = run_stream(entry, s, nullptr);
+        expect_slot32(ctx, 0, 2u);
+    }
+    // shr S32：0xC0000000 >> 31 = 1，CF=原 bit30=1（右移 CF = 最后移出的低位，
+    // 首版把 MSB 误当 CF 源 —— 期望算错非 VM 错，#33 同案）。
+    {
+        std::vector<u8> s;
+        isa::append_insn(s, mov_imm(0, 0xC0000000u));                    // 0
+        isa::append_insn(s, bin_imm(isa::VmOp::Shr, 0, 31, ir::Size::S32));  // 1
+        isa::append_insn(s, getflags(5));                                // 2
+        isa::append_insn(s, halt());                                     // 3
+        const auto ctx = run_stream(entry, s, nullptr);
+        expect_slot32(ctx, 0, 1u);
+        EXPECT_EQ(ctx.regs[5] & isa::kFlagCF, isa::kFlagCF);
+    }
+    // sar S32：0xC0000000 算术右移 31 → 0xFFFFFFFF（符号填充），CF=bit30=1。
+    {
+        std::vector<u8> s;
+        isa::append_insn(s, mov_imm(0, 0xC0000000u));                    // 0
+        isa::append_insn(s, bin_imm(isa::VmOp::Sar, 0, 31, ir::Size::S32));  // 1
+        isa::append_insn(s, getflags(5));                                // 2
+        isa::append_insn(s, halt());                                     // 3
+        const auto ctx = run_stream(entry, s, nullptr);
+        expect_slot32(ctx, 0, 0xFFFFFFFFu);
+        EXPECT_EQ(ctx.regs[5] & isa::kFlagCF, isa::kFlagCF);
+    }
+    // count=0 → 整条 no-op（flags 不变 —— SDM: count 0 不更新 flags）。
+    {
+        std::vector<u8> s;
+        isa::append_insn(s, mov_imm(0, 0x1234u));                        // 0
+        isa::append_insn(s, mov_imm(3, 0x15));                           // 1
+        isa::append_insn(s, isa::make_insn(isa::VmOp::SetFlags, isa::OpKind::Reg, 3,
+                                           isa::OpKind::None, 0, 0,
+                                           isa::size_field(ir::Size::S32)));  // 2
+        isa::append_insn(s, bin_imm(isa::VmOp::Shl, 0, 0, ir::Size::S32));  // 3
+        isa::append_insn(s, getflags(5));                                // 4
+        isa::append_insn(s, halt());                                     // 5
+        const auto ctx = run_stream(entry, s, nullptr);
+        expect_slot32(ctx, 0, 0x1234u);
+        EXPECT_EQ(ctx.regs[5] & isa::kFlagsMask, 0x15u);
+    }
+    // S8 宽度：0x11 << 4 = 0x10（低 8 位内移位，alias 合并保高位）。
+    {
+        std::vector<u8> s;
+        isa::append_insn(s, mov_imm(0, 0xABCD1211ull));                  // 0
+        isa::append_insn(s, bin_imm(isa::VmOp::Shl, 0, 4, ir::Size::S8));  // 1
+        isa::append_insn(s, halt());                                     // 2
+        const auto ctx = run_stream(entry, s, nullptr);
+        EXPECT_EQ(ctx.regs[0], 0xABCD'1210ull);
+    }
+    // S8 计数掩码钉：count=0x21 → &0x1F = 1（8 位档同为 5 位掩码）。
+    {
+        std::vector<u8> s;
+        isa::append_insn(s, mov_imm(0, 0x51));                           // 0
+        isa::append_insn(s, bin_imm(isa::VmOp::Shl, 0, 0x21, ir::Size::S8));  // 1
+        isa::append_insn(s, halt());                                     // 2
+        const auto ctx = run_stream(entry, s, nullptr);
+        EXPECT_EQ(ctx.regs[0], 0xA2ull);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// (17) X3b 批次二：cl 变体（ShlCl/ShrCl/SarCl —— 计数源自 RCX 槽低 8 位）
+// ---------------------------------------------------------------------------
+TEST(X86Battery, ShiftClReg) {
+    wvmp::Rng rng(12345);
+    const auto gen = rt::generate_runtime_x86(rng);
+    RwxImage rwx(gen.image.code);
+    const auto entry = rwx.entry();
+    const u8 rcx_slot = isa::vm_reg_of(ir::Reg::Rcx);
+
+    // shlcl：RCX 槽 = 0x104 → 计数取低 8 位 = 4 → 3 << 4 = 48。
+    {
+        std::vector<u8> s;
+        isa::append_insn(s, mov_imm(0, 3));                                  // 0
+        isa::append_insn(s, mov_imm(rcx_slot, 0x104));                       // 1
+        isa::append_insn(s, isa::make_insn(isa::VmOp::ShlCl, isa::OpKind::Reg, 0,
+                                           isa::OpKind::Reg, rcx_slot, 0,
+                                           isa::size_field(ir::Size::S32)));  // 2
+        isa::append_insn(s, halt());                                         // 3
+        const auto ctx = run_stream(entry, s, nullptr);
+        expect_slot32(ctx, 0, 48u);
+    }
+    // shrcl + sarcl：0x80000000 逻辑/算术右移 4。
+    {
+        std::vector<u8> s;
+        isa::append_insn(s, mov_imm(0, 0x80000000u));                        // 0
+        isa::append_insn(s, mov_imm(rcx_slot, 4));                           // 1
+        isa::append_insn(s, isa::make_insn(isa::VmOp::SarCl, isa::OpKind::Reg, 0,
+                                           isa::OpKind::Reg, rcx_slot, 0,
+                                           isa::size_field(ir::Size::S32)));  // 2
+        isa::append_insn(s, halt());                                         // 3
+        const auto ctx = run_stream(entry, s, nullptr);
+        expect_slot32(ctx, 0, 0xF8000000ull);
+    }
+    {
+        std::vector<u8> s;
+        isa::append_insn(s, mov_imm(0, 0x80000000u));                        // 0
+        isa::append_insn(s, mov_imm(rcx_slot, 4));                           // 1
+        isa::append_insn(s, isa::make_insn(isa::VmOp::ShrCl, isa::OpKind::Reg, 0,
+                                           isa::OpKind::Reg, rcx_slot, 0,
+                                           isa::size_field(ir::Size::S32)));  // 2
+        isa::append_insn(s, halt());                                         // 3
+        const auto ctx = run_stream(entry, s, nullptr);
+        expect_slot32(ctx, 0, 0x08000000ull);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// (18) X3b 批次二：Rol/Ror(+cl)（partial 装配 —— ZF/SF/PF 保留 + CF/OF 装配）
+// ---------------------------------------------------------------------------
+TEST(X86Battery, RolRorFlags) {
+    wvmp::Rng rng(12345);
+    const auto gen = rt::generate_runtime_x86(rng);
+    RwxImage rwx(gen.image.code);
+    const auto entry = rwx.entry();
+    const u8 rcx_slot = isa::vm_reg_of(ir::Reg::Rcx);
+
+    // rol S32 count=1：0x80000001 → 0x00000003，CF=旧 MSB=1，
+    // OF = MSB(res) xor CF = 0 xor 1 = 1。
+    {
+        std::vector<u8> s;
+        isa::append_insn(s, mov_imm(0, 0x80000001u));                    // 0
+        isa::append_insn(s, bin_imm(isa::VmOp::Rol, 0, 1, ir::Size::S32));  // 1
+        isa::append_insn(s, getflags(5));                                // 2
+        isa::append_insn(s, halt());                                     // 3
+        const auto ctx = run_stream(entry, s, nullptr);
+        expect_slot32(ctx, 0, 3u);
+        EXPECT_EQ(ctx.regs[5] & isa::kFlagsMask,
+                  isa::kFlagCF | isa::kFlagOF);
+    }
+    // **partial 保留钉（MIT-433 p432 案 32 位平移）**：cmp 1,2 → flags =
+    // CF|SF|PF（0xFFFFFFFF：SF=1、CF=1 借位、PF=1 低字节 0xFF 偶、ZF=0），
+    // 随后 rol 只写 CF/OF —— ZF/SF/PF 必须**原样保留**（旧值 0b11010 →
+    // 新值 = 0b11000 | CF<<1 | OF<<2）。rol 1 on 0x80000001 → CF=1, OF=1
+    // → 期望 0b11110 = 30。若走全量装配（x64 修前缺陷形态），zero5 等价
+    // 的宿主污染会把 ZF 覆写成 1。
+    {
+        std::vector<u8> s;
+        isa::append_insn(s, mov_imm(0, 1));                              // 0
+        isa::append_insn(s, mov_imm(1, 2));                              // 1
+        isa::append_insn(s, bin(isa::VmOp::Cmp, 0, 1, ir::Size::S32));   // 2  flags=0b11010
+        isa::append_insn(s, mov_imm(0, 0x80000001u));                    // 3
+        isa::append_insn(s, bin_imm(isa::VmOp::Rol, 0, 1, ir::Size::S32));  // 4
+        isa::append_insn(s, getflags(5));                                // 5
+        isa::append_insn(s, halt());                                     // 6
+        const auto ctx = run_stream(entry, s, nullptr);
+        expect_slot32(ctx, 0, 3u);
+        EXPECT_EQ(ctx.regs[5] & isa::kFlagsMask, 30u);
+    }
+    // ror S32 count=1：0x80000001 → 0xC0000000，CF=移出 LSB=1。
+    {
+        std::vector<u8> s;
+        isa::append_insn(s, mov_imm(0, 0x80000001u));                    // 0
+        isa::append_insn(s, bin_imm(isa::VmOp::Ror, 0, 1, ir::Size::S32));  // 1
+        isa::append_insn(s, getflags(5));                                // 2
+        isa::append_insn(s, halt());                                     // 3
+        const auto ctx = run_stream(entry, s, nullptr);
+        expect_slot32(ctx, 0, 0xC0000000ull);
+        EXPECT_EQ(ctx.regs[5] & isa::kFlagCF, isa::kFlagCF);
+    }
+    // rol S8 循环宽度：0x81 rol 4 → 0x18（8 位内闭环）。
+    {
+        std::vector<u8> s;
+        isa::append_insn(s, mov_imm(0, 0xABCD1281ull));                  // 0
+        isa::append_insn(s, bin_imm(isa::VmOp::Rol, 0, 4, ir::Size::S8));  // 1
+        isa::append_insn(s, halt());                                     // 2
+        const auto ctx = run_stream(entry, s, nullptr);
+        EXPECT_EQ(ctx.regs[0], 0xABCD'1218ull);
+    }
+    // rolcl：计数来自 RCX 槽（0x104 → 低 8 位 = 4）；0x10000001 rol 4 →
+    // 0x00000018，CF = 最后移出位（SDM: 循环 N 位后 CF = 最后一次 wrap 位）。
+    {
+        std::vector<u8> s;
+        isa::append_insn(s, mov_imm(0, 0x10000001u));                    // 0
+        isa::append_insn(s, mov_imm(rcx_slot, 0x104));                   // 1
+        isa::append_insn(s, isa::make_insn(isa::VmOp::RolCl, isa::OpKind::Reg, 0,
+                                           isa::OpKind::Reg, rcx_slot, 0,
+                                           isa::size_field(ir::Size::S32)));  // 2
+        isa::append_insn(s, getflags(5));                                // 3
+        isa::append_insn(s, halt());                                     // 4
+        const auto ctx = run_stream(entry, s, nullptr);
+        expect_slot32(ctx, 0, 0x11u);
+    }
+    // rorcl + partial 保留（cl 形态同面钉）。
+    {
+        std::vector<u8> s;
+        isa::append_insn(s, mov_imm(0, 1));                              // 0
+        isa::append_insn(s, mov_imm(1, 2));                              // 1
+        isa::append_insn(s, bin(isa::VmOp::Cmp, 0, 1, ir::Size::S32));   // 2  flags=0b11010
+        isa::append_insn(s, mov_imm(0, 0x80000001u));                    // 3
+        isa::append_insn(s, mov_imm(rcx_slot, 1));                       // 4
+        isa::append_insn(s, isa::make_insn(isa::VmOp::RorCl, isa::OpKind::Reg, 0,
+                                           isa::OpKind::Reg, rcx_slot, 0,
+                                           isa::size_field(ir::Size::S32)));  // 5
+        isa::append_insn(s, getflags(5));                                // 6
+        isa::append_insn(s, halt());                                     // 7
+        const auto ctx = run_stream(entry, s, nullptr);
+        // ror 1: 0x80000001 → 0xC0000000，CF=旧 LSB=1，OF 未定义（count=1 实
+        // 值可断但保守不断言）→ flags = 0b11000 | CF = 0b11010 = 26。
+        EXPECT_EQ(ctx.regs[5] & (isa::kFlagZF | isa::kFlagSF | isa::kFlagPF),
+                  isa::kFlagSF | isa::kFlagPF);
+        EXPECT_EQ(ctx.regs[5] & isa::kFlagCF, isa::kFlagCF);
+    }
+}

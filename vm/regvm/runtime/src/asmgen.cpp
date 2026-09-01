@@ -4201,6 +4201,60 @@ public:
                tail_lbl + ":\n" + advance_x86(dispatch);
     }
 
+    // x86 Shl/Shr/Sar/Rol/Ror（imm/cl 双形式 —— build_shift 的 32 位版）。
+    // 块体与 x64 逐段同构（load A → 计数装载（b_kind 分支）→ 掩码 → 计数 0
+    // 出口 → native → setcc5 → 写回），仅三处分叉：
+    //   1. 计数掩码 = **0x1F 全宽**：SDM Vol. 2 —— 6 位掩码仅 64 位模式
+    //      REX.W 生效，legacy/compat（含 32 位模式）恒 5 位。计数 32..63 在
+    //      S32 档：0x1F 掩码 → 0 → 走计数 0 出口（值与 flags 均不动，native
+    //      语义）；若沿用 x64 S32 的 0x3F 掩码，计数 32 会漏进 native（内部
+    //      再掩 0）且把 and 的宿主 flags 经 setcc 装配进 guest —— 静默污染
+    //      （x64 侧同形缺口属既有面，X3b 不触碰，报告披露）。电池
+    //      ShiftImmMask 实测钉死（count=0x20 值+flags 双不变）。
+    //   2. 计数 0 出口在 flags 装配**前**旁路（x64 同构）—— rol/ror 的
+    //      partial 装配同理（SDM: count&31 == 0 时 flags 不受影响）。
+    //   3. rol/ror 尾部 = flags_tail_partial_x86（ZF/SF/PF 从 [ctx+0x98] 旧值
+    //      保留，仅 CF/OF 照捕装配 —— MIT-433 MIT-P1 案的 32 位平移）。
+    // cl 变体与 imm 形式共享本 builder：translator 对 src=Reg 的 shift 发
+    // b_kind=Reg（reg_b = RCX 槽），计数装载走同一 b_kind 分支（x64
+    // build_shl_cl 同款）；物理 cl = ecx 恒保留于池外，零冲突。
+    std::string build_shift_x86(const char* native, u64 dispatch,
+                                bool partial_flags = false) const {
+        const std::string tag = std::string(native) + std::to_string(seq());
+        const std::string adv_lbl = "xadv_" + tag;
+        const std::string tail_lbl = "xtail_" + tag;
+        std::string blocks[3];
+        for (int s = 0; s < 3; ++s) {
+            const std::string stag = std::to_string(s) + "_" + tag;
+            std::string o;
+            o += load_operand_x86(s, kX86FAKind, kX86FRegA, t_[0], "a" + stag);
+            // 计数 → t1（Imm=aux 帧槽 / Reg=reg_b 槽 dword 读）。
+            o += std::string("    mov ") + r32x(t_[2]) + ", " + xf(kX86FBKind) + "\n";
+            o += std::string("    cmp ") + r32x(t_[2]) + ", " + imm(1) + "\n";
+            o += "    jne xcnti" + stag + "\n";
+            o += std::string("    mov ") + r32x(t_[2]) + ", " + xf(kX86FRegB) + "\n";
+            o += std::string("    mov ") + r32x(t_[1]) + ", dword ptr " + xslot(t_[2]) + "\n";
+            o += "    jmp xcntg" + stag + "\n";
+            o += "xcnti" + stag + ":\n";
+            o += std::string("    mov ") + r32x(t_[1]) + ", " + xf(kX86FAux) + "\n";
+            o += "xcntg" + stag + ":\n";
+            // cl 计数装载 + 5 位掩码（32 位模式全宽统一，见上注）。
+            o += std::string("    mov cl, ") + rs(t_[1], 0) + "\n";
+            o += std::string("    and cl, ") + imm(0x1F) + "\n";
+            o += "    jz " + adv_lbl + "\n";   // 计数 0：值与 flags 均不变
+            o += std::string("    ") + native + " " + rs(t_[0], s) + ", cl\n";
+            o += setcc5_x86();
+            o += writeback_x86(s, kX86FRegA, t_[0], t_[1]);
+            o += "    jmp " + tail_lbl + "\n";
+            blocks[s] = o;
+        }
+        std::string out = decode_prelude_x86() + size_chain_x86(blocks, tag, dispatch);
+        out += adv_lbl + ":\n" + advance_x86(dispatch);   // 计数 0 出口
+        out += tail_lbl + ":\n" +
+               (partial_flags ? flags_tail_partial_x86(dispatch) : flags_tail_x86(false, dispatch));
+        return out;
+    }
+
     // ---- x86 一元包装（HandlerDef 需要无参差成员函数指针） ----------------
     std::string build_x86_add(u64 d) const { return build_binary_x86("add", d, true); }
     std::string build_x86_sub(u64 d) const { return build_binary_x86("sub", d, true); }
@@ -4228,6 +4282,17 @@ public:
     std::string build_x86_imul(u64 d) const { return build_imul_x86(d); }
     std::string build_x86_mul(u64 d) const { return build_mul_x86(d); }
     std::string build_x86_cdq(u64 d) const { return build_cdq_x86(d); }
+    // X3b 批次二：移位/旋转族（imm 与 cl 变体共享 builder，b_kind 分支分流）。
+    std::string build_x86_shl(u64 d) const { return build_shift_x86("shl", d); }
+    std::string build_x86_shr(u64 d) const { return build_shift_x86("shr", d); }
+    std::string build_x86_sar(u64 d) const { return build_shift_x86("sar", d); }
+    std::string build_x86_rol(u64 d) const { return build_shift_x86("rol", d, true); }
+    std::string build_x86_ror(u64 d) const { return build_shift_x86("ror", d, true); }
+    std::string build_x86_shl_cl(u64 d) const { return build_shift_x86("shl", d); }
+    std::string build_x86_shr_cl(u64 d) const { return build_shift_x86("shr", d); }
+    std::string build_x86_sar_cl(u64 d) const { return build_shift_x86("sar", d); }
+    std::string build_x86_rol_cl(u64 d) const { return build_shift_x86("rol", d, true); }
+    std::string build_x86_ror_cl(u64 d) const { return build_shift_x86("ror", d, true); }
 
 private:
     Rng& rng_;
@@ -4305,6 +4370,17 @@ RuntimeGenResult generate_runtime_arch(wvmp::Rng& rng, AsmGen::HostArch arch) {
             {int(VmOp::Imul), "imul", &AsmGen::build_x86_imul},
             {int(VmOp::Mul), "mul", &AsmGen::build_x86_mul},
             {int(VmOp::Cdq), "cdq", &AsmGen::build_x86_cdq},
+            // —— X3b (MIT-444) A 档批次二：移位/旋转族（imm + cl 变体）——
+            {int(VmOp::Shl), "shl", &AsmGen::build_x86_shl},
+            {int(VmOp::Shr), "shr", &AsmGen::build_x86_shr},
+            {int(VmOp::Sar), "sar", &AsmGen::build_x86_sar},
+            {int(VmOp::Rol), "rol", &AsmGen::build_x86_rol},
+            {int(VmOp::Ror), "ror", &AsmGen::build_x86_ror},
+            {int(VmOp::ShlCl), "shlcl", &AsmGen::build_x86_shl_cl},
+            {int(VmOp::ShrCl), "shrcl", &AsmGen::build_x86_shr_cl},
+            {int(VmOp::SarCl), "sarcl", &AsmGen::build_x86_sar_cl},
+            {int(VmOp::RolCl), "rolcl", &AsmGen::build_x86_rol_cl},
+            {int(VmOp::RorCl), "rorcl", &AsmGen::build_x86_ror_cl},
         };
     } else {
         handlers = {

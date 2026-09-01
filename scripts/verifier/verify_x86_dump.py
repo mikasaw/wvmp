@@ -46,6 +46,9 @@ BATTERY_HANDLERS = {
     "getflags", "setflags",
     # X3b (MIT-444) A 档批次一：一元 / 带进借位二元 / 乘法 / 符号扩展。
     "not", "neg", "adc", "sbb", "imul", "mul", "cdq",
+    # X3b (MIT-444) A 档批次二：移位/旋转族（imm + cl 变体）。
+    "shl", "shr", "sar", "rol", "ror",
+    "shlcl", "shrcl", "sarcl", "rolcl", "rorcl",
 }
 
 HEADER_RE = re.compile(
