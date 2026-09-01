@@ -268,28 +268,27 @@ TEST(PeLoaderPass, LoadsFileIntoImageAndSlot) {
     EXPECT_EQ(meta->num_sections, u16(1));
 }
 
-// MIT-414 (G7p2 B.2)：x86 输入在 pass 层硬失败（ERROR diag + 抛错）——
-// 解析本身完成（修复后字段正确、无害），但绝不进入下游产壳流程，消灭
-// "静默无操作"与"产 WinError 193 坏壳"两态。
-TEST(PeLoaderPass, RejectsX86InputWithHardError) {
+// MIT-446 (X4) D1 解禁：x86 输入通行（auto 槽缺省 = machine 推导）。解析
+// 模型落槽，下游 x86 全管道承接（此前 MIT-414 的硬拒文案随解禁翻正，
+// mismatch 象限维持硬拒——见 TargetArchDeclGate）。
+TEST(PeLoaderPass, AutoDeclX86InputPassesAfterD1Unlock) {
     ProtectionContext ctx;
     ctx.input_path = write_temp("x86_target.exe", build_minimal_pe(false, kMachineX86));
     wvmp::passes::PeLoaderPass pass;
 
-    EXPECT_THROW(pass.run(ctx), std::runtime_error);
-    EXPECT_TRUE(ctx.diag.has_errors());
-    EXPECT_FALSE(ctx.has_slot(wvmp::passes::kImageMeta)); // 模型不落槽：下游无从继续
-    bool saw_gate = false;
-    for (const auto& d : ctx.diag.items())
-        if (d.severity == wvmp::Severity::Error &&
-            d.message.find("32 位目标 (x86) 未支持 (GAPS C5)") != std::string::npos)
-            saw_gate = true;
-    EXPECT_TRUE(saw_gate);
+    EXPECT_NO_THROW(pass.run(ctx));
+    EXPECT_FALSE(ctx.diag.has_errors());
+    const wvmp::passes::PeImage* meta = ctx.find_slot<wvmp::passes::PeImage>(
+        wvmp::passes::kImageMeta);
+    ASSERT_NE(meta, nullptr);
+    EXPECT_FALSE(meta->is_pe32_plus);
+    EXPECT_EQ(meta->machine, kMachineX86);
 }
 
-// MIT-438 (X1b) B.5: CLI arch 声明校验挂点——X64 声明与目标不符 → rc=2 显式
-// 拒（x86 machine 上消息区分于 C5 文本）；X64 声明 + x64 machine → 正常路径；
-// X86 声明（匹配亦未解禁 D1 / 声明不符）→ rc=2；无声明 → 现状行为不变。
+// MIT-438 (X1b) B.5: CLI arch 声明校验挂点——X64 声明与目标不符 → rc=2 显
+// 拒（x86 machine 上消息区分于旧 C5 文本）；X64 声明 + x64 machine → 正常
+// 路径；X86 声明 + x86 machine → MIT-446 (X4) D1 解禁放行；X86 声明 + x64
+// machine → 声明不符维持拒。
 TEST(PeLoaderPass, TargetArchDeclGate) {
     // X64 声明 + x64 machine → 正常通过（槽写入后常规路径零回踩）。
     {
@@ -318,22 +317,19 @@ TEST(PeLoaderPass, TargetArchDeclGate) {
                 saw_mismatch = true;
         EXPECT_TRUE(saw_mismatch);
     }
-    // X86 声明 + x86 machine（匹配）：x86 通行未解禁 (D1) → 显式拒。
+    // X86 声明 + x86 machine（匹配）：MIT-446 (X4) D1 解禁 → 放行。
     {
         ProtectionContext ctx;
         ctx.input_path = write_temp("decl_x86_matched.exe",
                                     build_minimal_pe(false, kMachineX86));
         ctx.slot<wvmp::u8>(wvmp::passes::kTargetArchDecl) = wvmp::passes::kTargetArchX86;
         wvmp::passes::PeLoaderPass pass;
-        EXPECT_THROW(pass.run(ctx), std::runtime_error);
-        EXPECT_TRUE(ctx.diag.has_errors());
-        EXPECT_FALSE(ctx.has_slot(wvmp::passes::kImageMeta));
-        bool saw_closed = false;
-        for (const auto& d : ctx.diag.items())
-            if (d.severity == wvmp::Severity::Error &&
-                d.message.find("config arch=x86") != std::string::npos)
-                saw_closed = true;
-        EXPECT_TRUE(saw_closed);
+        EXPECT_NO_THROW(pass.run(ctx));
+        EXPECT_FALSE(ctx.diag.has_errors());
+        const wvmp::passes::PeImage* meta = ctx.find_slot<wvmp::passes::PeImage>(
+            wvmp::passes::kImageMeta);
+        ASSERT_NE(meta, nullptr);
+        EXPECT_EQ(meta->machine, kMachineX86);
     }
     // X86 声明 + x64 machine → 声明不符显式拒。
     {

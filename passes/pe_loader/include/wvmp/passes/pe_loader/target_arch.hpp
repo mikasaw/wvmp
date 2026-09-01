@@ -12,11 +12,11 @@ namespace wvmp::passes {
 // CLI 侧枚举 = cli/include/wvmp/cli/config.hpp 的 ArchOpt（Auto/X64/X86），
 // main.cpp 经穷举 switch 映射到本常量——两侧禁止再增第三个定义面。
 //
-// 语义（派活单 §B.5 / §C D1）：
-//   Auto = machine 推导的现状行为（x64 通行 / x86 rc=2 硬拒，GAPS C5 不回退）；
+// 语义（MIT-438 派活单 §B.5 / §C D1；MIT-446 (X4) D1 解禁翻正）：
+//   Auto = machine 推导（x64 通行；x86 自 X4 起通行——全管道
+//          marker_scan/lifter/translator/runtime_x86/stub_link 承接）；
 //   X64  = 显式声明：machine != 0x8664 → rc=2 显式拒（声明与目标不符）；
-//   X86  = 匹配 0x014C 亦 rc=2——x86 通行**不随本单解禁**（D1：解禁时点 =
-//          X4 asmgen 收口单拍板），本面只铺校验基建。
+//   X86  = 显式声明：machine == 0x014C → 通行（X4 D1）；否则 rc=2 拒。
 // 未知 machine（非 0x014C/0x8664）在解析层白名单即拒（pe_image.cpp），不回退。
 inline constexpr std::string_view kTargetArchDecl = "target_arch_decl";
 inline constexpr u8 kTargetArchAuto = 0;
