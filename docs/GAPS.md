@@ -549,6 +549,7 @@ fork 面六块落地——**kVmOpMax=97 不动（全折条）、零新 handler�
 | plain 串形 movsd/lodsd/scasd/stosd/cmpsd（dxcompiler 10116 级） | ✅ 收 | 单发微程序 = G3 rep 微程序"循环一次"（载体域 23..27，kStrPlainBase）；movs/stos/lods 无 flags 包裹、scas/cmps Cmp 后直落（flags=末次比较） | x64 全链 E2E（样本区3，movsd×2+lodsd+cld） |
 | cld | ✅ 收（D5） | DF←0 与 VM DF=0 假设一致 → Op::Nop 放行（对齐 415 DF 判）；std → gate（G3 行） | x64 E2E（区3 区内 cld）+ 单测 |
 | call [mem]（msvbvm60 35% of call）/ call reg | ⛔ gate（D4 停手） | lifter 开口（Call dst=Mem/Reg）→ translator X3 披露 note；CallGate reg-target 通路 = asmgen 改动归 X3 | x64 E2E 负例区2/2b（IAT 形 FF 15 / call reg FF D0）+ 代码直读证据（asmgen.cpp step1） |
+| **call [mem] / call reg（X3c 翻正, 本行取代上行）** | ✅ 支持 | **MIT-445 (X3c) B.1**：translator 双 skip 解除 + asmgen build_callgate reg 值目标形（a_kind=Reg 判别, 零新 VmOp）；mem 形折条 Load/LoadRva(S64)+CallGate(reg)；x64 全链实证 forkface 区2/2b 翻案（stub 3→5, gate note 全消, 输出串恒同）；x86 电池真执行 3 用例 | 分支 c24e159；x86 CallGateRvaFormRealCall/CallGateRegFormRealCall/CallGateRegFormComputedTarget |
 | S16/p66（0.82%） | ✅ 收（D2 双向授权实测通过） | GP 面 S16 全通（lifter data_size / translator size_field / runtime size_chain 4 路分派 + S16 别名写回——G3「S16 通路现成」声明首次真验成立）；栈面例外：S16 push/pop 栈推进 2B 不在 VM 栈模型 → gate（修复旧静默错形）；S16 串形维持砍面（G4 行） | ctest S16 语义电池（Mov/Add/Sub/Load/Store/Cmp+Jcc/别名保高 48 位）+ x64 E2E（区4，66 B8/03/89/BA/33/3B/83） |
 | cwde/cbw（98，低频） | ✅ 收 | cwde = `[Movsx{Rax←Rax,S32,S16}; Mov{Rax←Rax,S32}]` 两 IR（build_movsx qword 写回高位污染 → "mov eax,eax" 零扩展 idiom 补偿——单条直折不可行实测钉死）；cbw（66 98，高 48 位保持）= translator 载体微程序（Op::Movsx + src2=Imm(28)=kExtCbw，GetFlags/SetFlags 包裹 8 VmOp） | ctest 槽语义电池（CwdeFoldSlotSemantics/CbwCarrierSlotSemantics）+ x64 E2E（区4，98/66 98 MASM 直编） |
 | shld/shrd | ⛔ 维持（X3） | 结构性必收但归 X3（派单分工），本单不动 | — |
@@ -809,6 +810,103 @@ diff 0 + ctest 16/16；x86 = 电池 28 用例（真执行语义 + capstone CS_MO
 xadd 旧值写回误用 kind 值槽代索引槽（写错槽）、cmpxchg S8 源载体未约束字
 节可编码集（seed 相关 ks_errno=512）、setcc tail 复用 cond 载体作槽索引
 （写错槽）——三处均为 x86 emit 面缺陷，x64 恒等逐批次复验未受扰。
+
+## asmgen x86 协议面收口：CallGate reg-target 双 arch + ExitNative 4B + Ret x86 形（MIT-445 X3c 收口）
+
+**状态（2026-09-01，分支 `mit-x3c-protocol`，三批次 c24e159/a5f6848/9d9b38e）**：
+协议三件套（X3b 纸面清单中 CallGate/ExitNative/Ret）全数收口为真执行；唯二解禁
+asmgen.cpp + translator.cpp（限 translate_call 通路）全程遵守；冻结契约
+（runtime.hpp/vm_op 97/kCtxSize/backend/lifter/cli/sdk/载体域 0..28）零 diff；
+kVmOpMax=97 不动、零新 VmOp。
+
+**B.1 CallGate reg-target（双 arch 同收, 442 D4 停手挂账翻案）**：
+- **字节级编码布局（D1 拍板报告项）**：VmOp::CallGate 双形共用, 判别位 = a_kind——
+  RVA 形（既有）: a_kind=None, reg_a 无义, aux=目标 RVA → VA = aux+image_base；
+  reg 形（新增）: a_kind=Reg, reg_a=目标槽(0..31), aux=0 → VA = regs[reg_a]
+  （槽值 = 绝对 VA；x64 槽全宽 u64 读 / x86 低 dword 读）。
+- **x64 handler**：目标 VA 双形分派置于参数快照（rax 搬运）之前——T3/T4 可能=rax,
+  先读后快照（首版顺序被 forkface 区2 E2E 当场炸出, cdb 崩点 [rsi+rax*8+0x10]
+  索引=快照残渣）；先读附带防御 reg_a∈24..27 reserved 覆写病态形。标签固定名
+  （不吃 seq()）——seq 号被消费会让后续 handler 内部标签顺移, 污染 dump 对账口径。
+- **translator**：Reg 形 emit CallGate(a_kind=Reg, reg_a)；Mem 形折条
+  emit_load（rip 形→LoadRva / 非 rip→Load, S64 载目标值入 fresh scratch）+
+  CallGate(reg)；双 skip（442 X3 披露 note）删除。
+- **x86 handler（build_callgate_x86, 表 57→58）**：结构差异 5 点对账入注（cdecl
+  0-arg 参数窗留 X4 / 窗口锚 = host_rsp [ctx+0x128] 自洽无需 native_sp /
+  pc·flags 内存常驻零 save-restore / eax 低 dword 写回 / esp 窗口切换纪律）；
+  窗口 kX86CallgateWindow=0x1000 16 对齐 + 探针写（406 同款）。
+- **x64 全链实证**：forkface 区2/2b 从 C1 gate → 真虚拟化（stub 3→5、双 skip
+  note 全消、stdout byte-exact rc=0：bal=0 哨兵 / callmem=997 / callreg=998 /
+  str=… / s16 全组恒同）；callee-saved 影响 = ctx_/base_ 恒 callee-saved 跨
+  call 存活（roll 约束）+ pc/flags/base 快照恢复链不变, 逐 step 对账零新增面。
+- **dump 对账（B.7, 分级口径）**：x64 @12345 f67c2d40(161756B)→ffd47289(161861B)：
+  entry 逐字节恒等、dispatch 仅 1 行表偏移（0x69C8→0x69D8）、**唯一码体 delta =
+  callgate handler（+6 行 a_kind 分支）**、跳表 20 项机械顺移。⚠️ 口径勘误（#33
+  亲测钉死）：asm_dump 是 seed 的纯函数（与样本无关——snake/forkface @12345 同
+  sha 实证），派单"48 样本恒等 + forkface 例外"的前提机械上不成立——callgate 码
+  体 delta 以同形出现在全部样本 dump；等价口径 = 逐 handler 对账（唯一 delta 段
+  = callgate）+ 行为恒等（multiseed 250/250 输出串逐字节恒同）。
+- **x86 电池**：CallGateRvaFormRealCall（base≠0 非 identity 反证）/ 
+  CallGateRegFormRealCall（reg 形真调用, g_xcg_calls 递增 + 返回值写回）/
+  CallGateRegFormComputedTarget（LeaRva 运行时算出目标）。
+
+**B.2 ExitNative x86 形（表 58→59）**：无条件 a_kind=Imm(2) / 条件 a_kind=None +
+cond_or_size=Cond 16 路链（build_jcc_x86 同构）；4B 退出槽 = dword [native_sp −
+kX86ExitSlotDepth(=4*4+kCtxSize+0x80=0x258)]（asmgen.cpp 单一来源派生,
+runtime.hpp 冻结零触碰; **X4 stub_gen 读侧对接锚**）; epilogue = add esp,0x24 +
+4 callee-saved 逆序 pop + ret（build_halt_x86 同构）; 退出不 advance（x64 同）。
+电池：ExitNativeUncondSlotProtocol（槽落账 0x401234 + pc 不写回）+
+ExitNativeCondTakenAndFallthrough（cond E 双路）。
+
+**B.3 Ret x86 形（表 59→60）**：ret_addr = dword [v4]; v4' = v4+4+imm（aux 槽,
+translator 0xFFFF 掩码既有; dword 回绕 = native esp 语义, 444 裁决表"零扩展不
+变量+dword 低半字算术"）; ret_addr → [v4'-4] 死槽; 出口 = 弃帧(0x28)+4 pop+
+物理 esp := v4'（宿主栈 push 暂存 + [esp−0x38] 坐标读, 常量
+kX86RetV4SlotFromExitRsp=0x38 派生 + static_assert）+ jmp [esp−4]。⚠️ 实战缺
+陷修正（cdb 铁证 eip=0/esp=guest_top−4）：push 暂存必须在死槽指针 (t0−=4) 之
+前——先减后 push 把死槽地址当 v4' 存入。438"guest 栈写恒 ≥ ns"对账：[v4'-4]
+死槽写与 x64 [v4'-8] 同形, 与 x86 保存区 [ns-4..ns-0x10] 重叠仅在未配平 ret
+病态形（同 x64 EXIT_SLOT 重叠披露）。电池：RetPlainStackBalance（naked
+landing + longjmp; v4'=top 平衡 + eax=0xBEEF 写回 + [ctx+0x30] 持久化）+
+RetImm16StackBalance（stdcall 栈序 ret 8 清栈回原点）。
+
+**x86 dump 对账口径（X3b→X3c）**：57→60 handler 每波重立底稿（X3b 19→57 同
+款机制）：新表行改变 shuffle 排列 → seq 标签号分配序漂移 → 既有 handler 文本
+标签号变化（归一化后码体结构零 diff——X3c 实测 40/40 纯标签）；x64 面无此效
+应（callgate 标签固定名 + build_ret_x86 仅入 x86 表 → x64 dump 三批次恒等
+ffd47289）。
+
+**X4 交接注记**：
+1. **S64 tag 改形精确点位（444 挂账, translator.cpp）**——x86 全管道解锁前必改,
+   否则 rsp 步进/地址算术在 x86 运行时 3 路尺寸链折防御 no-op 静默空转：
+   ① translate_push / translate_pop 的 rsp 步进（emit_ri(Sub/Add, rsp, 8u/4u,
+   sz64)）；② emit_address 双形全链（rip 形 :710-732 / 非 rip :738-772, Mov/
+   Shl/Add/Sub 全 sz64）；③ emit_imm64_split（:680-684）；④ LeaRva 通路
+   （:875-876）；⑤ G3 串微程序 rsi/rdi/rcx 步进（:1119-1241 域内多处）。
+   改形方向：栈步进改 VmOp::Push/Pop 单 op（X3a 已备 4B handler）或 sz 参数化;
+   地址算术改 S32 步进 tag。改形必须与 x86 电池联动（S64 防御出口改后需防回归）。
+2. **stub ABI 对齐锚**：B.1-B.3 未动 x86 entry/帧形（kX86FrameSize=0x24 不变）
+   ——x86 stub_gen 对接锚 = ① ExitNative 槽读 [ns−0x258]（kX86ExitSlotDepth,
+   asmgen.cpp 单一来源）；② callgate 窗口锚 = host_rsp 自洽（stub 无需预置
+   native_sp 之外的量——但 ExitNative 仍需 [ctx+0x120] native_sp）；③ Ret 出口
+   坐标 0x38 在"entry 4 push + 0x24 帧"不变量下成立, stub 帧形若变需同步该常量；
+   ④ x86 callgate 参数窗（cdecl 栈参数预置）= X4 落（D2 拍板不特化）——落参窗
+   时 build_callgate_x86 与 stub_gen 两处同步。
+3. **S16 串形配方留档核对**（444 遗留）：lifter ⑤ 放行 width==2 + translator
+   inc 派生补 S16?2 分支 + Load/Store/Cmp S16 槽通路——两文件最小 diff 配方
+   仍有效（lifter 冻结未触, 本单未动）。
+
+**B.5 shld/shrd/cwd 评估（442 挂账④, 只出数裁决不实施）**：
+- **shld/shrd**：语料低频——X0 missing 表内无独立频数（64 位算术偏走 CRT
+  __allshl 调用）, probe_64 rgn_wide 16 条中 2 条（12.5%, 收面后 100%）但"结构
+  性必收"（64 位移位仿真惯用）。**裁决 = 折条可行, 挂观察清单**：imm/cl 形可零
+  新 VmOp 折条（d = (d<<(c&31)) | (s>>(32−(c&31))) 微程序 5-7 op + flags 尾部
+  Or, 同 G8a 折条模式）, 但 lifter 无 lift 形（442 grep 亲验）→ 需先开 lifter
+  （冻结面, 同 S16 串形"两文件最小 diff 配方"模式）。触发条件 = 客户语料命中。
+- **cwd**：capstone 双 id 归 cwde 系（442 亲验"cwd 双 id 仅 cwde/cbw 系"）, X0
+  missing 表**无独立条目**（语料 0/噪声级——MSVC 16 位 DX:AX 仿真不产现代产物）。
+  **裁决 = 不立项**；cwde/cbw 已由 442 收口覆盖符号扩展语义面。若未来语料命中,
+  折条 = Movsx(S16 源) 写 dx 槽 + ax 保留, 同款两文件配方。
 
 ## G3 串指令族 rep movs/stos/scas/cmps/lods（MIT-415 收口）
 
