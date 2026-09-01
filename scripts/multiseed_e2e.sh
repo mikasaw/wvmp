@@ -262,7 +262,28 @@ samples=(
     # byte-exact (REQUIRE_REAL 3 stub 真虚拟化)。
     # 单边新增 1 样本 → 49 × 5 = 245 runs。
     "build/passes/marker_scan/tests/wvmp_retimm_sample.exe"
+    # MIT-442 (X2a): 形级 fork 面收口主样本 — 区1 leave 链 (折条真虚拟化 +
+    # bal=0 平衡哨兵) + 区3 plain 串形 (movsd×2/lodsd + cld no-op) + 区4
+    # p66 S16 (66 前缀 imm/ALU/store + cwde 两 IR 折条 + cbw 载体微程序)
+    # 真虚拟化 (REQUIRE_REAL ≥1 stub); 负例区2 call [mem] IAT 形 / 区2b
+    # call reg (D4 停手 gate 归 X3) / 区5 std (D5 gate) / 区6 67 前缀
+    # (B.4 闸, 禁调用) 行为 byte-exact。
+    # 单边新增 1 样本 → 50 × 5 = 250 runs。
+    "build/passes/marker_scan/tests/wvmp_forkface_sample.exe"
 )
+
+# MIT-442 (X2a) B.7: x86 (PE32) 样本池架子 — X5 收口单填池 (空池不跑)。
+# 语义: 样本产物路径按 build/x86_samples/*.exe 约定; 填池即自动 ×5 seeds
+# 入 multiseed 口径 (与 x64 同一 protect/byte-exact/REQUIRE_REAL 判据 —
+# 唯一差异 = 输入 PE32, x86 管道翻硬拒为声明后生效)。本单预铺只验证
+# "空池零开销不误伤" 与数组/循环就位, 不放任何样本 (x86 管道 rc=2 硬拒
+# 维持, D1 不回退 — X0 §6 表 X1 行的基建参数化切片预铺, 填池归 X5)。
+x86_samples=(
+)
+# 例 (X5 填池形态, 现留空):
+# x86_samples=(
+#     "build/x86_samples/wvmp_x86_marker_sample.exe"
+# )
 
 # Seeds: 1 (small), 12345 (default), 99999 (large), 0xDEADBEEF (magic), 0xCAFEBABE (magic).
 seeds=(1 12345 99999 3735928559 3405691582)
@@ -270,14 +291,12 @@ seeds=(1 12345 99999 3735928559 3405691582)
 pass=0
 fail=0
 
-for sample in "${samples[@]}"; do
-    if [[ ! -f "$sample" ]]; then
-        echo "[multiseed] 样本文件不存在: $sample" >&2
-        fail=$((fail + 1))
-        continue
-    fi
-    sample_win="$(cygpath -m "$sample")"
-    for seed in "${seeds[@]}"; do
+# MIT-442 (X2a) B.7: 单样本×单 seed 执行体提为函数 — x64 主池与 x86 预铺池
+# 共用同一判据 (protect rc=0 + REQUIRE_REAL stub 标记 + stdout/rc byte-exact +
+# 427 B.5 crash guard), 消除双池双份逻辑漂移面。pass/fail 为全局计数器。
+run_one_seed() {
+    local sample="$1"
+    local seed="$2"
         tmp="$(mktemp -d)"
         cfg="$tmp/e2e.toml"
         out_win="$(cygpath -m "$tmp")/wvmp_e2e_out.exe"
@@ -306,7 +325,7 @@ EOF
             echo "$out" >&2
             fail=$((fail + 1))
             rm -rf "$tmp"
-            continue
+            return
         fi
         # MIT-306: REQUIRE_REAL 校验日志含 "已生成 N 个入口 stub" 标记。
         # stub_link 在 virtualize pass 至少产生 1 个 VirtualizedFunction 时输出此
@@ -319,7 +338,7 @@ EOF
                 echo "$out" | tail -5 >&2
                 fail=$((fail + 1))
                 rm -rf "$tmp"
-                continue
+                return
             fi
         fi
         # Run both, compare stdout + rc byte-exact.
@@ -370,6 +389,32 @@ EOF
             pass=$((pass + 1))
         fi
         rm -rf "$tmp"
+}
+
+for sample in "${samples[@]}"; do
+    if [[ ! -f "$sample" ]]; then
+        echo "[multiseed] 样本文件不存在: $sample" >&2
+        fail=$((fail + 1))
+        continue
+    fi
+    sample_win="$(cygpath -m "$sample")"
+    for seed in "${seeds[@]}"; do
+        run_one_seed "$sample" "$seed"
+    done
+done
+
+# MIT-442 (X2a) B.7: x86 (PE32) 样本池 — 空池不跑 (零开销); X5 收口单填池后
+# 自动 ×5 seeds 入同一口径 (x86 管道翻硬拒为声明后生效; 现网 rc=2 硬拒维持,
+# 填池样本会 protect rc=2 FAIL — 这是 X5 的接线验收, 不是本单的)。
+for sample in "${x86_samples[@]}"; do
+    if [[ ! -f "$sample" ]]; then
+        echo "[multiseed] x86 样本文件不存在: $sample" >&2
+        fail=$((fail + 1))
+        continue
+    fi
+    sample_win="$(cygpath -m "$sample")"
+    for seed in "${seeds[@]}"; do
+        run_one_seed "$sample" "$seed"
     done
 done
 

@@ -271,10 +271,24 @@ TranslateResult translate_jcc(const cs_insn& ci, const cs_x86& x, ir::Arch arch)
     return ok(out);
 }
 
+// MIT-442 (X2a) ①: call [mem] 开口 — IAT thunk `call [__imp_x]` / `call [esp+..]`
+// 形 (X0 §1.4: msvbvm60 35% 的 call 是 mem 形)。镜像 409 Jmp(dst=Mem) 先例:
+// lift 为 Op::Call(dst=Mem), 翻译器侧按折条可行性裁决。
+//
+// ⚠️ #33 实测兜底推翻派单预判 (MIT-442 D4 停手披露): 派单 §A.2 "① = Load(目标
+// 地址) + 既有 call-reg 通路折条, 零新 VmOp 高置信" 被 asmgen 直读推翻 ——
+// build_callgate 的目标只吃 T5(=aux, 翻译期 RVA), 无 reg 值目标通路
+// (asmgen.cpp step1: `mov t0, t5; add t0, [ctx+0x110]`), 且 "call reg 可直用"
+// 也只是 lifter 白名单级 (translator translate_call 对 Reg/Mem 一律 skip →
+// C1 gate, runtime 从未有 call-reg E2E)。折条落地需 CallGate 支持 reg 值目标
+// = asmgen 改动 → 本单 D4 红线停手, 归 X3 (GAPS X2a 节 + 样本负例区钉 gate)。
+// 本开口零行为变化: lift 成功后 translator 照旧 skip (带 X3 披露 note) →
+// C1 整函数原生 byte-identical, 与 call reg 既有行为逐位一致。
 TranslateResult translate_call(const cs_insn& ci, const cs_x86& x, ir::Arch arch) {
     if (x.op_count != 1) return unsupported(ci.address, ci.size);
-    if (x.operands[0].type != X86_OP_IMM && x.operands[0].type != X86_OP_REG) {
-        return unsupported(ci.address, ci.size); // call [..] v1 跳过
+    if (x.operands[0].type != X86_OP_IMM && x.operands[0].type != X86_OP_REG &&
+        x.operands[0].type != X86_OP_MEM) {
+        return unsupported(ci.address, ci.size);
     }
     auto d = to_operand(x.operands[0]);
     if (!d) return unsupported(ci.address, ci.size);
@@ -298,6 +312,123 @@ TranslateResult translate_ret(const cs_insn& ci, const cs_x86& x, ir::Arch arch)
         if (x.operands[0].type != X86_OP_IMM) return unsupported(ci.address, ci.size);
         out.src = Operand::imm_(static_cast<i64>(x.operands[0].imm)); // ret imm16
     }
+    return ok(out);
+}
+
+// MIT-442 (X2a) ⑥: cbw 载体标记 — 域 28 (与 0..4 string / 5..13 lock /
+// 14..18 SSE mul+andn / 19..21 bridge / 22 flagless / 23..27 plain 串形
+// 分区连续零重叠; op 限定 Movsx, movsx 常规构造从不写 src2 — 419 §B.1
+// 审计纪律)。定义前置于此 (translate_cbw 前向引用)。
+constexpr int kExtCbw = 28;
+
+// MIT-442 (X2a) ③: leave (C9) — x86 栈帧主形 epilogue 惯用法 (X0 §1.4: 全语料
+// 0.37%, 非 FP 缺口第一名; x64 可执行形态 = 编译器 alloca/EH 函数真产 + 手写)。
+// 折叠 = 两既有 IR (零新 VmOp, X0 §7 #9 预判实测成立): SDM 语义 `RSP←RBP;
+// Pop RBP` →
+//   [Mov{Rsp←Rbp, size=ptr}   ; translator Mov-Rsp 通路现成 (v4 := v5 槽)
+//    Pop{Rbp,  size=ptr}]      ; translator Pop 通路现成 (Load+Add, stride 按
+//                              ; size 派生 — B.2 栈宽分叉, x64 8B / x86 4B)
+// updates_flags=false (SDM: LEAVE 不影响 EFLAGS); extra 通道 = 426 VEX 前置
+// IR 先例 (pre_insns 与主 insn 共享机器地址, 顺序执行语义)。
+TranslateResult translate_leave(const cs_insn& ci, const cs_x86& x, ir::Arch arch) {
+    (void)x;  // leave 零显式操作数
+    const Size sz = pointer_size(arch);
+    ir::Insn mv;
+    mv.op = Op::Mov;
+    mv.addr = ci.address;
+    mv.size = sz;
+    mv.updates_flags = false;
+    mv.dst = Operand::reg_(ir::Reg::Rsp);
+    mv.src = Operand::reg_(ir::Reg::Rbp);
+    ir::Insn pp;
+    pp.op = Op::Pop;
+    pp.addr = ci.address;
+    pp.size = sz;
+    pp.updates_flags = false;
+    pp.dst = Operand::reg_(ir::Reg::Rbp);
+    TranslateResult r = ok(pp);
+    r.extra.push_back(mv);
+    return r;
+}
+
+// MIT-442 (X2a) ⑥: cbw/cwde (98 族) — 符号扩展主形之一 (X0 §1.4: 低频, MSVC
+// 偏好 movsx; "≤1 小时顺路收" 预算内, 双形全收)。
+//
+// capstone 分裂枚举 (404 CDQE/MOVSXD 同款教训): 98 族按操作数宽分三态 —
+//   cwde (98, dst 32 位, x86 主形 / x64 手写面): X86_INS_CWDE 与 X86_INS_CBW
+//     双 id 均可报 (模式相关) → 统一经本派发器按 66 前缀判别;
+//   cbw  (66 98, dst 16 位, 双 arch 同 id 同语义): 66 落 prefix[2] (B.4 位置
+//     判据, 双 arch probe 单测钉死);
+//   cdqe (48 98, x64): 独立 id X86_INS_CDQE, 已由 translate_cdqe 归一
+//     Movsxd (404), 不经本函数。
+//
+// cwde (EAX←SX(AX), 双 arch 语义相同) 折条 = 两既有 IR (零新 VmOp):
+//   [Movsx{Rax←Rax, size=S32, src_size=S16}  ; VmOp::Movsx word 源符号扩展
+//    (槽 = sx64(ax) — build_movsx 恒 qword 写回, 高 32 位被符号位污染)
+//    Mov{Rax←Rax, size=S32}]                  ; "mov eax,eax" 零扩展 idiom —
+//   ; build_mov S32 writeback 清高 32 位 → 槽 = zext32(sx32(ax)) = 原生 cwde
+//   ⚠ 单条 Movsx 直折不可行 (实测代码直读结论, 非纸面): 槽高位污染在后续
+//   S64 地址拼装 (emit_address Mov acc,base S64 读全槽) 时错址 — 双 IR 补偿
+//   为必要。updates_flags=false (SDM: CWDE/CBW 不影响 EFLAGS)。
+//
+// cbw (AX←SX(AL), 高 48 位必须保持) 在 64 位槽模型下无既有 op 直折通路
+// (Movsx qword 写回污染 + IR 无 16 位合并原语 + IR 层无 scratch 寄存器) —
+// 走 translator 载体微程序: Op::Movsx + src2=Imm(28)=kExtCbw (域 28 与
+// 0..4 string / 5..13 lock / 14..18 SSE mul / 19..21 bridge / 22 flagless /
+// 23..27 plain 串形 分区连续零重叠; op 限定 Movsx, movsx 常规构造从不写
+// src2 — 419 §B.1 审计纪律)。
+TranslateResult translate_cwde(const cs_insn& ci, const cs_x86& x, ir::Arch arch) {
+    (void)arch;  // cwde 双 arch 语义相同 (EAX←SX(AX)), 槽宽补偿恒 S32
+    (void)x;
+    ir::Insn sx;
+    sx.op = Op::Movsx;
+    sx.addr = ci.address;
+    sx.size = Size::S32;
+    sx.src_size = Size::S16;
+    sx.updates_flags = false;
+    sx.dst = Operand::reg_(ir::Reg::Rax);
+    sx.src = Operand::reg_(ir::Reg::Rax);
+    ir::Insn zx;
+    zx.op = Op::Mov;
+    zx.addr = ci.address;
+    zx.size = Size::S32;
+    zx.updates_flags = false;
+    zx.dst = Operand::reg_(ir::Reg::Rax);
+    zx.src = Operand::reg_(ir::Reg::Rax);
+    TranslateResult r = ok(zx);
+    r.extra.push_back(sx);
+    return r;
+}
+
+TranslateResult translate_cbw(const cs_insn& ci, const cs_x86& x, ir::Arch arch) {
+    (void)arch;
+    (void)x;  // cbw 零显式操作数 (隐式 AL→AX), 判别由调用方按 66 前缀完成
+    ir::Insn out;
+    out.op = Op::Movsx;                 // 载体 (src2=kExtCbw 标记区分, 见上)
+    out.addr = ci.address;
+    out.size = Size::S16;               // dst = AX (语义标注; asmgen Movsx
+                                        // 不消费 size 字段, 宽度由微程序定)
+    out.src_size = Size::S8;
+    out.updates_flags = false;
+    out.dst = Operand::reg_(ir::Reg::Rax);
+    out.src = Operand::reg_(ir::Reg::Rax);
+    out.src2 = Operand::imm_(kExtCbw);
+    return ok(out);
+}
+
+// MIT-442 (X2a) ④ D5: cld — VM flags 无 DF 位 (G3 D1 在案, kFlagsMask 冻结),
+// VM 串微程序按 DF=0 展开 (415 既定披露)。cld 语义 = DF←0, 与 VM 假设完全
+// 一致 (且 stub 入口 Win64 ABI 本就 DF=0) → no-op 放行 (Op::Nop), 对齐 415
+// 既定 DF 判 (D5: 禁新语义发明)。std (DF←1) 无 case → switch default 照旧
+// gate: DF=1 输入下串微程序方向错 = 行为错误 (415 披露口径的边界内侧),
+// 保守整函数原生; 登记 GAPS「x86 已知 gate 清单」。
+TranslateResult translate_cld(const cs_insn& ci, const cs_x86& x, ir::Arch arch) {
+    (void)x;
+    ir::Insn out;
+    out.op = Op::Nop;
+    out.addr = ci.address;
+    out.size = pointer_size(arch);
+    out.updates_flags = false;
     return ok(out);
 }
 
@@ -1883,6 +2014,18 @@ TranslateResult translate_cmpxchg(const cs_insn& ci, const cs_x86& x, ir::Arch a
 
 enum : int { kStrMovs = 0, kStrStos = 1, kStrScas = 2, kStrCmps = 3, kStrLods = 4 };
 
+// MIT-442 (X2a) ②: plain (无前缀) 单发串形 — 形级 fork 面 (X0 §1.4: plain
+// movsd dxcompiler 10116 / msvbvm60 1311 lodsd 级, 结构体拷贝惯用法)。域
+// 23..27 与既有 0..4 (rep 串) / 5..13 (lock) / 14..18 (SSE mul+andn) /
+// 19..21 (bridge) / 22 (flagless) 分区连续零重叠; 载体仍 = Op::Mov +
+// src2=imm(域) (G3 先例), op 限定下与 cbw 载体 (域 28, op=Movsx) 零碰撞。
+// 单发语义 = G3 微程序"循环一次" (X0 §A.2 折叠预判实测成立): movs/stos/lods
+// 原生不写 flags → 无 GetFlags/SetFlags 包裹; scas/cmps 单发 flags = 末次
+// 比较 (与原生一致, 体内 Cmp 后直落)。DF 语义引用 G3 D1 裁决 (微程序恒
+// DF=0 方向, note 披露)。
+constexpr int kStrPlainBase = 23;  // 23..27 = plain movs/stos/scas/cmps/lods
+// (kExtCbw = 28 定义于 translate_leave 前置块 — translate_cbw 前向引用)
+
 // MIT-419 (G4): lock 族 src2 标记 — 与 string family (0..4) 分域零碰撞。
 // 编码约定 (与 translator.cpp is_lock_marker 对账):
 //   - 5..8: Op::Mov 载体族 (xadd/bts/btr/btc 无 ir::Op 枚举 — 冻结契约不可增,
@@ -1923,12 +2066,16 @@ std::optional<int> string_family_of(x86_insn id) {
 }
 
 // rep/repnz 串指令 → ir::Insn (编码约定见上)。形态不符一律 unsupported →
-// C1 gate 兜底 (保守底线零让步)。无前缀串指令 (plain movsb) 不走本函数 —
-// 前缀闸外, switch default 照旧 gate (§B.7 残余: 单发形态)。
+// C1 gate 兜底 (保守底线零让步)。
+// MIT-442 (X2a) ②: prefix[0]==0 的 plain 单发形 (A4/A5/AA/AB/AC/AD/AE/A6/A7
+// 及 Q 形) 亦经本函数 (switch 新 case 派入) — 前缀三元组放行 p==0, 编码域
+// 23..27 (kStrPlainBase), 单发语义见 translator translate_string_op。
 TranslateResult translate_string_op(const cs_insn& ci, const cs_x86& x, ir::Arch arch) {
-    // ① 前缀三元组: F3/F2 + 无段覆盖 (prefix[1]) + 无 66 (prefix[2]) + 无 67 (prefix[3])
+    // ① 前缀三元组: F3/F2 (rep 形) / 0 (plain 单发形) + 无段覆盖 (prefix[1]) +
+    // 无 66 (prefix[2], S16 串形 G3 砍面维持) + 无 67 (prefix[3], B.4 地址宽闸)
     const u8 p = x.prefix[0];
-    if ((p != 0xF3 && p != 0xF2) || x.prefix[1] != 0 || x.prefix[2] != 0 || x.prefix[3] != 0) {
+    if ((p != 0xF3 && p != 0xF2 && p != 0) || x.prefix[1] != 0 || x.prefix[2] != 0 ||
+        x.prefix[3] != 0) {
         return unsupported(ci.address, ci.size);
     }
     // ② lock 字节级检查: capstone 对 `F0 F3 A4` (lock rep movsb) 实证把 F0
@@ -1973,13 +2120,19 @@ TranslateResult translate_string_op(const cs_insn& ci, const cs_x86& x, ir::Arch
         return unsupported(ci.address, ci.size);  // S16 (66 F3 xx) 砍面 → §B.7
     }
     // ⑥ IR 编码 (family → 语义寄存器硬编码: 串指令寄存器由 ISA 固定, 无变体)
+    // MIT-442 (X2a): plain 单发形编码域 = kStrPlainBase + family (23..27);
+    // cond 字段对 plain 无意义 (无 rep/repne 之分), 恒 E — translator 按
+    // 域值判 plain, 不读 cond。
+    const bool plain = (p == 0);
     ir::Insn out;
     out.op = Op::Mov;  // 载体 (src2=family 标记区分, 见上)
     out.addr = ci.address;
     out.size = width == 1 ? ir::Size::S8 : width == 4 ? ir::Size::S32 : ir::Size::S64;
     out.cond = (p == 0xF2) ? ir::Cond::Ne : ir::Cond::E;  // repne / rep(repe)
+    // updates_flags: scas/cmps 真写 flags (rep 形微程序末态恢复 = 末次比较,
+    // plain 单发形 Cmp 后直落 = 原生) — movs/stos/lods 全形态不写 (SDM)。
     out.updates_flags = (*fam == kStrScas || *fam == kStrCmps);
-    out.src2 = Operand::imm_(*fam);
+    out.src2 = Operand::imm_(plain ? kStrPlainBase + *fam : *fam);
     const auto rsi_m = Operand::mem_(ir::MemOperand{ir::Reg::Rsi, ir::Reg::Flags, 0, 0});
     const auto rdi_m = Operand::mem_(ir::MemOperand{ir::Reg::Rdi, ir::Reg::Flags, 0, 0});
     const auto rax_r = Operand::reg_(ir::Reg::Rax);
@@ -2508,6 +2661,15 @@ TranslateResult translate_insn(const cs_insn& ci, ir::Arch arch) {
     // or/xor × mem-dst + cmpxchg/xchg/xadd mem 形式 + bts/btr/btc mem 形式
     // (translate_lock_op; D4 仅 F0 独前缀, strip-and-execute, 原子性边界见
     // GAPS G4 节)。非白名单 lock 组合照旧拒。
+    // MIT-442 (X2a) B.4: 67 (地址宽覆盖, prefix[3]) 显式 gate —— 16 位寻址
+    // (x86) / 地址截断 32 位 (x64) 编译器不产 (X0 §1.4 lea 行判), 平坦模型
+    // 地址语义不符 (x64 67 形 base 截断会错址), 保守拒。四位前缀位置判据
+    // (probe 单测钉死): prefix[0]=rep/lock, prefix[1]=段覆盖 (SEH 闸 438),
+    // prefix[2]=66 操作数宽 (S16/p66 通路, 双 arch 同位), prefix[3]=67 地址
+    // 宽 —— 互不误伤: 66/67 不触碰 SEH 闸, 66+67 组合由本闸先拦。
+    if (x.prefix[3] != 0) {
+        return unsupported(ci.address, ci.size);
+    }
     if (x.prefix[0] != 0 || x.prefix[1] != 0) {
         if (string_family_of(static_cast<x86_insn>(ci.id)).has_value())
             return translate_string_op(ci, x, arch);
@@ -2633,9 +2795,42 @@ TranslateResult translate_insn(const cs_insn& ci, ir::Arch arch) {
     case X86_INS_MOVDQU: return translate_sse_mov(ci, x, arch, Op::Movups, Size::S64);
     // MIT-408: movsd (F2 0F 10/11, scalar double, load/store 双向) 经
     // (Movss,S64) 编码。capstone 把 string movsd (A5, mem,mem) 与 SSE movsd
-    // 报同一 X86_INS_MOVSD (实证 id=486) — 由 translate_sse_mov 的双 MEM
-    // 拒绝规则区分, string 形式落 C1 gate 兜底.
-    case X86_INS_MOVSD: return translate_sse_mov(ci, x, arch, Op::Movss, Size::S64);
+    // 报同一 X86_INS_MOVSD (实证 id=486) — 由双 MEM 操作数形状互斥区分。
+    // MIT-442 (X2a) ②: string 形 (Mem,Mem, prefix 全零 = plain 单发) 改派
+    // translate_string_op (域 23 单发微程序, 415 前 "落 C1 gate" 的 plain
+    // 形翻正); SSE 形 (reg/mem 操作数) 照旧 translate_sse_mov (408 通路)。
+    case X86_INS_MOVSD:
+        if (x.op_count == 2 && x.operands[0].type == X86_OP_MEM &&
+            x.operands[1].type == X86_OP_MEM) {
+            return translate_string_op(ci, x, arch);
+        }
+        return translate_sse_mov(ci, x, arch, Op::Movss, Size::S64);
+    // MIT-442 (X2a) ②: plain 单发串形 (A4/A5/AA/AB/AC/AD/AE/A6/A7 + Q 形)。
+    // rep 形经入口前缀闸 (prefix[0]=F3/F2) 派入同一 translate_string_op 的
+    // rep 通路; 本组 case 只接 prefix 全零的单发形 (66 形 movsw/stosw/... 由
+    // 函数内前缀三元组检查照旧拒 — G3 S16 串形砍面维持)。CMPSD 的 SSE 同名
+    // 形 (F2 0F C2, 3 操作数 (xmm,xmm/m64,imm8)) 由 ④ 形状检查互斥 (非双
+    // MEM → unsupported, 与本单前 default-gate 行为一致); MOVSD 同理已在
+    // 上方双形态派发。Q 形 (48 A5 等) capstone 正常报 size 8 (REX 在前,
+    // 415 F3-in-front 缺陷不涉 plain); 宽度 1/4/8 放行, 2 (66 形) 拒。
+    case X86_INS_MOVSB: case X86_INS_MOVSW: case X86_INS_MOVSQ:
+    case X86_INS_STOSB: case X86_INS_STOSW: case X86_INS_STOSD: case X86_INS_STOSQ:
+    case X86_INS_SCASB: case X86_INS_SCASW: case X86_INS_SCASD: case X86_INS_SCASQ:
+    case X86_INS_CMPSB: case X86_INS_CMPSW: case X86_INS_CMPSD: case X86_INS_CMPSQ:
+    case X86_INS_LODSB: case X86_INS_LODSW: case X86_INS_LODSD: case X86_INS_LODSQ:
+        return translate_string_op(ci, x, arch);
+    // MIT-442 (X2a) ③: leave (C9) — [Mov rsp←rbp; Pop rbp] 两既有 IR 折条。
+    case X86_INS_LEAVE: return translate_leave(ci, x, arch);
+    // MIT-442 (X2a) ④ D5: cld — DF←0 与 VM DF=0 假设一致 → no-op 放行;
+    // std (F9) 无 case → default 照旧 gate (D5 裁决, GAPS 清单登记)。
+    case X86_INS_CLD: return translate_cld(ci, x, arch);
+    // MIT-442 (X2a) ⑥: 98 族 — 66 前缀判别 cbw (66 98) / cwde (98)。
+    // capstone 分裂枚举: X86_INS_CWDE 与 X86_INS_CBW 双 id 皆可报 cwde
+    // (模式相关), 统一按 prefix[2]==0x66 派发 (B.4 位置判据); cdqe (48 98)
+    // 走独立 X86_INS_CDQE case (上方 404 通路)。
+    case X86_INS_CBW: case X86_INS_CWDE:
+        return (x.prefix[2] == 0x66) ? translate_cbw(ci, x, arch)
+                                     : translate_cwde(ci, x, arch);
     // MIT-376: SSE 浮点位运算 xorps/orps/andps (REG-REG only, mod=11).
     //   - xorps 0F 57 /r / orps 0F 56 /r / andps 0F 54 /r (全 128-bit 按位,
     //     size=S64)。updates_flags=false (位运算不影响 EFLAGS)。

@@ -1121,3 +1121,23 @@ target_compile_options(wvmp_retimm_sample PRIVATE
 target_link_options(wvmp_retimm_sample PRIVATE
     $<$<CXX_COMPILER_ID:MSVC>:/INCREMENTAL:NO>
 )
+
+# MIT-442 (X2a): 形级 fork 面收口主样本 — x64 可执行形态全链 (B.5 D3 硬项):
+# 区1 leave 链 (push rbp/mov rbp,rsp/sub rsp/leave/ret 全在区内, 折条
+# [Mov rsp←rbp; Pop rbp] 真虚拟化 + bal=0 平衡哨兵) + 区3 plain 串形
+# (movsd×2/lodsd 单发微程序 + cld no-op 放行) + 区4 p66 S16 通路 (66 B8/03/89
+# + cwde 两 IR 折条 + cbw 载体微程序) 真虚拟化 (REQUIRE_REAL ≥1 stub);
+# 负例区2 call [mem] IAT 形 / 区2b call reg (D4 停手 gate 归 X3) / 区5 std
+# (D5 gate) / 区6 67 前缀 (B.4 闸, 禁调用) 函数级 gate 可调用/可取址,
+# 行为 byte-exact。multiseed 49→50 (250 runs)。
+add_executable(wvmp_forkface_sample
+    wvmp_forkface_sample_main.cpp
+    wvmp_forkface_sample_asm.asm
+)
+target_compile_options(wvmp_forkface_sample PRIVATE
+    $<$<AND:$<CXX_COMPILER_ID:MSVC>,$<COMPILE_LANGUAGE:C,CXX>>:/Od;/Ob0;/utf-8>
+    $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-O0>
+)
+target_link_options(wvmp_forkface_sample PRIVATE
+    $<$<CXX_COMPILER_ID:MSVC>:/INCREMENTAL:NO>
+)

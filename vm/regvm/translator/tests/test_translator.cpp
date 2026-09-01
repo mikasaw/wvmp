@@ -1102,14 +1102,17 @@ TEST(Translate, JumpTableOutOfRegionGates) {
 // flags 保存/恢复 + repne/repe 早退 (早退迭代不推进指针不减计数)。
 
 // 串指令 IR 构造 (与 lifter translate_string_op 的编码对账)。
+// MIT-442 (X2a): family ≥ 23 = plain 单发域 (kStrPlainBase), 操作数/flags 按
+// 归一后 fam 选择 — 与 lifter 域值约定逐位对账。
 ir::Insn str_op(int family, ir::Size sz, ir::Cond c = ir::Cond::E) {
     ir::Insn i = I(ir::Op::Mov, sz);
     i.cond = c;
     i.src2 = ir::Operand::imm_(family);
-    i.updates_flags = (family == 2 || family == 3);
+    const int norm = family >= 23 ? family - 23 : family;
+    i.updates_flags = (norm == 2 || norm == 3);
     const ir::MemOperand rsi_m{ir::Reg::Rsi, ir::Reg::Flags, 0, 0};
     const ir::MemOperand rdi_m{ir::Reg::Rdi, ir::Reg::Flags, 0, 0};
-    switch (family) {
+    switch (norm) {
     case 0: i.dst = ir::Operand::mem_(rdi_m); i.src = ir::Operand::mem_(rsi_m); break;  // movs
     case 1: i.dst = ir::Operand::mem_(rdi_m); i.src = ir::Operand::reg_(ir::Reg::Rax); break;  // stos
     case 2: i.dst = ir::Operand::reg_(ir::Reg::Rax); i.src = ir::Operand::mem_(rdi_m); break;  // scas
@@ -1807,6 +1810,166 @@ TEST(Translate, BmiNativeShiftImmNotIntercepted) {
     const Decoded d = one_insn(i);
     ASSERT_EQ(d.insns.size(), static_cast<size_t>(3));
     expect_is(d.insns[0], VmOp::Ror, OpKind::Reg, kRax, OpKind::Imm, 0, 24, kS32);
+}
+
+// ==================== MIT-442 (X2a): 形级 fork 面 translator 矩阵 ====================
+
+TEST(Translate, PushPopArchForkX86) {
+    // B.2 栈宽分叉: x86 (S32 push/pop) → stride 4 + S32 访存; rsp 算术恒 S64。
+    // x64 (S64) 路径已由 PushPopExpansion 钉死 (8/S64, 逐字节不变)。
+    const auto r = wvmp::regvm::translator::translate_function(
+        fn_of({blk(0x1000, [] {
+                   std::vector<ir::Insn> v;
+                   ir::Insn p = I(ir::Op::Push, ir::Size::S32);
+                   p.dst = ir::Operand::reg_(ir::Reg::Rax);
+                   v.push_back(p);
+                   ir::Insn q = I(ir::Op::Pop, ir::Size::S32);
+                   q.dst = ir::Operand::reg_(ir::Reg::Rbx);
+                   v.push_back(q);
+                   return v;
+               }())}));
+    EXPECT_TRUE(r.notes.empty());
+    const Decoded d = decode_program(r.program);
+    ASSERT_EQ(d.insns.size(), static_cast<size_t>(6));
+    expect_is(d.insns[0], VmOp::Sub, OpKind::Reg, kRsp, OpKind::Imm, 0, 4, kS64);
+    expect_is(d.insns[1], VmOp::Store, OpKind::Reg, kRsp, OpKind::Reg, kRax, 0, kS32);
+    expect_is(d.insns[2], VmOp::Load, OpKind::Reg, kRbx, OpKind::Reg, kRsp, 0, kS32);
+    expect_is(d.insns[3], VmOp::Add, OpKind::Reg, kRsp, OpKind::Imm, 0, 4, kS64);
+}
+
+TEST(Translate, PushS16Gated) {
+    // B.4: S16 push (66 50, 栈推进 2B 不在 VM 栈模型内) → gate (修复旧静默
+    // 错形: 旧码 S16 push 也走 8B stride)。
+    ir::Insn p = I(ir::Op::Push, ir::Size::S16);
+    p.dst = ir::Operand::reg_(ir::Reg::Rax);
+    const auto r = wvmp::regvm::translator::translate_function(fn_of({blk(0x1000, {p})}));
+    ASSERT_FALSE(r.notes.empty());
+    EXPECT_NE(r.notes[0].find("push 位宽未支持"), std::string::npos);
+}
+
+TEST(Translate, LeaveFoldTwoInsnWords) {
+    // ③ leave 折条: [Mov rsp←rbp S64; Pop rbp S64] (lifter extra 通道产出,
+    // translator 侧两既有通路直发, 零新机制):
+    //   [0] Mov r4←r5 S64          (rsp := rbp)
+    //   [1] Load r5←[r4] S64       (rbp := [rsp])
+    //   [2] Add r4, 8 S64          (rsp += 8)
+    ir::Insn pp = I(ir::Op::Pop, ir::Size::S64);
+    pp.dst = ir::Operand::reg_(ir::Reg::Rbp);
+    const auto r = wvmp::regvm::translator::translate_function(fn_of({blk(
+        0x1000, {mov(ir::Reg::Rsp, ir::Reg::Rbp, ir::Size::S64), pp})}));
+    EXPECT_TRUE(r.notes.empty());
+    const Decoded d = decode_program(r.program);
+    ASSERT_EQ(d.insns.size(), static_cast<size_t>(5));  // 3 + Jmp + Halt
+    expect_is(d.insns[0], VmOp::Mov, OpKind::Reg, kRsp, OpKind::Reg, kRbp, 0, kS64);
+    expect_is(d.insns[1], VmOp::Load, OpKind::Reg, kRbp, OpKind::Reg, kRsp, 0, kS64);
+    expect_is(d.insns[2], VmOp::Add, OpKind::Reg, kRsp, OpKind::Imm, 0, 8, kS64);
+}
+
+TEST(Translate, PlainStringSingleStepFolds) {
+    // ② plain 单发形 (域 23..27): "循环一次" — 无 rcx 预检/无回边/无 flags 包裹。
+    // plain movsd (23, S32): Load t,[rsi]; Store [rdi],t; Add rsi,4; Add rdi,4
+    const Decoded d1 = one_insn_n(str_op(23, ir::Size::S32));
+    ASSERT_EQ(d1.insns.size(), static_cast<size_t>(6));  // 4 + Jmp + Halt
+    const u8 s18 = isa::kScratchFirst;
+    const u8 kRsi = isa::vm_reg_of(ir::Reg::Rsi);
+    const u8 kRdi = isa::vm_reg_of(ir::Reg::Rdi);
+    expect_is(d1.insns[0], VmOp::Load, OpKind::Reg, s18, OpKind::Reg, kRsi, 0, kS32);
+    expect_is(d1.insns[1], VmOp::Store, OpKind::Reg, kRdi, OpKind::Reg, s18, 0, kS32);
+    expect_is(d1.insns[2], VmOp::Add, OpKind::Reg, kRsi, OpKind::Imm, 0, 4, kS64);
+    expect_is(d1.insns[3], VmOp::Add, OpKind::Reg, kRdi, OpKind::Imm, 0, 4, kS64);
+
+    // plain lodsd (27, S32): Load rax,[rsi]; Add rsi,4 — 无 flags 包裹 (原生
+    // lods 不写 flags)。
+    const Decoded d2 = one_insn_n(str_op(27, ir::Size::S32));
+    ASSERT_EQ(d2.insns.size(), static_cast<size_t>(4));  // 2 + Jmp + Halt
+    expect_is(d2.insns[0], VmOp::Load, OpKind::Reg, kRax, OpKind::Reg, kRsi, 0, kS32);
+    expect_is(d2.insns[1], VmOp::Add, OpKind::Reg, kRsi, OpKind::Imm, 0, 4, kS64);
+
+    // plain scasd (25, S32): Load t,[rdi]; Cmp rax,t; Add rdi,4 — Cmp 后直落,
+    // flags = 末次比较 (原生), 无 GetFlags/SetFlags。
+    const Decoded d3 = one_insn_n(str_op(25, ir::Size::S32));
+    ASSERT_EQ(d3.insns.size(), static_cast<size_t>(5));  // 3 + Jmp + Halt
+    expect_is(d3.insns[0], VmOp::Load, OpKind::Reg, s18, OpKind::Reg, kRdi, 0, kS32);
+    expect_is(d3.insns[1], VmOp::Cmp, OpKind::Reg, kRax, OpKind::Reg, s18, 0, kS32);
+    expect_is(d3.insns[2], VmOp::Add, OpKind::Reg, kRdi, OpKind::Imm, 0, 4, kS64);
+
+    // plain cmpsd (26, S32): Load t1,[rsi]; Load t2,[rdi]; Cmp t1,t2; Add rdi;
+    // Add rsi — 双指针推进。
+    const Decoded d4 = one_insn_n(str_op(26, ir::Size::S32));
+    ASSERT_EQ(d4.insns.size(), static_cast<size_t>(7));  // 5 + Jmp + Halt
+    expect_is(d4.insns[0], VmOp::Load, OpKind::Reg, s18, OpKind::Reg, kRsi, 0, kS32);
+    expect_is(d4.insns[1], VmOp::Load, OpKind::Reg, s18 + 1, OpKind::Reg, kRdi, 0, kS32);
+    expect_is(d4.insns[2], VmOp::Cmp, OpKind::Reg, s18, OpKind::Reg, s18 + 1, 0, kS32);
+    expect_is(d4.insns[3], VmOp::Add, OpKind::Reg, kRdi, OpKind::Imm, 0, 4, kS64);
+    expect_is(d4.insns[4], VmOp::Add, OpKind::Reg, kRsi, OpKind::Imm, 0, 4, kS64);
+
+    // plain movsq (23, S64): 步长 8。
+    const Decoded d5 = one_insn_n(str_op(23, ir::Size::S64));
+    ASSERT_EQ(d5.insns.size(), static_cast<size_t>(6));
+    expect_is(d5.insns[2], VmOp::Add, OpKind::Reg, kRsi, OpKind::Imm, 0, 8, kS64);
+}
+
+TEST(Translate, PlainStringEmitsSingleStepNote) {
+    std::vector<std::string> notes;
+    (void)one_insn_n(str_op(23, ir::Size::S32), &notes);
+    ASSERT_EQ(notes.size(), static_cast<size_t>(1));
+    // "string-op @" 前缀 = backend 过滤白名单 (413 纪律, 命中不触发 gate)
+    EXPECT_NE(notes[0].find("string-op @"), std::string::npos);
+    EXPECT_NE(notes[0].find("plain movsd single-step"), std::string::npos);
+}
+
+TEST(Translate, CbwCarrierMicroProgramWords) {
+    // ⑥ cbw 载体 (Op::Movsx + src2=28): GetFlags s_f; Mov s0←rax; Movsx
+    // rax←rax (aux=0 byte 源); Shr s0,16; Shl s0,16; And rax,0xFFFF;
+    // Or rax,s0; SetFlags s_f — 8 VmOp, 高 48 位保持 + flags 包裹 (G8a 先例)。
+    ir::Insn i = I(ir::Op::Movsx, ir::Size::S16);
+    i.src_size = ir::Size::S8;
+    i.dst = ir::Operand::reg_(ir::Reg::Rax);
+    i.src = ir::Operand::reg_(ir::Reg::Rax);
+    i.src2 = ir::Operand::imm_(28);
+    const Decoded d = one_insn_n(i);
+    ASSERT_EQ(d.insns.size(), static_cast<size_t>(10));  // 8 + Jmp + Halt
+    const u8 s_f = isa::kScratchFirst;
+    const u8 s0 = isa::kScratchFirst + 1;
+    expect_is(d.insns[0], VmOp::GetFlags, OpKind::Reg, s_f, OpKind::None, 0, 0, kS64);
+    expect_is(d.insns[1], VmOp::Mov, OpKind::Reg, s0, OpKind::Reg, kRax, 0, kS64);
+    expect_is(d.insns[2], VmOp::Movsx, OpKind::Reg, kRax, OpKind::Reg, kRax, 0, kS64);
+    expect_is(d.insns[3], VmOp::Shr, OpKind::Reg, s0, OpKind::Imm, 0, 16, kS64);
+    expect_is(d.insns[4], VmOp::Shl, OpKind::Reg, s0, OpKind::Imm, 0, 16, kS64);
+    expect_is(d.insns[5], VmOp::And, OpKind::Reg, kRax, OpKind::Imm, 0, 0xFFFF, kS64);
+    expect_is(d.insns[6], VmOp::Or, OpKind::Reg, kRax, OpKind::Reg, s0, 0, kS64);
+    expect_is(d.insns[7], VmOp::SetFlags, OpKind::Reg, s_f, OpKind::None, 0, 0, kS64);
+}
+
+TEST(Translate, CwdeFoldTranslateWords) {
+    // ⑥ cwde 两 IR 折条: [Movsx{rax←rax, aux=1(S16 源), S32}; Mov{rax←rax,
+    // S32}] — 第二条 "mov eax,eax" 零扩展 idiom 清槽高位 (build_mov S32
+    // writeback 零扩展), 槽终态 = zext32(sx32(ax)) = 原生 cwde。
+    ir::Insn sx = I(ir::Op::Movsx, ir::Size::S32);
+    sx.src_size = ir::Size::S16;
+    sx.dst = ir::Operand::reg_(ir::Reg::Rax);
+    sx.src = ir::Operand::reg_(ir::Reg::Rax);
+    ir::Insn zx = I(ir::Op::Mov, ir::Size::S32);
+    zx.dst = ir::Operand::reg_(ir::Reg::Rax);
+    zx.src = ir::Operand::reg_(ir::Reg::Rax);
+    const auto r = wvmp::regvm::translator::translate_function(
+        fn_of({blk(0x1000, {sx, zx})}));
+    EXPECT_TRUE(r.notes.empty());
+    const Decoded d = decode_program(r.program);
+    ASSERT_EQ(d.insns.size(), static_cast<size_t>(4));  // 2 + Jmp + Halt
+    expect_is(d.insns[0], VmOp::Movsx, OpKind::Reg, kRax, OpKind::Reg, kRax, 1, kS32);
+    expect_is(d.insns[1], VmOp::Mov, OpKind::Reg, kRax, OpKind::Reg, kRax, 0, kS32);
+}
+
+TEST(Translate, CallMemGateNoteX3) {
+    // ① D4 停手钉: lifter 已 lift (Call dst=Mem), translator gate note 指向
+    // X3 挂账 (CallGate 协议仅吃 aux RVA — asmgen step1 直读)。
+    ir::Insn c = I(ir::Op::Call, ir::Size::S64);
+    c.dst = ir::Operand::mem_(m(ir::Reg::Rbp, ir::Reg::Flags, 0, -8));
+    const auto r = wvmp::regvm::translator::translate_function(fn_of({blk(0x1000, {c})}));
+    ASSERT_FALSE(r.notes.empty());
+    EXPECT_NE(r.notes[0].find("call [mem]"), std::string::npos);
+    EXPECT_NE(r.notes[0].find("X3"), std::string::npos);
 }
 
 } // namespace

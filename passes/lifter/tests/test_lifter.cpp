@@ -2714,7 +2714,11 @@ TEST_F(LifterTranslate, RepCmpsAndRepLodsLifted) {
 TEST_F(LifterTranslate, RepStringOpNegativesStillGated) {
     // 负例全谱 (B.1 白名单纪律 — 放行必须 detail 级, 禁 prefix[0]!=0 全放):
     // rep 前缀非串指令 / lock rep / repne+movs (Intel undefined) / 16 位
-    // (66 砍面, §B.7) / 67 地址宽 / 段覆盖 / 无前缀单发 — 全部照旧 gate。
+    // (66 砍面, §B.7) / 67 地址宽 / 段覆盖 — 全部照旧 gate。
+    // MIT-442 (X2a) ② 负例翻转登记 (425/428 §B.4 先例): 无前缀单发形
+    // (A4 movsb / 48 A5 movsq / A5 movsd / AD lodsd / AE scasd) 由 gate
+    // 翻正为 plain 单发微程序 (域 23..27), 断言迁移至 PlainStringLift*;
+    // 66 形单发 (66 A5 movsw) 维持砍面 (S16 串形 G3 残余)。
     const wvmp::u8 pause[] = {0xF3, 0x90};          // rep nop = pause
     EXPECT_EQ(translate_bytes(x64, pause, ir::Arch::X64).status,
               lifter::TranslateStatus::Unsupported);
@@ -2733,11 +2737,9 @@ TEST_F(LifterTranslate, RepStringOpNegativesStillGated) {
     const wvmp::u8 segovr[] = {0x64, 0xF3, 0xA4};   // fs 段覆盖 + rep movsb
     EXPECT_EQ(translate_bytes(x64, segovr, ir::Arch::X64).status,
               lifter::TranslateStatus::Unsupported);
-    const wvmp::u8 plain[] = {0xA4};                // 无前缀 movsb (单发) → gate
-    EXPECT_EQ(translate_bytes(x64, plain, ir::Arch::X64).status,
-              lifter::TranslateStatus::Unsupported);
-    const wvmp::u8 plainq[] = {0x48, 0xA5};         // 无前缀 movsq → gate
-    EXPECT_EQ(translate_bytes(x64, plainq, ir::Arch::X64).status,
+    // MIT-442 (X2a) ②: 66 形单发 (66 A5 = movsw) 维持 gate (S16 串形砍面)。
+    const wvmp::u8 plain16[] = {0x66, 0xA5};
+    EXPECT_EQ(translate_bytes(x64, plain16, ir::Arch::X64).status,
               lifter::TranslateStatus::Unsupported);
 }
 
@@ -3296,6 +3298,296 @@ TEST_F(LifterTranslate, BmiNegativeFamilyStillGated) {
         auto r = translate_bytes(x64, b, ir::Arch::X64);
         EXPECT_EQ(r.status, lifter::TranslateStatus::Unsupported);
     }
+}
+
+// ==================== MIT-442 (X2a): 形级 fork 面双 arch 矩阵 ====================
+//
+// B.6 x86 纸面断言层 (X0 §F.3 证据分级: x86 侧 = 纸面级, x64 侧另有 E2E 全链
+// 实证 wvmp_forkface_sample)。六形态: ① call [mem] ② plain 串形 ③ leave
+// ④ cld/std (D5) ⑤ S16/p66 (含 66/67/段覆盖四位前缀互不误伤) ⑥ cwde/cbw。
+// RetImm16LiftIntoSrc (438) 为本矩阵的格式先例。
+
+TEST_F(LifterTranslate, LeaveLiftTwoInsnFold) {
+    // ③ x64: C9 = leave → extra=[Mov{Rsp←Rbp, S64}] + main=Pop{Rbp, S64}
+    const wvmp::u8 b[] = {0xC9};
+    auto r = translate_bytes(x64, b, ir::Arch::X64);
+    ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r.insn.op, ir::Op::Pop);
+    ASSERT_EQ(r.insn.dst.kind, ir::Operand::Kind::Reg);
+    EXPECT_EQ(r.insn.dst.reg, ir::Reg::Rbp);
+    EXPECT_EQ(r.insn.size, ir::Size::S64);
+    EXPECT_FALSE(r.insn.updates_flags);
+    ASSERT_EQ(r.extra.size(), 1u);                    // 前置 Mov (426 extra 通道)
+    EXPECT_EQ(r.extra[0].op, ir::Op::Mov);
+    EXPECT_EQ(r.extra[0].size, ir::Size::S64);
+    EXPECT_EQ(r.extra[0].dst.reg, ir::Reg::Rsp);
+    EXPECT_EQ(r.extra[0].src.reg, ir::Reg::Rbp);
+    EXPECT_EQ(r.extra[0].addr, r.insn.addr);          // 共享机器地址 (426 约定)
+
+    // ③ x86 (CS_MODE_32, 纸面级): C9 → 同构 S32 对 (栈宽 B.2 分叉)
+    auto r86 = translate_bytes(x86, b, ir::Arch::X86);
+    ASSERT_EQ(r86.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r86.insn.op, ir::Op::Pop);
+    EXPECT_EQ(r86.insn.size, ir::Size::S32);
+    ASSERT_EQ(r86.extra.size(), 1u);
+    EXPECT_EQ(r86.extra[0].op, ir::Op::Mov);
+    EXPECT_EQ(r86.extra[0].size, ir::Size::S32);
+}
+
+TEST_F(LifterTranslate, CallMemLiftForkFace) {
+    // ① x64: FF 55 F8 = call qword ptr [rbp-8] → Op::Call dst=Mem (409 Jmp 先例;
+    //    translator 侧 D4 停手 gate, 见 test_translator CallMemGateNoteX3)
+    const wvmp::u8 b[] = {0xFF, 0x55, 0xF8};
+    auto r = translate_bytes(x64, b, ir::Arch::X64);
+    ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r.insn.op, ir::Op::Call);
+    ASSERT_EQ(r.insn.dst.kind, ir::Operand::Kind::Mem);
+    EXPECT_EQ(r.insn.dst.mem.base, ir::Reg::Rbp);
+    EXPECT_EQ(r.insn.dst.mem.disp, -8);
+
+    // ① x86 IAT 形: FF 15 78 56 34 12 = call [0x12345678] (abs disp32, 纸面级)
+    const wvmp::u8 b86[] = {0xFF, 0x15, 0x78, 0x56, 0x34, 0x12};
+    auto r86 = translate_bytes(x86, b86, ir::Arch::X86);
+    ASSERT_EQ(r86.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r86.insn.op, ir::Op::Call);
+    ASSERT_EQ(r86.insn.dst.kind, ir::Operand::Kind::Mem);
+    EXPECT_EQ(r86.insn.dst.mem.base, ir::Reg::Flags);  // 无 base → 哨兵
+    EXPECT_EQ(r86.insn.dst.mem.disp, 0x12345678);
+
+    // ① x86 reg-间接: FF 10 = call [eax] ([esp+..] 形同构)
+    const wvmp::u8 b86b[] = {0xFF, 0x10};
+    auto r86b = translate_bytes(x86, b86b, ir::Arch::X86);
+    ASSERT_EQ(r86b.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r86b.insn.dst.kind, ir::Operand::Kind::Mem);
+    EXPECT_EQ(r86b.insn.dst.mem.base, ir::Reg::Rax);
+
+    // call reg (FF D0 = call rax) lift 钉: 白名单内, translator gate 归 X3
+    const wvmp::u8 br[] = {0xFF, 0xD0};
+    auto rr = translate_bytes(x64, br, ir::Arch::X64);
+    ASSERT_EQ(rr.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(rr.insn.op, ir::Op::Call);
+    ASSERT_EQ(rr.insn.dst.kind, ir::Operand::Kind::Reg);
+    EXPECT_EQ(rr.insn.dst.reg, ir::Reg::Rax);
+}
+
+TEST_F(LifterTranslate, PlainStringLiftForkFace) {
+    // ② x64 plain 单发形 → 域 23..27 (kStrPlainBase):
+    // A5 = movsd (dword 单发) → (Mov, 23, S32)
+    const wvmp::u8 md[] = {0xA5};
+    auto r1 = translate_bytes(x64, md, ir::Arch::X64);
+    ASSERT_EQ(r1.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r1.insn.op, ir::Op::Mov);
+    ASSERT_EQ(r1.insn.src2.kind, ir::Operand::Kind::Imm);
+    EXPECT_EQ(r1.insn.src2.imm, 23);                  // plain movs
+    EXPECT_EQ(r1.insn.size, ir::Size::S32);
+    EXPECT_FALSE(r1.insn.updates_flags);              // movs 不写 flags
+    // 48 A5 = movsq → S64 (REX 正常在前, 415 F3-in-front 缺陷不涉 plain)
+    const wvmp::u8 mq[] = {0x48, 0xA5};
+    auto r2 = translate_bytes(x64, mq, ir::Arch::X64);
+    ASSERT_EQ(r2.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r2.insn.src2.imm, 23);
+    EXPECT_EQ(r2.insn.size, ir::Size::S64);
+    // AD = lodsd → (Mov, 27, S32); AC = lodsb → S8
+    const wvmp::u8 ld[] = {0xAD};
+    auto r3 = translate_bytes(x64, ld, ir::Arch::X64);
+    ASSERT_EQ(r3.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r3.insn.src2.imm, 27);                  // plain lods
+    EXPECT_EQ(r3.insn.size, ir::Size::S32);
+    const wvmp::u8 lb[] = {0xAC};
+    auto r4 = translate_bytes(x64, lb, ir::Arch::X64);
+    ASSERT_EQ(r4.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r4.insn.src2.imm, 27);
+    EXPECT_EQ(r4.insn.size, ir::Size::S8);
+    // AE = scasd → (Mov, 25, S32) updates_flags=true (单发比较真写 flags)
+    const wvmp::u8 sc[] = {0xAE};
+    auto r5 = translate_bytes(x64, sc, ir::Arch::X64);
+    ASSERT_EQ(r5.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r5.insn.src2.imm, 25);                  // plain scas
+    EXPECT_TRUE(r5.insn.updates_flags);
+    // AA = stosb → (Mov, 24, S8); A6 = cmpsb → (Mov, 26, S8) flags=true
+    const wvmp::u8 st[] = {0xAA};
+    auto r6 = translate_bytes(x64, st, ir::Arch::X64);
+    ASSERT_EQ(r6.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r6.insn.src2.imm, 24);
+    const wvmp::u8 cp[] = {0xA6};
+    auto r7 = translate_bytes(x64, cp, ir::Arch::X64);
+    ASSERT_EQ(r7.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r7.insn.src2.imm, 26);
+    EXPECT_TRUE(r7.insn.updates_flags);
+
+    // x86 (纸面级): A5/A4/AD 同构 S32/S8
+    auto r86 = translate_bytes(x86, md, ir::Arch::X86);
+    ASSERT_EQ(r86.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r86.insn.src2.imm, 23);
+    EXPECT_EQ(r86.insn.size, ir::Size::S32);
+    const wvmp::u8 mb86[] = {0xA4};
+    auto r86b = translate_bytes(x86, mb86, ir::Arch::X86);
+    ASSERT_EQ(r86b.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r86b.insn.src2.imm, 23);
+    EXPECT_EQ(r86b.insn.size, ir::Size::S8);
+
+    // 66 形单发 (66 A5 = movsw) 维持 gate (S16 串形 G3 残余, 位置判据双 arch)
+    const wvmp::u8 sw[] = {0x66, 0xA5};
+    EXPECT_EQ(translate_bytes(x86, sw, ir::Arch::X86).status,
+              lifter::TranslateStatus::Unsupported);
+}
+
+TEST_F(LifterTranslate, CldNopStdGate) {
+    // ④ D5: FC = cld → Op::Nop no-op 放行 (VM DF=0 假设一致, 415 口径)
+    const wvmp::u8 c[] = {0xFC};
+    auto r = translate_bytes(x64, c, ir::Arch::X64);
+    ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r.insn.op, ir::Op::Nop);
+    EXPECT_FALSE(r.insn.updates_flags);
+    EXPECT_EQ(r.skipped_ranges.size(), 0u);
+    auto r86 = translate_bytes(x86, c, ir::Arch::X86);
+    ASSERT_EQ(r86.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r86.insn.op, ir::Op::Nop);
+
+    // FD = std → 照旧 gate (DF←1 不可建模, 保守整函数原生; GAPS 清单登记)
+    const wvmp::u8 s[] = {0xFD};
+    auto rs = translate_bytes(x64, s, ir::Arch::X64);
+    EXPECT_EQ(rs.status, lifter::TranslateStatus::Unsupported);
+    ASSERT_EQ(rs.skipped_ranges.size(), 1u);
+    auto rs86 = translate_bytes(x86, s, ir::Arch::X86);
+    EXPECT_EQ(rs86.status, lifter::TranslateStatus::Unsupported);
+}
+
+TEST_F(LifterTranslate, CwdeCbwFoldForkFace) {
+    // ⑥ x64: 98 = cwde (EAX←SX(AX)) → 两 IR: extra=[Movsx{Rax,Rax,S32,S16}]
+    // + main=Mov{Rax,Rax,S32} (槽高位零扩展补偿, 见 translate_cwde 注)
+    const wvmp::u8 w[] = {0x98};
+    auto r = translate_bytes(x64, w, ir::Arch::X64);
+    ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+    ASSERT_EQ(r.extra.size(), 1u);
+    EXPECT_EQ(r.extra[0].op, ir::Op::Movsx);
+    EXPECT_EQ(r.extra[0].size, ir::Size::S32);
+    EXPECT_EQ(r.extra[0].src_size, ir::Size::S16);
+    EXPECT_EQ(r.extra[0].dst.reg, ir::Reg::Rax);
+    EXPECT_EQ(r.extra[0].src.reg, ir::Reg::Rax);
+    EXPECT_EQ(r.insn.op, ir::Op::Mov);
+    EXPECT_EQ(r.insn.size, ir::Size::S32);
+    EXPECT_EQ(r.insn.dst.reg, ir::Reg::Rax);
+
+    // ⑥ x86 (纸面级): 98 同构 (x86 主形)
+    auto r86 = translate_bytes(x86, w, ir::Arch::X86);
+    ASSERT_EQ(r86.status, lifter::TranslateStatus::Ok);
+    ASSERT_EQ(r86.extra.size(), 1u);
+    EXPECT_EQ(r86.extra[0].op, ir::Op::Movsx);
+    EXPECT_EQ(r86.extra[0].src_size, ir::Size::S16);
+
+    // ⑥ 66 98 = cbw (双 arch) → 载体 (Op::Movsx + src2=Imm(28)=kExtCbw)
+    const wvmp::u8 cb[] = {0x66, 0x98};
+    auto rc = translate_bytes(x64, cb, ir::Arch::X64);
+    ASSERT_EQ(rc.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(rc.insn.op, ir::Op::Movsx);
+    ASSERT_EQ(rc.insn.src2.kind, ir::Operand::Kind::Imm);
+    EXPECT_EQ(rc.insn.src2.imm, 28);
+    EXPECT_EQ(rc.insn.size, ir::Size::S16);
+    EXPECT_EQ(rc.insn.src_size, ir::Size::S8);
+    auto rc86 = translate_bytes(x86, cb, ir::Arch::X86);
+    ASSERT_EQ(rc86.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(rc86.insn.src2.imm, 28);
+
+    // cdqe (48 98) 既有通路不回踩 (404 归一 Movsxd)
+    const wvmp::u8 cq[] = {0x48, 0x98};
+    auto rq = translate_bytes(x64, cq, ir::Arch::X64);
+    ASSERT_EQ(rq.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(rq.insn.op, ir::Op::Movsxd);
+
+    // cwd (66 99) 维持 gate (dx = sx(ax), 无折条 — X0 §1.4 缺失行)
+    const wvmp::u8 cw[] = {0x66, 0x99};
+    EXPECT_EQ(translate_bytes(x64, cw, ir::Arch::X64).status,
+              lifter::TranslateStatus::Unsupported);
+}
+
+TEST_F(LifterTranslate, AddressSize67Gate) {
+    // B.4: 67 (prefix[3]) 显式 gate — 双 arch。x64: 67 8B 40 10 = mov eax,
+    // [eax+10h] (地址截断 32 位, 平坦模型错址面); x86: 67 8B 00 = mov eax,
+    // [bx+si] (16 位寻址, 编译器不产) — 两者均编译器不产形态, 保守拒。
+    const wvmp::u8 b64[] = {0x67, 0x8B, 0x40, 0x10};
+    const cs_insn* ci64 = decode_first(x64, b64);
+    ASSERT_NE(ci64, nullptr);
+    EXPECT_EQ(ci64->detail->x86.prefix[3], 0x67);     // 位置判据 probe 钉死
+    auto r64 = lifter::translate_insn(*ci64, ir::Arch::X64);
+    EXPECT_EQ(r64.status, lifter::TranslateStatus::Unsupported);
+    ASSERT_EQ(r64.skipped_ranges.size(), 1u);
+
+    const wvmp::u8 b86[] = {0x67, 0x8B, 0x00};
+    const cs_insn* ci86 = decode_first(x86, b86);
+    ASSERT_NE(ci86, nullptr);
+    EXPECT_EQ(ci86->detail->x86.prefix[3], 0x67);
+    auto r86 = lifter::translate_insn(*ci86, ir::Arch::X86);
+    EXPECT_EQ(r86.status, lifter::TranslateStatus::Unsupported);
+
+    // 66+67 组合 → 67 闸先拦 (prefix[3]); 67+段覆盖 → 本闸先拦 (互不误伤:
+    // SEH 闸管 prefix[1], 本闸管 prefix[3], 位域正交)
+    const wvmp::u8 b6667[] = {0x66, 0x67, 0x8B, 0xC1};
+    auto r6667 = translate_bytes(x64, b6667, ir::Arch::X64);
+    EXPECT_EQ(r6667.status, lifter::TranslateStatus::Unsupported);
+    const wvmp::u8 bseg67[] = {0x64, 0x67, 0x8B, 0x05, 0x78, 0x56, 0x34, 0x12};
+    auto rseg67 = translate_bytes(x64, bseg67, ir::Arch::X64);
+    EXPECT_EQ(rseg67.status, lifter::TranslateStatus::Unsupported);
+}
+
+TEST_F(LifterTranslate, P66S16LiftAndPrefixPositionPin) {
+    // ⑤ S16/p66: 66 落 prefix[2] (双 arch 同位 — B.4 位置判据实测重钉, X0 §7
+    // 报法在案)。66 B8 05 00 = mov ax, 5 → (Mov, S16) 子寄存器折叠 + 宽度
+    // 入 size (x86_translate.hpp 语义约定)。
+    const wvmp::u8 b[] = {0x66, 0xB8, 0x05, 0x00};
+    const cs_insn* ci = decode_first(x64, b);
+    ASSERT_NE(ci, nullptr);
+    const auto& x = ci->detail->x86;
+    EXPECT_EQ(x.prefix[0], 0);
+    EXPECT_EQ(x.prefix[1], 0);                        // 不触碰 SEH 闸 (438)
+    EXPECT_EQ(x.prefix[2], 0x66);                     // 66 位置 = prefix[2]
+    EXPECT_EQ(x.prefix[3], 0);                        // 不触碰 67 闸 (B.4)
+    auto r = lifter::translate_insn(*ci, ir::Arch::X64);
+    ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r.insn.op, ir::Op::Mov);
+    EXPECT_EQ(r.insn.size, ir::Size::S16);
+    ASSERT_EQ(r.insn.dst.kind, ir::Operand::Kind::Reg);
+    EXPECT_EQ(r.insn.dst.reg, ir::Reg::Rax);          // AX → Rax 折叠
+    ASSERT_EQ(r.insn.src.kind, ir::Operand::Kind::Imm);
+    EXPECT_EQ(r.insn.src.imm, 5);
+
+    // x86 同位 (纸面级): 66 B8 05 00 → S16
+    const cs_insn* ci86 = decode_first(x86, b);
+    ASSERT_NE(ci86, nullptr);
+    EXPECT_EQ(ci86->detail->x86.prefix[2], 0x66);
+    auto r86 = lifter::translate_insn(*ci86, ir::Arch::X86);
+    ASSERT_EQ(r86.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r86.insn.size, ir::Size::S16);
+
+    // S16 ALU: 66 03 C3 = add ax, bx → (Add, S16)
+    const wvmp::u8 ba[] = {0x66, 0x03, 0xC3};
+    auto ra = translate_bytes(x64, ba, ir::Arch::X64);
+    ASSERT_EQ(ra.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(ra.insn.op, ir::Op::Add);
+    EXPECT_EQ(ra.insn.size, ir::Size::S16);
+
+    // S16 访存: 66 89 45 FA = mov [rbp-6], ax → (Store, S16)
+    const wvmp::u8 bs[] = {0x66, 0x89, 0x45, 0xFA};
+    auto rbs = translate_bytes(x64, bs, ir::Arch::X64);
+    ASSERT_EQ(rbs.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(rbs.insn.op, ir::Op::Store);
+    EXPECT_EQ(rbs.insn.size, ir::Size::S16);
+
+    // 互不误伤 (B.4): 66+段覆盖 → SEH 闸赢 (prefix[1], 438 判据不变);
+    // 66+rep 串 → S16 串形砍面 (G3 残余); 66+lock → lock 闸 (D4 仅 F0 独前缀)
+    const wvmp::u8 bseg[] = {0x66, 0x64, 0x8B, 0x05, 0x78, 0x56, 0x34, 0x12};
+    const cs_insn* ciseg = decode_first(x64, bseg);
+    ASSERT_NE(ciseg, nullptr);
+    EXPECT_EQ(ciseg->detail->x86.prefix[1], 0x64);    // 段覆盖仍 prefix[1]
+    EXPECT_EQ(ciseg->detail->x86.prefix[2], 0x66);    // 66 仍 prefix[2]
+    EXPECT_EQ(lifter::translate_insn(*ciseg, ir::Arch::X64).status,
+              lifter::TranslateStatus::Unsupported);  // SEH 闸优先, 无 66 误放
+    const wvmp::u8 brep[] = {0x66, 0xF3, 0xA5};
+    EXPECT_EQ(translate_bytes(x64, brep, ir::Arch::X64).status,
+              lifter::TranslateStatus::Unsupported);
+    const wvmp::u8 blk[] = {0x66, 0xF0, 0x0F, 0xB1, 0x06};
+    EXPECT_EQ(translate_bytes(x64, blk, ir::Arch::X64).status,
+              lifter::TranslateStatus::Unsupported);
 }
 
 } // namespace

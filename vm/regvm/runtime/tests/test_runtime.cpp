@@ -3735,4 +3735,169 @@ TEST(Interpreter, BmiAndnCarrierExpansionSemantics) {
         }
     }
 }
+
+// ==================== MIT-442 (X2a) B.3: S16/p66 通路 x64 runtime 实测 ====================
+//
+// G3 时代 "S16 通路现成" 声明 (GAPS G3 残余注) 首次真验 (派单 §E #33: 全部
+// 预判实测兜底)。size_chain 4 路分派 + load_operand S16 (movzx 16 位读) +
+// writeback S16 (别名合并保高 48 位) 的组合语义, 以下电池逐位钉死。
+
+TEST(Interpreter, S16WidthSemanticBattery) {
+    wvmp::Rng rng(44201);
+    const auto result = rt::generate_runtime(rng);
+    RwxImage rwx(result.image.code);
+    const auto entry = rwx.entry();
+    alignas(16) std::array<u8, 0x10000> scratch{};
+
+    // (a) Mov S16 imm + Add S16: 低 16 位运算, 高 48 位保留 (别名写回)。
+    //     0x7FFF + 1 = 0x8000 (16 位溢出截断)。
+    {
+        std::vector<u8> s;
+        mov_imm64_into(s, 0, isa::kScratchFirst, 0x1234'5678'9ABC'DEF0ull);  // 0..3
+        isa::append_insn(s, mov_imm(1, 0x7FFF, ir::Size::S16));          // 4
+        isa::append_insn(s, bin_imm(isa::VmOp::Add, 1, 1, ir::Size::S16));  // 5 +1
+        isa::append_insn(s, halt());                                     // 6
+        const auto ctx = run_stream(entry, s, scratch.data());
+        EXPECT_EQ(ctx.regs[1], 0x8000ull);  // S16 写回保高 48 位 (槽原本 0)
+        EXPECT_EQ(ctx.regs[0], 0x1234'5678'9ABC'DEF0ull);
+    }
+
+    // (b) S16 别名写回保高 48 位: 槽预置高 48 位魔数, S16 Add 只动低 16 位。
+    {
+        std::vector<u8> s;
+        mov_imm64_into(s, 0, isa::kScratchFirst, 0xFEED'FACE'0000'1000ull);  // 0..3
+        mov_imm64_into(s, 1, isa::kScratchFirst + 1, 0x8000ull);             // 4..7
+        isa::append_insn(s, bin(isa::VmOp::Add, 0, 1, ir::Size::S16));       // 8
+        isa::append_insn(s, halt());                                         // 9
+        const auto ctx = run_stream(entry, s, scratch.data());
+        EXPECT_EQ(ctx.regs[0], 0xFEED'FACE'0000'9000ull);  // 高 48 保, 低 16 溢出截断
+    }
+
+    // (c) S16 flags + Jcc: 0x0001 - 0x0002 = 0xFFFF → SF=1 ZF=0; 0 相等 → ZF=1。
+    {
+        std::vector<u8> s;
+        isa::append_insn(s, mov_imm(0, 1, ir::Size::S16));               // 0
+        isa::append_insn(s, mov_imm(1, 2, ir::Size::S16));               // 1
+        isa::append_insn(s, bin(isa::VmOp::Sub, 0, 1, ir::Size::S16));   // 2
+        isa::append_insn(s, isa::make_insn(isa::VmOp::GetFlags, isa::OpKind::Reg, 2,
+                                           isa::OpKind::None, 0));       // 3
+        isa::append_insn(s, halt());                                     // 4
+        const auto ctx = run_stream(entry, s, scratch.data());
+        // 16 位减: 0xFFFF → SF=1 (bit3), ZF=0, CF=1 (borrow), PF: 0xFFFF 8 个
+        // 1 → 偶 → PF=1 (bit4), OF=0 (1-2 无 16 位溢出)。
+        EXPECT_EQ(ctx.regs[2] & isa::kFlagsMask,
+                  u64(isa::kFlagSF | isa::kFlagCF | isa::kFlagPF));
+        EXPECT_EQ(ctx.regs[0], 0xFFFFull);
+    }
+
+    // (d) S16 Load/Store 真访存: 绝对 VA 写 16 位, 邻字节不动 (非 4B 对齐地址)。
+    {
+        scratch.fill(0);
+        scratch[0x50] = 0x11; scratch[0x51] = 0x22; scratch[0x52] = 0x33;
+        const u64 data_addr = reinterpret_cast<u64>(scratch.data()) + 0x50;
+        std::vector<u8> s;
+        mov_imm64_into(s, 5, isa::kScratchFirst, data_addr);             // 0..3
+        isa::append_insn(s, mov_imm(6, 0xABCD, ir::Size::S16));          // 4
+        isa::append_insn(s, store(5, 6, ir::Size::S16));                 // 5
+        isa::append_insn(s, load(7, 5, ir::Size::S16));                  // 6
+        isa::append_insn(s, halt());                                     // 7
+        const auto ctx = run_stream(entry, s, scratch.data());
+        EXPECT_EQ(ctx.regs[7], 0xABCDull);
+        EXPECT_EQ(scratch[0x50], 0xCD);   // LE 低字节
+        EXPECT_EQ(scratch[0x51], 0xAB);   // 高字节
+        EXPECT_EQ(scratch[0x52], 0x33);   // 邻字节不动 (S16 精确宽度访存)
+    }
+
+    // (e) S16 Cmp + Jcc E 循环: 16 位计数递减回跳 (p66 计数惯用法)。
+    {
+        std::vector<u8> s;
+        isa::append_insn(s, mov_imm(0, 0));                              // 0
+        isa::append_insn(s, mov_imm(1, 5, ir::Size::S16));               // 1
+        isa::append_insn(s, bin_imm(isa::VmOp::Add, 0, 3, ir::Size::S32));  // 2 循环头
+        isa::append_insn(s, bin_imm(isa::VmOp::Sub, 1, 1, ir::Size::S16));  // 3
+        isa::append_insn(s, jcc(ir::Cond::Ne, u32(-2)));                 // 4
+        isa::append_insn(s, halt());                                     // 5
+        const auto ctx = run_stream(entry, s, scratch.data());
+        EXPECT_EQ(ctx.regs[0], 15ull);
+        EXPECT_EQ(ctx.regs[1], 0ull);
+    }
+}
+
+// ---- MIT-442 (X2a) ⑥: cwde/cbw 折条与 asmgen build_movsx/build_mov 的互作
+//      语义 (lifter 两 IR 折条的 VmOp 层直钉 — 样本侧另有 MASM 98/66 98 真
+//      编码全链覆盖)。
+
+TEST(Interpreter, CwdeFoldSlotSemantics) {
+    wvmp::Rng rng(44202);
+    const auto result = rt::generate_runtime(rng);
+    RwxImage rwx(result.image.code);
+    const auto entry = rwx.entry();
+    alignas(16) std::array<u8, 0x10000> scratch{};
+
+    // 槽 = 0x...0000'8000 (ax=0x8000 负数): Movsx(word) → 槽全 64 位符号扩展
+    // (0xFFFF...FFFF'FFFF'FFFF'8000), 随后 Mov S32 零扩展 idiom 清高 32 位 →
+    // 0x0000'0000'FFFF'8000 = 原生 cwde。ax=0x1234 正数同验。
+    {
+        std::vector<u8> s;
+        mov_imm64_into(s, 0, isa::kScratchFirst, 0x8000ull);              // 0..3
+        isa::append_insn(s, isa::make_insn(isa::VmOp::Movsx, isa::OpKind::Reg, 0,
+                                           isa::OpKind::Reg, 0, 1,
+                                           isa::size_field(ir::Size::S32)));  // 4 aux=1 word
+        isa::append_insn(s, isa::make_insn(isa::VmOp::Mov, isa::OpKind::Reg, 0,
+                                           isa::OpKind::Reg, 0, 0,
+                                           isa::size_field(ir::Size::S32)));  // 5
+        isa::append_insn(s, halt());                                          // 6
+        const auto ctx = run_stream(entry, s, scratch.data());
+        EXPECT_EQ(ctx.regs[0], 0xFFFF'8000ull);
+    }
+    {
+        std::vector<u8> s;
+        mov_imm64_into(s, 0, isa::kScratchFirst, 0x1122'3344'5566'1234ull);  // 0..3
+        isa::append_insn(s, isa::make_insn(isa::VmOp::Movsx, isa::OpKind::Reg, 0,
+                                           isa::OpKind::Reg, 0, 1,
+                                           isa::size_field(ir::Size::S32)));  // 4
+        isa::append_insn(s, isa::make_insn(isa::VmOp::Mov, isa::OpKind::Reg, 0,
+                                           isa::OpKind::Reg, 0, 0,
+                                           isa::size_field(ir::Size::S32)));  // 5
+        isa::append_insn(s, halt());                                          // 6
+        const auto ctx = run_stream(entry, s, scratch.data());
+        EXPECT_EQ(ctx.regs[0], 0x1234ull);  // 正数: 槽 = zext32(0x1234), 高位清零
+    }
+}
+
+TEST(Interpreter, CbwCarrierSlotSemantics) {
+    wvmp::Rng rng(44203);
+    const auto result = rt::generate_runtime(rng);
+    RwxImage rwx(result.image.code);
+    const auto entry = rwx.entry();
+    alignas(16) std::array<u8, 0x10000> scratch{};
+
+    // cbw 载体 8-op 微程序 (translator translate_cbw_carrier 镜像): 高 48 位
+    // 保持 + 低 16 位 = sx16(al) + flags 原样 (And/Shr/Shl/Or 包裹抹平)。
+    // al=0x80 → sx16 = 0xFF80; 原槽高位 0xABCD'EF01'2345'6000 保持。
+    {
+        std::vector<u8> s;
+        const u8 sz64 = isa::size_field(ir::Size::S64);
+        mov_imm64_into(s, 0, isa::kScratchFirst, 0xABCD'EF01'2345'6080ull);  // 0..3
+        isa::append_insn(s, isa::make_insn(isa::VmOp::GetFlags, isa::OpKind::Reg, 18,
+                                           isa::OpKind::None, 0, 0, sz64));  // 4
+        isa::append_insn(s, isa::make_insn(isa::VmOp::Mov, isa::OpKind::Reg, 19,
+                                           isa::OpKind::Reg, 0, 0, sz64));   // 5 stash
+        isa::append_insn(s, isa::make_insn(isa::VmOp::Movsx, isa::OpKind::Reg, 0,
+                                           isa::OpKind::Reg, 0, 0, sz64));   // 6 aux=0 byte
+        isa::append_insn(s, isa::make_insn(isa::VmOp::Shr, isa::OpKind::Reg, 19,
+                                           isa::OpKind::Imm, 0, 16, sz64));  // 7
+        isa::append_insn(s, isa::make_insn(isa::VmOp::Shl, isa::OpKind::Reg, 19,
+                                           isa::OpKind::Imm, 0, 16, sz64));  // 8
+        isa::append_insn(s, isa::make_insn(isa::VmOp::And, isa::OpKind::Reg, 0,
+                                           isa::OpKind::Imm, 0, 0xFFFF, sz64));  // 9
+        isa::append_insn(s, isa::make_insn(isa::VmOp::Or, isa::OpKind::Reg, 0,
+                                           isa::OpKind::Reg, 19, 0, sz64));  // 10
+        isa::append_insn(s, isa::make_insn(isa::VmOp::SetFlags, isa::OpKind::Reg, 18,
+                                           isa::OpKind::None, 0, 0, sz64));  // 11
+        isa::append_insn(s, halt());                                         // 12
+        const auto ctx = run_stream(entry, s, scratch.data());
+        EXPECT_EQ(ctx.regs[0], 0xABCD'EF01'2345'FF80ull);  // 高 48 保 + 低 16 符号扩展
+    }
+}
 } // namespace

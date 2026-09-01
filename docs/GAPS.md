@@ -531,6 +531,54 @@ gate，整函数原生 byte-identical 零逃逸）**：
 | # | 形态 | gate 层 | 依据/出处 |
 |---|---|---|---|
 | G1 | 段覆盖前缀（64/65/26/2E/36/3E = prefix[1]）——FS:[0] SEH 链 / GS TLS 访问 | lifter 入口闸 unsupported → skipped_ranges | MIT-438 B.4；单测 SehFsSegmentOverrideGate（x86 32 位模 + x64 SIB 形 + GS 前缀三形） |
+| G2 | 67 地址宽覆盖前缀（prefix[3]）——16 位寻址（x86）/ 地址截断 32 位（x64），编译器不产（X0 §1.4 lea 行判） | lifter 入口闸（67 闸先于段覆盖闸，位域正交互不误伤） | MIT-442 (X2a) B.4；单测 AddressSize67Gate（双 arch + 66+67 组合 + 段+67 组合）；样本负例区6（禁调用） |
+| G3 | std（DF←1）——DF 语义不可建模（VM flags 无 DF 位，kFlagsMask 冻结，G3 D1 在案）；DF=1 输入下串微程序方向错 = 行为错误 | lifter unsupported（无 case → switch default） | MIT-442 (X2a) D5 裁决；单测 CldNopStdGate；cld（DF←0）与 VM DF=0 假设一致 → Op::Nop 放行（对齐 415 既定 DF 判，禁新语义发明） |
+| G4 | 串指令 S16 形（66 A5/A6/AA/AC/AE/A7/2E 系 movsw/stosw/…）——G3 S16 串形砍面维持（runtime 元素宽参数化属 asmgen X3 面） | lifter translate_string_op 前缀三元组（prefix[2]=66 拒） | MIT-415 §B.7 残余维持 + MIT-442 复核；单测 RepStringOpNegativesStillGated（66 F3 A5 + 66 A5 双钉） |
+| G5 | call [mem] / call reg（目标 = 运行时值）——CallGate 协议仅吃 aux RVA（asmgen build_callgate step1 直读），reg-target 通路需 asmgen 改动 → **D4 停手归 X3**（IAT thunk `call [__imp_x]` msvbvm60 35% of call / vtable call reg dxcompiler 4167 级） | lifter 已 lift（Call dst=Mem/Reg，409 Jmp 先例）→ translator skip 带 X3 披露 note → C1 整函数原生 | MIT-442 (X2a) ① #33 实测推翻「Load+Call(reg) 零新 VmOp 高置信」预判（call-reg "可直用" 系 lifter 白名单级，runtime 从未有 E2E）；单测 CallMemGateNoteX3；样本负例区2/2b |
+| G6 | cbw 之外的低频尾族：shld/shrd（X3 结构性必收）/ enter（噪声）/ cwd（66 99，无折条）——X0 §1.4 缺失行维持 | lifter default | X0 §1.4 + MIT-442 分工（shld/shrd 归 X3，本单不动）；单测 CwdeCbwFoldForkFace（cwd 66 99 gate 钉） |
+
+## X2a 形级 fork 面收口（MIT-442）：六形态折叠 + x64 全链实证
+
+**状态（2026-09-01，分支 `mit-x2a-fork-fold` 基于 main 110a6aa）**：X0 §1.4
+fork 面六块落地——**kVmOpMax=97 不动（全折条）、零新 handler（asmgen.cpp
+零 diff 机器证明）、冻结契约零触碰**。
+
+| X0 §1.4 行 | 本单裁决 | 折条/门形态 | 证据级 |
+|---|---|---|---|
+| leave（0.37% 非 FP 缺口第一） | ✅ 收 | `[Mov rsp←rbp; Pop rbp]` 两既有 IR（extra 通道，426 先例）+ translator push/pop 栈宽按 size 派生 | x64 全链 E2E（样本区1，bal=0 + ret 值断言） |
+| plain 串形 movsd/lodsd/scasd/stosd/cmpsd（dxcompiler 10116 级） | ✅ 收 | 单发微程序 = G3 rep 微程序"循环一次"（载体域 23..27，kStrPlainBase）；movs/stos/lods 无 flags 包裹、scas/cmps Cmp 后直落（flags=末次比较） | x64 全链 E2E（样本区3，movsd×2+lodsd+cld） |
+| cld | ✅ 收（D5） | DF←0 与 VM DF=0 假设一致 → Op::Nop 放行（对齐 415 DF 判）；std → gate（G3 行） | x64 E2E（区3 区内 cld）+ 单测 |
+| call [mem]（msvbvm60 35% of call）/ call reg | ⛔ gate（D4 停手） | lifter 开口（Call dst=Mem/Reg）→ translator X3 披露 note；CallGate reg-target 通路 = asmgen 改动归 X3 | x64 E2E 负例区2/2b（IAT 形 FF 15 / call reg FF D0）+ 代码直读证据（asmgen.cpp step1） |
+| S16/p66（0.82%） | ✅ 收（D2 双向授权实测通过） | GP 面 S16 全通（lifter data_size / translator size_field / runtime size_chain 4 路分派 + S16 别名写回——G3「S16 通路现成」声明首次真验成立）；栈面例外：S16 push/pop 栈推进 2B 不在 VM 栈模型 → gate（修复旧静默错形）；S16 串形维持砍面（G4 行） | ctest S16 语义电池（Mov/Add/Sub/Load/Store/Cmp+Jcc/别名保高 48 位）+ x64 E2E（区4，66 B8/03/89/BA/33/3B/83） |
+| cwde/cbw（98，低频） | ✅ 收 | cwde = `[Movsx{Rax←Rax,S32,S16}; Mov{Rax←Rax,S32}]` 两 IR（build_movsx qword 写回高位污染 → "mov eax,eax" 零扩展 idiom 补偿——单条直折不可行实测钉死）；cbw（66 98，高 48 位保持）= translator 载体微程序（Op::Movsx + src2=Imm(28)=kExtCbw，GetFlags/SetFlags 包裹 8 VmOp） | ctest 槽语义电池（CwdeFoldSlotSemantics/CbwCarrierSlotSemantics）+ x64 E2E（区4，98/66 98 MASM 直编） |
+| shld/shrd | ⛔ 维持（X3） | 结构性必收但归 X3（派单分工），本单不动 | — |
+
+**B.2 五处 412 时代 S64 硬编码点复核（逐点披露）**：412 §2 所记
+translator.cpp:127-145（跳转表）/ :316-323（imm64 split）/ :328-346（rip 地址
+拼装）/ :370、:403（mem disp）五点，行号按 main 110a6aa 重定位后逐一复核——
+**全部为常量误名（VM 64 位槽内部宽度，非架构宽度）**：跳转表表项宽 = scale
+4/8 双架构同款；imm64 拆条在 x86 不可达（RVA 恒 u32，fits_aux 恒真）；槽算术
+S64 是 VM 槽宽与 arch 无关。**真 arch 分叉点 = 栈宽**（push/pop/leave 的
+stride 与访存宽——已按 IR.size 派生分叉，x64 8B/S64 逐字节不变，x86 4B/S32
+纸面级）+ runtime pop 宽度（build_ret，asmgen X3/X4 参数化面，438 已登记）。
+x64 零 diff 由 multiseed 245 既有全绿 + wvmpTest stubs=14 双跑 diff 0 兜底。
+
+**区内 push 写穿 stub 保存区（#33 E2E 实证，边界规则化）**：样本首版把
+`push rbp; mov rbp,rsp` 放区内 → packed bal 探针分叉。机制：stub callee-saved
+保存区位于 [ns-8 .. ns-0x40]（ns = stub 入口 rsp = v4 预载值），区内 push 写
+[v4-8] 与保存区首槽重叠，后续局部槽写覆写保存的 rbx → 出口链 pop rbx 读到
+guest 数据（观察值 = 入参合成值 0x1E00000007，机制吻合）。438 build_ret 注释
+「guest 未配平 push 写穿」登记面的 E2E 实证 + 规则化：**guest 栈写必须恒
+≥ ns**——样本区1 改为 prologue（push rbp/mov rbp,rsp）原生在区域外、
+leave/epilogue 面收区内（局部槽写 [E-16] 在 ns 上方零触碰），修复后
+byte-exact。此规则对后续含栈帧形态样本（X3 epilogue 面）为设计约束前置。
+
+**X0 §1.4 行号更新对照（交付后 fork→direct 翻正行）**：leave → 折条收；
+plain movsd/lodsd/stosd/scasd/cmpsd（S8/S32/S64）→ 单发收（S16 形维持砍面）；
+cld → Nop 收；cwde/cbw → 折条收；mov r/m16（p66 GP 面 S16）→ 全宽收（S16
+push/pop 与 S16 串形除外）；call [mem]/call reg → gate 面（G5 行，X3）；
+shld/shrd → 维持（X3）；std → gate 面（G3 行）。x86 侧全部为纸面级（rc=2
+硬拒维持，X0 §F.3 证据分级），x64 侧 = 全链 E2E 实证。
 
 ## x87 (永久 gate, R3 裁决) —— 文档化不保护
 

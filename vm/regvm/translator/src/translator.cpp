@@ -169,6 +169,23 @@ enum : int { kBmiFlagless = 22 };
     }
 }
 
+// MIT-442 (X2a) ②: plain (无前缀) 单发串形标记域 — 与 lifter
+// (x86_translate.cpp kStrPlainBase 域注) 严格对账 (23..27; 载体 = Op::Mov +
+// src2=imm(域), op 限定 Mov — 与 0..4 rep 串同载体, 域值连续分区)。
+// 语义 = G3 rep 微程序"循环一次": 无 rcx 预检 / 无循环回边; movs/stos/lods
+// 无 GetFlags/SetFlags 包裹 (原生不写 flags), scas/cmps 体内 Cmp 后直落
+// (flags = 末次比较, 与原生一致)。
+enum : int { kStrPlainBase = 23 };  // 23..27 = plain movs/stos/scas/cmps/lods
+
+// MIT-442 (X2a) ⑥: cbw 载体 — Op::Movsx + src2=Imm(28) (kExtCbw)。与 lifter
+// (x86_translate.cpp translate_cbw 域注) 对账: 域 28 与 0..27 分区连续零重叠;
+// op 限定 Movsx (movsx 常规构造从不写 src2 — 419 §B.1 审计纪律), 与 plain
+// 串形 (op=Mov) 零碰撞。
+enum : int { kExtCbw = 28 };
+[[nodiscard]] bool is_cbw_marker(i64 v) {
+    return v == kExtCbw;
+}
+
 // ==================== MIT-409 + MIT-413 (G2): 跳转表特化 ====================
 //
 // 识别模式 = 受限模板匹配（D1 决策，派活单 §A.2 实测模板 + G2 三参数
@@ -671,6 +688,14 @@ void emit_imm64_split(Emitter& em, Scratch& sc, u8 d, u64 v) {
 // next_ip + disp 算 RVA 直接发为 S64 立即数（带 index/disp 一律零相加；
 // x64 [rip+disp32] 实际 = next_ip + disp32, next_ip = current_rva + insn_len,
 // 由 caller 通过 next_ip_of_ 传入). 无效 scale/越界 RVA 返回 false.
+// MIT-442 (X2a) B.2: 412 §2 五处 "S64 硬编码点" 复核结论 — 本函数 (rip 地址
+// 拼装 + mem disp 两点) 与 emit_imm64_split / 跳转表表项宽共四处属**常量
+// 误名**: S64 是 VM 64 位槽的内部宽度 (u64 槽上的地址/立即数算术), 与目标
+// 架构地址宽无关 (x86 面槽值即 u32 零扩展, fits_aux 恒真 → imm64 拆条在
+// x86 不可达); 真正的 arch 宽度分叉点 = 栈宽 (translate_push/translate_pop/
+// leave 折条, 已分叉) 与 runtime pop 宽度 (build_ret, asmgen X3/X4 参数化
+// 面)。x86 S64 槽算术的 native 编码可行性属 asmgen XL (X3) 范畴, 翻译层
+// 不改 (x86 管道现网 rc=2 硬拒, 纸面级)。
 [[nodiscard]] bool emit_address(Emitter& em, Scratch& sc, const ir::MemOperand& m,
                                 u64 current_rva, u64 next_ip, u8& acc_out) {
     if (m.base == ir::Reg::Rip) {
@@ -922,6 +947,12 @@ struct Translator {
                 ok = translate_movsxd(em, sc, in, current_rva, next_ip);
             } else if (in.op == ir::Op::Movzx) {
                 ok = translate_movzx(em, sc, in, current_rva, next_ip);
+            } else if (in.op == ir::Op::Movsx && in.src2.kind == ir::Operand::Kind::Imm &&
+                       is_cbw_marker(in.src2.imm)) {
+                // MIT-442 (X2a) ⑥: cbw (66 98) 载体 dispatch — (Op::Movsx,
+                // src2=Imm(28)) 判据 (op+标记双限定, movsx 常规构造从不写
+                // src2 — 419 §B.1 纪律)。必须先于通用 Movsx 分支。
+                ok = translate_cbw_carrier(em, sc, in);
             } else if (in.op == ir::Op::Movsx) {
                 ok = translate_movsx(em, sc, in, current_rva, next_ip);
             } else if (in.op == ir::Op::Popcnt) {
@@ -1076,10 +1107,14 @@ struct Translator {
     // backend 过滤白名单对账 (413 纪律): "string-op @" 前缀走 diag 通道,
     // 不触发 C1 gate。
     bool translate_string_op(Emitter& em, Scratch& sc, const ir::Insn& in) {
-        const i64 family = in.src2.imm;  // 0=movs 1=stos 2=scas 3=cmps 4=lods
+        const i64 marker = in.src2.imm;
+        // MIT-442 (X2a) ②: plain 单发形 (域 23..27) 与 rep 形 (0..4) 同函数
+        // 派发 — fam 归一后共用语义寄存器/宽度逻辑, 展开结构分叉见下。
+        const bool plain = marker >= kStrPlainBase;
+        const i64 family = plain ? marker - kStrPlainBase : marker;  // 0..4
         if (family < 0 || family > 4)
             return skip(in, "string-op family 标记非法，建议 gate", nullptr);
-        const bool repne = (in.cond == ir::Cond::Ne);
+        const bool repne = !plain && (in.cond == ir::Cond::Ne);
         const u8 sz = isa::size_field(in.size);
         const u8 sz64 = isa::size_field(ir::Size::S64);
         const u8 rsi = isa::vm_reg_of(ir::Reg::Rsi);
@@ -1087,6 +1122,50 @@ struct Translator {
         const u8 rax = isa::vm_reg_of(ir::Reg::Rax);
         const u8 rcx = isa::vm_reg_of(ir::Reg::Rcx);
         const u8 inc = in.size == ir::Size::S64 ? 8u : in.size == ir::Size::S32 ? 4u : 1u;
+
+        // ---- MIT-442 (X2a) ②: plain 单发形 — "循环一次" 展开 (X0 §A.2 预判
+        // 实测成立: 415 微程序框架现成)。无 rcx 预检/无循环回边/无早退;
+        // movs/stos/lods 原生不写 flags → 无 GetFlags/SetFlags 包裹 (体内
+        // Load/Store/Add 全 flags-free); scas/cmps 单发 = 体内 Cmp 后直落,
+        // flags = 末次比较 (原生语义, 不恢复)。DF=0 假定沿用 G3 D1 口径。
+        if (plain) {
+            if (family == 0) {            // movsd/movsb/movsq 单发: [rdi]←[rsi]
+                const u8 t1 = sc.take();
+                em.emit_rr(VmOp::Load, t1, rsi, sz);
+                em.emit_rr(VmOp::Store, rdi, t1, sz);
+                em.emit_ri(VmOp::Add, rsi, inc, sz64);
+                em.emit_ri(VmOp::Add, rdi, inc, sz64);
+            } else if (family == 1) {     // stos: [rdi] ← AL/EAX/RAX
+                em.emit_rr(VmOp::Store, rdi, rax, sz);
+                em.emit_ri(VmOp::Add, rdi, inc, sz64);
+            } else if (family == 4) {     // lods: AL/EAX/RAX ← [rsi]
+                em.emit_rr(VmOp::Load, rax, rsi, sz);
+                em.emit_ri(VmOp::Add, rsi, inc, sz64);
+            } else if (family == 2) {     // scas 单发: cmp acc, [rdi]
+                const u8 t1 = sc.take();
+                em.emit_rr(VmOp::Load, t1, rdi, sz);
+                em.emit_rr(VmOp::Cmp, rax, t1, sz);
+                em.emit_ri(VmOp::Add, rdi, inc, sz64);
+            } else {                      // cmps 单发: cmp [rsi], [rdi]
+                const u8 t1 = sc.take();
+                const u8 t2 = sc.take();
+                em.emit_rr(VmOp::Load, t1, rsi, sz);
+                em.emit_rr(VmOp::Load, t2, rdi, sz);
+                em.emit_rr(VmOp::Cmp, t1, t2, sz);
+                em.emit_ri(VmOp::Add, rdi, inc, sz64);
+                em.emit_ri(VmOp::Add, rsi, inc, sz64);
+            }
+            const char* fam_name_p = family == 0 ? "movs" : family == 1 ? "stos"
+                                   : family == 2 ? "scas" : family == 3 ? "cmps" : "lods";
+            const char suffix_p = inc == 1 ? 'b' : inc == 4 ? 'd' : 'q';
+            char note_p[192];
+            std::snprintf(note_p, sizeof(note_p),
+                          "string-op @ 0x%" PRIX64 ": plain %s%c single-step (elem %uB) "
+                          "DF=0 assumption (MIT-442 X2a ②, G3 D1 口径)",
+                          in.addr, fam_name_p, suffix_p, inc);
+            notes.emplace_back(note_p);
+            return true;
+        }
 
         // 预检: rcx==0 → 零次迭代 (movs/stos/lods: 不动内存; scas/cmps: 不比较)
         const u8 s0 = sc.take();  // 原 flags 保存槽 (rcx==0 路径恢复)
@@ -1415,23 +1494,37 @@ struct Translator {
 
     // ---- 栈 ----
 
+    // MIT-442 (X2a) B.2: 栈宽 arch 分叉 —— 412 §2 复核后认定的**真 arch 宽度
+    // 点** (412 时代五处 S64 硬编码点中唯一真分叉面; 其余四处 = VM 内部槽宽
+    // 常量误名, 见 emit_address 域注)。x64 push/pop 恒 8B (S64), x86 恒 4B
+    // (S32) — 宽度由 IR.size 携带 (lifter data_size: 子寄存器折叠 + 宽度入
+    // size), stride 从 size 派生, 无需新 arch 侧信道 (B.1 "arch 参数已在链"
+    // 纪律)。S16/S8 (66 50 push r16 — x64 合法编码, 栈推进 2B 不在 VM 栈模
+    // 型内) → 保守 gate (修复既有静默错形: 旧码 S16 push 也走 8B stride)。
+    // rsp 槽算术恒 S64 (VM 槽宽, 与 arch 无关)。
     bool translate_push(Emitter& em, const ir::Insn& in) {
         if (in.dst.kind != ir::Operand::Kind::Reg)
             return skip(in, "push 操作数形态未支持", nullptr); // push imm：lifter 不产出
+        if (in.size == ir::Size::S16 || in.size == ir::Size::S8)
+            return skip(in, "push 位宽未支持 (S16/S8 栈推进不在 VM 栈模型内)", nullptr);
         const u8 sz64 = isa::size_field(ir::Size::S64);
         const u8 rsp = isa::vm_reg_of(ir::Reg::Rsp);
-        em.emit_ri(VmOp::Sub, rsp, 8, sz64);
-        em.emit_rr(VmOp::Store, rsp, isa::vm_reg_of(in.dst.reg), sz64);
+        em.emit_ri(VmOp::Sub, rsp, in.size == ir::Size::S64 ? 8u : 4u, sz64);
+        em.emit_rr(VmOp::Store, rsp, isa::vm_reg_of(in.dst.reg),
+                   isa::size_field(in.size));
         return true;
     }
 
     bool translate_pop(Emitter& em, const ir::Insn& in) {
         if (in.dst.kind != ir::Operand::Kind::Reg)
             return skip(in, "pop 操作数形态未支持", nullptr);
+        if (in.size == ir::Size::S16 || in.size == ir::Size::S8)
+            return skip(in, "pop 位宽未支持 (S16/S8 栈推进不在 VM 栈模型内)", nullptr);
         const u8 sz64 = isa::size_field(ir::Size::S64);
         const u8 rsp = isa::vm_reg_of(ir::Reg::Rsp);
-        em.emit_rr(VmOp::Load, isa::vm_reg_of(in.dst.reg), rsp, sz64);
-        em.emit_ri(VmOp::Add, rsp, 8, sz64);
+        em.emit_rr(VmOp::Load, isa::vm_reg_of(in.dst.reg), rsp,
+                   isa::size_field(in.size));
+        em.emit_ri(VmOp::Add, rsp, in.size == ir::Size::S64 ? 8u : 4u, sz64);
         return true;
     }
 
@@ -1583,11 +1676,28 @@ struct Translator {
     //     emit VmOp::CallGate（aux = target RVA, cond_or_size = arg_count）。
     //   - 目标 RVA 越界（同 rip-relative 越界判定）→ skip 触发 C1 gate。
     bool translate_call(Emitter& em, const ir::Insn& in, u64 /*next_ip*/) {
+        // MIT-442 (X2a) ①: lifter 已开 call [mem] / call reg 双口 (lift 层面
+        // 翻正), 但折条落地 (Load + Call(reg)) 被 D4 红线拦停 —— 实测 asmgen
+        // build_callgate 目标只吃 T5(=aux, 翻译期 RVA) 不吃 reg 值目标
+        // (asmgen.cpp step1 直读), reg-target 通路 = asmgen 改动 → 归 X3
+        // (派单 §A.2 "零新 VmOp 高置信" 预判被 #33 实测推翻, 报告披露)。
+        // 本两路照旧 skip → C1 整函数原生 byte-identical, gate note 指向
+        // X3 挂账。
         if (in.dst.kind == ir::Operand::Kind::Reg)
-            return skip(in, "间接 call 未支持，建议 gate", nullptr);
-        if (in.dst.kind == ir::Operand::Kind::Mem)
-            return skip(in, "call [mem] 未支持，建议 gate",
-                        in.dst.mem.base == ir::Reg::Rip ? &in.dst.mem : nullptr);
+            return skip(in, "间接 call 目标为运行时值: CallGate 协议仅吃 aux RVA "
+                            "无 reg-target 通路 (asmgen step1 实读), 折条需 asmgen "
+                            "改动归 X3 (MIT-442 D4 停手)", nullptr);
+        if (in.dst.kind == ir::Operand::Kind::Mem) {
+            // MIT-442: note 不走 skip() 的 rip 通用覆写 (否则 rip 形 IAT thunk
+            // 的 D4/X3 披露被吞, 413 纪律 gate note 可审计性) — 文本内自带
+            // rip 形标注。
+            if (in.dst.mem.base == ir::Reg::Rip)
+                return skip(in, "call [mem] (rip 形, IAT thunk 同构) 折条=Load+Call(reg) "
+                                "需 CallGate reg-target 通路, asmgen 改动归 X3 (MIT-442 "
+                                "D4 停手披露)", nullptr);
+            return skip(in, "call [mem] 折条=Load+Call(reg) 需 CallGate reg-target "
+                            "通路, asmgen 改动归 X3 (MIT-442 D4 停手披露)", nullptr);
+        }
         if (in.dst.kind != ir::Operand::Kind::Imm)
             return skip(in, "call 目标非立即数，未支持", nullptr);
         const i64 rva_i = static_cast<i64>(in.dst.imm);
@@ -2066,6 +2176,39 @@ struct Translator {
             return true;
         }
         return skip(in, "movsx 操作数形态未支持", nullptr);
+    }
+
+    // ---- MIT-442 (X2a) ⑥: cbw (66 98) 载体微程序 ----
+    //
+    // 语义 (SDM CBW): AX←SX(AL), 位 15:63 保持。64 位槽模型下 VmOp::Movsx
+    // 恒 qword 写回 (build_movsx 直读: word/byte 源符号扩展进完整物理寄存器
+    // → qword 落槽), 直折会把高 48 位污染成符号扩展 — 需 stash+合并补偿。
+    // IR 层无 scratch 寄存器 (GP 全是 guest 态), 补偿必须在 VmOp 层用
+    // scratch 槽 (v18..v23) 完成:
+    //   [GetFlags s_f          (And/Shr/Shl/Or 全写 VM flags, 434 G8a 先例包裹)
+    //    Mov s0←rax S64        (stash 原 64 位槽)
+    //    Movsx rax←rax aux=0   (byte 源 → 槽 = sx64(al))
+    //    Shr s0,16; Shl s0,16  (s0 = 原值 & ~0xFFFF — 无 imm64 拆条)
+    //    And rax,0xFFFF        (rax = zext16(sx16(al)), 高位清零)
+    //    Or rax,s0             (合并: (原值&~0xFFFF) | zext16(sx16(al)))
+    //    SetFlags s_f]         (8 VmOp, 全既有 op; 原生 cbw 不写 flags → 包裹)
+    // 低频面膨胀披露 (对齐 434 bzhi 16-17 op 先例口径)。
+    bool translate_cbw_carrier(Emitter& em, Scratch& sc, const ir::Insn& in) {
+        if (in.dst.kind != ir::Operand::Kind::Reg || in.src.kind != ir::Operand::Kind::Reg)
+            return skip(in, "cbw 载体操作数形态未支持", nullptr);
+        const u8 rax = isa::vm_reg_of(ir::Reg::Rax);
+        const u8 sz64 = isa::size_field(ir::Size::S64);
+        const u8 s_f = sc.take();
+        const u8 s0 = sc.take();
+        em.emit(VmOp::GetFlags, OpKind::Reg, s_f, OpKind::None, 0, 0, sz64);
+        em.emit_rr(VmOp::Mov, s0, rax, sz64);
+        em.emit(VmOp::Movsx, OpKind::Reg, rax, OpKind::Reg, rax, 0, sz64);  // aux=0 → byte 源
+        em.emit_ri(VmOp::Shr, s0, 16, sz64);
+        em.emit_ri(VmOp::Shl, s0, 16, sz64);
+        em.emit_ri(VmOp::And, rax, 0xFFFF, sz64);
+        em.emit_rr(VmOp::Or, rax, s0, sz64);
+        em.emit(VmOp::SetFlags, OpKind::Reg, s_f, OpKind::None, 0, 0, sz64);
+        return true;
     }
 
     // ---- MIT-349: popcnt (比特计数, SSE4.2) ----
