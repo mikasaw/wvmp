@@ -278,12 +278,16 @@ samples=(
 # 唯一差异 = 输入 PE32, x86 管道翻硬拒为声明后生效)。本单预铺只验证
 # "空池零开销不误伤" 与数组/循环就位, 不放任何样本 (x86 管道 rc=2 硬拒
 # 维持, D1 不回退 — X0 §6 表 X1 行的基建参数化切片预铺, 填池归 X5)。
+# MIT-446 (X4) B.4: 首批填池 — 3 族级样本 × 5 seeds = 15 runs (基线
+# 250 → 265)。REQUIRE_REAL 断言按样本登记: forkface 6 stub / callgate
+# 2 stub; sse 样本 = 1 stub (SSE 函数走 x86 白名单 gate 整函数原生 —
+# 池判据只要求 ≥1 stub, helper 真虚拟化满足)。每样本 protect 日志附
+# machine=0x14C 断言见 .multica 交付报告 (dumpbin 亲验)。
 x86_samples=(
+    "build/x86_samples/wvmp_x86_forkface_sample.exe"
+    "build/x86_samples/wvmp_x86_sse_sample.exe"
+    "build/x86_samples/wvmp_x86_callgate_sample.exe"
 )
-# 例 (X5 填池形态, 现留空):
-# x86_samples=(
-#     "build/x86_samples/wvmp_x86_marker_sample.exe"
-# )
 
 # Seeds: 1 (small), 12345 (default), 99999 (large), 0xDEADBEEF (magic), 0xCAFEBABE (magic).
 seeds=(1 12345 99999 3735928559 3405691582)

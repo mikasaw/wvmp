@@ -63,6 +63,30 @@ if(WIN32 AND MSVC AND EXISTS "${WVMP_VS_DIR}/VC/Auxiliary/Build/vcvarsamd64_x86.
     )
 endif()
 
+# —— X4 (MIT-446): x86 E2E 首批三样本（族级：整数+控制流 / SSE 面 / 混合+
+# cdecl callgate 参数窗）——32 位交叉构建（build_x86_e2e_samples.bat，
+# ml.exe + /MACHINE:X86，437 配方），产物落 build/x86_samples/（multiseed
+# x86_samples 池约定路径）。含 native rc=0 哨兵（D4 native 全绿先，428 教训）。
+# 环境无 vcvarsamd64_x86.bat 时降级跳过（池条目按文件缺失计数，不误伤）。
+if(WIN32 AND MSVC AND EXISTS "${WVMP_VS_DIR}/VC/Auxiliary/Build/vcvarsamd64_x86.bat")
+    set(WVMP_X86_E2E_SAMPLE_DIR "${CMAKE_BINARY_DIR}/x86_samples")
+    file(MAKE_DIRECTORY "${WVMP_X86_E2E_SAMPLE_DIR}")
+    add_custom_command(
+        OUTPUT "${WVMP_X86_E2E_SAMPLE_DIR}/wvmp_x86_callgate_sample.exe"
+        COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/build_x86_e2e_samples.bat" "${WVMP_X86_E2E_SAMPLE_DIR}"
+        DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/x86_forkface_sample.asm"
+                "${CMAKE_CURRENT_SOURCE_DIR}/x86_forkface_main.c"
+                "${CMAKE_CURRENT_SOURCE_DIR}/x86_sse_sample.asm"
+                "${CMAKE_CURRENT_SOURCE_DIR}/x86_sse_main.c"
+                "${CMAKE_CURRENT_SOURCE_DIR}/x86_callgate_sample.asm"
+                "${CMAKE_CURRENT_SOURCE_DIR}/x86_callgate_main.c"
+                "${CMAKE_CURRENT_SOURCE_DIR}/build_x86_e2e_samples.bat"
+        COMMENT "x86 E2E 首批三样本交叉构建 (X4: ml.exe + /MACHINE:X86 -> build/x86_samples)"
+        VERBATIM)
+    add_custom_target(wvmp_x86_e2e_samples ALL
+        DEPENDS "${WVMP_X86_E2E_SAMPLE_DIR}/wvmp_x86_callgate_sample.exe")
+endif()
+
 # M2-4：端到端虚拟化样例（区域仅含白名单指令）。
 add_executable(wvmp_virt_sample virtual_sample_main.cpp)
 target_link_libraries(wvmp_virt_sample PRIVATE wvmp::sdk)
