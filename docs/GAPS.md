@@ -701,6 +701,68 @@ rc=0 输出≈输入，用户以为受保护）与**产坏壳**（手造连续�
 > `passes/marker_scan/include/wvmp/passes/marker_scan/scan_core.hpp` 双段
 > 注释（上列旧主张 1 的"不连续"实证即本单收口对象）。
 
+> **X3a 增补（MIT-443，2026-09-01）**：asmgen x86 核心就位（KS_MODE_32 双模
+> + 池 6/临时 4 分配器 + entry/dispatch + 电池集 19 handler 真执行电池），
+> C5 的 asmgen 断层（旧主张 3）对 x86 码体生成面**翻正为已闭合**；全管道
+> 解禁仍维持 D1 红线（X5 收口拍板），x86 (PE32) 平台行保持显式硬拒。详见
+> 下节「asmgen x86 核心」。
+
+## asmgen x86 核心：KS_MODE_32 双模 + 池重构 + x86 runtime 电池（MIT-443 X3a 收口）
+
+**状态（2026-09-01，分支 `mit-x3a-asmgen-core`）**：asmgen.cpp 双模化合入
+（x64 输出路径按 D6 逐字节恒等），`generate_runtime_x86`（新头
+`runtime_x86.hpp`；runtime.hpp/kCtxSize 零 diff，D4 冻结不破）产出 32 位
+解释器码体，11 用例 x86 电池在 32 位测试进程（WOW64）真执行全绿
+（`ctest --test-dir build\x86 -R x86_runtime_battery`，构建 =
+`scripts\build_x86_tests.bat` vcvarsamd64_x86 交叉链）。
+
+**池重构设计（验收 §D.3 映射表）**
+
+| 角色 | x64（池 14） | x86（池实测 6） |
+|---|---|---|
+| ctx_ | callee-saved 池随机（callgate 约束） | callee-saved {ebx,ebp,esi,edi} 随机其一 |
+| base_ | callee-saved 池随机（其余） | callee-saved 随机另一（dispatch 跳表基址） |
+| pc_ | 寄存器（pool[0]） | **内存常驻 [ctx+0x8]**（既有持久槽，零新字段） |
+| flags_ | 寄存器（pool[1]） | **内存常驻 [ctx+0x98]**（= regs[17] 同槽） |
+| t_[0]/t_[5] | callee-saved 固定（callgate 参数避让） | 数据临时 t_[0]/t_[1]：**字节可编码集 {eax,edx,ebx} 均匀抽 2**（al/dl/bl 可编码；bpl/sil/dil REX 专属名 32 位不可编码 —— B.1 rs() 复用度真验结论：四名列对 32/16 位全就位，字节档仅部分就位） |
+| t_[1..4]/t_[6..9]（8 个临时） | pool 洗牌 | 寻址临时 t_[2]/t_[3]：池剩余 2 位洗牌 |
+| spill 纪律 | 不需要（10 临时充裕） | **固定宿主栈帧 kX86FrameSize=0x24**：entry `sub esp,0x24` 常量槽（insn_lo/aux/reg_a/reg_b/size/a_kind/b_kind + setcc 捕获区 5 字节），esp 跨指令稳定，零动态 push/pop；池尽溢出走帧槽（非 ctx 扩容，D4） |
+| zero5 | 清 T3/T4/T6/T7/T9 五寄存器 | **空**（setcc 直写帧槽全字节 + movzx 全字节读取，无需预清零）；x86 形影响 handler 清单 = 全部 flags 捕获族（本单 9 个：add/sub/and/or/xor/cmp/test/inc/dec；X3b 批迁同模板） |
+
+**entry/dispatch（D2/D3 按拍板默认）**：BASE 取址 = call/pop idiom（
+`push base(1B); call next(5B); next: pop base; sub base,6`，确定性偏移回指
+码基址，不涉 pe_writer reloc 面）；跳表保 8B 表项（x86 读表项低 dword，表
+字节格式与 x64 逐位一致，掩码/两遍法零改动）；dispatch 双字取指落帧。
+
+**保存区裁决（B.4，验收 §D.4）**：**维持 442 规则 "guest 栈写恒 ≥ ns"，
+不重排**。理由：(a) x86 epilogue 与 x64 同构（4 callee-saved push/pop +
+ret），保存区冲突形完全同构（x86 侧 [ns-4..ns-0x10] 更小），442 反例形
+（区内 push 撞保存区）由 lifter 保守 gate 整函数兜底，行为已规则化；
+(b) 重排保存区必牵 stub_gen 布局 = X4 单范围，越单；(c) x86 电池（本波
+真验证通道）无 stub 无区内 push，规则维持零成本。证据 = 442 区1 反例的
+E2E 分叉记录（GAPS 本文件前节）+ 本单 x86 epilogue 对称性设计。
+
+**x86 handler 面（X3b 交接注记）**：本单真可跑（电池覆盖）= 电池集 19
+handler：Mov/Lea/Add/Sub/And/Or/Xor/Cmp/Test/Inc/Dec/Load/Store/Jcc/Jmp/
+Nop/Halt/GetFlags/SetFlags（三宽度 S8/S16/S32；S64 块防御 no-op —— x86
+翻译器不产 S64）。仍纸面（x86 码体内跳表折叠 Halt，恢复友好）= 其余 ~78
+op：X3b 批迁 ~45 A 档（宽度模板平移，直接在 x86 handler 表加行）+ B 档
+GP 面（Push/Pop 4B 槽/Jmp/Jcc S32 目标已在本单/RVA 族/S16 串元素宽）+
+X2b 面（SSE 族 34 handler，编码双平台相同但槽位偏移公式按 x86 帧/寄存器
+面重核）+ callgate/ExitNative/Ret（X3c，协议面 4B 化）。电池可扩展设计：
+`tests/test_runtime_x86.cpp` 直接加 TEST 行 + handler 表加行 + dump 门
+`scripts/verifier/verify_x86_dump.py` 的 BATTERY_HANDLERS 集合同步。
+
+**验证铁证**：x64 零扰动 = 同 seed（12345）snake protect 的 asm_dump 逐字
+节 cmp 恒等（main 底稿 vs 分支，161756 B）+ multiseed 250/250 + wvmpTest
+双跑 diff 0；x86 = 电池 11/11（真执行语义 + capstone CS_MODE_32 反汇编断
+言 + 5 seed 稳定性）+ x86 dump 门 PASS（entry idiom/dispatch 掩码/19
+handler 首条可解码）+ 静态立即数扫描 PASS。已知妥协（派单 §F 如实注记）：
+x86 覆盖面 = 代表性 19 op（全 95 = X3b）；WOW64 与真 32 位 OS 寄存器池同
+构、差异 0 预期；池 shuffle 可复现空间在 6 寄存器下收窄（安全性非本单语
+义）；电池首跑曾炸出 size_chain_x86 首版 S16 空转缺陷（3 路尺寸只放 2 个
+cmp、链尾顺延落防御出口），已修并以三路显式分派 + 全电池回归钉死。
+
 ## G3 串指令族 rep movs/stos/scas/cmps/lods（MIT-415 收口）
 
 **状态（2026-08-29，main 92928e0 后）：rep/repnz 串指令已入面**——lifter 前缀闸
