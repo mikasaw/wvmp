@@ -19,9 +19,12 @@ namespace wvmp::regvm::runtime {
 //     5B 确定性偏移回指码基址，不涉 pe_writer reloc 面）。
 //   - dispatch 跳表保 8B 表项（D3：x86 读表项低 dword，表字节格式与 x64
 //     逐位一致，掩码/两遍法逻辑零改动）。
-//   - handler 面 = X3a 电池集 19 项（Mov/Lea/Add/Sub/And/Or/Xor/Cmp/Test/
-//     Inc/Dec/Load/Store/Jcc/Jmp/Nop/Halt/GetFlags/SetFlags），其余 VmOp 沿
-//     既有机制折叠 Halt（跳表缺项 → halt，恢复友好）；全 95 op 批迁 = X3b。
+//   - handler 面 = X3b 起 57 项（X3a 电池集 19 + MIT-444 批迁 38：A 档整数
+//     面 Not/Neg/Adc/Sbb/Imul/Mul/Cdq/Shift 族/Movzx·Movsx(+Mem)/Bswap/
+//     Xchg/Setcc/Cmovcc/Popcnt/Lzcnt/Tzcnt/Cmpxchg + 锁原子 Xadd/Bts/Btr/
+//     Btc + B 档 GP Push/Pop/RVA 族），其余 VmOp 沿既有机制折叠 Halt
+//     （跳表缺项 → halt，恢复友好；残余纸面 = Div/Idiv D2 折叠 + Movsxd x86
+//     不可达 + CallGate/ExitNative/Ret X3c 协议面 + SSE 族 32）。
 //   - size：S8/S16/S32 三路（x86 翻译器不产 S64；handler 内 S64 块防御 no-op）。
 //
 // 验证通道 = 32 位测试进程（WOW64）真执行电池 tests/test_runtime_x86.cpp

@@ -12,7 +12,8 @@ Why this gate exists:
        entry 首四条 = push/call/pop/sub（D2 call/pop idiom）；
     3. dispatch 含 and <r>, 0x7f（kTableEntries-1 掩码）+ 间接 jmp（D3 8B
        表项决策的落地证据）；
-    4. 电池集 19 handler 全部在 dump 中登记（跳表缺项折叠 Halt 的对账面），
+    4. 电池集 handler（X3b 起 57）全部在 dump 中登记（跳表缺项折叠 Halt 的
+       对账面），
        每个登记 handler 的码体反汇编至少含 1 条指令（空 handler 检测）；
     5. 硬条款：立即数十六进制纪律（capstone 显示 0x 口径）与
        zero5-x86-空/内存常驻 flags 的结构性断言由电池层覆盖，此处不重复。

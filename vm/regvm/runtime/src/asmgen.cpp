@@ -58,7 +58,8 @@
 //   MIT-443 (X3a)：asmgen 双模化。AsmGen::HostArch 分叉点收敛为四处 ——
 //   KsSession 汇编模式、roll() 分配器、build_entry/build_dispatch 文本、
 //   handler 表选择；x64 路径在分叉点后逐字保留（D6：x64 输出按同 seed
-//   dump 逐字节恒等，48 单史 sha 纪律）。x86 面设计（电池 19 handler）：
+//   dump 逐字节恒等，48 单史 sha 纪律）。x86 面设计（X3b 起 57 handler，
+//   真可跑 = x64 表 96 唯一 VmOp 补集的整数面 + GP/RVA 面）：
 //
 //   - 池 = kPhys[0..5]（eax/edx/ebx/ebp/esi/edi）6 个：esp 恒不在 kPhys、
 //     ecx 保留（cl 移位计数 + rep 串）、kPhys[6..13]（r8-r15）32 位模式无
@@ -3499,7 +3500,7 @@ public:
     }
 
     // =======================================================================
-    // MIT-443 (X3a)：x86 (KS_MODE_32) 码体生成面 —— 电池集 19 handler。
+    // MIT-443 (X3a)：x86 (KS_MODE_32) 码体生成面 —— X3b 起 57 handler。
     //
     // 与 x64 面的关系：x64 emit 代码一概不经此处（arch 分叉收敛在 KsSession
     // 模式 / roll / build_entry / build_dispatch / handler 表选择五处），x64
@@ -4895,8 +4896,12 @@ RuntimeGenResult generate_runtime_arch(wvmp::Rng& rng, AsmGen::HostArch arch) {
     //    Sar 在 MIT-244 已接管。Adc 在 MIT-245 已接管；Sbb 在 MIT-246 已接管；
     //    Rol/Ror 在 MIT-247 已接管。CallGate 在 MIT-249 已接管。
     //    Ret 在 MIT-438 已接管（清栈返回，见 build_ret 注释）。）
-    //    x86 面（MIT-443 (X3a)）：电池集 19 handler；其余 op 沿既有机制折叠
-    //    Halt（跳表缺项 → halt，恢复友好）；全 95 op 批迁 = X3b（在此加行）。
+    //    x86 面（MIT-444 (X3b) 批迁后）：57 行 = 电池集 19（X3a）+ A 档整数
+    //    面 29（一元/进借位/乘除扩展/移位旋转/扩展传送/条件/位计数/原子）
+    //    + B 档 GP 5（Push/Pop + RVA 族）+ G4 原子 4（Xadd/Bts/Btr/Btc）。
+    //    仍纸面（折叠 Halt，恢复友好）= Div/Idiv（D2 除零折叠）、Movsxd/
+    //    MovsxdMem（x86 不可达）、CallGate/ExitNative/Ret（X3c 协议面）、
+    //    SSE 族 32（X2b/X3c 面）—— 精确清单见 docs/GAPS.md X3b 节。
     std::vector<HandlerDef> handlers;
     if (arch == AsmGen::HostArch::X86) {
         handlers = {

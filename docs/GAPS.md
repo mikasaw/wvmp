@@ -742,26 +742,73 @@ ret），保存区冲突形完全同构（x86 侧 [ns-4..ns-0x10] 更小），44
 真验证通道）无 stub 无区内 push，规则维持零成本。证据 = 442 区1 反例的
 E2E 分叉记录（GAPS 本文件前节）+ 本单 x86 epilogue 对称性设计。
 
-**x86 handler 面（X3b 交接注记）**：本单真可跑（电池覆盖）= 电池集 19
-handler：Mov/Lea/Add/Sub/And/Or/Xor/Cmp/Test/Inc/Dec/Load/Store/Jcc/Jmp/
-Nop/Halt/GetFlags/SetFlags（三宽度 S8/S16/S32；S64 块防御 no-op —— x86
-翻译器不产 S64）。仍纸面（x86 码体内跳表折叠 Halt，恢复友好）= 其余 ~78
-op：X3b 批迁 ~45 A 档（宽度模板平移，直接在 x86 handler 表加行）+ B 档
-GP 面（Push/Pop 4B 槽/Jmp/Jcc S32 目标已在本单/RVA 族/S16 串元素宽）+
-X2b 面（SSE 族 34 handler，编码双平台相同但槽位偏移公式按 x86 帧/寄存器
-面重核）+ callgate/ExitNative/Ret（X3c，协议面 4B 化）。电池可扩展设计：
-`tests/test_runtime_x86.cpp` 直接加 TEST 行 + handler 表加行 + dump 门
-`scripts/verifier/verify_x86_dump.py` 的 BATTERY_HANDLERS 集合同步。
+**x86 handler 面（X3b 收口后，MIT-444 2026-09-01 —— 本节为 X3c 权威输入）**：
+真可跑（x86 表 57 行，全部带真执行语义电池 + dump 门登记）= 电池集 19
+（Mov/Lea/Add/Sub/And/Or/Xor/Cmp/Test/Inc/Dec/Load/Store/Jcc/Jmp/Nop/Halt/
+GetFlags/SetFlags）+ A 档整数面 29（Not/Neg/Adc/Sbb/Imul/Mul/Cdq；Shl/Shr/
+Sar/Rol/Ror + ShlCl/ShrCl/SarCl/RolCl/RorCl；Movzx/MovzxMem/Movsx/MovsxMem/
+Bswap/Xchg；Setcc/Cmovcc；Popcnt/Lzcnt/Tzcnt/Cmpxchg）+ 锁原子 4（Xadd/Bts/
+Btr/Btc）+ B 档 GP 5（Push/Pop/LoadRva/StoreRva/LeaRva）。三宽度 S8/S16/S32；
+S64 块/不可达形防御 no-op（经 size_chain_x86 链尾出口）。
+**仍纸面（跳表折叠 Halt，恢复友好）精确清点 = 39**：Div/Idiv（2，D2 拍板
+除零折叠，真 #DE 语义未定义，X3c/未来单评估）、Movsxd/MovsxdMem（2，x86
+native 无 movsxd 且 lifter translate_movsxd arch!=X64 拒 —— x86 不可达面，
+且 32→64 符号扩展写满 8B 槽会破 "槽高半字恒 0" 不变量，永久纸面合理）、
+CallGate/ExitNative/Ret（3，协议面 4B 化 = X3c 主体；Call 无 x64 行不在
+96 集内）、SSE 族 32（Addss..GpFromXmm 去 Xadd/Bts/Btr/Btc —— 编码双平台
+相同，槽位偏移公式按 x86 帧/寄存器面重核 = X2b/X3c 面）。粗数对账（#33）：
+派单/GAPS 旧文 "仍纸面 ~77/78 op、A 档 ~45、SSE 34" 按实表修正为
+77 = 38 批迁 + 2 D2 + 2 不可达 + 3 协议 + 32 SSE；批迁 38 而非 45（差值
+= D2 Div/Idiv 2 + Movsxd 2 + SSE 误计入 A 档面 3+）。电池可扩展设计
+（X3a 设计兑现）：`tests/test_runtime_x86.cpp` 加 TEST + handler 表加行 +
+`scripts/verifier/verify_x86_dump.py` BATTERY_HANDLERS 同步，三处每 handler
+齐动（本单 38 op 全数践行）。
 
-**验证铁证**：x64 零扰动 = 同 seed（12345）snake protect 的 asm_dump 逐字
-节 cmp 恒等（main 底稿 vs 分支，161756 B）+ multiseed 250/250 + wvmpTest
-双跑 diff 0；x86 = 电池 11/11（真执行语义 + capstone CS_MODE_32 反汇编断
-言 + 5 seed 稳定性）+ x86 dump 门 PASS（entry idiom/dispatch 掩码/19
-handler 首条可解码）+ 静态立即数扫描 PASS。已知妥协（派单 §F 如实注记）：
-x86 覆盖面 = 代表性 19 op（全 95 = X3b）；WOW64 与真 32 位 OS 寄存器池同
-构、差异 0 预期；池 shuffle 可复现空间在 6 寄存器下收窄（安全性非本单语
-义）；电池首跑曾炸出 size_chain_x86 首版 S16 空转缺陷（3 路尺寸只放 2 个
-cmp、链尾顺延落防御出口），已修并以三路显式分派 + 全电池回归钉死。
+**X3b 三项裁决（MIT-444 实测钉死）**：
+1. **Push/Pop 4B 槽**：guest esp 步进 4B（S32 栈宽）⨯ ctx rsp 槽 8B（VM 槽
+   宽，442 "rsp 槽算术恒 S64" 注的真义）—— 槽内值恒 32 位零扩展（"槽高半
+   字恒 0" 不变量）⇒ dword 低半字 sub/add 等价 64 位槽算术且回绕 = 32 位
+   esp native 语义（build_push_x86/build_pop_x86 落地）。⚠️ X4 挂账：翻译
+   器 emit_address/translate_push·pop 的 rsp 步进 VmOp::Sub/Add 与 rip-RVA
+   VmOp::Mov 均带 size_field(S64)（VM 槽宽 tag）—— x86 运行时 3 路链把 S64
+   折防御 no-op，x86 全管道解锁（X4 stub + X5）前必须改为 VmOp::Push/Pop
+   单 op 形（本单已备好 4B 正确 handler）或 S32 步进参数化，否则静默空转。
+2. **x86 移位计数掩码 = 0x1F 全宽**（32 位模式 legacy/compat 恒 5 位掩码，
+   SDM 6 位掩码仅 64 位模式 REX.W）：count=0x20 → 计数 0 出口（值+flags 双
+   不变，电池钉死）；count=0x21 → 移 1 位。x64 S32 档沿用 0x3F handler 掩
+   码（64 位模式下无 REX 的 S32 native 仍内掩 0x1F）—— count∈32..63 且消
+   费 flags 时存在同形污染窗口，属 x64 既有面，X3b 未触碰（零 diff），记
+   观察项。
+3. **RVA 族 = base+RVA 非 identity**：PE32 VA = ImageBase + RVA 仍成立
+   （battery RvaFamily 以 base≠0 反证钉死）；image_base 经 ctx+0x110
+   scratch_mem 低 dword 参与运算，u32 值域零溢出顾虑。
+
+**B.3 translator 收口证据（MIT-444，零代码改动面）**：
+- **pop 位宽对称面**：派单 A.2 "442 只 gate 了 push S16/S8" 与实况失配 ——
+  `git log -S "pop 位宽未支持"` 定位 5ce27c7（MIT-442）同时引入
+  translate_push/translate_pop 的 S16/S8 gate（translator.cpp:1508/1522），
+  pop 对称面 442 已收口，X3b 核对 = 零 diff 兑现。
+- **S16 串形元素宽**：维持 gate（不做）。做不动证据链：lifter 是唯一 S16
+  串形来源闸（x86_translate.cpp translate_string_op ① prefix[2]!=0 拒 +
+  ⑤ width∉{1,4,8} 拒），而 lifter 冻结（D3 唯二解禁 = asmgen/translator）；
+  translator 侧 inc 派生 `S64?8:S32?4:1` 对 S16 恒错（应为 2），单改
+  translator 不开闸 = 不可达死代码。X3c/未来单开面配方（两文件最小 diff）：
+  lifter ⑤ 放行 width==2（size=S16）+ 翻译器 inc 派生补 `S16?2` 分支 +
+  Load/Store/Cmp VmOp S16 槽通路（x86 电池 28 用例已证 S16 handler 全绿，
+  运行时零改动）。442 负例区行为对账：S16 串形样本仍走 C1 gate 兜底
+  （multiseed 250/250 含 forkeface 样本全绿 = 证据）。
+
+**验证铁证（X3b 增补）**：x64 零扰动 = 同 seed（12345）snake protect 的
+asm_dump 逐字节 cmp 恒等（main 4050a4c 底稿 vs 分支每 commit 批次复验，
+161756 B，sha f67c2d40…）+ multiseed 250/250（REQUIRE_REAL）+ wvmpTest
+stubs=14 + jump-table@0xDD84 entries=8 + exit-native 17 + 双跑 103/103
+diff 0 + ctest 16/16；x86 = 电池 28 用例（真执行语义 + capstone CS_MODE_32
+反汇编断言 + 5 seed 稳定性 + 批迁面 ≥15 op 抽样链）+ x86 dump 门 PASS
+（57 handler 登记全覆盖 + 首条可解码）+ 静态立即数扫描双跑 PASS（asmgen.cpp
+源面 + x86 dump 文本面）。批迁过程缺陷实录（#33，电池当场炸出当场修）：
+xadd 旧值写回误用 kind 值槽代索引槽（写错槽）、cmpxchg S8 源载体未约束字
+节可编码集（seed 相关 ks_errno=512）、setcc tail 复用 cond 载体作槽索引
+（写错槽）——三处均为 x86 emit 面缺陷，x64 恒等逐批次复验未受扰。
 
 ## G3 串指令族 rep movs/stos/scas/cmps/lods（MIT-415 收口）
 
