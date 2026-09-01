@@ -265,7 +265,7 @@
 | SIMD 尾族三行（pmovmskb / pcmpeq/pcmpgt / punpck 系） | ⛔ gate（分层定稿） | 频率分层：客户态新抽 14 exe 全零 vs SIMD/CRT 域 punpck 0.06–0.074% / pmovmskb 0.015–0.055% 密度；punpck 粒度分裂 d/q 88–100% hash/安全域 vs b/w 73% codec 域；lqdq/hqdq D1 拍板 gate 不折 | MIT-432 §1/§1.4（`.multica/mit-G9r-triage.md`）+ MIT-GZ D1 |
 | G8b 三条（mulx/pdep/pext）+ blsr 族四条（blsr/blsi/blsmsk/bextr） | ⛔ gate（挂账/永久） | mulx/pdep/pext = G8b 档 native 直执行 + CPUID gate 基建挂账，mulx CF Zen5 实测不写 vs SDM 厂商分叉待决；blsr 族 27 文件语料 0 永久 gate | MIT-432 §2/§6.4 + MIT-GZ B.1 |
 | ymm / EVEX / FMA / 加密（AES 等） | ⛔ gate（档B） | xmm 跟踪区 kCtxSize 0x1C8 冻结面；档B 立项即触发跳表扩容评估 | MIT-424 (档B) |
-| x86 (PE32) 平台 | 🔧 显式硬拒绝 | 已剥离出本阶段 → 独立里程碑“多目标平台”（计划后续另立） | MIT-412 / MIT-414 (G7p2) + MIT-GZ D3 |
+| x86 (PE32) 平台（MIT-446 (X4) 翻正，取代上行"显式硬拒绝"旧态） | ✅ 支持 | 全管道首通：D1 解禁（auto/x86 声明双形放行）+ stub x86 cdecl + S64 tag 改形 + cdecl callgate 参数窗 + x86 白名单 gate；E2E 首批 3 族级样本 WOW64 byte-exact；残余 gate 面 = SSE 族 32 / Div / Idiv（见「x86 战役已知 gate 清单」G7/G8） | MIT-446 (X4) |
 | 16-bit 目标 | ⛔ 不可行 | PE 格式白名单只收 0x014C/0x8664 | MIT-412（GAPS C5 交叉引用） |
 
 > 观察清单与挂账联动见 `docs/STATUS.md`「指令虚拟化阶段（M2.5-G）收口」节；
@@ -536,6 +536,8 @@ gate，整函数原生 byte-identical 零逃逸）**：
 | G4 | 串指令 S16 形（66 A5/A6/AA/AC/AE/A7/2E 系 movsw/stosw/…）——G3 S16 串形砍面维持（runtime 元素宽参数化属 asmgen X3 面） | lifter translate_string_op 前缀三元组（prefix[2]=66 拒） | MIT-415 §B.7 残余维持 + MIT-442 复核；单测 RepStringOpNegativesStillGated（66 F3 A5 + 66 A5 双钉） |
 | G5 | call [mem] / call reg（目标 = 运行时值）——CallGate 协议仅吃 aux RVA（asmgen build_callgate step1 直读），reg-target 通路需 asmgen 改动 → **D4 停手归 X3**（IAT thunk `call [__imp_x]` msvbvm60 35% of call / vtable call reg dxcompiler 4167 级） | lifter 已 lift（Call dst=Mem/Reg，409 Jmp 先例）→ translator skip 带 X3 披露 note → C1 整函数原生 | MIT-442 (X2a) ① #33 实测推翻「Load+Call(reg) 零新 VmOp 高置信」预判（call-reg "可直用" 系 lifter 白名单级，runtime 从未有 E2E）；单测 CallMemGateNoteX3；样本负例区2/2b |
 | G6 | cbw 之外的低频尾族：shld/shrd（X3 结构性必收）/ enter（噪声）/ cwd（66 99，无折条）——X0 §1.4 缺失行维持 | lifter default | X0 §1.4 + MIT-442 分工（shld/shrd 归 X3，本单不动）；单测 CwdeCbwFoldForkFace（cwd 66 99 gate 钉） |
+| G7 | SSE 全族（x86 面 32 op：Addss..GpFromXmm）——x86 runtime 无 SSE handler，跳表缺项折叠 Halt = C2 类静默错 → **MIT-446 (X4) 起 stub_link x86 白名单 gate 整函数原生**（跳表缺项 VmOp 检出，覆写 .text 前拦截） | stub_link emit 层 gate（x86_handler_opcodes 单一来源）+ x87 同款"整函数 gate"证据链 | MIT-446 (X4)；样本 wvmp_x86_sse_sample（gate note + helper 真虚拟化双证据）；handler 开面归 X2b/未来单 |
+| G8 | Div/Idiv（x86 面）——D2 除零折叠维持（真 #DE 语义未定义），跳表缺项 | stub_link x86 白名单 gate（同 G7 通道） | MIT-444 (X3b) D2 拍板 + MIT-446 (X4) gate 化；开面归未来单评估 |
 
 ## X2a 形级 fork 面收口（MIT-442）：六形态折叠 + x64 全链实证
 
@@ -707,6 +709,14 @@ rc=0 输出≈输入，用户以为受保护）与**产坏壳**（手造连续�
 > C5 的 asmgen 断层（旧主张 3）对 x86 码体生成面**翻正为已闭合**；全管道
 > 解禁仍维持 D1 红线（X5 收口拍板），x86 (PE32) 平台行保持显式硬拒。详见
 > 下节「asmgen x86 核心」。
+
+> **X4 增补（MIT-446，2026-09-02）**：**D1 解禁落地**——pe_loader x86 通行
+> （auto（槽缺省）/ 显式 arch=x86 双形放行；mismatch（arch=x64 + 0x014C /
+> arch=x86 + 0x8664）维持 rc=2 硬拒；上文 X1a/X3a 增补中的"rc=2 硬拒维持 /
+> 不随本单解禁"表述自本单起翻正）。全管道 = marker_scan 双段 magic → lifter
+> pointer_size → translator（S64 tag 改形后）→ runtime_x86 → stub x86 cdecl
+> → pe_writer，E2E 首批 3 族级样本 WOW64 byte-exact。详见下节「x86 全管道
+> 打通（MIT-446 X4 收口）」。
 
 ## asmgen x86 核心：KS_MODE_32 双模 + 池重构 + x86 runtime 电池（MIT-443 X3a 收口）
 
@@ -907,6 +917,92 @@ ffd47289）。
   missing 表**无独立条目**（语料 0/噪声级——MSVC 16 位 DX:AX 仿真不产现代产物）。
   **裁决 = 不立项**；cwde/cbw 已由 442 收口覆盖符号扩展语义面。若未来语料命中,
   折条 = Movsx(S16 源) 写 dx 槽 + ax 保留, 同款两文件配方。
+
+## x86 全管道打通：stub cdecl 重写 + S64 tag 改形 + D1 解禁 + E2E 首批入池（MIT-446 X4 收口）
+
+**状态（2026-09-02，分支 `mit-x4-stub-e2e` 基于 main e20b383）**：x86 战役
+"从 0 到 1"一棒收口——PE32 输入→全 pass 链→packed PE32→WOW64 真执行，
+main 自本单起具备 x86 生产能力。x64 零扰动铁证 = asm_dump @12345 sha
+`ffd4728901812932…`/161,861B 逐字节恒等（全批次五次 cmp 实证）。
+
+**B.2 S64 tag 改形（444 X3b 挂账，五点位 + 同族残段 ×3）**：Translator 新增
+`arch_/sz_step_` 单一来源（translate_function 按 fn.arch 派生，x64 = S64
+现形 / x86 = S32）。点位：① translate_push/pop x86 分叉改 VmOp::Push/Pop
+单 op 形（X3b 4B handler），x64 Sub+Store 现形逐字节不动；② emit_address
+双形全链；③ emit_imm64_split（x86 fits_aux 恒真不可达，防御形）；④
+LeaRva 通路（emit_sse_mem_addr / lock xadd / lock bit）；⑤ G3 串微程序
+步进 + flags 包裹。清单外同族残段 ×3 一并参数化（披露）：跳转表比较链
+（413 面先于 442 审计，同"地址算术折 no-op"类）/ bzhi 边界 CF 补丁段 /
+cbw 载体 stash 合并段（x86 S32 形 = 66 98 native 位 31:16 保持语义，
+"槽高半字恒 0" 相容）。fallthrough Jmp 维持 S64（x86 build_jmp 无尺寸链
+实测无害）。防回归 = translator 双 arch 快照 ×3（X86 Push/Pop 单 op 形 =
+复辟探测器）+ 电池 StepTagS32LiveAndS64NoopGuard（S32 真块推进+访存 vs
+S64 链尾 no-op 双钉）。
+
+**B.1 stub x86 cdecl 形（stub_gen.cpp 双形化）**：`StubArch` 注入通道 +
+`build_stub_asm_x64`（逐字保留）/`build_stub_asm_x86`。差异清单：4
+callee-saved push（kStubPushBytesX86=0x10，mod-16 static_assert，与
+kX86ExitSlotDepth 派生式互锁）；ctx 经 `push esp` 栈参对接 runtime_x86
+entry `[esp+0x14]`；ctx 区 `rep stosd` 清零（"槽高半字恒 0" 不变量的栈帧
+来源；eax/ecx/edx/edi 四寄存器临时捕获——⚠️ **edi 必须恢复**：Ret 直退
+路径不经 stub 出口 pop，runtime 出口恢复"进入时刻" callee-saved，碎 edi
+污染 guest caller 帧，E2E 首通实录 stdout 空 + 0xC0000029）；预载 eax..edi
+8 槽（保存区读回偏移 = kCtxSize + 0x10 − 4(i+1)，**先 push 在高址**——
+首通实录：顺序写反致 slot5(ebp)=原 esi 值，[ebp−4] 写飞，cdb 铁证
+`mov [edx],ebx` edx=0x7717667C=原 esi−4）；易失回写 eax/ecx/edx 三槽
+（callee-saved 绝不从 ctx 回写——区域未含 epilogue 时 guest 槽值不可信）；
+ExitNative/HALT 共用 `jmp dword ptr [esp − kX86ExitSlotDepth]`（4B 槽，
+kX86ExitSlotDepth 单一来源上移 runtime_x86.hpp）；blob 指针 imm32 VA（32
+位无 rip 寻址，免 x64 disp32 回填）；xmm 同步不适用（x86 无 SSE handler，
+Win32 xmm 全易失）。
+
+**B.1 callgate cdecl 参数窗（445 D2"不特化"挂账翻案）**：`kX86CallgateArgDwords=4`
+协议（asmgen 与 stub 两处同步锚④）——handler step 2.5 从 guest
+`[v4 + 4i]`（i=3..0 逆序 push，arg0 落最低）固定预置 4 dword 到 callee
+窗口；guest 侧约定 = 区域把参数写 prologue 预留的 esp 上方 scratch
+（`mov [esp+k], arg; call f`，写址 ≥ ns 合 442 规则）；cdecl caller-cleans
+语义下多预置无害（0-arg callee 不读、esp 由 host_rsp 重基回收）；翻译层
+零 arg_count 通路（cond_or_size 维持 0）。
+
+**x86 白名单 gate（C2 类静默错的结构性封堵）**：asmgen x86 handler 表提为
+`x86_handler_table()` 单一来源 + 导出 `x86_handler_opcodes()`（runtime_x86.hpp
+契约）；stub_link 按 PeImage.machine 分叉：x86 目标逐条解码 blob，字节码含
+跳表缺项 VmOp 的函数整函数保持原生（覆写 .text 前把"跳表折叠 Halt"C2 类
+静默错拦成 C1 类显式 gate）。证据 = sse 样本 gate note（opcode: 85 68 85 86
+85 68 86）+ 1 stub（helper 真虚拟化满足 REQUIRE_REAL）。
+
+**B.3 D1 四象限（pe_loader）**：auto+x86 放行 / x86+x86 放行 / x64decl+x86
+拒 / x86decl+x64 拒（mismatch 文案原样）；2.6 块限定 machine≠x86（修放行
+路径落旧 x86 全局拒块的误伤，亲测当场炸）。单测 AutoDeclX86InputPassesAfterD1Unlock
++ TargetArchDeclGate 翻正。
+
+**B.4 E2E 首批（3 族级样本，build/x86_samples/，multiseed 首次填池
+250→265）**：① forkface-x86 移植形（整数 ALU/循环/位操作 + leave/ret 面
+（prologue 原生收区外）+ rep movsb 非对齐/stosd/repne scasd/lodsd + p66
+S16/cwde/cbw + call reg/call [mem] + ret imm16（asm wrapper 压参）+ x87 区
+R-SSE-only 定稿 gate 负例）6 stub byte-exact；② SSE 面（movdqa/movdqu/
+movaps/movups 折叠族 x86 形，**设计性 x86 白名单 gate 负例**——SSE 函数整
+函数保原生 + 整数 helper 真虚拟化）1 stub byte-exact；③ 混合+cdecl
+callgate 参数窗（3-arg/2-arg/0-arg/call [mem] 全经参数窗 + 第二真虚拟化区）
+2 stub byte-exact。样本 ABI 纪律（D4 native 全绿先）：区域内只用
+eax/ecx/edx + 全局内存、无 push（callee-saved 保护区不回写 + 442 guest≥ns
+规则）；stdcall 面经 asm wrapper（C 主 cdecl 调 wrapper，ret 8 清栈在
+VM 内）。B.5 pe_writer 评估结论：SizeOfImage(+56)/SizeOfHeaders(+60)/
+CheckSum(+64)/节表追加以 PE32/PE32+ 同布局，零代码改动即就绪（E2E 实证）；
+reloc/ASLR 口径 = 对齐 x64 现网事实（仅 ImageBase 声明 + 清 DYNAMIC_BASE，
+不发布 reloc——pe_writer:39-42 注释同口径文档化，不扩面）。
+
+**B.6 六件套（全绿）**：build 0 错 0 警 / ctest 16/16 / multiseed
+265/265（REQUIRE_REAL，x64 250 + x86 15）/ wvmpTest stubs=14 双跑 diff 0 /
+x86 电池 36/36（35+1）/ dump 门 60 项 PASS + x64 dump `ffd47289…` 恒等。
+
+**已知 gate/缺口面清单（X5 交接）**：x86 运行时 60 handler 之外的折叠面 =
+SSE 族 32（X2b/未来单，x86 白名单 gate 整函数原生）/ Div/Idiv 2（D2 除零
+折叠维持）/ Movsxd·MovsxdMem 2（x86 不可达，永久纸面）；lifter 面 gate =
+x87 全族（R-SSE-only 永久 gate）/ SEH·段覆盖（G1）/ 67 地址宽（G2）/ std
+（G3）/ S16 串形（G4）/ shld/shrd·enter·cwd（G6）；B.2 同族残段已收
+（跳表链/bzhi/cbw 一并参数化，x86 真块）。跳表余量 = kVmOpMax 97/128（30，
+不动）。
 
 ## G3 串指令族 rep movs/stos/scas/cmps/lods（MIT-415 收口）
 
