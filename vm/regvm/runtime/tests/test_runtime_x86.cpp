@@ -2035,3 +2035,100 @@ TEST(X86Battery, CallGateRegFormComputedTarget) {
     EXPECT_EQ(ctx.pc, 4u);
 }
 
+// ---------------------------------------------------------------------------
+// (32) X3c B.2：ExitNative 无条件直退 + 4B 退出槽协议（真执行断言）。
+//      槽地址 = native_sp - 0x258（kX86ExitSlotDepth，X4 stub_gen 读侧对接
+//      锚）；槽内容 = aux + image_base（目标 VA dword）。epilogue（帧回收 +
+//      4 callee-saved pop + ret）后控制返回测试进程。
+// ---------------------------------------------------------------------------
+// 退出槽承载区：静态缓冲（native_sp = 缓冲末端，槽 = 末端 - 0x258 落缓冲内
+// ——电池无 stub，native_sp 由测试预置 [ctx+0x120]）。
+static unsigned long g_xen_area[0x260 / sizeof(unsigned long)];
+
+static isa::VmInsn exitnative_uncond(u32 rva) {
+    return isa::make_insn(isa::VmOp::ExitNative, isa::OpKind::Imm, 0,
+                          isa::OpKind::None, 0, rva, 0);
+}
+static isa::VmInsn exitnative_cond(ir::Cond c, u32 rva) {
+    return isa::make_insn(isa::VmOp::ExitNative, isa::OpKind::None, 0,
+                          isa::OpKind::None, 0, rva, u8(c));
+}
+static isa::VmInsn setflags(u8 slot) {
+    return isa::make_insn(isa::VmOp::SetFlags, isa::OpKind::Reg, slot,
+                          isa::OpKind::None, 0, 0,
+                          isa::size_field(ir::Size::S32));
+}
+
+TEST(X86Battery, ExitNativeUncondSlotProtocol) {
+    wvmp::Rng rng(12345);
+    const auto gen = rt::generate_runtime_x86(rng);
+    RwxImage rwx(gen.image.code);
+    constexpr u64 kFakeBase = 0x400000;
+    const u64 kNs = reinterpret_cast<u64>(g_xen_area) + sizeof(g_xen_area);
+    const u64 kSlot = kNs - 0x258;   // kX86ExitSlotDepth（同 static_assert 锚）
+    std::vector<u8> s;
+    isa::append_insn(s, exitnative_uncond(0x1234));                      // 0
+    isa::append_insn(s, halt());                                         // 1 (不可达)
+    rt::VmContext ctx;
+    ctx.bytecode = s.data();
+    ctx.pc = 0;
+    ctx.scratch_mem = kFakeBase;
+    ctx.native_sp = kNs;
+    ctx.regs[isa::vm_reg_of(ir::Reg::Rsp)] = 0;
+    *reinterpret_cast<unsigned long*>(kSlot) = 0xBBBBBBBBul;             // 哨兵
+    rwx.entry()(&ctx);
+    // 4B 槽协议：目标 VA = aux + image_base 落 [ns-0x258]。
+    EXPECT_EQ(*reinterpret_cast<unsigned long*>(kSlot), 0x401234ul);
+    // 退出路径不 advance（pc 不写回；x64 build_exitnative 同语义）。
+    EXPECT_EQ(ctx.pc, 0u);
+}
+
+// ---------------------------------------------------------------------------
+// (33) X3c B.2：ExitNative 条件形双路——满足退出（槽落账）/ 不满足继续 VM。
+// ---------------------------------------------------------------------------
+TEST(X86Battery, ExitNativeCondTakenAndFallthrough) {
+    wvmp::Rng rng(12345);
+    const auto gen = rt::generate_runtime_x86(rng);
+    RwxImage rwx(gen.image.code);
+    constexpr u64 kFakeBase = 0x400000;
+    const u64 kNs = reinterpret_cast<u64>(g_xen_area) + sizeof(g_xen_area);
+    const u64 kSlot = kNs - 0x258;
+    // 路 1: ZF=1（SetFlags v2=1）→ cond E 满足 → 退出。
+    {
+        std::vector<u8> s;
+        isa::append_insn(s, mov_imm(2, 0x1));                            // 0 ZF 位
+        isa::append_insn(s, setflags(2));                                // 1
+        isa::append_insn(s, exitnative_cond(ir::Cond::E, 0x1234));       // 2
+        isa::append_insn(s, halt());                                     // 3 (不可达)
+        rt::VmContext ctx;
+        ctx.bytecode = s.data();
+        ctx.pc = 0;
+        ctx.scratch_mem = kFakeBase;
+        ctx.native_sp = kNs;
+        ctx.regs[isa::vm_reg_of(ir::Reg::Rsp)] = 0;
+        *reinterpret_cast<unsigned long*>(kSlot) = 0xBBBBBBBBul;
+        rwx.entry()(&ctx);
+        EXPECT_EQ(*reinterpret_cast<unsigned long*>(kSlot), 0x401234ul);
+        EXPECT_EQ(ctx.pc, 2u);   // 退出路径不 advance（pc 停在 ExitNative 本条）
+    }
+    // 路 2: ZF=0（SetFlags v2=0x1E: CF/OF/SF/PF 置位、ZF 清零）→ 不满足 →
+    // advance 继续 VM → Halt；槽哨兵不变。
+    {
+        std::vector<u8> s;
+        isa::append_insn(s, mov_imm(2, 0x1E));                           // 0
+        isa::append_insn(s, setflags(2));                                // 1
+        isa::append_insn(s, exitnative_cond(ir::Cond::E, 0x1234));       // 2
+        isa::append_insn(s, halt());                                     // 3
+        rt::VmContext ctx;
+        ctx.bytecode = s.data();
+        ctx.pc = 0;
+        ctx.scratch_mem = kFakeBase;
+        ctx.native_sp = kNs;
+        ctx.regs[isa::vm_reg_of(ir::Reg::Rsp)] = 0;
+        *reinterpret_cast<unsigned long*>(kSlot) = 0xBBBBBBBBul;
+        rwx.entry()(&ctx);
+        EXPECT_EQ(*reinterpret_cast<unsigned long*>(kSlot), 0xBBBBBBBBul);
+        EXPECT_EQ(ctx.pc, 4u);   // ExitNative advance + Halt pc+1
+        EXPECT_EQ(ctx.ret_value, 0u);
+    }
+}

@@ -3550,7 +3550,7 @@ public:
 
     // =======================================================================
     // MIT-443 (X3a)：x86 (KS_MODE_32) 码体生成面 —— X3b 起 57 handler
-    //（X3c 批次一后 58：+ CallGate）。
+    //（X3c 批次二后 59：+ CallGate/ExitNative）。
     //
     // 与 x64 面的关系：x64 emit 代码一概不经此处（arch 分叉收敛在 KsSession
     // 模式 / roll / build_entry / build_dispatch / handler 表选择五处），x64
@@ -4836,6 +4836,77 @@ public:
         return o;
     }
 
+    // =======================================================================
+    // MIT-445 (X3c B.2)：x86 ExitNative（区域外跳转单向退出, 4B 退出槽）。
+    //
+    // 编码（x64 build_exitnative 同协议）：无条件 a_kind=Imm(2)（Jmp 越区
+    // 形）；条件 a_kind=None + cond_or_size=ir::Cond 0..15（Jcc 越区形）。
+    //
+    // 退出协议 = 4B 槽（X0 §3.2-C(4) x86 形）：目标 VA（dword = aux +
+    // image_base 低 dword）写 [native_sp - kX86ExitSlotDepth]（native_sp =
+    // [ctx+0x120]，stub/电池预置；X4 stub_gen 读侧对接锚）。随后 x86
+    // epilogue（add esp,0x24 帧回收 + 4 callee-saved 逆序 pop + ret）退出
+    // 解释器——x64 面退出后经 stub HALT 段 jmp 槽；x86 无 stub（X4 前电池
+    // 直执），entry 调用方拿到控制后按同址读槽（电池断言即此语义）。
+    //
+    // 与 x64 的结构差异（逐条对账）：
+    //   1) 槽宽 4B（dword；x64 = qword [rsp-0x38] host_rsp 坐标）；
+    //   2) pc 不写回（x64 同——退出路径不 advance，调用方语义）；
+    //   3) 易失寄存器/xmm 写回链不在 handler（x64 在 stub HALT 段；X4 stub
+    //      对接时同位实现，电池直执下 ctx 槽即真相源）；
+    //   4) 条件链 cond_eval_x86（flags 常驻 [ctx+0x98]，cond_perm 随机，
+    //      build_jcc_x86 同构）；无条件判据 = 帧槽 kX86FAKind==2（x64 用
+    //      T3 寄存器同判）。
+    // =======================================================================
+    std::string build_exitnative_x86(u64 dispatch) const {
+        const std::string test_lbl = "xen_t";
+        const std::string exit_lbl = "xen_x";
+        const std::string adv_lbl = "xen_a";
+        std::string o = decode_prelude_x86();
+        // 0) 无条件直退: a_kind==Imm(2)（固定标签, 不吃 seq(), 理由同 callgate）
+        o += std::string("    mov ") + r32x(t_[0]) + ", " + xf(kX86FAKind) + "\n";
+        o += std::string("    cmp ") + r32x(t_[0]) + ", " + imm(2) + "\n";
+        o += "    je " + exit_lbl + "\n";
+        // 1) 条件链 (cond 0..15, build_jcc_x86 同构: 16 路随机分派)
+        for (int i = 0; i < 15; ++i) {
+            const int c = cond_perm_[i];
+            o += std::string("    cmp dword ptr ") + xf(kX86FSize) + ", " + imm(c) + "\n";
+            o += "    je xcc" + std::to_string(c) + "_" + test_lbl + "\n";
+        }
+        o += "xcc" + std::to_string(cond_perm_[15]) + "_" + test_lbl + ":\n" +
+             cond_eval_x86(cond_perm_[15]) + "    jmp " + test_lbl + "\n";
+        for (int i = 0; i < 15; ++i) {
+            const int c = cond_perm_[i];
+            o += "xcc" + std::to_string(c) + "_" + test_lbl + ":\n";
+            o += cond_eval_x86(c);
+            o += "    jmp " + test_lbl + "\n";
+        }
+        o += test_lbl + ":\n";
+        o += std::string("    test ") + r32x(t_[0]) + ", " + r32x(t_[0]) + "\n";
+        o += "    jz " + adv_lbl + "\n";
+        // 2) 退出路径: 目标 VA = aux + image_base → 4B 退出槽
+        //    （槽地址 = [ctx+0x120] - kX86ExitSlotDepth, 标签不吃 seq()）
+        o += exit_lbl + ":\n";
+        o += std::string("    mov ") + r32x(t_[1]) + ", " + xf(kX86FAux) + "\n";
+        o += std::string("    add ") + r32x(t_[1]) + ", dword ptr [" + r32x(ctx_) +
+             " + 0x110]\n";
+        o += std::string("    mov ") + r32x(t_[0]) + ", dword ptr [" + r32x(ctx_) +
+             " + 0x120]\n";
+        o += std::string("    sub ") + r32x(t_[0]) + ", " + imm(kX86ExitSlotDepth) + "\n";
+        o += std::string("    mov dword ptr [") + r32x(t_[0]) + "], " + r32x(t_[1]) + "\n";
+        // 3) x86 epilogue: 帧回收 + callee-saved 逆序恢复 + ret（build_halt_x86 同构）
+        o += std::string("    add esp, ") + imm(kX86FrameSize) + "\n";
+        const auto order = x86_save_order();
+        for (int i = 3; i >= 0; --i)
+            o += std::string("    pop ") + r32x(order[i]) + "\n";
+        o += "    ret\n";
+        o += adv_lbl + ":\n";
+        o += advance_x86(dispatch);
+        return o;
+    }
+
+    std::string build_x86_exitnative(u64 d) const { return build_exitnative_x86(d); }
+
     std::string build_x86_callgate(u64 d) const { return build_callgate_x86(d); }
 
     // x86 LoadRva（build_loadrva 的 32 位版）：b 槽 = RVA（u32），+ image_base
@@ -5014,12 +5085,13 @@ RuntimeGenResult generate_runtime_arch(wvmp::Rng& rng, AsmGen::HostArch arch) {
     //    Sar 在 MIT-244 已接管。Adc 在 MIT-245 已接管；Sbb 在 MIT-246 已接管；
     //    Rol/Ror 在 MIT-247 已接管。CallGate 在 MIT-249 已接管。
     //    Ret 在 MIT-438 已接管（清栈返回，见 build_ret 注释）。）
-    //    x86 面（MIT-445 (X3c) 批次一后）：58 行 = 电池集 19（X3a）+ A 档
+    //    x86 面（MIT-445 (X3c) 批次二后）：59 行 = 电池集 19（X3a）+ A 档
     //    整数面 29（一元/进借位/乘除扩展/移位旋转/扩展传送/条件/位计数/原子）
     //    + B 档 GP 5（Push/Pop + RVA 族）+ G4 原子 4（Xadd/Bts/Btr/Btc）
-    //    + CallGate（X3c B.1 reg 值目标 + RVA 双形）。
+    //    + CallGate（X3c B.1 reg 值目标 + RVA 双形）+ ExitNative（X3c B.2
+    //    4B 退出槽）。
     //    仍纸面（折叠 Halt，恢复友好）= Div/Idiv（D2 除零折叠）、Movsxd/
-    //    MovsxdMem（x86 不可达）、ExitNative/Ret（X3c 协议面余二）、
+    //    MovsxdMem（x86 不可达）、Ret（X3c 协议面余一）、
     //    SSE 族 32（X2b/X3c 面）—— 精确清单见 docs/GAPS.md X3b/X3c 节。
     std::vector<HandlerDef> handlers;
     if (arch == AsmGen::HostArch::X86) {
@@ -5089,6 +5161,8 @@ RuntimeGenResult generate_runtime_arch(wvmp::Rng& rng, AsmGen::HostArch arch) {
             {int(VmOp::LeaRva), "learva", &AsmGen::build_x86_learva},
             // —— X3c (MIT-445) 协议面批次一：CallGate reg 值目标 + RVA 双形 ——
             {int(VmOp::CallGate), "callgate", &AsmGen::build_x86_callgate},
+            // —— X3c (MIT-445) 协议面批次二：ExitNative 4B 退出槽 ——
+            {int(VmOp::ExitNative), "exitnative", &AsmGen::build_x86_exitnative},
         };
     } else {
         handlers = {
