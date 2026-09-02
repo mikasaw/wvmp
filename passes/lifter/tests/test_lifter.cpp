@@ -445,6 +445,30 @@ TEST_F(LifterTranslate, PushPop) {
     EXPECT_EQ(q.insn.dst.reg, ir::Reg::Rbx);
 }
 
+TEST_F(LifterTranslate, PushImmLiftsDstImm) {
+    // MIT-454 (X6 B.1) #33 钉：push imm 本就被 lifter lift 为 Op::Push
+    // dst=Imm（is_data_operand 含 Imm——X6 派单 A.1 "lifter 拒 imm 形" 定位
+    // 被基线 gate note 推翻, 真卡点在 translator）。本用例把该既有行为钉死,
+    // 防"开面"回流误改 lifter。x86 面 (68 imm32 + 6A imm8) 双编码:
+    //   68 10 00 00 00: push 0x10   (x86, imm32)
+    //   6A FB:          push -5     (x86, imm8 sext → capstone imm=-5)
+    const wvmp::u8 b32[] = {0x68, 0x10, 0x00, 0x00, 0x00};
+    auto a = translate_bytes(x86, b32, ir::Arch::X86);
+    ASSERT_EQ(a.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(a.insn.op, ir::Op::Push);
+    ASSERT_EQ(a.insn.dst.kind, ir::Operand::Kind::Imm);
+    EXPECT_EQ(a.insn.dst.imm, 0x10);
+    EXPECT_EQ(a.insn.size, ir::Size::S32);
+
+    const wvmp::u8 b8[] = {0x6A, 0xFB};
+    auto b = translate_bytes(x86, b8, ir::Arch::X86);
+    ASSERT_EQ(b.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(b.insn.op, ir::Op::Push);
+    ASSERT_EQ(b.insn.dst.kind, ir::Operand::Kind::Imm);
+    EXPECT_EQ(b.insn.dst.imm, -5);
+    EXPECT_EQ(b.insn.size, ir::Size::S32);
+}
+
 TEST_F(LifterTranslate, CmpTest) {
     // 39 C8: cmp eax, ecx
     const wvmp::u8 cb[] = {0x39, 0xC8};

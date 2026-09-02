@@ -1564,26 +1564,51 @@ struct Translator {
     // 纪律)。S16/S8 (66 50 push r16 — x64 合法编码, 栈推进 2B 不在 VM 栈模
     // 型内) → 保守 gate (修复既有静默错形: 旧码 S16 push 也走 8B stride)。
     // rsp 槽算术恒 S64 (VM 槽宽, 与 arch 无关)。
+    // MIT-454 (X6 B.1): push imm 开面。#33 实测修正 X6 派单 A.1 定位——
+    // 卡点不在 lifter（x86_translate.cpp is_data_operand 本就接受 Imm, push
+    // imm 一直被 lift 为 Op::Push dst=Imm），而在本函数的 dst.kind != Reg
+    // skip（wvmpTest x86 基线 gate note 全部为本函数文本, 11 处 = aa18×1 +
+    // b678×10）。开面 = x86 单 op Push/Imm（X3b build_push_x86 a_kind 双形
+    // 的 xpimm_ 分支既有, 读 aux 槽）；x64 维持 skip（D2 x86-only 裁决, x64
+    // push imm 语义 = sext 到 64 位, 与 x86 零扩展值域不同面, 留 X6b）。
+    // imm 值域: x86 编码 68 imm32 / 6A imm8(sext) 的存储值恒 32 位——
+    // capstone imm(i64, sext) 取低 32 位即存储 dword（-1 → 0xFFFFFFFF 与
+    // 0xFFFFFFFF → 0xFFFFFFFF 同值）；超 32 位值域（x64 sext 形混入）防御
+    // skip。S16/S8 位宽 gate 前置（66 68 push imm16 同 gate 口径, 对齐 442
+    // push 位宽面）。
     bool translate_push(Emitter& em, const ir::Insn& in) {
-        if (in.dst.kind != ir::Operand::Kind::Reg)
-            return skip(in, "push 操作数形态未支持", nullptr); // push imm：lifter 不产出
         if (in.size == ir::Size::S16 || in.size == ir::Size::S8)
             return skip(in, "push 位宽未支持 (S16/S8 栈推进不在 VM 栈模型内)", nullptr);
-        // MIT-446 (X4) B.2 点位①（444 X3b 挂账落地）：x86 栈步进改单
-        // VmOp::Push（X3b 已备 4B handler，a_kind 双形 Reg/Imm；此路径恒
-        // Reg 形）。旧形 Sub rsp (S64 tag) 在 x86 运行时折防御 no-op 静默
-        // 空转；x64 路径维持 Sub+Store 现形逐字节不动（D2 恒等铁约束）。
-        if (arch_ == ir::Arch::X86) {
-            em.emit(VmOp::Push, OpKind::Reg, isa::vm_reg_of(in.dst.reg),
-                    OpKind::None, 0, 0, isa::size_field(in.size));
+        if (in.dst.kind == ir::Operand::Kind::Reg) {
+            // MIT-446 (X4) B.2 点位①（444 X3b 挂账落地）：x86 栈步进改单
+            // VmOp::Push（X3b 已备 4B handler，a_kind 双形 Reg/Imm；X6 起此
+            // 路径 Reg/Imm 双形真产）。旧形 Sub rsp (S64 tag) 在 x86 运行时
+            // 折防御 no-op 静默空转；x64 路径维持 Sub+Store 现形逐字节不动
+            // （D2 恒等铁约束）。
+            if (arch_ == ir::Arch::X86) {
+                em.emit(VmOp::Push, OpKind::Reg, isa::vm_reg_of(in.dst.reg),
+                        OpKind::None, 0, 0, isa::size_field(in.size));
+                return true;
+            }
+            const u8 sz64 = isa::size_field(ir::Size::S64);
+            const u8 rsp = isa::vm_reg_of(ir::Reg::Rsp);
+            em.emit_ri(VmOp::Sub, rsp, in.size == ir::Size::S64 ? 8u : 4u, sz64);
+            em.emit_rr(VmOp::Store, rsp, isa::vm_reg_of(in.dst.reg),
+                       isa::size_field(in.size));
             return true;
         }
-        const u8 sz64 = isa::size_field(ir::Size::S64);
-        const u8 rsp = isa::vm_reg_of(ir::Reg::Rsp);
-        em.emit_ri(VmOp::Sub, rsp, in.size == ir::Size::S64 ? 8u : 4u, sz64);
-        em.emit_rr(VmOp::Store, rsp, isa::vm_reg_of(in.dst.reg),
-                   isa::size_field(in.size));
-        return true;
+        // X6 B.1: x86 push imm —— 单 op Push/Imm（a_kind=Imm, handler 读
+        // aux 槽 dword 直存 [esp]）。
+        if (in.dst.kind == ir::Operand::Kind::Imm && arch_ == ir::Arch::X86) {
+            const i64 v = in.dst.imm;
+            if (v < -0x80000000LL || v > 0xFFFFFFFFLL)
+                return skip(in, "push imm 值域超出 32 位存储面 (防御 gate)", nullptr);
+            em.emit(VmOp::Push, OpKind::Imm, 0, OpKind::None, 0,
+                    static_cast<u32>(static_cast<u64>(v)), isa::size_field(in.size));
+            return true;
+        }
+        // x64 push imm（D2 维持 gate）+ 其余形态兜底。
+        return skip(in, "push 操作数形态未支持", nullptr);
     }
 
     bool translate_pop(Emitter& em, const ir::Insn& in) {

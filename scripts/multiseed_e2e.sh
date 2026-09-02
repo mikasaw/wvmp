@@ -313,6 +313,12 @@ x86_samples=(
     # (jmp .data VA >= .text tail, address-taken never-called, C1 gate
     # note in protect log; REQUIRE_REAL 2 stubs).
     "build/x86_samples/wvmp_x86_tailexit_sample.exe"
+    # MIT-454 (X6) B.1: pushimm (pool 14 -> 15, x86 75 runs, total 325).
+    # in-region push immediate faces (68 imm32 + 6A imm8 + boundaries)
+    # virtualized through the X6 B.1 single-op Push/Imm opening + call-arg
+    # push-imm pair (callgate reads pushed dwords from the guard zone);
+    # net depth 0 at Halt.
+    "build/x86_samples/wvmp_x86_pushimm_sample.exe"
 )
 
 # Seeds: 1 (small), 12345 (default), 99999 (large), 0xDEADBEEF (magic), 0xCAFEBABE (magic).

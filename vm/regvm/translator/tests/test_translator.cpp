@@ -2225,6 +2225,80 @@ TEST(Translate, X86PushPopSingleOpForm) {
     expect_is(d.insns[1], VmOp::Pop, OpKind::Reg, kRbx, OpKind::None, 0, 0, kS32);
 }
 
+// ==================== MIT-454 (X6 B.1): push imm 开面 ====================
+
+namespace {
+ir::Insn push_imm_insn(i64 imm, ir::Size sz) {
+    ir::Insn i = I(ir::Op::Push, sz);
+    i.dst = ir::Operand::imm_(imm);
+    return i;
+}
+// 平衡栈形（push imm + pop）：孤立 push 会被栈深 walk "Halt 出口栈不平衡"
+// 正确 gate（X5b 产品行为），单测聚焦本开面须用平衡形。
+ir::FunctionRegion fn86_pushimm(i64 imm) {
+    ir::FunctionRegion fn = fn_of({blk(0x1000, {push_imm_insn(imm, ir::Size::S32),
+                                                pop_insn(ir::Reg::Rbx, ir::Size::S32)})});
+    fn.arch = ir::Arch::X86;
+    return fn;
+}
+} // namespace
+
+TEST(Translate, X86PushImmSingleOpForm) {
+    // X6 B.1: x86 push imm32 (68 iv) → 单 VmOp::Push a_kind=Imm（handler
+    // xpimm_ 分支读 aux 槽 dword 直存 [esp]）。lifter 本就产出 Op::Push
+    // dst=Imm（is_data_operand 含 Imm——#33 修正派单 A.1 "lifter 拒 imm"
+    // 定位），本用例钉 translator 侧开面后单 op 发射 + 零 skip note。
+    const auto r = wvmp::regvm::translator::translate_function(fn86_pushimm(0x10));
+    EXPECT_TRUE(r.notes.empty());
+    const Decoded d = decode_program(r.program);
+    ASSERT_EQ(d.insns.size(), static_cast<size_t>(4));  // 2 + Jmp(+1) + Halt
+    expect_is(d.insns[0], VmOp::Push, OpKind::Imm, 0, OpKind::None, 0, 0x10, kS32);
+}
+
+TEST(Translate, X86PushImm8SextLowDword) {
+    // 6A ib (imm8 sext) 与 68 iv 负值形：capstone imm(i64, sext) = -1 →
+    // 存储 dword 0xFFFFFFFF（低 32 位截取 = x86 32 位存储语义）。
+    const auto r = wvmp::regvm::translator::translate_function(fn86_pushimm(-1));
+    EXPECT_TRUE(r.notes.empty());
+    const Decoded d = decode_program(r.program);
+    ASSERT_EQ(d.insns.size(), static_cast<size_t>(4));
+    expect_is(d.insns[0], VmOp::Push, OpKind::Imm, 0, OpKind::None, 0,
+              0xFFFFFFFFu, kS32);
+}
+
+TEST(Translate, X86PushImmZeroValue) {
+    // push 0（X6 新样本边界形之一）：aux=0 合法发射。
+    const auto r = wvmp::regvm::translator::translate_function(fn86_pushimm(0));
+    EXPECT_TRUE(r.notes.empty());
+    const Decoded d = decode_program(r.program);
+    ASSERT_EQ(d.insns.size(), static_cast<size_t>(4));
+    expect_is(d.insns[0], VmOp::Push, OpKind::Imm, 0, OpKind::None, 0, 0, kS32);
+}
+
+TEST(Translate, X64PushImmStillGated) {
+    // D2 裁决钉：x64 push imm 维持 skip（sext 64 位语义不同面, 留 X6b）。
+    // gate note 文本与 X6 前逐字节一致（x64 恒等约束的翻译层锚）。孤立
+    // push 先吃 x64 budget=0 栈深 walk note（notes[0]），形 note 随后。
+    ir::Insn p = push_imm_insn(0x10, ir::Size::S64);
+    const auto r = wvmp::regvm::translator::translate_function(
+        fn_of({blk(0x1000, {p})}));
+    ASSERT_FALSE(r.notes.empty());
+    bool has_shape_note = false;
+    for (const auto& n : r.notes)
+        if (n.find("push 操作数形态未支持") != std::string::npos) has_shape_note = true;
+    EXPECT_TRUE(has_shape_note);
+}
+
+TEST(Translate, X86PushImmS16Gated) {
+    // B.4: 66 68 push imm16 → S16 位宽 gate（442 push 位宽面口径维持,
+    // 栈推进 2B 不在 VM 栈模型内；S16 不入栈深 walk 建模, note[0] 即形注）。
+    ir::FunctionRegion fn = fn_of({blk(0x1000, {push_imm_insn(0x10, ir::Size::S16)})});
+    fn.arch = ir::Arch::X86;
+    const auto r = wvmp::regvm::translator::translate_function(fn);
+    ASSERT_FALSE(r.notes.empty());
+    EXPECT_NE(r.notes[0].find("push 位宽未支持"), std::string::npos);
+}
+
 // ==================== MIT-451 (X5b) B.2: 栈深 walk 正反例 ====================
 
 namespace {

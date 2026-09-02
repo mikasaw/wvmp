@@ -100,6 +100,8 @@ if(WIN32 AND MSVC AND EXISTS "${WVMP_VS_DIR}/VC/Auxiliary/Build/vcvarsamd64_x86.
                 "${CMAKE_CURRENT_SOURCE_DIR}/x86_pushform_main.c"
                 "${CMAKE_CURRENT_SOURCE_DIR}/x86_guardover_sample.asm"
                 "${CMAKE_CURRENT_SOURCE_DIR}/x86_guardover_main.c"
+                "${CMAKE_CURRENT_SOURCE_DIR}/x86_pushimm_sample.asm"
+                "${CMAKE_CURRENT_SOURCE_DIR}/x86_pushimm_main.c"
                 "${CMAKE_CURRENT_SOURCE_DIR}/build_x86_e2e_samples.bat"
         COMMENT "x86 E2E 首批三样本交叉构建 (X4: ml.exe + /MACHINE:X86 -> build/x86_samples)"
         VERBATIM)

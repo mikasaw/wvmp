@@ -1965,6 +1965,53 @@ TEST(X86Battery, PushPopStack) {
     }
 }
 
+// (26b) MIT-454 (X6 B.1): Push-Imm 真执行边界专测 —— push 0 / 负值 sext 形 /
+//       3 连 imm push 的 esp 步进 12B + 栈内存值逐 dword 断言（X6 派单 B.1
+//       "电池 Push-Imm 真执行 esp 步进+值断言" 验收锚；PushPopStack 已有
+//       LIFO 闭环混推，本用例补 imm-only 面 + push 0 边界）。
+// ---------------------------------------------------------------------------
+TEST(X86Battery, PushImmMultiValueStack) {
+    wvmp::Rng rng(12345);
+    const auto gen = rt::generate_runtime_x86(rng);
+    alignas(4) std::array<u8, 0x40> scratch{};
+    scratch.fill(0);
+    RwxImage rwx(gen.image.code);
+    const auto entry = rwx.entry();
+    const u32 stack_top = static_cast<u32>(reinterpret_cast<uintptr_t>(scratch.data())) + 0x20;
+    const u8 rsp_slot = isa::vm_reg_of(ir::Reg::Rsp);
+
+    rt::VmContext ctx;
+    ctx.bytecode = nullptr;  // 装配于下
+    std::vector<u8> s;
+    auto push_imm = [&s](u32 v) {
+        isa::append_insn(s, isa::make_insn(isa::VmOp::Push, isa::OpKind::Imm, 0,
+                                           isa::OpKind::None, 0, v,
+                                           isa::size_field(ir::Size::S32)));
+    };
+    push_imm(0u);            // 0  push 0（X6 新样本边界形）
+    push_imm(0xDEADBEEFu);   // 1  imm32 大值
+    push_imm(0xFFFFFFFBu);   // 2  6A imm8 sext -5 的 32 位存储形
+    isa::append_insn(s, halt());                                             // 3
+
+    ctx.bytecode = const_cast<u8*>(s.data());
+    ctx.pc = 0;
+    ctx.scratch_mem = 0;
+    ctx.regs[rsp_slot] = stack_top;
+    entry(&ctx);
+
+    // esp 步进 4B×3 = 12B。
+    EXPECT_EQ(ctx.regs[rsp_slot], static_cast<u64>(stack_top) - 12u);
+    // 栈内存逐 dword（push 先减后写，LIFO：首推最高址、末推最低址）：
+    // [top-4]=0、[top-8]=0xDEADBEEF、[top-12]=0xFFFFFFFB。
+    u32 v0, v1, v2;
+    std::memcpy(&v0, scratch.data() + 0x1C, 4);
+    std::memcpy(&v1, scratch.data() + 0x18, 4);
+    std::memcpy(&v2, scratch.data() + 0x14, 4);
+    EXPECT_EQ(v0, 0u);
+    EXPECT_EQ(v1, 0xDEADBEEFu);
+    EXPECT_EQ(v2, 0xFFFFFFFBu);
+}
+
 // ---------------------------------------------------------------------------
 // (27) X3b 批次六：RVA 族（LoadRva/StoreRva/LeaRva —— base+RVA 公式钉，非
 //      identity：base ≠ 0 时 VA ≠ RVA）

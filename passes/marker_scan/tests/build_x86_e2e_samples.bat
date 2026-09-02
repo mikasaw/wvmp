@@ -120,6 +120,17 @@ cl /nologo /utf-8 /O1 /MD /c "%~dp0x86_tailexit_main.c" || goto :fail
 link /nologo /SUBSYSTEM:CONSOLE /MACHINE:X86 x86_tailexit_main.obj x86_tailexit_sample.obj /OUT:"%~1\wvmp_x86_tailexit_sample.exe" || goto :fail
 .\wvmp_x86_tailexit_sample.exe || goto :fail
 
+rem ---- MIT-454 (X6) B.1: pool 14 -> 15 (push-imm opening) ----
+
+rem (15) pushimm: in-region push immediate faces (68 imm32 large/-1/80h
+rem boundary, 6A imm8 0/-5/7Fh) + call-arg push-imm pair (callgate reads
+rem pushed imm dwords from the guard zone), net depth 0 at Halt; X6 B.1
+rem single-op Push/Imm opening acceptance sample.
+ml /nologo /c /Coff "%~dp0x86_pushimm_sample.asm" || goto :fail
+cl /nologo /utf-8 /O1 /MD /c "%~dp0x86_pushimm_main.c" || goto :fail
+link /nologo /SUBSYSTEM:CONSOLE /MACHINE:X86 x86_pushimm_main.obj x86_pushimm_sample.obj /OUT:"%~1\wvmp_x86_pushimm_sample.exe" || goto :fail
+.\wvmp_x86_pushimm_sample.exe || goto :fail
+
 popd
 exit /b 0
 :fail
