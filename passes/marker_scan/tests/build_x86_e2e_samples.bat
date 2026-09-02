@@ -67,6 +67,29 @@ cl /nologo /utf-8 /O1 /MD /c "%~dp0x86_looplea_main.c" || goto :fail
 link /nologo /SUBSYSTEM:CONSOLE /MACHINE:X86 x86_looplea_main.obj x86_looplea_sample.obj /OUT:"%~1\wvmp_x86_looplea_sample.exe" || goto :fail
 .\wvmp_x86_looplea_sample.exe || goto :fail
 
+rem ---- MIT-450 (X5) B.3: gate E2E negative family (x86 real pipeline) ----
+
+rem (6) x87gate: dedicated R-SSE-only face -- x87-only region (fld/fadd/fmul/
+rem fdiv/fstp) gates whole-function native + GP helper (REQUIRE_REAL stub).
+ml /nologo /c /Coff "%~dp0x86_x87gate_sample.asm" || goto :fail
+cl /nologo /utf-8 /O1 /MD /c "%~dp0x86_x87gate_main.c" || goto :fail
+link /nologo /SUBSYSTEM:CONSOLE /MACHINE:X86 x86_x87gate_main.obj x86_x87gate_sample.obj /OUT:"%~1\wvmp_x86_x87gate_sample.exe" || goto :fail
+.\wvmp_x86_x87gate_sample.exe || goto :fail
+
+rem (7) sehgate: real MSVC __try/__except function with an in-region fs:[...]
+rem TEB read (G1 segment override -> whole-function native gate) + GP helper.
+ml /nologo /c /Coff "%~dp0x86_sehgate_sample.asm" || goto :fail
+cl /nologo /utf-8 /O1 /MD /c "%~dp0x86_sehgate_main.c" || goto :fail
+link /nologo /SUBSYSTEM:CONSOLE /MACHINE:X86 x86_sehgate_main.obj x86_sehgate_sample.obj /OUT:"%~1\wvmp_x86_sehgate_sample.exe" || goto :fail
+.\wvmp_x86_sehgate_sample.exe || goto :fail
+
+rem (8) std67gate: std D5 gate (callable, native balance) + 67-prefix gate
+rem (address taken, never called) + GP helper.
+ml /nologo /c /Coff "%~dp0x86_std67gate_sample.asm" || goto :fail
+cl /nologo /utf-8 /O1 /MD /c "%~dp0x86_std67gate_main.c" || goto :fail
+link /nologo /SUBSYSTEM:CONSOLE /MACHINE:X86 x86_std67gate_main.obj x86_std67gate_sample.obj /OUT:"%~1\wvmp_x86_std67gate_sample.exe" || goto :fail
+.\wvmp_x86_std67gate_sample.exe || goto :fail
+
 popd
 exit /b 0
 :fail
