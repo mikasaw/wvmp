@@ -2090,13 +2090,18 @@ struct Translator {
         const u8 s = isa::vm_reg_of(in.src.reg);
         // 3-op imm 形式 (REG)：mov scratch, imm32 → Imul(dst, scratch)
         // native imul 第 3 操作数必须是汇编期常量, 不可用 reg, 故拆 mov+imul。
-        // 注意: 语义是 dst = src*imm, 但本路径下 src 与 dst 同寄存器 (MSVC
-        // /Od 默认 codegen imul r,r,imm, 例 imul rax, rax, 100), 故
-        // dst=dst*imm 与 dst=src*imm 等价。
+        // MIT-453 (X5c): src≠dst 形态须先把 src 物化进 dst——wvmpTest x86
+        // md5 (idx7) 实证 MSVC /Od 产 `imul edx, ecx, 3` / `imul eax, edx, 3`
+        // 等 REG src≠dst 形 4 处 + `imul ecx, eax, 0` 系 imm=0 形 3 处 (结果
+        // 恰为 0 掩盖缺陷), 旧折叠直接 Imul(dst, scratch) 把 src 丢成
+        // dst*imm, 新翻正函数首次真执行当场炸 (packed kern.md5_block_vectors
+        // 确定性 AV, cdb 铁证: S 表 Load 地址槽被 F 值污染)。修法与上方
+        // MEM-3op 路径同款 (先物化源到 dst); src==dst 时字节不动 (x64 恒等)。
         if (in.src2.kind == ir::Operand::Kind::Imm) {
             if (!fits_aux(in.src2.imm))
                 return skip(in, "imul imm32 越界", nullptr);
             const u8 scratch = sc.take();
+            if (s != d) em.emit_rr(VmOp::Mov, d, s, sz);
             em.emit_ri(VmOp::Mov, scratch,
                        static_cast<u32>(static_cast<u64>(in.src2.imm)), sz);
             em.emit_rr(VmOp::Imul, d, scratch, sz);

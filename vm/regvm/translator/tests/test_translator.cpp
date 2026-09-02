@@ -1629,6 +1629,43 @@ TEST(Translate, ImulThreeOpImmInLockMarkerRangeNotIntercepted) {
     expect_is(d.insns[3], VmOp::Halt, OpKind::None, 0, OpKind::None, 0, 0, 0);
 }
 
+TEST(Translate, ImulThreeOpRegSrcNeDstMaterializesSrc) {
+    // MIT-453 (X5c) 回归: imul 3-op REG src≠dst 形 (`imul edx, ecx, 3`) —
+    // 旧折叠直接 Imul(dst, scratch) 把 src 丢成 dst*imm（注释先验 "MSVC /Od
+    // src 与 dst 同寄存器" 被 wvmpTest x86 md5 推翻: `imul edx, ecx, 3` /
+    // `imul eax, edx, 3` 实存, 新翻正函数首次真执行确定性 AV）。期望:
+    // 先 Mov(dst, src) 物化源, 再 Mov(scratch, imm) + Imul(dst, scratch)
+    // —— 与 MEM-3op 路径同款 (dst := src * imm)。
+    ir::Insn i = I(ir::Op::Imul, ir::Size::S32);
+    i.dst = ir::Operand::reg_(ir::Reg::Rdx);
+    i.src = ir::Operand::reg_(ir::Reg::Rcx);
+    i.src2 = ir::Operand::imm_(3);
+    const Decoded d = one_insn(i);
+    ASSERT_EQ(d.insns.size(), static_cast<size_t>(5));  // Mov+Mov+Imul+Jmp+Halt
+    const u8 s18 = isa::kScratchFirst;
+    expect_is(d.insns[0], VmOp::Mov, OpKind::Reg, kRdx, OpKind::Reg, kRcx, 0, kS32);
+    expect_is(d.insns[1], VmOp::Mov, OpKind::Reg, s18, OpKind::Imm, 0, 3, kS32);
+    expect_is(d.insns[2], VmOp::Imul, OpKind::Reg, kRdx, OpKind::Reg, s18, 0, kS32);
+    expect_is(d.insns[3], VmOp::Jmp, OpKind::None, 0, OpKind::None, 0, 1, kS64);
+    expect_is(d.insns[4], VmOp::Halt, OpKind::None, 0, OpKind::None, 0, 0, 0);
+}
+
+TEST(Translate, ImulThreeOpRegSrcEqDstNoExtraMov) {
+    // D2 恒等铁约束: src==dst 形 (`imul rax, rax, 100`, MSVC x64 /Od 常态)
+    // 折条不变——不得多出 Mov(dst, dst) 冗余条, x64 既有字节码逐字节不动。
+    ir::Insn i = I(ir::Op::Imul, ir::Size::S64);
+    i.dst = ir::Operand::reg_(ir::Reg::Rax);
+    i.src = ir::Operand::reg_(ir::Reg::Rax);
+    i.src2 = ir::Operand::imm_(100);
+    const Decoded d = one_insn(i);
+    ASSERT_EQ(d.insns.size(), static_cast<size_t>(4));  // Mov+Imul+Jmp+Halt
+    const u8 s18 = isa::kScratchFirst;
+    expect_is(d.insns[0], VmOp::Mov, OpKind::Reg, s18, OpKind::Imm, 0, 100, kS64);
+    expect_is(d.insns[1], VmOp::Imul, OpKind::Reg, kRax, OpKind::Reg, s18, 0, kS64);
+    expect_is(d.insns[2], VmOp::Jmp, OpKind::None, 0, OpKind::None, 0, 1, kS64);
+    expect_is(d.insns[3], VmOp::Halt, OpKind::None, 0, OpKind::None, 0, 0, 0);
+}
+
 // ==================== MIT-423 (G4b): lock inc/dec 载体 ====================
 
 TEST(Translate, LockIncFoldsLikePlainUnaryMem) {
@@ -1795,7 +1832,11 @@ TEST(Translate, GpMulUnaffectedByMarkerDomain) {
         i.src2 = ir::Operand::imm_(v);  // 恰在新标记域 (14..18) 的合法 imul 乘数
         const Decoded d = one_insn(i);  // notes 空 = 未被 SSE/lock 拦截
         const u8 s18 = isa::kScratchFirst;
-        expect_is(d.insns[1], VmOp::Imul, OpKind::Reg, kRax, OpKind::Reg, s18, 0, kS64);
+        // MIT-453: src≠dst → 先 Mov(dst,src) 物化 (ImulThreeOpRegSrcNeDst
+        // MaterializesSrc 同款), 折条 5 条, Imul 落位 [2]。
+        ASSERT_EQ(d.insns.size(), static_cast<size_t>(5));
+        expect_is(d.insns[0], VmOp::Mov, OpKind::Reg, kRax, OpKind::Reg, kRcx, 0, kS64);
+        expect_is(d.insns[2], VmOp::Imul, OpKind::Reg, kRax, OpKind::Reg, s18, 0, kS64);
     }
 }
 

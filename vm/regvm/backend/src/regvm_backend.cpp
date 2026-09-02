@@ -87,27 +87,77 @@ public:
             }
         }
         if (!skipped) {
-            // MIT-407: 越区跳转 ExitNative 上界接线。上界 = 该函数 .pdata
-            // RUNTIME_FUNCTION EndAddress；lifter 检出越区目标回跳本区
-            // （LiftMetadata.exit_native_blocked）或 .pdata 缺失时返回
-            // nullopt → translator 维持原 C1 gate（行为与修复前逐字节
-            // 一致）。v1 在此处禁用接线是 segfault 未修的暂时回退。
+            // MIT-407: 越区跳转 ExitNative 上界接线。x64 路径上界 = 该函数
+            // .pdata RUNTIME_FUNCTION EndAddress；lifter 检出越区目标回跳本区
+            // （LiftMetadata.exit_native_blocked）时返回 nullopt → translator
+            // 维持原 C1 gate。v1 在此处禁用接线是 segfault 未修的暂时回退。
+            // MIT-453 (X5c F1, 452 triage §3.1/§4): pdata_empty 分支补区域表
+            // 回退——x86 PE32 无 .pdata（DataDirectory[3] = 0/0，dumpbin 实测），
+            // 旧短路 `pdata_empty → nullopt` 使 ExitNative 对全部无 .pdata 目标
+            // 恒不可达（17 处 jtbn 的唯一失败条件 D）。修法 = 单点位（本
+            // lambda），translator 判定链零改动（D3 冻结）。
             const wvmp::passes::PeImage* pe = ctx.find_slot<wvmp::passes::PeImage>(kPeImage);
             translator::FunctionUpperBoundFn upper_bound_of =
                 [pe, &ctx](u64 begin_rva) -> std::optional<u64> {
-                if (pe == nullptr || pe->pdata_empty) return std::nullopt;
+                if (pe == nullptr) return std::nullopt; // 无镜像元数据, 保守 gate（原样）
                 if (const auto* meta_list =
                         ctx.find_slot<std::vector<wvmp::passes::lifter::LiftMetadata>>(
                             wvmp::passes::lifter::kLiftedMetadata);
                     meta_list != nullptr) {
                     // 平行下标契约：meta_list 与 ctx.functions 按 begin_rva
                     // 反查（find_metadata_by_begin_rva）。回跳检出 → 整函数
-                    // 禁用 ExitNative（gate 本就是函数粒度）。
+                    // 禁用 ExitNative（gate 本就是函数粒度）。BFS 回跳检出
+                    // 是 arch 共享码（452 triage §3.4：fix 后 x86 照常生效，
+                    // 17 处实测 0/17 blocked），故置于分支之前两路共用。
                     const auto* m =
                         find_metadata_by_begin_rva(ctx, meta_list, begin_rva);
                     if (m != nullptr && m->exit_native_blocked) return std::nullopt;
                 }
-                return pe->find_function_end_rva(begin_rva);
+                // x64 路径恒有 .pdata（PE32+ 表式 SEH 专属）——pdata 分支
+                // 在前原样, 条件序与修复前一致（D2: find_function_end_rva
+                // 结果逐字节不变, dump 恒等机器证明见交付报告）。
+                if (!pe->pdata_empty) return pe->find_function_end_rva(begin_rva);
+                // —— MIT-453 (X5c F1) pdata_empty 回退链（典型 = x86）——
+                // ub = min{fr.begin_rva > begin_rva}（ctx.functions 下一区域
+                // begin；对嵌套/重叠/乱序输入按定义式逐元素取 min，不依赖
+                // 排序——begin 相同不计入（min 严格大于），越界语义保守）。
+                // 无后继区域（末区）→ 回退所在节节尾。节尾同时作为收紧
+                // 上界（cap）：下一区域 begin 若落在节尾之后（多执行节
+                // 病态布局），[节尾, next_begin) 是零填充/他节内存，
+                // ExitNative 落进去即执行垃圾——cap 保证裁决表"目标出节尾
+                // = gate"在任意布局下成立；单 .text 产物 next-begin 恒在
+                // 节尾之前，cap 不绑定，实测读数零差。
+                // 节尾口径 = VirtualAddress + VirtualSize（链接器内容实长；
+                // VirtualSize==0 时按 PE 规范回退 SizeOfRawData）。不对齐
+                // 到 SectionAlignment：[内容尾, 对齐面) 是零填充，放进去
+                // 同样即崩——取内容实长是"不吞真函数体"的最大安全值。
+                std::optional<u64> next_begin;
+                for (const auto& fr : ctx.functions) {
+                    if (fr.begin_rva > begin_rva &&
+                        (!next_begin.has_value() || fr.begin_rva < *next_begin)) {
+                        next_begin = fr.begin_rva;
+                    }
+                }
+                const wvmp::passes::SectionInfo* sec = nullptr;
+                for (const auto& s : pe->sections) {
+                    const u64 lo = s.virtual_addr;
+                    const u64 hi =
+                        lo + (s.virtual_size != 0 ? s.virtual_size : s.raw_size);
+                    if (begin_rva >= lo && begin_rva < hi) {
+                        sec = &s;
+                        break;
+                    }
+                }
+                if (sec == nullptr) {
+                    // 区域不在任何节内容面内（病态镜像）→ 无可靠上界，
+                    // 保守 gate（行为同修复前）。
+                    return std::nullopt;
+                }
+                const u64 tail = static_cast<u64>(sec->virtual_addr) +
+                                 (sec->virtual_size != 0 ? sec->virtual_size
+                                                         : sec->raw_size);
+                if (next_begin.has_value() && *next_begin < tail) return *next_begin;
+                return tail; // 无后继区域 → 末区 .text 节尾兜底（X5c D1）
             };
             // MIT-409 + MIT-413 (G2): 跳转表条目读取。表体 RVA + 下标 +
             // 宽度(4/8) → u64 小端条目（4B 表项零扩展，8B 表项全 8 字节——

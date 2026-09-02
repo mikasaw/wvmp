@@ -108,6 +108,18 @@ cl /nologo /utf-8 /O1 /MD /c "%~dp0x86_guardover_main.c" || goto :fail
 link /nologo /SUBSYSTEM:CONSOLE /MACHINE:X86 x86_guardover_main.obj x86_guardover_sample.obj /OUT:"%~1\wvmp_x86_guardover_sample.exe" || goto :fail
 .\wvmp_x86_guardover_sample.exe || goto :fail
 
+rem ---- MIT-453 (X5c) B.2: pool 13 -> 14 (tailexit pair) ----
+
+rem (14) tailexit: last-region .text-tail ExitNative fallback positive
+rem (region 3 has no successor -> ub = .text section tail; endcall face
+rem target==end_rva + earlyret face target in gap) + region 1 next-begin
+rem ub positive + region 2 gate negative (jmp to .data VA >= .text tail,
+rem address taken never called, C1 gate note in protect log).
+ml /nologo /c /Coff "%~dp0x86_tailexit_sample.asm" || goto :fail
+cl /nologo /utf-8 /O1 /MD /c "%~dp0x86_tailexit_main.c" || goto :fail
+link /nologo /SUBSYSTEM:CONSOLE /MACHINE:X86 x86_tailexit_main.obj x86_tailexit_sample.obj /OUT:"%~1\wvmp_x86_tailexit_sample.exe" || goto :fail
+.\wvmp_x86_tailexit_sample.exe || goto :fail
+
 popd
 exit /b 0
 :fail

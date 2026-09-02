@@ -306,6 +306,13 @@ x86_samples=(
     # function native, protect-log gate note).
     "build/x86_samples/wvmp_x86_pushform_sample.exe"
     "build/x86_samples/wvmp_x86_guardover_sample.exe"
+    # MIT-453 (X5c) B.2: tailexit (pool 13 -> 14, x86 70 runs, total 320).
+    # last-region .text-tail ExitNative fallback positive (region 3 no
+    # successor -> ub = .text tail; endcall target==end_rva + earlyret in
+    # gap) + region 1 next-begin ub positive + region 2 gate negative
+    # (jmp .data VA >= .text tail, address-taken never-called, C1 gate
+    # note in protect log; REQUIRE_REAL 2 stubs).
+    "build/x86_samples/wvmp_x86_tailexit_sample.exe"
 )
 
 # Seeds: 1 (small), 12345 (default), 99999 (large), 0xDEADBEEF (magic), 0xCAFEBABE (magic).
