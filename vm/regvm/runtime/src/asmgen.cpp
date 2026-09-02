@@ -4857,6 +4857,273 @@ public:
     }
 
     // =======================================================================
+    // MIT-454 (X6 A=X3d)：x86 SSE handler 面 —— x64 表 32 op SSE 族的 32 位
+    // 镜像（批二 30：算术 16 + 传送 6 + 位运算 4 + mem 原语 2 + GP↔xmm 桥 2；
+    // 批三 2：ucomis flags 族）。x64 SSE builder 家族（build_addss …
+    // build_gp_from_xmm）逐 op 以本组 32 位模板平移：
+    //   - 编码双平台同（X0 §7 实测兜底 + 电池 DisasmX86SseEncodingDualMode
+    //     capstone 双模逐 op 断言钉死）：SSE 基础编码无 REX 依赖，
+    //     CS_MODE_32/64 同字节；x86 物理 xmm 仅 xmm0-7（无 REX 不可编码
+    //     xmm8-15）—— guest 槽域 24..31 结构性覆盖全部可达形（x86 侧
+    //     capstone 只产 xmm0-7，槽 32..47 不可达）。
+    //   - ctx.xmm 区（kCtxXmmBase=0x140，8×16B）布局与 arch 无关（regs
+    //     u64[32] + xmm[8] 均 VM 槽宽），x86 帧公式 = (slot-24)*16 + 0x140，
+    //     32 位寻址 [ctx + t]（base+index；Keystone 不支持 (reg-24)*16 内联，
+    //     拆步 mov/sub/shl/add —— 24/4/0x140 一律 imm()，pitfall #78）。
+    //   - 物理寄存器：xmm0/xmm1 = 指令内临时（读 ctx → 算 → 写 ctx，指令
+    //     边界无活值 —— x64 callgate 5.5 无条件覆写同款安全性论证）；寻址
+    //     临时 t_[0]/t_[1]（SSE handler 不用 load_operand_x86，与 GP 面
+    //     t_[2]/t_[3] 寻址约定互不干扰）。
+    //   - stub 侧配套（stub_gen.cpp X6）：x86 stub 入口 host→ctx.xmm 同步 +
+    //     出口 ctx→host 同步（Win32 ABI xmm 全易失；x64 371 面的 32 位镜像，
+    //     446 "xmm 同步不适用" 注的前提"x86 运行时无 SSE handler"随本批
+    //     翻转）；ExitNative/Ret 直退 handler 内联 ctx→xmm 恢复（不经 stub
+    //     出口，x64 build_ret 步 3 同款镜像）。
+    // =======================================================================
+
+    // xmm 区槽偏移入临时：t = (slot - 24)*16 + kCtxXmmBase。slot_text =
+    // 帧槽 xf(kX86FRegA/kX86FRegB)（读槽号）或已含槽号的临时。
+    std::string xmm_offset_into_t_x86(int reg_t, const std::string& slot_text) const {
+        std::string o;
+        o += std::string("    mov ") + r32x(reg_t) + ", " + slot_text + "\n";
+        o += std::string("    sub ") + r32x(reg_t) + ", " + imm(24) + "\n";
+        o += std::string("    shl ") + r32x(reg_t) + ", " + imm(4) + "\n";
+        o += std::string("    add ") + r32x(reg_t) + ", " + imm(kCtxXmmBase) + "\n";
+        return o;
+    }
+
+    // 读 src 槽 → 物理 xmm1（load_src_slot_into_xmm1 的 32 位版，MIT-408
+    // 双语义寻址）：reg_b >= 24 → xmm 区公式；reg_b < 24 → GP 双槽
+    //（[ctx + reg_b*8 + 0x10]，16B 覆盖 vN+vN+1 —— ALU mem 源折条的
+    // XmmLoad 临时落点）。寻址临时 tmp（调用方保证与自有寻址临时不冲突
+    // —— XmmStore 的地址临时用 t_[0]，本 helper 用 t_[1]，x64 T1/T9 分工
+    // 同款纪律）。
+    std::string load_src_slot_into_xmm1_x86(const std::string& tag, int tmp = 1) const {
+        const std::string lbl_x = "xsrcx_" + tag;
+        const std::string lbl_d = "xsrcd_" + tag;
+        std::string o;
+        o += std::string("    mov ") + r32x(tmp) + ", " + xf(kX86FRegB) + "\n";
+        o += std::string("    cmp ") + r32x(tmp) + ", " + imm(24) + "\n";
+        o += "    jae " + lbl_x + "\n";
+        // GP 双槽: 16B 直读（0x10 为寻址位移非立即数，verifier 闸面同 x64）
+        o += std::string("    movups xmm1, [") + r32x(ctx_) + " + " + r32x(tmp) +
+             "*8 + 0x10]\n";
+        o += "    jmp " + lbl_d + "\n";
+        o += lbl_x + ":\n";
+        o += xmm_offset_into_t_x86(tmp, xf(kX86FRegB));
+        o += std::string("    movups xmm1, [") + r32x(ctx_) + " + " + r32x(tmp) + "]\n";
+        o += lbl_d + ":\n";
+        return o;
+    }
+
+    // x86 SSE 二元运算/传送共通模板（build_addss / build_xmm_transfer 的
+    // 32 位镜像）：dst 槽 128-bit 读 xmm0 → src 槽读 xmm1 → native op →
+    // dst 128-bit 写回 → advance。零 flags（ucomis 族批三独立 builder）。
+    // dual_src（x64 命名沿用）：true = src 走双语义寻址（ALU 族 mem 源折条
+    // 把 src 编码为 GP 双槽）；false = src 恒 xmm 槽（mov 族 —— mem 源经
+    // XmmLoad 直落 xmm 槽）。
+    std::string build_x86_sse_binop(u64 dispatch, const char* native_mn,
+                                    bool dual_src) const {
+        const std::string tag = std::string(native_mn) + std::to_string(seq());
+        std::string o = decode_prelude_x86();
+        o += xmm_offset_into_t_x86(t_[0], xf(kX86FRegA));   // t0 = dst 偏移
+        o += std::string("    movups xmm0, [") + r32x(ctx_) + " + " + r32x(t_[0]) + "]\n";
+        if (dual_src) {
+            o += load_src_slot_into_xmm1_x86(tag);
+        } else {
+            o += xmm_offset_into_t_x86(t_[1], xf(kX86FRegB));  // t1 = src 偏移
+            o += std::string("    movups xmm1, [") + r32x(ctx_) + " + " +
+                 r32x(t_[1]) + "]\n";
+        }
+        o += std::string("    ") + native_mn + " xmm0, xmm1\n";
+        o += xmm_offset_into_t_x86(t_[0], xf(kX86FRegA));   // 重算 dst 偏移写回
+        o += std::string("    movups [") + r32x(ctx_) + " + " + r32x(t_[0]) + "], xmm0\n";
+        o += advance_x86(dispatch);
+        return o;
+    }
+
+    // 算术族 16（x64 同名 builder 镜像；中间行 = native mn，其余全同）：
+    //   addss F3 0F 58 / addps 0F 58 / addpd 66 0F 58
+    //   subss F3 0F 5C / subps 0F 5C / subpd 66 0F 5C
+    //   mulss F3 0F 59 / mulsd F2 0F 59 / mulps 0F 59 / mulpd 66 0F 59
+    //   divss F3 0F 5E / divsd F2 0F 5E / divps 0F 5E / divpd 66 0F 5E
+    //   addsd F2 0F 58 / subsd F2 0F 5C
+    // 除法族 = IEEE inf 语义非 #DE（x64 电池先例平移，G8 GP Div 例外不适用）。
+    std::string build_x86_addss(u64 d) const { return build_x86_sse_binop(d, "addss", true); }
+    std::string build_x86_addps(u64 d) const { return build_x86_sse_binop(d, "addps", true); }
+    std::string build_x86_addpd(u64 d) const { return build_x86_sse_binop(d, "addpd", true); }
+    std::string build_x86_subss(u64 d) const { return build_x86_sse_binop(d, "subss", true); }
+    std::string build_x86_subps(u64 d) const { return build_x86_sse_binop(d, "subps", true); }
+    std::string build_x86_subpd(u64 d) const { return build_x86_sse_binop(d, "subpd", true); }
+    std::string build_x86_mulss(u64 d) const { return build_x86_sse_binop(d, "mulss", true); }
+    std::string build_x86_mulsd(u64 d) const { return build_x86_sse_binop(d, "mulsd", true); }
+    std::string build_x86_mulps(u64 d) const { return build_x86_sse_binop(d, "mulps", true); }
+    std::string build_x86_mulpd(u64 d) const { return build_x86_sse_binop(d, "mulpd", true); }
+    std::string build_x86_divss(u64 d) const { return build_x86_sse_binop(d, "divss", true); }
+    std::string build_x86_divsd(u64 d) const { return build_x86_sse_binop(d, "divsd", true); }
+    std::string build_x86_divps(u64 d) const { return build_x86_sse_binop(d, "divps", true); }
+    std::string build_x86_divpd(u64 d) const { return build_x86_sse_binop(d, "divpd", true); }
+    std::string build_x86_addsd(u64 d) const { return build_x86_sse_binop(d, "addsd", true); }
+    std::string build_x86_subsd(u64 d) const { return build_x86_sse_binop(d, "subsd", true); }
+    // 传送族 6（dual_src=false —— src 恒 xmm 槽）：movss F3 0F 10（只改
+    // lane0 高 96 保持 —— dst 预读模板语义必需）/ movsd F2 0F 10（高 64
+    // 保持）/ movaps 0F 28 / movapd 66 0F 28 / movups 0F 10 / movupd 66 0F 10。
+    std::string build_x86_movss(u64 d) const { return build_x86_sse_binop(d, "movss", false); }
+    std::string build_x86_movsd(u64 d) const { return build_x86_sse_binop(d, "movsd", false); }
+    std::string build_x86_movaps(u64 d) const { return build_x86_sse_binop(d, "movaps", false); }
+    std::string build_x86_movapd(u64 d) const { return build_x86_sse_binop(d, "movapd", false); }
+    std::string build_x86_movups(u64 d) const { return build_x86_sse_binop(d, "movups", false); }
+    std::string build_x86_movupd(u64 d) const { return build_x86_sse_binop(d, "movupd", false); }
+    // 位运算族 4（dual_src=true —— 408 mem 源折条 GP 双槽）：
+    //   xorps 0F 57 / orps 0F 56 / andps 0F 54 / andnps 0F 55（dst=~dst&src）。
+    std::string build_x86_xorps(u64 d) const { return build_x86_sse_binop(d, "xorps", true); }
+    std::string build_x86_orps(u64 d) const { return build_x86_sse_binop(d, "orps", true); }
+    std::string build_x86_andps(u64 d) const { return build_x86_sse_binop(d, "andps", true); }
+    std::string build_x86_andnps(u64 d) const { return build_x86_sse_binop(d, "andnps", true); }
+
+    // MIT-408 XmmLoad 的 32 位版：内存 → 槽。a 槽 = 目的（>=24 xmm 区 /
+    // <24 GP 双槽），b 槽 = 地址槽（绝对 VA；dword 读 —— guest VA < 4GB，
+    // 槽高半字 0 不变量），aux = 访存宽度（4/8/16，翻译器恒发合法值，
+    // 16 为链尾顺延）。内存源清零语义由 native movss/movsd 直产（SDM）。
+    std::string build_xmm_load_x86(u64 dispatch) const {
+        const std::string tag = "xxmmld" + std::to_string(seq());
+        const std::string lbl4 = "xld4_" + tag;
+        const std::string lbl8 = "xld8_" + tag;
+        const std::string lbl16 = "xld16_" + tag;
+        const std::string lblx = "xldx_" + tag;
+        const std::string lbld = "xldd_" + tag;
+        std::string o = decode_prelude_x86();
+        // 地址 → t1（b 槽 dword 读）
+        o += std::string("    mov ") + r32x(t_[1]) + ", " + xf(kX86FRegB) + "\n";
+        o += std::string("    mov ") + r32x(t_[1]) + ", dword ptr " + xslot(t_[1]) + "\n";
+        // 宽度链: aux ∈ {4, 8, 16}
+        o += std::string("    cmp dword ptr ") + xf(kX86FAux) + ", " + imm(4) + "\n";
+        o += "    je " + lbl4 + "\n";
+        o += std::string("    cmp dword ptr ") + xf(kX86FAux) + ", " + imm(8) + "\n";
+        o += "    je " + lbl8 + "\n";
+        o += "    jmp " + lbl16 + "\n";
+        o += lbl4 + ":\n";
+        o += std::string("    movss xmm0, dword ptr [") + r32x(t_[1]) + "]\n";
+        o += "    jmp " + lblx + "\n";
+        o += lbl8 + ":\n";
+        o += std::string("    movsd xmm0, qword ptr [") + r32x(t_[1]) + "]\n";
+        o += "    jmp " + lblx + "\n";
+        o += lbl16 + ":\n";
+        o += std::string("    movups xmm0, xmmword ptr [") + r32x(t_[1]) + "]\n";
+        // 目的槽: reg_a >= 24 → xmm 区公式；< 24 → GP 双槽
+        o += lblx + ":\n";
+        o += std::string("    mov ") + r32x(t_[0]) + ", " + xf(kX86FRegA) + "\n";
+        o += std::string("    cmp ") + r32x(t_[0]) + ", " + imm(24) + "\n";
+        o += "    jae " + lbld + "\n";
+        o += std::string("    movups [") + r32x(ctx_) + " + " + r32x(t_[0]) +
+             "*8 + 0x10], xmm0\n";
+        o += "    jmp done_" + tag + "\n";
+        o += lbld + ":\n";
+        o += xmm_offset_into_t_x86(t_[0], xf(kX86FRegA));
+        o += std::string("    movups [") + r32x(ctx_) + " + " + r32x(t_[0]) + "], xmm0\n";
+        o += "done_" + tag + ":\n";
+        o += advance_x86(dispatch);
+        return o;
+    }
+
+    // MIT-408 XmmStore 的 32 位版：槽 → 内存。a 槽 = 地址槽，b 槽 = 源槽
+    // （双语义寻址），aux = 访存宽度。128-bit 读进 xmm1 → 宽度链低宽度截断
+    // 落盘（movss/movsd store 只写低 4/8B —— SDM 内存写语义）。
+    std::string build_xmm_store_x86(u64 dispatch) const {
+        const std::string tag = "xxmmst" + std::to_string(seq());
+        const std::string lbl4 = "xst4_" + tag;
+        const std::string lbl8 = "xst8_" + tag;
+        const std::string lbl16 = "xst16_" + tag;
+        std::string o = decode_prelude_x86();
+        // 地址 → t0（a 槽 dword 读；⚠️ src 寻址用 t1 —— 临时分工纪律见
+        // load_src_slot_into_xmm1_x86 注，电池 XmmStore 首炸实证）
+        o += std::string("    mov ") + r32x(t_[0]) + ", " + xf(kX86FRegA) + "\n";
+        o += std::string("    mov ") + r32x(t_[0]) + ", dword ptr " + xslot(t_[0]) + "\n";
+        o += load_src_slot_into_xmm1_x86(tag, t_[1]);
+        // 宽度链（按 xmm1 落盘，低宽度截断）
+        o += std::string("    cmp dword ptr ") + xf(kX86FAux) + ", " + imm(4) + "\n";
+        o += "    je " + lbl4 + "\n";
+        o += std::string("    cmp dword ptr ") + xf(kX86FAux) + ", " + imm(8) + "\n";
+        o += "    je " + lbl8 + "\n";
+        o += "    jmp " + lbl16 + "\n";
+        o += lbl4 + ":\n";
+        o += std::string("    movss dword ptr [") + r32x(t_[0]) + "], xmm1\n";
+        o += "    jmp done_" + tag + "\n";
+        o += lbl8 + ":\n";
+        o += std::string("    movsd qword ptr [") + r32x(t_[0]) + "], xmm1\n";
+        o += "    jmp done_" + tag + "\n";
+        o += lbl16 + ":\n";
+        o += std::string("    movups xmmword ptr [") + r32x(t_[0]) + "], xmm1\n";
+        o += "done_" + tag + ":\n";
+        o += advance_x86(dispatch);
+        return o;
+    }
+
+    // MIT-427 XmmFromGp 的 32 位版（movd/movq 桥 load 方向）：src 槽低 4/8
+    // 字节 → dst xmm 槽，dst 槽其余字节清零（SDM MOVD 清 127:32 / MOVQ 清
+    // 127:64 —— mem 形式 native 直产）。编码: a=xmm_dst 槽 (24..31)，
+    // b=src 槽（GP 0..15 或 xmm 24..31 双语义），aux=宽度 (4|8)。
+    std::string build_xmm_from_gp_x86(u64 dispatch) const {
+        const std::string tag = "xxmmfg" + std::to_string(seq());
+        const std::string lblx = "xfgx_" + tag;
+        const std::string lbl4 = "xfg4_" + tag;
+        const std::string lbld = "xfgd_" + tag;
+        std::string o = decode_prelude_x86();
+        // src 槽域分派: reg_b >= 24 → xmm 槽（仅 width=8 —— F3 0F 7E 形态，
+        // movsd mem 形式 = 低 64 读 + 高 64 清零）；< 24 → GP 槽宽度链
+        o += std::string("    mov ") + r32x(t_[1]) + ", " + xf(kX86FRegB) + "\n";
+        o += std::string("    cmp ") + r32x(t_[1]) + ", " + imm(24) + "\n";
+        o += "    jae " + lblx + "\n";
+        o += std::string("    cmp dword ptr ") + xf(kX86FAux) + ", " + imm(4) + "\n";
+        o += "    je " + lbl4 + "\n";
+        o += std::string("    movq xmm0, qword ptr [") + r32x(ctx_) + " + " +
+             r32x(t_[1]) + "*8 + 0x10]\n";
+        o += "    jmp " + lbld + "\n";
+        o += lbl4 + ":\n";
+        o += std::string("    movd xmm0, dword ptr [") + r32x(ctx_) + " + " +
+             r32x(t_[1]) + "*8 + 0x10]\n";
+        o += "    jmp " + lbld + "\n";
+        o += lblx + ":\n";
+        o += xmm_offset_into_t_x86(t_[1], xf(kX86FRegB));
+        o += std::string("    movsd xmm0, qword ptr [") + r32x(ctx_) + " + " +
+             r32x(t_[1]) + "]\n";
+        // dst xmm 槽 16B 全量写（清零语义落槽）
+        o += lbld + ":\n";
+        o += xmm_offset_into_t_x86(t_[0], xf(kX86FRegA));
+        o += std::string("    movups [") + r32x(ctx_) + " + " + r32x(t_[0]) + "], xmm0\n";
+        o += advance_x86(dispatch);
+        return o;
+    }
+
+    // MIT-427 GpFromXmm 的 32 位版（桥 store 方向）：src xmm 槽低 4/8 字节
+    // 截取 → dst GP 槽。width=8: movq（低 64 截取）；width=4: movd + 高 4
+    // 字节清零（native movd r32 写 32 位零扩展对齐 —— x64 双 store 等价形）。
+    std::string build_gp_from_xmm_x86(u64 dispatch) const {
+        const std::string tag = "xgpfx" + std::to_string(seq());
+        const std::string lbl4 = "xfx4_" + tag;
+        const std::string lbld = "xfxd_" + tag;
+        std::string o = decode_prelude_x86();
+        // src xmm 槽 128-bit 读 → xmm0
+        o += xmm_offset_into_t_x86(t_[1], xf(kX86FRegB));
+        o += std::string("    movups xmm0, [") + r32x(ctx_) + " + " + r32x(t_[1]) + "]\n";
+        // dst GP 槽宽度链截取: T0 = reg_a 槽号
+        o += std::string("    mov ") + r32x(t_[0]) + ", " + xf(kX86FRegA) + "\n";
+        o += std::string("    cmp dword ptr ") + xf(kX86FAux) + ", " + imm(4) + "\n";
+        o += "    je " + lbl4 + "\n";
+        o += std::string("    movq qword ptr [") + r32x(ctx_) + " + " + r32x(t_[0]) +
+             "*8 + 0x10], xmm0\n";
+        o += "    jmp " + lbld + "\n";
+        o += lbl4 + ":\n";
+        o += std::string("    movd dword ptr [") + r32x(ctx_) + " + " + r32x(t_[0]) +
+             "*8 + 0x10], xmm0\n";
+        o += std::string("    mov dword ptr [") + r32x(ctx_) + " + " + r32x(t_[0]) +
+             "*8 + 0x14], " + imm(0) + "\n";
+        o += lbld + ":\n";
+        o += advance_x86(dispatch);
+        return o;
+    }
+
+    // =======================================================================
     // MIT-445 (X3c B.1)：x86 CallGate（reg 值目标 + RVA 双形，零新 VmOp）。
     //
     // 编码（x64 build_callgate 同协议，a_kind 判别）：RVA 形 a_kind=None +
@@ -4990,6 +5257,13 @@ public:
              " + 0x120]\n";
         o += std::string("    sub ") + r32x(t_[0]) + ", " + imm(kX86ExitSlotDepth) + "\n";
         o += std::string("    mov dword ptr [") + r32x(t_[0]) + "], " + r32x(t_[1]) + "\n";
+        // 2.5) X6 A: xmm0-7 写回（ctx.xmm → 物理 —— SSE 面；ExitNative x86
+        //      内联 epilogue 直退不经 stub 出口，与 Halt 面 stub 出口同步
+        //      语义对齐 —— x64 ExitNative 经 Halt→stub 出口吃同步，x86 因
+        //      X3c 内联 epilogue 结构须自带）。
+        for (int i = 0; i < 8; ++i)
+            o += std::string("    movups xmm") + std::to_string(i) + ", [" +
+                 r32x(ctx_) + " + " + imm(kCtxXmmBase + u64(i) * 16) + "]\n";
         // 3) x86 epilogue: 帧回收 + callee-saved 逆序恢复 + ret（build_halt_x86 同构）
         o += std::string("    add esp, ") + imm(kX86FrameSize) + "\n";
         const auto order = x86_save_order();
@@ -5056,6 +5330,11 @@ public:
         o += std::string("    mov eax, dword ptr [") + r32x(ctx_) + " + 0x10]\n";
         o += std::string("    mov ecx, dword ptr [") + r32x(ctx_) + " + 0x18]\n";
         o += std::string("    mov edx, dword ptr [") + r32x(ctx_) + " + 0x20]\n";
+        // 3.5) X6 A: xmm0-7 写回（ctx.xmm → 物理 —— SSE 面；Ret 直退不经
+        //      stub 出口，x64 build_ret 步 3 同款镜像）。
+        for (int i = 0; i < 8; ++i)
+            o += std::string("    movups xmm") + std::to_string(i) + ", [" +
+                 r32x(ctx_) + " + " + imm(kCtxXmmBase + u64(i) * 16) + "]\n";
         // 4) 弃帧（含暂存槽顶出）+ 恢复宿主 callee-saved（entry push 序严格逆序）。
         o += std::string("    add esp, ") + imm(kX86RetExitFrameAdvance) + "\n";
         const auto order = x86_save_order();
@@ -5299,6 +5578,38 @@ std::vector<HandlerDef> x86_handler_table() {
         {int(VmOp::ExitNative), "exitnative", &AsmGen::build_x86_exitnative},
         // —— X3c (MIT-445) 协议面批次三：Ret 4B 清栈返回 ——
         {int(VmOp::Ret), "ret", &AsmGen::build_x86_ret},
+        // —— X6 (MIT-454) A=X3d 批次二：SSE 32 位镜像（算术 16 + 传送 6 +
+        // 位运算 4 + mem 原语 2 + GP↔xmm 桥 2；批三 ucomis 2）——
+        {int(VmOp::Addss), "addss", &AsmGen::build_x86_addss},
+        {int(VmOp::Addps), "addps", &AsmGen::build_x86_addps},
+        {int(VmOp::Addpd), "addpd", &AsmGen::build_x86_addpd},
+        {int(VmOp::Subss), "subss", &AsmGen::build_x86_subss},
+        {int(VmOp::Subps), "subps", &AsmGen::build_x86_subps},
+        {int(VmOp::Subpd), "subpd", &AsmGen::build_x86_subpd},
+        {int(VmOp::Mulss), "mulss", &AsmGen::build_x86_mulss},
+        {int(VmOp::Mulsd), "mulsd", &AsmGen::build_x86_mulsd},
+        {int(VmOp::Mulps), "mulps", &AsmGen::build_x86_mulps},
+        {int(VmOp::Mulpd), "mulpd", &AsmGen::build_x86_mulpd},
+        {int(VmOp::Divss), "divss", &AsmGen::build_x86_divss},
+        {int(VmOp::Divsd), "divsd", &AsmGen::build_x86_divsd},
+        {int(VmOp::Divps), "divps", &AsmGen::build_x86_divps},
+        {int(VmOp::Divpd), "divpd", &AsmGen::build_x86_divpd},
+        {int(VmOp::Addsd), "addsd", &AsmGen::build_x86_addsd},
+        {int(VmOp::Subsd), "subsd", &AsmGen::build_x86_subsd},
+        {int(VmOp::Movss), "movss", &AsmGen::build_x86_movss},
+        {int(VmOp::Movsd), "movsd", &AsmGen::build_x86_movsd},
+        {int(VmOp::Movaps), "movaps", &AsmGen::build_x86_movaps},
+        {int(VmOp::Movapd), "movapd", &AsmGen::build_x86_movapd},
+        {int(VmOp::Movups), "movups", &AsmGen::build_x86_movups},
+        {int(VmOp::Movupd), "movupd", &AsmGen::build_x86_movupd},
+        {int(VmOp::Xorps), "xorps", &AsmGen::build_x86_xorps},
+        {int(VmOp::Orps), "orps", &AsmGen::build_x86_orps},
+        {int(VmOp::Andps), "andps", &AsmGen::build_x86_andps},
+        {int(VmOp::Andnps), "andnps", &AsmGen::build_x86_andnps},
+        {int(VmOp::XmmLoad), "xmmload", &AsmGen::build_xmm_load_x86},
+        {int(VmOp::XmmStore), "xmmstore", &AsmGen::build_xmm_store_x86},
+        {int(VmOp::XmmFromGp), "xmmfromgp", &AsmGen::build_xmm_from_gp_x86},
+        {int(VmOp::GpFromXmm), "gpfromxmm", &AsmGen::build_gp_from_xmm_x86},
     };
 }
 

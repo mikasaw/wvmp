@@ -31,6 +31,7 @@
 #include "wvmp/vm/backend.hpp"
 
 #include <capstone/capstone.h>
+#include <keystone/keystone.h>
 
 #include <gtest/gtest.h>
 
@@ -2010,6 +2011,326 @@ TEST(X86Battery, PushImmMultiValueStack) {
     EXPECT_EQ(v0, 0u);
     EXPECT_EQ(v1, 0xDEADBEEFu);
     EXPECT_EQ(v2, 0xFFFFFFFBu);
+}
+
+// ---------------------------------------------------------------------------
+// (26c) MIT-454 (X6 A=X3d) 批次二：x86 SSE 面 —— 算术/传送/位运算/mem 原语/
+//       GP↔xmm 桥真执行语义（x64 SSE 电池的 32 位镜像；ctx.xmm 读回可观察
+//       —— 影子纪律：仅 stdout 不构成验收）。
+// ---------------------------------------------------------------------------
+namespace {
+isa::VmInsn sse_rr(isa::VmOp op, u8 dst, u8 src) {
+    return isa::make_insn(op, isa::OpKind::Reg, dst, isa::OpKind::Reg, src, 0,
+                          isa::size_field(ir::Size::S32));
+}
+isa::VmInsn xmm_load(u8 dst, u8 addr, u32 width) {
+    return isa::make_insn(isa::VmOp::XmmLoad, isa::OpKind::Reg, dst,
+                          isa::OpKind::Reg, addr, width, isa::size_field(ir::Size::S64));
+}
+isa::VmInsn xmm_store(u8 addr, u8 src, u32 width) {
+    return isa::make_insn(isa::VmOp::XmmStore, isa::OpKind::Reg, addr,
+                          isa::OpKind::Reg, src, width, isa::size_field(ir::Size::S64));
+}
+rt::VmContext run_stream_ctx(RwxImage::Entry entry, const std::vector<u8>& stream,
+                             rt::VmContext preset) {
+    preset.bytecode = const_cast<u8*>(stream.data());
+    preset.pc = 0;
+    preset.scratch_mem = 0;
+    preset.regs[isa::vm_reg_of(ir::Reg::Rsp)] = 0;
+    entry(&preset);
+    return preset;
+}
+} // namespace
+
+TEST(X86Battery, X86SseArithRealExec) {
+    wvmp::Rng rng(12345);
+    const auto gen = rt::generate_runtime_x86(rng);
+    RwxImage rwx(gen.image.code);
+    const auto entry = rwx.entry();
+
+    // addss/subss/mulss 链：标量低 32 位运算、dst 高 96 位保持（SDM: 常规
+    // SSE 标量运算 bits 127:32 无变化 —— dst 预读模板的语义必要性锚）。
+    {
+        std::vector<u8> s;
+        isa::append_insn(s, sse_rr(isa::VmOp::Addss, 24, 25));   // 0
+        isa::append_insn(s, sse_rr(isa::VmOp::Subss, 26, 27));   // 1
+        isa::append_insn(s, sse_rr(isa::VmOp::Mulss, 28, 29));   // 2
+        isa::append_insn(s, halt());                             // 3
+        rt::VmContext ctx;
+        ctx.xmm[0].xmm_lo = 0x3FC00000u;                          // 1.5f
+        ctx.xmm[0].xmm_hi = 0xAABBCCDDEEFF0011ull;                // 高 96 哨兵
+        ctx.xmm[1].xmm_lo = 0x40200000u;                          // 2.5f
+        ctx.xmm[2].xmm_lo = 0x3FC00000u;                          // 1.5f
+        ctx.xmm[2].xmm_hi = 0x1122334455667788ull;
+        ctx.xmm[3].xmm_lo = 0x3F000000u;                          // 0.5f
+        ctx.xmm[4].xmm_lo = 0x3FC00000u;                          // 1.5f
+        ctx.xmm[4].xmm_hi = 0xDEADBEEFCAFEBABEull;
+        ctx.xmm[5].xmm_lo = 0x40200000u;                          // 2.5f
+        const auto r = run_stream_ctx(entry, s, std::move(ctx));
+        EXPECT_EQ(r.xmm[0].xmm_lo, 0x40800000u);                  // 4.0f
+        EXPECT_EQ(r.xmm[0].xmm_hi, 0xAABBCCDDEEFF0011ull);        // 高 96 保持
+        EXPECT_EQ(r.xmm[2].xmm_lo, 0x3F800000u);                  // 1.0f
+        EXPECT_EQ(r.xmm[2].xmm_hi, 0x1122334455667788ull);
+        EXPECT_EQ(r.xmm[4].xmm_lo, 0x40700000u);                  // 3.75f
+        EXPECT_EQ(r.xmm[4].xmm_hi, 0xDEADBEEFCAFEBABEull);
+    }
+    // divss 真除 + 除零 IEEE inf 语义（非 #DE —— G8 GP Div 例外不适用，
+    // x64 电池先例平移）。
+    {
+        std::vector<u8> s;
+        isa::append_insn(s, sse_rr(isa::VmOp::Divss, 24, 25));   // 0
+        isa::append_insn(s, sse_rr(isa::VmOp::Divss, 26, 27));   // 1
+        isa::append_insn(s, halt());                             // 2
+        rt::VmContext ctx;
+        ctx.xmm[0].xmm_lo = 0x3FC00000u;   // 1.5f
+        ctx.xmm[1].xmm_lo = 0x40400000u;   // 3.0f → 0.5f
+        ctx.xmm[2].xmm_lo = 0x3F800000u;   // 1.0f
+        ctx.xmm[3].xmm_lo = 0x00000000u;   // 0.0f → +inf（IEEE）
+        const auto r = run_stream_ctx(entry, s, std::move(ctx));
+        EXPECT_EQ(r.xmm[0].xmm_lo, 0x3F000000u);                  // 0.5f
+        EXPECT_EQ(r.xmm[2].xmm_lo, 0x7F800000u);                  // +inf
+    }
+    // addsd/subsd（F2 标量双精度，(op,S64) 载体族）。
+    {
+        std::vector<u8> s;
+        isa::append_insn(s, isa::make_insn(isa::VmOp::Addsd, isa::OpKind::Reg, 24,
+                                           isa::OpKind::Reg, 25, 0,
+                                           isa::size_field(ir::Size::S64)));  // 0
+        isa::append_insn(s, isa::make_insn(isa::VmOp::Subsd, isa::OpKind::Reg, 26,
+                                           isa::OpKind::Reg, 27, 0,
+                                           isa::size_field(ir::Size::S64)));  // 1
+        isa::append_insn(s, halt());                                       // 2
+        rt::VmContext ctx;
+        ctx.xmm[0].xmm_lo = 0x3FF8000000000000ull;   // 1.5
+        ctx.xmm[1].xmm_lo = 0x4004000000000000ull;   // 2.5 → 4.0
+        ctx.xmm[2].xmm_lo = 0x4004000000000000ull;   // 2.5
+        ctx.xmm[3].xmm_lo = 0x3FF8000000000000ull;   // 1.5 → 1.0
+        const auto r = run_stream_ctx(entry, s, std::move(ctx));
+        EXPECT_EQ(r.xmm[0].xmm_lo, 0x4010000000000000ull);        // 4.0
+        EXPECT_EQ(r.xmm[2].xmm_lo, 0x3FF0000000000000ull);        // 1.0
+    }
+    // ALU mem 源折条 = GP 双槽 src（load_src_slot_into_xmm1_x86 GP 分支）：
+    // XmmLoad w4 → v18 双槽 + Addss dst=24 src=18（< 24 → GP 公式）。
+    {
+        alignas(16) std::array<u8, 0x20> scratch{};
+        const u32 f_bits = 0x3F000000u;   // 0.5f
+        std::memcpy(scratch.data(), &f_bits, 4);
+        const u32 addr = static_cast<u32>(reinterpret_cast<uintptr_t>(scratch.data()));
+        std::vector<u8> s;
+        isa::append_insn(s, mov_imm(19, addr));                   // 0
+        isa::append_insn(s, xmm_load(18, 19, 4));                 // 1 (GP 双槽落点)
+        isa::append_insn(s, sse_rr(isa::VmOp::Addss, 24, 18));    // 2
+        isa::append_insn(s, halt());                              // 3
+        rt::VmContext ctx;
+        ctx.xmm[0].xmm_lo = 0x3FC00000u;   // 1.5f + 0.5f → 2.0f
+        const auto r = run_stream_ctx(entry, s, std::move(ctx));
+        EXPECT_EQ(r.xmm[0].xmm_lo, 0x40000000u);                  // 2.0f
+        expect_slot32(r, 19, 0u);   // 双槽高 dword = XmmLoad 清零面
+    }
+}
+
+TEST(X86Battery, X86SseMovBitwiseBridgeRealExec) {
+    wvmp::Rng rng(12345);
+    const auto gen = rt::generate_runtime_x86(rng);
+    alignas(16) std::array<u8, 0x40> scratch{};
+    scratch.fill(0);
+    RwxImage rwx(gen.image.code);
+    const auto entry = rwx.entry();
+
+    // movss 只改 lane0（高 96 保持）+ movaps 全量搬。
+    {
+        std::vector<u8> s;
+        isa::append_insn(s, sse_rr(isa::VmOp::Movss, 24, 25));   // 0
+        isa::append_insn(s, sse_rr(isa::VmOp::Movaps, 26, 27));  // 1
+        isa::append_insn(s, halt());                             // 2
+        rt::VmContext ctx;
+        ctx.xmm[0].xmm_lo = 0x1122334444556677ull;
+        ctx.xmm[0].xmm_hi = 0x9988776655443322ull;
+        ctx.xmm[1].xmm_lo = 0x40200000u;                          // 2.5f
+        ctx.xmm[3].xmm_lo = 0xAAAAAAAAAAAAAAAAull;
+        ctx.xmm[3].xmm_hi = 0x5555555555555555ull;
+        const auto r = run_stream_ctx(entry, s, std::move(ctx));
+        EXPECT_EQ(r.xmm[0].xmm_lo, 0x1122334440200000ull);        // lane0 替换
+        EXPECT_EQ(r.xmm[0].xmm_hi, 0x9988776655443322ull);        // 高保持
+        EXPECT_EQ(r.xmm[2].xmm_lo, 0xAAAAAAAAAAAAAAAAull);        // movaps 全量
+        EXPECT_EQ(r.xmm[2].xmm_hi, 0x5555555555555555ull);
+    }
+    // xorps/orps/andps/andnps 位真值（andnps = ~dst & src，SDM 0F 55）。
+    {
+        struct OpCase { isa::VmOp op; u8 dst, src; u8 dslot, sslot; };
+        const OpCase cases[] = {
+            {isa::VmOp::Xorps, 24, 25, 0, 1},
+            {isa::VmOp::Andps, 26, 27, 2, 3},
+            {isa::VmOp::Orps, 28, 29, 4, 5},
+            {isa::VmOp::Andnps, 30, 31, 6, 7},
+        };
+        for (const auto& tc : cases) {
+            std::vector<u8> s;
+            isa::append_insn(s, sse_rr(tc.op, tc.dst, tc.src));
+            isa::append_insn(s, halt());
+            rt::VmContext ctx;
+            ctx.xmm[tc.dslot] = {0xAAAAAAAAAAAAAAAAull, 0x5555555555555555ull};
+            ctx.xmm[tc.sslot] = {0xFFFFFFFFFFFFFFFFull, 0x0000000000000000ull};
+            const auto r = run_stream_ctx(entry, s, std::move(ctx));
+            if (tc.op == isa::VmOp::Xorps) {
+                EXPECT_EQ(r.xmm[tc.dslot].xmm_lo, 0x5555555555555555ull);
+                EXPECT_EQ(r.xmm[tc.dslot].xmm_hi, 0x5555555555555555ull);
+            } else if (tc.op == isa::VmOp::Andps) {
+                EXPECT_EQ(r.xmm[tc.dslot].xmm_lo, 0xAAAAAAAAAAAAAAAAull);
+                EXPECT_EQ(r.xmm[tc.dslot].xmm_hi, 0x0000000000000000ull);
+            } else if (tc.op == isa::VmOp::Orps) {
+                EXPECT_EQ(r.xmm[tc.dslot].xmm_lo, 0xFFFFFFFFFFFFFFFFull);
+                EXPECT_EQ(r.xmm[tc.dslot].xmm_hi, 0x5555555555555555ull);
+            } else {
+                EXPECT_EQ(r.xmm[tc.dslot].xmm_lo, 0x5555555555555555ull);  // ~a & b
+                EXPECT_EQ(r.xmm[tc.dslot].xmm_hi, 0x0000000000000000ull);
+            }
+        }
+    }
+    // XmmLoad/XmmStore 三宽（4/8/16）+ XmmFromGp/GpFromXmm 桥（x86 可达形
+    // = w4 GP + w8 xmm-src（F3 0F 7E）；GP w8 = movq r64 REX.W 专属，32 位
+    // 结构性不可达，handler 保留防御分支）。
+    {
+        const u32 addr = static_cast<u32>(reinterpret_cast<uintptr_t>(scratch.data()));
+        // 源内存: [0..3]=0xDEADBEEF、[4..F]=0、[10..17]=1.5 f64 形
+        const u32 d0 = 0xDEADBEEFu;
+        std::memcpy(scratch.data(), &d0, 4);
+        const u64 d10 = 0x3FF8000000000000ull;
+        std::memcpy(scratch.data() + 0x10, &d10, 8);
+        // (a) XmmLoad 16B
+        {
+            std::vector<u8> s;
+            isa::append_insn(s, mov_imm(19, addr));
+            isa::append_insn(s, xmm_load(24, 19, 16));
+            isa::append_insn(s, halt());
+            rt::VmContext ctx;
+            const auto r = run_stream_ctx(entry, s, std::move(ctx));
+            EXPECT_EQ(r.xmm[0].xmm_lo, 0x00000000DEADBEEFull);
+            EXPECT_EQ(r.xmm[0].xmm_hi, 0ull);
+        }
+        // (b) XmmStore 16B
+        {
+            std::vector<u8> s;
+            isa::append_insn(s, mov_imm(20, addr + 0x20));
+            isa::append_insn(s, xmm_store(20, 24, 16));
+            isa::append_insn(s, halt());
+            rt::VmContext ctx;
+            ctx.xmm[0].xmm_lo = 0x00000000DEADBEEFull;
+            const auto r = run_stream_ctx(entry, s, std::move(ctx));
+            u32 back = 0;
+            std::memcpy(&back, scratch.data() + 0x20, 4);
+            EXPECT_EQ(back, 0xDEADBEEFu);
+            u64 back8 = 0;
+            std::memcpy(&back8, scratch.data() + 0x28, 8);
+            EXPECT_EQ(back8, 0u);
+        }
+        // (c) XmmLoad 8B/4B（w4 取 [addr] = 0xDEADBEEF 形 —— [addr+0x10] 的
+        //     f64 1.5 低 dword 恒 0，钉"低宽度截取低址 dword"语义）
+        {
+            std::vector<u8> s;
+            isa::append_insn(s, mov_imm(21, addr + 0x10));
+            isa::append_insn(s, mov_imm(22, addr));
+            isa::append_insn(s, xmm_load(25, 21, 8));
+            isa::append_insn(s, xmm_load(26, 22, 4));
+            isa::append_insn(s, halt());
+            rt::VmContext ctx;
+            const auto r = run_stream_ctx(entry, s, std::move(ctx));
+            EXPECT_EQ(r.xmm[1].xmm_lo, 0x3FF8000000000000ull);
+            EXPECT_EQ(r.xmm[1].xmm_hi, 0ull);
+            EXPECT_EQ(r.xmm[2].xmm_lo, 0x00000000DEADBEEFull);
+            EXPECT_EQ(r.xmm[2].xmm_hi, 0ull);
+        }
+        // (d) 桥 XmmFromGp w4 / GpFromXmm w4（x86 可达形）
+        {
+            std::vector<u8> s;
+            isa::append_insn(s, mov_imm(6, 0x12345678u));
+            isa::append_insn(s, isa::make_insn(isa::VmOp::XmmFromGp,
+                                               isa::OpKind::Reg, 27, isa::OpKind::Reg, 6,
+                                               4, isa::size_field(ir::Size::S64)));
+            isa::append_insn(s, isa::make_insn(isa::VmOp::GpFromXmm,
+                                               isa::OpKind::Reg, 7, isa::OpKind::Reg, 24,
+                                               4, isa::size_field(ir::Size::S64)));
+            isa::append_insn(s, halt());
+            rt::VmContext ctx;
+            ctx.xmm[0].xmm_lo = 0x00000000DEADBEEFull;   // GpFromXmm 源
+            ctx.xmm[3].xmm_lo = 0xFFFFFFFFFFFFFFFFull;   // XmmFromGp dst 哨兵
+            const auto r = run_stream_ctx(entry, s, std::move(ctx));
+            EXPECT_EQ(r.xmm[3].xmm_lo, 0x12345678ull);
+            EXPECT_EQ(r.xmm[3].xmm_hi, 0ull);
+            expect_slot32(r, 7, 0xDEADBEEFu);
+        }
+    }
+}
+
+// X6 A 逐 op 编码双平台断言（#33 纪律：别整体信 X0 —— 26 mnemonics 逐条
+// Keystone KS_MODE_32/64 双模装配同字节 + capstone CS_MODE_32/64 双解同
+// mnemonic/op_str，SSE 基础编码无 REX 依赖的机器证明）。
+TEST(X86Battery, DisasmX86SseEncodingDualMode) {
+    const char* kMn[] = {"addss", "addps", "addpd", "subss", "subps", "subpd",
+                         "mulss", "mulsd", "mulps", "mulpd", "divss", "divsd",
+                         "divps", "divpd", "addsd", "subsd",
+                         "movss", "movsd", "movaps", "movapd", "movups", "movupd",
+                         "xorps", "orps", "andps", "andnps"};
+    ks_engine* ks32 = nullptr;
+    ks_engine* ks64 = nullptr;
+    ASSERT_EQ(ks_open(KS_ARCH_X86, KS_MODE_32, &ks32), KS_ERR_OK);
+    ASSERT_EQ(ks_open(KS_ARCH_X86, KS_MODE_64, &ks64), KS_ERR_OK);
+    ks_option(ks32, KS_OPT_SYNTAX, KS_OPT_SYNTAX_INTEL);
+    ks_option(ks64, KS_OPT_SYNTAX, KS_OPT_SYNTAX_INTEL);
+    csh cs32 = 0, cs64 = 0;
+    ASSERT_EQ(cs_open(CS_ARCH_X86, CS_MODE_32, &cs32), CS_ERR_OK);
+    ASSERT_EQ(cs_open(CS_ARCH_X86, CS_MODE_64, &cs64), CS_ERR_OK);
+    for (const char* mn : kMn) {
+        const std::string text = std::string(mn) + " xmm0, xmm1\n";
+        unsigned char* enc32 = nullptr;
+        unsigned char* enc64 = nullptr;
+        size_t size32 = 0, size64 = 0, count = 0;
+        ASSERT_EQ(ks_asm(ks32, text.c_str(), 0x1000, &enc32, &size32, &count), 0) << mn;
+        ASSERT_EQ(ks_asm(ks64, text.c_str(), 0x1000, &enc64, &size64, &count), 0) << mn;
+        ASSERT_EQ(size32, size64) << mn;
+        ASSERT_EQ(std::memcmp(enc32, enc64, size32), 0) << mn << " enc differs";
+        // capstone 双解：同 mnemonic + 同 op_str（CS_MODE_32/64 无 REX 歧义）。
+        cs_insn* insn32 = nullptr;
+        cs_insn* insn64 = nullptr;
+        ASSERT_EQ(cs_disasm(cs32, enc32, size32, 0x1000, 1, &insn32), size_t(1)) << mn;
+        const std::string mn32 = insn32->mnemonic;
+        const std::string op32 = insn32->op_str;
+        ASSERT_EQ(cs_disasm(cs64, enc64, size64, 0x1000, 1, &insn64), size_t(1)) << mn;
+        EXPECT_EQ(mn32, std::string(insn64->mnemonic)) << mn;
+        EXPECT_EQ(op32, std::string(insn64->op_str)) << mn;
+        cs_free(insn32, 1);
+        cs_free(insn64, 1);
+        ks_free(enc32);
+        ks_free(enc64);
+    }
+    cs_close(&cs32);
+    cs_close(&cs64);
+    ks_close(ks32);
+    ks_close(ks64);
+}
+
+// X6 A 五种子稳定性（442 模式）：重生成 × 5 seed，SSE 链逐 seed 真执行。
+TEST(X86Battery, X86SseFiveSeed) {
+    const u64 seeds[] = {1, 12345, 99999, 3735928559ull, 3405691582ull};
+    for (u64 seed : seeds) {
+        wvmp::Rng rng(seed);
+        const auto gen = rt::generate_runtime_x86(rng);
+        RwxImage rwx(gen.image.code);
+        const auto entry = rwx.entry();
+        std::vector<u8> s;
+        isa::append_insn(s, sse_rr(isa::VmOp::Addss, 24, 25));   // 0
+        isa::append_insn(s, sse_rr(isa::VmOp::Mulps, 26, 27));   // 1
+        isa::append_insn(s, halt());                             // 2
+        rt::VmContext ctx;
+        ctx.xmm[0].xmm_lo = 0x3FC00000u;   // 1.5f
+        ctx.xmm[1].xmm_lo = 0x40200000u;   // 2.5f → 4.0f
+        ctx.xmm[2].xmm_lo = 0x3F800000u;   // packed lanes 0..3
+        ctx.xmm[3].xmm_lo = 0x00000000u;
+        const auto r = run_stream_ctx(entry, s, std::move(ctx));
+        EXPECT_EQ(r.xmm[0].xmm_lo, 0x40800000u) << "seed=" << seed;
+        // mulps lane0: 1.0f * 0.0f = 0.0f
+        EXPECT_EQ(r.xmm[2].xmm_lo, 0u) << "seed=" << seed;
+    }
 }
 
 // ---------------------------------------------------------------------------

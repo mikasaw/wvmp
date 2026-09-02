@@ -197,8 +197,12 @@ std::string build_stub_asm_x64(u64 rt_entry_rva, u64 resume_rva, u64 image_base)
 //      PE32 VA < 4GB——407 v2 RVA/VA 铁律：裸 RVA 进槽 = 野跳）；
 //   7. blob 指针 = image_base + blob_stream_rva 立即数（32 位模式无 rip
 //      寻址，无需 disp32 回填；generate_entry_stub 的 x64 回填面 x86 跳过）；
-//   8. xmm 同步不适用（x86 运行时无 SSE handler，ctx.xmm 面未消费；
-//      Win32 ABI xmm 全易失，callgate callee 副作用不建模）。
+//   8. xmm 同步：X6 (MIT-454) A=X3d 起**适用**（x86 运行时 SSE handler 面
+//      落地，446 "ctx.xmm 面未消费" 前提翻转）——入口 host xmm0..7 →
+//      ctx.xmm（Win32 ABI xmm 全易失，区域读取进入时刻 xmm 值须有源；
+//      x64 371 面的 32 位镜像）、出口 ctx.xmm → host xmm0..7（区域结果
+//      回到 caller 可见物理寄存器）。callgate callee 副作用不建模不变
+//      （Win32 cdecl FP 参数走栈、返回走 ST(0)，无 xmm 协议面）。
 //
 // MIT-451 (X5b) B.2：帧形更新（guard 垫栈）。序言最前 `sub esp,
 // kX86GuardBytes` 垫出保护区 [ns-G..ns-4]，4 callee-saved push 与 ctx 区整体
@@ -284,6 +288,14 @@ std::string build_stub_asm_x86(u64 rt_entry_rva, u64 blob_stream_rva,
     // 无 rip 寻址，无需 x64 disp32 回填；pe_writer 清 DYNAMIC_BASE 下与
     // x64 rip-relative 形等价）。
     o += "mov dword ptr [esp], " + hex(image_base + blob_stream_rva) + "\n";
+    // —— X6 (MIT-454) A: host xmm0..7 → ctx.xmm 同步（SSE face；x64 371 面
+    //      的 32 位镜像。Win32 ABI xmm 全易失，区域若读取进入时刻的 xmm
+    //      值（caller 遗留 / 前序计算）必须以 ctx.xmm 为源 —— 零初始化值
+    //      与原生语义不符）。esp 此刻 = ctx 基址，disp32 直达 0x140 区。——
+    for (int i = 0; i < 8; ++i) {
+        o += std::string("movups [esp + ") + hex(kCtxXmmBase + u64(i) * 16) +
+             "], xmm" + std::to_string(i) + "\n";
+    }
     // —— 调共享解释器（cdecl：ctx 指针经栈参，runtime_x86 entry [esp+0x14] 读）。
     o += "push esp\n";
     o += "call " + hex(rt_entry_rva) + "\n";
@@ -293,6 +305,14 @@ std::string build_stub_asm_x86(u64 rt_entry_rva, u64 blob_stream_rva,
     o += "mov eax, [esp + " + hex(kCtxRegs + 0 * 8) + "]\n";
     o += "mov ecx, [esp + " + hex(kCtxRegs + 1 * 8) + "]\n";
     o += "mov edx, [esp + " + hex(kCtxRegs + 2 * 8) + "]\n";
+    // —— X6 (MIT-454) A: ctx.xmm → host xmm0..7 同步（SSE handler 写回的
+    //      结果经此回到 caller 可见物理寄存器 —— Win32 易失语义下 caller
+    //      不依赖跨调用存续，但区域退出时刻的原生可见面须如实还原；与
+    //      x64 stub 出口 movups 链同构。esp 此刻 = ctx 基址）。——
+    for (int i = 0; i < 8; ++i) {
+        o += std::string("movups xmm") + std::to_string(i) + ", [esp + " +
+             hex(kCtxXmmBase + u64(i) * 16) + "]\n";
+    }
     o += "add esp, " + hex(kCtxSize) + "\n";
     o += "pop edi\n pop esi\n pop ebp\n pop ebx\n";
     // X5b：unwind guard 区回到 esp = ns 再终态跳（ExitNative 落点 esp = ns

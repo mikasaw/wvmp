@@ -61,6 +61,14 @@ BATTERY_HANDLERS = {
     # X3c (MIT-445) 协议面：CallGate reg 值目标 + RVA 双形 / ExitNative 4B 槽
     # / Ret 4B 清栈返回。
     "callgate", "exitnative", "ret",
+    # X6 (MIT-454) A=X3d 批次二：SSE 32 位镜像（算术 16 + 传送 6 + 位运算 4
+    # + mem 原语 2 + GP↔xmm 桥 2；批次三 ucomis 2 随批三追加）。
+    "addss", "addps", "addpd", "subss", "subps", "subpd",
+    "mulss", "mulsd", "mulps", "mulpd",
+    "divss", "divsd", "divps", "divpd", "addsd", "subsd",
+    "movss", "movsd", "movaps", "movapd", "movups", "movupd",
+    "xorps", "orps", "andps", "andnps",
+    "xmmload", "xmmstore", "xmmfromgp", "gpfromxmm",
 }
 
 HEADER_RE = re.compile(
