@@ -69,6 +69,8 @@ BATTERY_HANDLERS = {
     "movss", "movsd", "movaps", "movapd", "movups", "movupd",
     "xorps", "orps", "andps", "andnps",
     "xmmload", "xmmstore", "xmmfromgp", "gpfromxmm",
+    # X6 (MIT-454) A=X3d 批次三：SSE 比较族（flags 面，32 op 收尾）。
+    "ucomiss", "ucomisd",
 }
 
 HEADER_RE = re.compile(

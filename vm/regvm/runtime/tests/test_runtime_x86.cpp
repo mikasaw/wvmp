@@ -43,6 +43,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -2330,6 +2331,54 @@ TEST(X86Battery, X86SseFiveSeed) {
         EXPECT_EQ(r.xmm[0].xmm_lo, 0x40800000u) << "seed=" << seed;
         // mulps lane0: 1.0f * 0.0f = 0.0f
         EXPECT_EQ(r.xmm[2].xmm_lo, 0u) << "seed=" << seed;
+    }
+}
+
+// X6 A 批次三：ucomiss/ucomisd flags 面（SDM 真值表四象限：greater/less/
+// equal/unordered — ZF/CF/OF/SF/PF = bit0..4 全量读回断言）。
+TEST(X86Battery, X86SseUcomisFlagsRealExec) {
+    wvmp::Rng rng(12345);
+    const auto gen = rt::generate_runtime_x86(rng);
+    RwxImage rwx(gen.image.code);
+    const auto entry = rwx.entry();
+
+    struct Case { float a, b; u32 want; };
+    const Case cases[] = {
+        {2.0f, 1.0f, 0x00u},                      // greater: 全 0
+        {1.0f, 2.0f, isa::kFlagCF},               // less: CF
+        {1.0f, 1.0f, isa::kFlagZF},               // equal: ZF
+        {std::numeric_limits<float>::quiet_NaN(), 1.0f,
+         isa::kFlagZF | isa::kFlagPF | isa::kFlagCF},  // unordered: ZF|PF|CF
+    };
+    for (const auto& tc : cases) {
+        std::vector<u8> s;
+        isa::append_insn(s, isa::make_insn(isa::VmOp::Ucomiss, isa::OpKind::Reg, 24,
+                                           isa::OpKind::Reg, 25, 0,
+                                           isa::size_field(ir::Size::S32)));  // 0
+        isa::append_insn(s, getflags(2));                                       // 1
+        isa::append_insn(s, halt());                                            // 2
+        rt::VmContext ctx;
+        u32 a_bits, b_bits;
+        std::memcpy(&a_bits, &tc.a, 4);
+        std::memcpy(&b_bits, &tc.b, 4);
+        ctx.xmm[0].xmm_lo = a_bits;
+        ctx.xmm[1].xmm_lo = b_bits;
+        const auto r = run_stream_ctx(entry, s, std::move(ctx));
+        expect_slot32(r, 2, tc.want);
+    }
+    // ucomisd（F2 0F 2E，(Ucomiss,S64) 载体）双精度 equal/less 两象限。
+    {
+        std::vector<u8> s;
+        isa::append_insn(s, isa::make_insn(isa::VmOp::Ucomisd, isa::OpKind::Reg, 24,
+                                           isa::OpKind::Reg, 25, 0,
+                                           isa::size_field(ir::Size::S64)));  // 0
+        isa::append_insn(s, getflags(2));                                     // 1
+        isa::append_insn(s, halt());                                          // 2
+        rt::VmContext ctx;
+        ctx.xmm[0].xmm_lo = 0x4000000000000000ull;   // 2.0
+        ctx.xmm[1].xmm_lo = 0x3FF8000000000000ull;   // 1.5 → greater
+        const auto r = run_stream_ctx(entry, s, std::move(ctx));
+        expect_slot32(r, 2, 0x00u);
     }
 }
 

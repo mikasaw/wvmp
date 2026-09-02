@@ -5124,6 +5124,37 @@ public:
     }
 
     // =======================================================================
+    // MIT-454 (X6 A=X3d 批次三)：x86 SSE 比较族 —— ucomiss/ucomisd flags 面
+    //（32 op SSE 名单收尾 2 op）。
+    //
+    // Ucomis* 与位运算/传送族本质不同: **只写 EFLAGS (ZF/PF/CF), 不改 xmm
+    // 操作数** — 无 dst 写回步, 走 ALU binop 同一条 flags 通路 (setcc 落帧
+    // 捕获区 → flags_tail_x86 装配), 与 setcc/jcc handler 共享 [ctx+0x98]
+    // flags 槽 (x64 build_ucomis_flags 的 32 位镜像; x86 无 zero5 —— setcc
+    // 直写帧捕获区全字节, zero5 x86 形 = 空)。
+    //
+    // 顺序严格性 (与 build_binary_x86 一致): 槽位偏移计算 (mov/sub/shl/add
+    // 改宿主 EFLAGS) → native ucomis* 产真值 → setcc5_x86 紧随捕获 (中间
+    // 不得插入任何改 EFLAGS 的指令) → flags_tail_x86 装配。
+    //
+    // SDM UCOMISS/UCOMISD 真值表 (native 直产): greater → ZF=0 CF=0 /
+    // less → ZF=0 CF=1 / equal → ZF=1 CF=0 / unordered (NaN) → ZF=PF=CF=1;
+    // OF/SF/AF 清 0 — flags_tail_x86 按 ZF/CF/OF/SF/PF=bit0..4 装配即得。
+    std::string build_ucomis_flags_x86(u64 dispatch, const char* native_mn) const {
+        const std::string tag = std::string(native_mn) + std::to_string(seq());
+        std::string o = decode_prelude_x86();
+        o += xmm_offset_into_t_x86(t_[0], xf(kX86FRegA));   // t0 = dst 偏移
+        o += std::string("    movups xmm0, [") + r32x(ctx_) + " + " + r32x(t_[0]) + "]\n";
+        o += load_src_slot_into_xmm1_x86(tag, t_[1]);
+        o += std::string("    ") + native_mn + " xmm0, xmm1\n";
+        o += setcc5_x86();
+        o += flags_tail_x86(false, dispatch);
+        return o;
+    }
+    std::string build_x86_ucomiss(u64 d) const { return build_ucomis_flags_x86(d, "ucomiss"); }
+    std::string build_x86_ucomisd(u64 d) const { return build_ucomis_flags_x86(d, "ucomisd"); }
+
+    // =======================================================================
     // MIT-445 (X3c B.1)：x86 CallGate（reg 值目标 + RVA 双形，零新 VmOp）。
     //
     // 编码（x64 build_callgate 同协议，a_kind 判别）：RVA 形 a_kind=None +
@@ -5610,6 +5641,9 @@ std::vector<HandlerDef> x86_handler_table() {
         {int(VmOp::XmmStore), "xmmstore", &AsmGen::build_xmm_store_x86},
         {int(VmOp::XmmFromGp), "xmmfromgp", &AsmGen::build_xmm_from_gp_x86},
         {int(VmOp::GpFromXmm), "gpfromxmm", &AsmGen::build_gp_from_xmm_x86},
+        // —— X6 (MIT-454) A=X3d 批次三：SSE 比较族（flags 面，32 op 收尾）——
+        {int(VmOp::Ucomiss), "ucomiss", &AsmGen::build_x86_ucomiss},
+        {int(VmOp::Ucomisd), "ucomisd", &AsmGen::build_x86_ucomisd},
     };
 }
 
