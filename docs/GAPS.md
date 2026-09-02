@@ -265,7 +265,7 @@
 | SIMD 尾族三行（pmovmskb / pcmpeq/pcmpgt / punpck 系） | ⛔ gate（分层定稿） | 频率分层：客户态新抽 14 exe 全零 vs SIMD/CRT 域 punpck 0.06–0.074% / pmovmskb 0.015–0.055% 密度；punpck 粒度分裂 d/q 88–100% hash/安全域 vs b/w 73% codec 域；lqdq/hqdq D1 拍板 gate 不折 | MIT-432 §1/§1.4（`.multica/mit-G9r-triage.md`）+ MIT-GZ D1 |
 | G8b 三条（mulx/pdep/pext）+ blsr 族四条（blsr/blsi/blsmsk/bextr） | ⛔ gate（挂账/永久） | mulx/pdep/pext = G8b 档 native 直执行 + CPUID gate 基建挂账，mulx CF Zen5 实测不写 vs SDM 厂商分叉待决；blsr 族 27 文件语料 0 永久 gate | MIT-432 §2/§6.4 + MIT-GZ B.1 |
 | ymm / EVEX / FMA / 加密（AES 等） | ⛔ gate（档B） | xmm 跟踪区 kCtxSize 0x1C8 冻结面；档B 立项即触发跳表扩容评估 | MIT-424 (档B) |
-| x86 (PE32) 平台（MIT-446 (X4) 翻正，MIT-450 (X5) 收口扩证） | ✅ 支持 | 全管道：D1 解禁 + stub x86 cdecl + cdecl callgate 参数窗（X5 裁决 = 可见参数桥，4 dword）+ x86 白名单 gate；样本池 11 族级样本 byte-exact（X5）；残余 gate 面 = SSE 族 32 / Div / Idiv + X5 新实测三条（跳表匹配器 S64 硬编码 / REG-REG 位测试族不在 lifter 面 / 真实产物 in-region push，见 X5 收口节） | MIT-446 (X4) / MIT-450 (X5) |
+| x86 (PE32) 平台（MIT-446 (X4) 翻正，MIT-450 (X5) 收口扩证） | ✅ 支持 | 全管道：D1 解禁 + stub x86 cdecl + cdecl callgate 参数窗（X5 裁决 = 可见参数桥，4 dword）+ x86 白名单 gate；样本池 11 族级样本 byte-exact（X5）；ExitNative x86 上界接线已翻正（X5c F1：17 处 en 0→17、末区 .text 节尾兜底 + cap；stubs 0→9，wvmpTest 103-kernel 14 标记区真虚拟化 9 = 64.3%，全 103 面 8.7%）；残余 gate 面 = SSE 族 32 / Div / Idiv（b59b 实撞，jtbn 掩盖消除后由白名单如实转明）/ push-imm 11 / 间接 jmp 1 / 栈深 1（30→13，见 X5c 收口节） | MIT-446 (X4) / MIT-450 (X5) / MIT-451 (X5b) / MIT-453 (X5c) |
 | 16-bit 目标 | ⛔ 不可行 | PE 格式白名单只收 0x014C/0x8664 | MIT-412（GAPS C5 交叉引用） |
 
 > 观察清单与挂账联动见 `docs/STATUS.md`「指令虚拟化阶段（M2.5-G）收口」节；
@@ -691,6 +691,8 @@ rc=0 输出≈输入，用户以为受保护）与**产坏壳**（手造连续�
   未来归属规则可加"目标与锚点间无可执行指令"类强校验或降窗口。
 - **ExitNative .pdata 依赖在 x86 天然失效**（triage §8 #6）：x86 通常无
   .pdata → find_function_end_rva 退 nullopt → 保守 gate 兜底，行为差异非缺陷。
+  **【MIT-453 (X5c) 翻正】**该面已按 F1 收口（区域表回退 + 末区 .text 节尾
+  兜底 + 节尾 cap），x86 ExitNative 17 处全翻正——见「X5c 收口」节。
 - **CLI 无 arch 表达面**（triage §8 #7）：config 无 arch 字段、无 --help 子命令，
   32 位全支持需配置面扩口（P1 G7x-7）。
 
@@ -1253,3 +1255,83 @@ X5 三条实测 gate 面（in-region push / 跳表匹配器 S64 硬编码 / REG-
    `ffd4728901812932…`/161,861B sha256 逐字节恒等 = D6 机器证明**。
    冻结契约零 diff（kCtxSize 0x1C8 / runtime.hpp / vm_op 97 / 载体域
    0..28 / 跳表 128）。
+## X5c 收口（MIT-453）——ExitNative x86 上界接线修复（backend 单点 F1 + 末区 .text 兜底专项反证）
+
+**状态（2026-09-02，分支 `mit-x5c-exitbound` 基于 main 9647a13，批次 d2edaac/c675e07）**：
+452 (X5cr) 裁定的 T1 单型缺口（上界 lambda 硬绑 .pdata → x86 恒 nullopt →
+判定链条件 D 恒败 → 17 处 jtbn、en=0、stubs=0）按派单 F1 单点位收口。
+**translator 判定链零 diff**（D3：translate_jump 本体一字未动，452 结论
+"链无 bug 只缺上界供给" 保持成立）。
+
+1. **F1 实施（regvm_backend.cpp 上界 lambda，单点位）**：pdata_empty 分支
+   补区域表回退——ub = min{fr.begin_rva > begin_rva}（ctx.functions 逐元素
+   取 min，不依赖排序；嵌套/重叠按定义式保守：ub < 自身 end_rva 时 C/D 联合
+   不可满足 → gate）；无后继（末区）→ 所在节节尾；**节尾兼作收紧上界
+   （cap）**——下一区域 begin 落在节尾之后（多执行节病态布局）时
+   [节尾, next_begin) 是零填充/他节内存，cap 保证"目标出节尾=gate"裁决表
+   在任意布局下成立（单 .text 产物 next-begin 恒 < 节尾，cap 不绑定）。
+   **节尾口径** = VirtualAddress + VirtualSize（链接器内容实长；vsz==0 回退
+   SizeOfRawData），**不对齐到 SectionAlignment**——[内容尾, 对齐面) 是零
+   填充，放进即崩，内容实长 = "不吞真函数体"的最大安全值。pe==nullptr 与
+   无 .text（区域不在任何节内容面）维持 nullopt 保守 gate；回跳检出
+   （exit_native_blocked）提前至双路共用（452 §3.4：BFS 为 arch 共享码，
+   x86 17 处实测 0/17 blocked）；x64 路径（pdata 分支在前）条件序与修复前
+   一致。
+2. **B.2 末区专项反证（D1 核心条款）**：① wvmpTest x86 末区 0xC972 走查
+   （修复后实测读数）——site `jge 0xC9D5`（cond=13）@ marker@0xbd2c
+   （idx13，begin_rva=0xC92C），end_rva=0xC9D5（END-call 位置，452 脚本
+   复现），bd2c 无后继区域 → ub = .text 节尾 = **0xAE7AA**（实读
+   VirtualAddress 0x1000 + VirtualSize 0xAD7AA）；判定链 A) jge+Imm ✓ /
+   B) upper 非空 ✓ / C) 0xC9D5 ≥ 0xC9D5 ✓（边界）/ D) 0xC9D5 < 0xAE7AA ✓ /
+   E) fits_aux ✓ → **emit ExitNative**；产品日志实证 `exit-native @ 0xC972
+   -> 0xC9D5 (cond=13)`。② 新样本 `wvmp_x86_tailexit_sample`（446 MASM 链，
+   池 13→14）：rgn_exit_ok（next-begin ub，endcall target==end_rva /
+   earlyret 目标落 gap / fallthrough Halt 三面）+ rgn_tailexit_ok（末区
+   .text 兜底 ub，同三面，即 0xC972 形）+ rgn_tail_beyond（gate 负例，
+   E9+rel32 手编码目标越节尾、禁调用、C1 gate note rva=0x11EF；MASM
+   `jmp g_far_data` 对 .data 标签产 FF 25 间接形，会归因错族——手编码直跳
+   形才钉得住越节尾语义）。③ 兜底语义裁决表：末区 + 目标 ∈ [end_rva, 节尾)
+   = **放行**（ExitNative）；末区 + 目标 ≥ 节尾 = **gate**；非末区 + 目标 ≥
+   min(节尾, next_begin) = gate。单测 ③④⑤ 钉死（B.3）。
+3. **B.3 病态形防护单测 ×10**（regvm_backend_tests，ctest 16/16 维持）：
+   常规面 / 末区节尾兜底 / 越节尾 gate / cap 收紧（next_begin > 节尾）/
+   嵌套外层 gate / 区域表空退化 / pe==nullptr / blocked 组合 / 无 .text /
+   pdata 非空对照（x64 路径原样钉）。
+4. **A.3 读数表逐项对账（D5）**：en **0→17** ✓ / jtbn **17→0** ✓ / 残面
+   **30→13** ✓（push-imm 11 + 间接 jmp 1 + stack-depth 1，逐 site 归因
+   grep 实证）/ **stubs 9（452 预估 10，失配点名 #33）**——452 §4 "4 个
+   他族 gate 函数（aa18/aebb/b38d/b678）" 漏记第 5 个：**marker@0xb59b 含
+   `div` → VmOp::Div(78) 撞 x86 运行时白名单（G8 已入册面，D2 除零折叠
+   维持纸面）→ stub_link C2 gate**。修复前该缺口被 jtbn 掩盖（b59b 当时
+   在翻译期 gate），翻译翻正后 C2 面如实浮出——保守方向正确（宁 gate 勿
+   错），C2 handler 补面归后续 C2 类派单。wvmpTest x86 **103 kernel 双跑
+   diff-0 达成**（12 处 ExitNative 真执行首次全量真跑；9 stubs）。
+5. **当场修：translate_imul REG-3op src≠dst 丢源缺陷**（B.4 双跑首炸，
+   §E 当场炸当场修条款）：wvmpTest x86 packed 首次全量真跑在
+   kern.md5_block_vectors 确定性 AV（rc=139 双跑）。cdb 铁证：eip =
+   .wvmp+0x693（Load handler xsz2 分支），`Load(dst, [rsp 槽])` 地址槽 =
+   0xCF288CB3（md5 F 值）——字节码解码定位 idx7（md5，CallGate 0xb3f0 =
+   md5_T）round-4 分支：`Mov(slot2←16)`（guest `mov ecx,10h`）+ `Imul(slot0
+   ← slot0*slot18)`——guest 实码 `imul edx, ecx, 3` 系 3-op **src≠dst** 形
+   （idx7 实测 4 处 + `imul ecx, eax, 0` 系 imm=0 形 3 处，后者结果恰 0
+   掩盖），旧折叠假设 "MSVC /Od imul r,r,imm 恒 src==dst" 把 src 丢成
+   dst*imm。修复 = src≠dst 时先 `Mov(dst, src)` 物化（同函数 MEM-3op 路径
+   同款），src==dst 字节不动（**x64 恒等保持**：multiseed x64 250 + dump
+   恒等复验）。D3 边界披露：改动位于 translate_imul，**不在 ExitNative
+   判定链内**，不推翻 452 结论；单测
+   ImulThreeOpRegSrcNeDstMaterializesSrc / ImulThreeOpRegSrcEqDstNoExtraMov
+   双向钉死，GpMulUnaffectedByMarkerDomain 随新折条更新。
+6. **B.4 六件套**：build 0/0（项目码 0 警告；C4335 sse_bridge 既有）、
+   ctest 16/16（+ backend UpperBound 10 例 + translator imul 2 例）、
+   multiseed **320/320**（REQUIRE_REAL=1，x64 250 + x86 70，池 50+14，
+   §F.3 预估精确命中）、wvmpTest x86 9 stubs / en 17 / 残面 13 / 双跑
+   diff-0 ×2、wvmpTest x64 14 stubs / en 17 / 0 gate / 双跑 diff-0、
+   x86 电池 37 PASS + dump 门 60 项 PASS + 静态立即数扫描双面 PASS、
+   **x64 dump `ffd4728901812932…`/161,861B sha256 双 CLI cmp 逐字节恒等**
+   （D2 机器证明，全 hash 首录 =
+   ffd4728901812932d4d85dfed13f80be4edd8f78f93c6f483ff415bfd5d06206）。
+   冻结契约零 diff（kCtxSize / runtime.hpp / vm_op 97 / 载体域 / 跳表 128）。
+7. **B.6 文档**：本节 + §8 观察清单 ExitNative x86 行翻正 + 支持矩阵
+   x86 行读数刷新（103-kernel：14 标记区 9 真虚拟化 = 64.3%，全 103 面
+   真虚拟化率 8.7%；残 gate 面 13 = push-imm 11 / 间接 jmp 1 / 栈深 1，
+   另 C2 面 b59b Div 白名单 gate 由 jtbn 掩盖转明）+ STATUS 里程碑行。
