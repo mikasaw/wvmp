@@ -319,6 +319,12 @@ x86_samples=(
     # push-imm pair (callgate reads pushed dwords from the guard zone);
     # net depth 0 at Halt.
     "build/x86_samples/wvmp_x86_pushimm_sample.exe"
+    # MIT-X7 (MIT-455) B.2: div (pool 15 -> 16, x86 80 runs, total 330).
+    # In-region division faces (div reg + div mem divisor + idiv with cdq
+    # prologue + idiv negative divisor) virtualized through the 32-bit
+    # build_div_idiv_x86 handlers (x64 build_div_idiv mirror; 453 b59b
+    # residual face closure, stubs 11 -> 12 on wvmpTest b59b).
+    "build/x86_samples/wvmp_x86_div_sample.exe"
 )
 
 # Seeds: 1 (small), 12345 (default), 99999 (large), 0xDEADBEEF (magic), 0xCAFEBABE (magic).

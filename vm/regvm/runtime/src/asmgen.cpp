@@ -4289,6 +4289,75 @@ public:
                tail_lbl + ":\n" + advance_x86(dispatch);
     }
 
+    // x86 Div/Idiv（build_div_idiv 的 32 位版，S32 真面）—— MIT-X7 批二：
+    // X5c 收口钉死的 453 b59b 残面（VmOp::Div/Idiv 78/79 折叠 Halt → x86
+    // 白名单闸整函数 gate）解除。D4 语义基准 = x64 build_div_idiv 真镜像
+    // （不造第三套语义）：native "div/idiv r/m32" 隐式 dividend = 物理
+    // EDX:EAX、商→EAX、余→EDX；除零/商溢出 = 真 #DE（x64 D2.1 同口径：
+    // 崩溃形态与未加壳一致，不做 VM 内拦截）；flags 按 Intel undefined ——
+    // setcc5_x86 捕 native 真值（照抄 build_imul 处置，同 build_mul_x86 序）。
+    // 与数据临时物理重合的排布纪律（本节首注 ③ + build_mul_x86 先例）：
+    //   - 除数 → ts：t_[0..3] 首个 ∉ {eax,edx} 的物理位。build_mul_x86 只
+    //     需避 eax（mul 装载 EAX），div 装载 EDX:EAX 双位 —— 除数临时若与
+    //     EDX 重合会被 dividend 第二步装载覆盖（错除数）。t_[0..3] 四个互异
+    //     池位中 {eax,edx} 至多占 2 ⇒ 恒有安全解（生成期静态可判，保险丝
+    //     兜底）。t_[2] 是 load_operand_x86 的寻址 scratch，本 handler 用
+    //     t_[2] 做槽索引后即空闲，除数落 ts 后不再触任何数据临时。
+    //   - 物理 EDX ← Rdx 槽 / EAX ← Rax 槽（先高后低；ts ∉ {eax,edx} 静态
+    //     保证除数不被冲）
+    //   - native div/idiv ts 直通
+    //   - 商(eax)/余(edx) 双槽写回（内存直写；32 位写零扩展高半字，"槽高
+    //     半字恒 0"不变量维持，build_xchg S32 同款）
+    // 除数读法同 build_mul_x86：reg_b 槽 dword 直读（translator
+    // translate_div_idiv 对 Div/Idiv 的 b_kind 恒为 Reg —— REG 直发 / MEM
+    // 经 emit_load 折条入 scratch VM reg）。
+    // S8/S16 块防御（lifter translate_div_idiv 拒 S8/S16 —— dividend=AX /
+    // 0x66 前缀面，x64 s=0/1 空块同款）。
+    std::string build_div_idiv_x86(u64 dispatch, const char* native_mn) const {
+        const std::string tag =
+            std::string("x") + native_mn + std::to_string(seq());
+        const std::string tail_lbl = "xtail_" + tag;
+        constexpr int kEaxIdx = 0;  // kPhys[0] = rax/eax
+        constexpr int kEdxIdx = 1;  // kPhys[1] = rdx/edx
+        const u8 rax_slot = isa::vm_reg_of(ir::Reg::Rax);  // = 0
+        const u8 rdx_slot = isa::vm_reg_of(ir::Reg::Rdx);  // = 2
+        const std::string rax_slot_off = imm(static_cast<u64>(rax_slot) * 8 + 0x10);
+        const std::string rdx_slot_off = imm(static_cast<u64>(rdx_slot) * 8 + 0x10);
+        int ts = -1;
+        for (int i = 0; i < 4; ++i) {
+            if (t_[i] != kEaxIdx && t_[i] != kEdxIdx) { ts = t_[i]; break; }
+        }
+        if (ts < 0)
+            throw std::runtime_error("regvm runtime x86: div temp pool broken");
+        std::string blocks[3];
+        for (int s = 0; s < 3; ++s) {
+            std::string o;
+            if (s == 2) {
+                // 除数 → ts（reg_b 槽 dword 直读；t_[2] = 槽索引 scratch）
+                o += std::string("    mov ") + r32x(t_[2]) + ", " + xf(kX86FRegB) + "\n";
+                o += std::string("    mov ") + r32x(ts) + ", dword ptr " + xslot(t_[2]) + "\n";
+                // dividend：物理 EDX ← Rdx 槽 / EAX ← Rax 槽（先高后低）
+                o += std::string("    mov edx, dword ptr [") + r32x(ctx_) + " + " +
+                     rdx_slot_off + "]\n";
+                o += std::string("    mov eax, dword ptr [") + r32x(ctx_) + " + " +
+                     rax_slot_off + "]\n";
+                // native 直通: edx:eax ÷ ts → 商 eax, 余 edx
+                o += std::string("    ") + native_mn + " " + r32x(ts) + "\n";
+                // 商/余双槽写回（内存直写，不经临时 —— setcc5_x86 无寄存器副作用）
+                o += std::string("    mov dword ptr [") + r32x(ctx_) + " + " +
+                     rax_slot_off + "], eax\n";
+                o += std::string("    mov dword ptr [") + r32x(ctx_) + " + " +
+                     rdx_slot_off + "], edx\n";
+                o += setcc5_x86();
+            }
+            // s=0/1：防御空块（S8 dividend=AX 语义不符 / S16 0x66 前缀入口拒）
+            o += "    jmp " + tail_lbl + "\n";
+            blocks[s] = o;
+        }
+        return decode_prelude_x86() + size_chain_x86(blocks, tag, dispatch) +
+               tail_lbl + ":\n" + flags_tail_x86(false, dispatch);
+    }
+
     // x86 Shl/Shr/Sar/Rol/Ror（imm/cl 双形式 —— build_shift 的 32 位版）。
     // 块体与 x64 逐段同构（load A → 计数装载（b_kind 分支）→ 掩码 → 计数 0
     // 出口 → native → setcc5 → 写回），仅三处分叉：
@@ -5480,6 +5549,9 @@ public:
     std::string build_x86_imul(u64 d) const { return build_imul_x86(d); }
     std::string build_x86_mul(u64 d) const { return build_mul_x86(d); }
     std::string build_x86_cdq(u64 d) const { return build_cdq_x86(d); }
+    // MIT-X7 批二：Div/Idiv x86 白名单闸解除（453 b59b 残面收口）。
+    std::string build_x86_div(u64 d) const { return build_div_idiv_x86(d, "div"); }
+    std::string build_x86_idiv(u64 d) const { return build_div_idiv_x86(d, "idiv"); }
     // X3b 批次二：移位/旋转族（imm 与 cl 变体共享 builder，b_kind 分支分流）。
     std::string build_x86_shl(u64 d) const { return build_shift_x86("shl", d); }
     std::string build_x86_shr(u64 d) const { return build_shift_x86("shr", d); }
@@ -5567,6 +5639,10 @@ std::vector<HandlerDef> x86_handler_table() {
         {int(VmOp::Imul), "imul", &AsmGen::build_x86_imul},
         {int(VmOp::Mul), "mul", &AsmGen::build_x86_mul},
         {int(VmOp::Cdq), "cdq", &AsmGen::build_x86_cdq},
+        // —— X7 (MIT-455) 批二：Div/Idiv 32 位真 handler（build_div_idiv
+        // 镜像；453 b59b 残面收口，除零=真 #DE 直通 x64 D2.1 同口径）——
+        {int(VmOp::Div), "div", &AsmGen::build_x86_div},
+        {int(VmOp::Idiv), "idiv", &AsmGen::build_x86_idiv},
         // —— X3b (MIT-444) A 档批次二：移位/旋转族（imm + cl 变体）——
         {int(VmOp::Shl), "shl", &AsmGen::build_x86_shl},
         {int(VmOp::Shr), "shr", &AsmGen::build_x86_shr},
@@ -5679,9 +5755,10 @@ RuntimeGenResult generate_runtime_arch(wvmp::Rng& rng, AsmGen::HostArch arch) {
     //    + B 档 GP 5（Push/Pop + RVA 族）+ G4 原子 4（Xadd/Bts/Btr/Btc）
     //    + 协议面 3（X3c 收口：CallGate reg 值目标 + RVA 双形 / ExitNative
     //    4B 退出槽 / Ret 4B 清栈返回）。
-    //    仍纸面（折叠 Halt，恢复友好）= Div/Idiv（D2 除零折叠）、Movsxd/
-    //    MovsxdMem（x86 不可达）、SSE 族 32（X2b/X3c 面）—— 精确清单见
-    //    docs/GAPS.md X3b/X3c 节。
+    //    仍纸面（折叠 Halt，恢复友好）= Movsxd/MovsxdMem（x86 不可达）、
+    //    SSE 族 32（X2b/X3c 面）—— 精确清单见 docs/GAPS.md X3b/X3c 节。
+    //    MIT-X7 批二：Div/Idiv 出纸面入真表（build_div_idiv_x86，D2 除零
+    //    折叠 → x64 真 #DE 直通口径镜像，92 → 94 行）。
     std::vector<HandlerDef> handlers;
     if (arch == AsmGen::HostArch::X86) {
         // MIT-446 (X4)：表定义提为 x86_handler_table()（与 x86_handler_opcodes

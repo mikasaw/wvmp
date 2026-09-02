@@ -1031,9 +1031,14 @@ TranslateResult translate_cdqe(const cs_insn& ci, const cs_x86& x, ir::Arch arch
 // EFLAGS)。asmgen build_cdq 按 size 选 native 99 / 48 99 直通。
 // 注: cwd (66 99, S16) 的 0x66 落 prefix[0], translate_insn 入口统一拒绝,
 // 不可达 — handler 的 S16 分支仅为模板完备的防御路径。
+// MIT-X7 批二: x86 cdq 开面（S32 形）—— Div face 必要条件（真实 idiv
+// 代码恒有 cdq 前置，无 cdq lift 则 x86 Div 族面只剩无符号 div 孤形，
+// 派活单 §B.2 "Div 族 x86 handler" 交付不成形；MIT-404 时点 x86 asmgen
+// 未存在故当时限 x64，X3b 已备 build_cdq_x86 S32 真面 handler，本单接线）。
+// cqo（REX.W）仍 x64 专属：32 位模式无 REX 前缀，rex_w 恒 false，防御拒。
 TranslateResult translate_cdq(const cs_insn& ci, const cs_x86& x, ir::Arch arch) {
-    if (arch != ir::Arch::X64) return unsupported(ci.address, ci.size);
     const bool rex_w = (x.rex & 0x08) != 0;
+    if (arch == ir::Arch::X86 && rex_w) return unsupported(ci.address, ci.size);
     ir::Insn out;
     out.op = Op::Cdq;
     out.addr = ci.address;

@@ -1057,6 +1057,22 @@ TEST(Interpreter, SbbE2EMirrorChain) {
 TEST(Interpreter, MovdBridgeSemantic) {
     wvmp::Rng rng(12345);
     const auto result = rt::generate_runtime(rng);
+    // 调试钩子（MIT-X7 批二补齐）：WVMP_X64_ASM_DUMP=<win 路径> 时落盘本
+    // 测试（seed=12345）的 asm_dump —— x64 恒等底稿 `ffd47289…`/161,861B
+    // 的独立复跑锚（此前底稿生成命令未入仓，恒等对账不可独立复跑）。不影
+    // 响断言，与 x86 侧 WVMP_X86_ASM_DUMP（test_runtime_x86.cpp）同款。
+    {
+        char* dp = nullptr;
+        size_t dp_len = 0;
+        if (_dupenv_s(&dp, &dp_len, "WVMP_X64_ASM_DUMP") == 0 && dp && dp_len > 1) {
+            FILE* f = nullptr;
+            if (fopen_s(&f, dp, "wb") == 0 && f) {
+                std::fwrite(result.asm_dump.data(), 1, result.asm_dump.size(), f);
+                std::fclose(f);
+            }
+        }
+        std::free(dp);
+    }
     RwxImage rwx(result.image.code);
     auto entry = rwx.entry();
 

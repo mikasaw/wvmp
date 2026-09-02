@@ -3594,6 +3594,50 @@ TEST_F(LifterTranslate, CwdeCbwFoldForkFace) {
               lifter::TranslateStatus::Unsupported);
 }
 
+TEST_F(LifterTranslate, CdqX86LiftAndCqoBoundary) {
+    // MIT-X7 批二: x86 cdq (99) 开面（Div face 必要条件——真实 idiv 代码
+    // 恒有 cdq 前置）; cqo (48 99) x64 通路不回踩; cwd (66 99) 双 arch gate。
+    // x86 cdq (99, 无 REX) → Op::Cdq S32。
+    const wvmp::u8 c86[] = {0x99};
+    auto r86 = translate_bytes(x86, c86, ir::Arch::X86);
+    ASSERT_EQ(r86.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r86.insn.op, ir::Op::Cdq);
+    EXPECT_EQ(r86.insn.size, ir::Size::S32);
+    EXPECT_EQ(r86.insn.updates_flags, false);
+    // x64 cdq (99) → Op::Cdq S32（404 既有通路）。
+    auto r64 = translate_bytes(x64, c86, ir::Arch::X64);
+    ASSERT_EQ(r64.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r64.insn.op, ir::Op::Cdq);
+    EXPECT_EQ(r64.insn.size, ir::Size::S32);
+    // x64 cqo (48 99, REX.W) → Op::Cdq S64（404 既有通路不回踩）。
+    const wvmp::u8 cq[] = {0x48, 0x99};
+    auto rq = translate_bytes(x64, cq, ir::Arch::X64);
+    ASSERT_EQ(rq.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(rq.insn.op, ir::Op::Cdq);
+    EXPECT_EQ(rq.insn.size, ir::Size::S64);
+    // x86 cwd (66 99) 维持 gate（prefix[0]=0x66 → 66 前缀面 S16, 双 arch 同）。
+    const wvmp::u8 cwd[] = {0x66, 0x99};
+    EXPECT_EQ(translate_bytes(x86, cwd, ir::Arch::X86).status,
+              lifter::TranslateStatus::Unsupported);
+    // x86 idiv reg/mem 形 lift（Div face 主体）: F7 F9 = idiv ecx,
+    // F7 39 = idiv dword ptr [ecx]。
+    const wvmp::u8 iv[] = {0xF7, 0xF9};
+    auto ri = translate_bytes(x86, iv, ir::Arch::X86);
+    ASSERT_EQ(ri.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(ri.insn.op, ir::Op::Idiv);
+    EXPECT_EQ(ri.insn.size, ir::Size::S32);
+    EXPECT_EQ(ri.insn.updates_flags, true);
+    const wvmp::u8 im[] = {0xF7, 0x39};
+    auto rim = translate_bytes(x86, im, ir::Arch::X86);
+    ASSERT_EQ(rim.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(rim.insn.op, ir::Op::Idiv);
+    ASSERT_EQ(rim.insn.src.kind, ir::Operand::Kind::Mem);
+    // x86 idiv S8/S16 防御: F6 F9 = idiv cl (S8, dividend=AX 不符拒)。
+    const wvmp::u8 iv8[] = {0xF6, 0xF9};
+    EXPECT_EQ(translate_bytes(x86, iv8, ir::Arch::X86).status,
+              lifter::TranslateStatus::Unsupported);
+}
+
 TEST_F(LifterTranslate, AddressSize67Gate) {
     // B.4: 67 (prefix[3]) 显式 gate — 双 arch。x64: 67 8B 40 10 = mov eax,
     // [eax+10h] (地址截断 32 位, 平坦模型错址面); x86: 67 8B 00 = mov eax,

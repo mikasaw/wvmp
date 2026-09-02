@@ -131,6 +131,18 @@ cl /nologo /utf-8 /O1 /MD /c "%~dp0x86_pushimm_main.c" || goto :fail
 link /nologo /SUBSYSTEM:CONSOLE /MACHINE:X86 x86_pushimm_main.obj x86_pushimm_sample.obj /OUT:"%~1\wvmp_x86_pushimm_sample.exe" || goto :fail
 .\wvmp_x86_pushimm_sample.exe || goto :fail
 
+rem ---- MIT-X7 (MIT-455) B.2: pool 15 -> 16 (div/idiv opening) ----
+
+rem (16) div: in-region division faces (div reg + div mem divisor + idiv
+rem with cdq prologue + idiv negative divisor, quotient/remainder both
+rem observed) virtualized through the 32-bit build_div_idiv_x86 handlers
+rem (x64 build_div_idiv mirror; 453 b59b residual face closure). #DE
+rem divide-by-zero crash parity is a documented alignment, not executed.
+ml /nologo /c /Coff "%~dp0x86_div_sample.asm" || goto :fail
+cl /nologo /utf-8 /O1 /MD /c "%~dp0x86_div_main.c" || goto :fail
+link /nologo /SUBSYSTEM:CONSOLE /MACHINE:X86 x86_div_main.obj x86_div_sample.obj /OUT:"%~1\wvmp_x86_div_sample.exe" || goto :fail
+.\wvmp_x86_div_sample.exe || goto :fail
+
 popd
 exit /b 0
 :fail

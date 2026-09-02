@@ -524,6 +524,21 @@ TEST(X86Battery, DisasmStaticGate) {
         }
         std::free(cp);
     }
+    // 调试钩子（verify_x86_dump.py --asm 消费面）：WVMP_X86_ASM_DUMP=<win
+    // 路径> 时把 asm_dump 文本落盘（MIT-X7 批二补齐，与 CODE_DUMP 同款；
+    // 此前 --asm 只能从临时贴文本取，门不可独立复跑）。
+    {
+        char* ap = nullptr;
+        size_t ap_len = 0;
+        if (_dupenv_s(&ap, &ap_len, "WVMP_X86_ASM_DUMP") == 0 && ap && ap_len > 1) {
+            FILE* f = nullptr;
+            if (fopen_s(&f, ap, "wb") == 0 && f) {
+                std::fwrite(gen.asm_dump.data(), 1, gen.asm_dump.size(), f);
+                std::fclose(f);
+            }
+        }
+        std::free(ap);
+    }
 
     csh handle = 0;
     ASSERT_EQ(cs_open(CS_ARCH_X86, CS_MODE_32, &handle), CS_ERR_OK);
@@ -1059,6 +1074,98 @@ TEST(X86Battery, CdqSignExt) {
         isa::append_insn(s, halt());                                         // 2
         const auto ctx = run_stream(entry, s, nullptr);
         expect_slot32(ctx, rdx_slot, 0u);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// (15b) X7 批二：Div/Idiv（32 位真 handler，build_div_idiv 镜像 —— 453 b59b
+// 残面收口）。商/余双槽协议（Rax/Rdx 槽）+ #DE 直通面（除零不在电池内
+// 执行 —— 真 #DE 会杀进程，行为面由样本负例/native 对齐口径披露）。
+// flags 按 Intel undefined（SDM：DIV/IDIV 后 flags 无定义）—— 不做断言，
+// 与 x64 build_div_idiv 的 setcc5 捕真值口径一致（不预期具体值）。
+// ---------------------------------------------------------------------------
+TEST(X86Battery, DivIdivQuotRem) {
+    wvmp::Rng rng(12345);
+    const auto gen = rt::generate_runtime_x86(rng);
+    RwxImage rwx(gen.image.code);
+    const auto entry = rwx.entry();
+    const u8 rax_slot = isa::vm_reg_of(ir::Reg::Rax);  // 0
+    const u8 rdx_slot = isa::vm_reg_of(ir::Reg::Rdx);  // 2
+    auto cdq = []() {
+        return isa::make_insn(isa::VmOp::Cdq, isa::OpKind::None, 0, isa::OpKind::None, 0, 0,
+                              isa::size_field(ir::Size::S32));
+    };
+
+    // div 100 / 7 → 商 14 余 2。
+    {
+        std::vector<u8> s;
+        isa::append_insn(s, mov_imm(rax_slot, 100));                            // 0
+        isa::append_insn(s, mov_imm(1, 7));                                     // 1
+        isa::append_insn(s, bin(isa::VmOp::Div, rdx_slot, 1, ir::Size::S32));   // 2
+        isa::append_insn(s, halt());                                            // 3
+        const auto ctx = run_stream(entry, s, nullptr);
+        expect_slot32(ctx, rax_slot, 14u);
+        expect_slot32(ctx, rdx_slot, 2u);
+    }
+    // div 0xFFFFFFFF / 0x10 → 商 0x0FFFFFFF 余 0xF（无符号满值边界）。
+    {
+        std::vector<u8> s;
+        isa::append_insn(s, mov_imm(rax_slot, 0xFFFFFFFFu));                    // 0
+        isa::append_insn(s, mov_imm(1, 0x10u));                                 // 1
+        isa::append_insn(s, bin(isa::VmOp::Div, rdx_slot, 1, ir::Size::S32));   // 2
+        isa::append_insn(s, halt());                                            // 3
+        const auto ctx = run_stream(entry, s, nullptr);
+        expect_slot32(ctx, rax_slot, 0x0FFFFFFFu);
+        expect_slot32(ctx, rdx_slot, 0xFu);
+    }
+    // idiv -100 / 7（cdq 前置：edx = sext(eax) = 0xFFFFFFFF）→ 商 -14 余 -2。
+    {
+        std::vector<u8> s;
+        isa::append_insn(s, mov_imm(rax_slot, static_cast<u32>(-100)));         // 0
+        isa::append_insn(s, cdq());                                             // 1
+        isa::append_insn(s, mov_imm(1, 7));                                     // 2
+        isa::append_insn(s, bin(isa::VmOp::Idiv, rdx_slot, 1, ir::Size::S32));  // 3
+        isa::append_insn(s, halt());                                            // 4
+        const auto ctx = run_stream(entry, s, nullptr);
+        expect_slot32(ctx, rax_slot, static_cast<u32>(-14));
+        expect_slot32(ctx, rdx_slot, static_cast<u32>(-2));
+    }
+    // idiv 100 / -7（cdq: edx=0，正被除数）→ 商 -14 余 2（C 语义截断向零）。
+    {
+        std::vector<u8> s;
+        isa::append_insn(s, mov_imm(rax_slot, 100));                            // 0
+        isa::append_insn(s, cdq());                                             // 1
+        isa::append_insn(s, mov_imm(1, static_cast<u32>(-7)));                  // 2
+        isa::append_insn(s, bin(isa::VmOp::Idiv, rdx_slot, 1, ir::Size::S32));  // 3
+        isa::append_insn(s, halt());                                            // 4
+        const auto ctx = run_stream(entry, s, nullptr);
+        expect_slot32(ctx, rax_slot, static_cast<u32>(-14));
+        expect_slot32(ctx, rdx_slot, 2u);
+    }
+    // div by 1 → 商 = 被除数 余 0（identity 边界）。
+    {
+        std::vector<u8> s;
+        isa::append_insn(s, mov_imm(rax_slot, 0xDEADBEEFu));                    // 0
+        isa::append_insn(s, mov_imm(1, 1));                                     // 1
+        isa::append_insn(s, bin(isa::VmOp::Div, rdx_slot, 1, ir::Size::S32));   // 2
+        isa::append_insn(s, halt());                                            // 3
+        const auto ctx = run_stream(entry, s, nullptr);
+        expect_slot32(ctx, rax_slot, 0xDEADBEEFu);
+        expect_slot32(ctx, rdx_slot, 0u);
+    }
+    // 被除数槽不受除数槽选取影响：div 后 Rax/Rdx 之外的槽原样（ts ∉ {eax,
+    // edx} 静态保证的旁证 —— 除数临时不复用 dividend 物理位）。
+    {
+        std::vector<u8> s;
+        isa::append_insn(s, mov_imm(rax_slot, 1000));                           // 0
+        isa::append_insn(s, mov_imm(3, 0xABCDu));                               // 1  观察槽
+        isa::append_insn(s, mov_imm(1, 10));                                    // 2
+        isa::append_insn(s, bin(isa::VmOp::Div, rdx_slot, 1, ir::Size::S32));   // 3
+        isa::append_insn(s, halt());                                            // 4
+        const auto ctx = run_stream(entry, s, nullptr);
+        expect_slot32(ctx, rax_slot, 100u);
+        expect_slot32(ctx, rdx_slot, 0u);
+        expect_slot32(ctx, 3, 0xABCDu);
     }
 }
 

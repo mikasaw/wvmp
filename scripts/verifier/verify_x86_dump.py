@@ -71,6 +71,9 @@ BATTERY_HANDLERS = {
     "xmmload", "xmmstore", "xmmfromgp", "gpfromxmm",
     # X6 (MIT-454) A=X3d 批次三：SSE 比较族（flags 面，32 op 收尾）。
     "ucomiss", "ucomisd",
+    # X7 (MIT-455) 批二：Div/Idiv 32 位真 handler（build_div_idiv 镜像，
+    # 453 b59b 残面收口；除零 = 真 #DE 直通，电池 6 组商/余双槽断言）。
+    "div", "idiv",
 }
 
 HEADER_RE = re.compile(
