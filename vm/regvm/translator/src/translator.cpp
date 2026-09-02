@@ -8,6 +8,8 @@
 #include "wvmp/regvm/isa/encoding.hpp"
 #include "wvmp/regvm/isa/vm_op.hpp"
 #include "wvmp/regvm/isa/vm_reg.hpp"
+// MIT-451 (X5b) B.2：kX86GuardBytes（x86 栈深 walk 预算单一来源）。
+#include "wvmp/regvm/runtime/runtime_x86.hpp"
 
 #include <cinttypes>
 #include <cstdio>
@@ -3019,6 +3021,276 @@ struct Translator {
     }
 };
 
+// ============================================================================
+// MIT-451 (X5b) B.2：翻译期栈深 walk（D1 路线 (i) 兜底层，双 arch 共享，D4）。
+//
+// 背景（X5 B.2 缺陷实录 → 442 规则升级为产品正确性边界）：真实 codegen 在
+// 区域内发 push（mul64hi 的 call-arg push 形）时，guest push 从 ns（区域进
+// 入时刻 esp = v4 初值）下探真实写内存；x86 stub 的 callee-saved 保存区
+// [ns-4..ns-0x10] 与 ctx 区正位于此——写穿 → VM 退出还原垃圾 → 确定性 AV。
+// X5b 起硬件侧由 entry guard 垫栈吸收（runtime_x86.hpp kX86GuardBytes，
+// x64 无 guard）；本 walk = 逻辑侧守门：净栈深（字节）超 guard 预算的函数
+// 整函数 C1 gate 保原生（note 通道既有机制，零新协议面）。
+//
+// 预算（bytes，guest 可下探深度上限）：
+//   x86 = kX86GuardBytes（guard 区实际容量）；x64 = 0（无 guard，任何区内
+//   push/sub rsp 即 gate——x64 prologue 常态 sub rsp/mov [rsp+8] 不命中，
+//   X5 实测 wvmpTest x64 0 gate，本 walk 是手写/第三方 x64 形态的盲区预防）。
+//
+// 规则（线性地址序 over-approximation，宁窄勿宽，D5）：
+//   1) 净深 d（有符号字节，v4 相对 ns 的偏移）：Push += stride(size)
+//      （S64=8/S16=2/其余=4）、Pop -=；Op::Sub/Add dst=Rsp src=Imm → ±imm；
+//      d > budget 任一点 → gate。
+//   2) rsp 静态改写面：Mov/Lea dst=Rsp —— 源 = Rsp 自身/别名跟踪寄存器
+//      （leave 链经 lifter 折条为 Mov Rsp<-Rbp + Pop Rbp，X2a ⑥）可跟踪；
+//      其余（绝对改写 / 未知值源）→ gate（保守）。
+//   3) 负位移 reach：Load/Store/Lea/ALU-mem/lock 载体的 mem 操作数
+//      base=Rsp 或 base=别名寄存器（值 = v4+off，mov ebp,esp / lea 系标准
+//      帧指针形态）且 disp<0 时，最深字节 = d - off + |disp| + 访存宽 >
+//      budget → gate（guard 区是唯一安全区）。base 值未知（未跟踪寄存器）
+//      的负位移不检查——静态不可判定，如实披露（预判 §F.2 折打面）。
+//   4) 回边增长：Jcc/Jmp（Imm 目标在区内）目标地址 < 指令地址（回边/环）
+//      且 d_branch > d_target → 无界增长 → gate；d_branch <= d_target 有界
+//      （逐次不增）放行。前向边不查（线性 carry 已是任何路径的 over-approx）。
+//   5) 出口平衡：ExitNative 候选（Imm 目标越区）与 Halt（末块 fallthrough
+//      可达终态）点要求 d == 0——出口物理 esp = ns（stub 尾声 add esp,kCtxSize
+//      + 4 pop + add esp,G 后终态 jmp；Ret 出口例外，物理 esp := v4' 自配
+//      平），延续代码对 esp 敏感（/O2 esp 帧 [esp±X]）时 d!=0 即静默错。
+//      mul64hi（call-arg push、清栈在区外延迟执行）由此保持 gate——行为
+//      保真，esp-resync 前瞻（静态验证延续代码 mov esp,ebp 重同步）留档
+//      GAPS X5b 节后续单。
+//   6) 跳转表命中（Jmp Reg/Mem 预扫描 ok）：targets 逐个按 4) 检查；未命中
+//      间接 jmp 不在此 gate（translate_jump 既有 note 兜底，避免双 note）。
+//   7) Ret 不检查（出口自配平）；Call 不改 d（callgate 参数桥读 [v4+4i]，
+//      窗在 v4 上方，callee 用独立窗口）。
+//
+// 别名跟踪（小规模、保守）：reg → 相对 v4 的偏移。建立 = Mov reg<-Rsp(=0) /
+// Lea reg<-[Rsp+disp](=disp) / Mov reg<-别名(=off) / Add·Sub 别名 ±imm；
+// 失效 = 其余任何写（Pop/Load/ALU 非跟踪源/Imul/移位族/一元族）与 Call 的
+// caller-saved 清空（x86 eax/ecx/edx，x64 另含 r8-r11；callee-saved 跨
+// callgate 存活 = ABI 事实，帧指针惯用面恰在其上）。
+// ============================================================================
+
+struct StackWalkVerdict {
+    bool ok = true;
+    // 首个违例描述（gate note 正文；含点位 RVA 与数值，不匹配 backend 过滤
+    // 白名单前缀 —— 本 note 必须触发 C1 gate）。
+    std::string violation;
+};
+
+[[nodiscard]] StackWalkVerdict walk_region_stack_depth(
+    const ir::FunctionRegion& fn, i64 budget,
+    const std::unordered_map<u64, JumpTableHandle>& jump_tables) {
+    StackWalkVerdict v;
+    const auto fail = [&](u64 addr, std::string_view what) {
+        if (!v.ok) return;
+        v.ok = false;
+        char buf[160];
+        std::snprintf(buf, sizeof(buf), "stack-depth-gate @ 0x%" PRIX64 ": %.*s",
+                      addr, static_cast<int>(what.size()), what.data());
+        v.violation = buf;
+    };
+    const auto stride_of = [](ir::Size sz) -> i64 {
+        switch (sz) {
+        case ir::Size::S64: return 8;
+        case ir::Size::S16: return 2;
+        case ir::Size::S8: return 1;
+        default: return 4;
+        }
+    };
+    const auto mem_width = [&](ir::Size sz) -> i64 {
+        return stride_of(sz);  // 同宽表（S64=8/S16=2/S8=1/其余=4）
+    };
+    // caller-saved 别名失效集（ir::Reg 域）。
+    const auto is_caller_saved = [&](ir::Reg r) {
+        switch (r) {
+        case ir::Reg::Rax: case ir::Reg::Rcx: case ir::Reg::Rdx:
+            return true;
+        case ir::Reg::R8: case ir::Reg::R9: case ir::Reg::R10:
+        case ir::Reg::R11:
+            return fn.arch == ir::Arch::X64;  // x86 无 r8+
+        default:
+            return false;
+        }
+    };
+
+    i64 d = 0;                                  // 净深（字节，v4 相对 ns）
+    i64 max_d = 0;
+    std::unordered_map<ir::Reg, i64> alias;     // 寄存器 → 相对 v4 偏移
+    std::unordered_map<u64, i64> d_at;          // 指令地址 → walk 时刻 d
+    d_at.reserve(fn.blocks.size() * 8);
+
+    const auto check_reach = [&](u64 addr, const ir::MemOperand& m, i64 width) {
+        if (m.disp >= 0) return;
+        // 地址 = v4 + off + disp（base=Rsp 时 off=0）；其相对 ns 的深度 =
+        // d - off - disp，加访存宽 = 最深字节触碰面。
+        i64 off = 0;
+        if (m.base == ir::Reg::Rsp) {
+            off = 0;
+        } else if (m.base != ir::Reg::Rip) {
+            const auto it = alias.find(m.base);
+            if (it == alias.end()) return;  // 值未知基：披露面，不 gate（规则 3）
+            off = it->second;
+        } else {
+            return;  // rip 无栈语义
+        }
+        const i64 reach = d - off - m.disp + width;
+        if (reach > budget)
+            fail(addr, "栈写下探超 guard 预算 (负位移 reach)");
+    };
+
+    for (const ir::BasicBlock& b : fn.blocks) {
+        for (const ir::Insn& in : b.insns) {
+            d_at[in.addr] = d;
+            // --- 净深推进（规则 1/2）---
+            // S16/S8 push/pop 不在本 walk 建模内（translate_push/pop 对该
+            // 位宽既有 gate note 兜底——442 裁决"栈推进 2B 不在 VM 栈模型
+            // 内"，walk 只建模翻译器真实发射的栈效应，避免双 note 噪声）。
+            const bool stack_modeled =
+                in.size == ir::Size::S32 || in.size == ir::Size::S64;
+            if (in.op == ir::Op::Push && stack_modeled) {
+                d += stride_of(in.size);
+                max_d = std::max(max_d, d);
+                if (d > budget) fail(in.addr, "区域内 push 净深超 guard 预算");
+            } else if (in.op == ir::Op::Pop && stack_modeled) {
+                d -= stride_of(in.size);
+                if (in.dst.kind == ir::Operand::Kind::Reg)
+                    alias.erase(in.dst.reg);
+            } else if ((in.op == ir::Op::Sub || in.op == ir::Op::Add) &&
+                       in.dst.kind == ir::Operand::Kind::Reg &&
+                       in.dst.reg == ir::Reg::Rsp &&
+                       in.src.kind == ir::Operand::Kind::Imm) {
+                d += in.op == ir::Op::Sub ? in.src.imm : -in.src.imm;
+                max_d = std::max(max_d, d);
+                if (d > budget) fail(in.addr, "区域内 sub esp 净深超 guard 预算");
+            } else if (in.dst.kind == ir::Operand::Kind::Reg &&
+                       in.dst.reg == ir::Reg::Rsp &&
+                       (in.op == ir::Op::Mov || in.op == ir::Op::Lea)) {
+                // rsp 静态改写面（规则 2）。源 = 别名跟踪寄存器（leave 链
+                // `mov esp,ebp` 形）可精确跟踪；未跟踪寄存器源按"良构帧
+                // 指针 >= esp"假定处理（ebp = 帧基在 esp 上方，esp:=ebp 只
+                // 上移 → 深度不增；违例形态 = 帧指针在栈顶之下，编译器不
+                // 产——披露面 GAPS X5b 节）：d 保守维持原值（此后 reach/预算
+                // 检查按更深的原 d 判，安全方向）。绝对不可跟踪形（立即数/
+                // 计算地址）→ gate。
+                bool tracked = false;
+                if (in.op == ir::Op::Mov && in.src.kind == ir::Operand::Kind::Reg) {
+                    if (in.src.reg == ir::Reg::Rsp) {
+                        tracked = true;  // 自身搬移，no-op
+                    } else {
+                        const auto it = alias.find(in.src.reg);
+                        if (it != alias.end()) {
+                            d -= it->second;
+                            tracked = true;
+                        } else {
+                            tracked = true;  // 帧上移假定：d 保守不变
+                        }
+                    }
+                } else if (in.op == ir::Op::Lea &&
+                           in.src.kind == ir::Operand::Kind::Mem &&
+                           in.src.mem.base == ir::Reg::Rsp &&
+                           in.src.mem.index == ir::Reg::Flags) {
+                    d -= in.src.mem.disp;
+                    tracked = true;
+                }
+                if (!tracked) fail(in.addr, "rsp 非静态可跟踪改写");
+                max_d = std::max(max_d, d);
+            }
+            // --- 别名维护 ---
+            if (in.dst.kind == ir::Operand::Kind::Reg &&
+                in.dst.reg != ir::Reg::Rsp) {
+                const ir::Reg rd = in.dst.reg;
+                bool defined = false;
+                if (in.op == ir::Op::Mov) {
+                    if (in.src.kind == ir::Operand::Kind::Reg &&
+                        in.src.reg == ir::Reg::Rsp) {
+                        alias[rd] = 0; defined = true;
+                    } else if (in.src.kind == ir::Operand::Kind::Reg) {
+                        const auto it = alias.find(in.src.reg);
+                        if (it != alias.end()) { alias[rd] = it->second; defined = true; }
+                    }
+                } else if (in.op == ir::Op::Lea &&
+                           in.src.kind == ir::Operand::Kind::Mem) {
+                    if (in.src.mem.base == ir::Reg::Rsp &&
+                        in.src.mem.index == ir::Reg::Flags) {
+                        alias[rd] = in.src.mem.disp; defined = true;
+                    } else if (in.src.mem.index == ir::Reg::Flags) {
+                        const auto it = alias.find(in.src.mem.base);
+                        if (it != alias.end()) {
+                            alias[rd] = it->second + in.src.mem.disp; defined = true;
+                        }
+                    }
+                } else if ((in.op == ir::Op::Add || in.op == ir::Op::Sub) &&
+                           in.src.kind == ir::Operand::Kind::Imm) {
+                    const auto it = alias.find(rd);
+                    if (it != alias.end()) {
+                        // off = 值 − v4；值 ±imm 而 v4 不动 → off 同向跟随。
+                        it->second += in.op == ir::Op::Add ? in.src.imm : -in.src.imm;
+                        defined = true;
+                    }
+                }
+                if (!defined) alias.erase(rd);
+            }
+            if (in.op == ir::Op::Call) {
+                for (int r = 0; r < 32; ++r)
+                    if (is_caller_saved(static_cast<ir::Reg>(r))) alias.erase(static_cast<ir::Reg>(r));
+            }
+            // --- 负位移 reach（规则 3）---
+            const i64 width = mem_width(in.size);
+            if (in.dst.kind == ir::Operand::Kind::Mem)
+                check_reach(in.addr, in.dst.mem, width);
+            if (in.src.kind == ir::Operand::Kind::Mem)
+                check_reach(in.addr, in.src.mem, width);
+            // --- 控制流检查（规则 4/5/6）---
+            if (in.op == ir::Op::Jcc || in.op == ir::Op::Jmp) {
+                if (in.dst.kind == ir::Operand::Kind::Imm) {
+                    const u64 target = static_cast<u64>(in.dst.imm);
+                    const bool in_region =
+                        target >= fn.begin_rva && target < fn.end_rva;
+                    if (!in_region) {
+                        if (d != 0)
+                            fail(in.addr, "ExitNative 出口栈不平衡 (d != 0)");
+                    } else {
+                        // lifter 不变量：区内分支目标必为已提升指令地址
+                        // （块切分即分支目标）；d_at miss 仅见于合成 IR
+                        // （测试 helper 固定 addr）——跳过不 gate。
+                        const auto it = d_at.find(target);
+                        if (it != d_at.end() && target < in.addr &&
+                            d > it->second) {
+                            fail(in.addr, "回边栈净深无界增长");
+                        }
+                    }
+                } else if (in.op == ir::Op::Jmp) {
+                    const auto h = jump_tables.find(in.addr);
+                    if (h != jump_tables.end() && h->second.ok) {
+                        for (const u64 target : h->second.targets) {
+                            const auto it = d_at.find(target);
+                            if (it != d_at.end() && target < in.addr &&
+                                d > it->second) {
+                                fail(in.addr, "跳表回边栈净深无界增长");
+                            }
+                        }
+                    }
+                    // 未命中表形态 → translate_jump 既有 gate note 兜底
+                }
+            }
+            if (!v.ok) return v;  // 首违例即收（note 一次，门为函数粒度）
+        }
+    }
+    // --- 终态平衡（规则 5）：末块 fallthrough 可达 Halt 时 d 必须为 0 ---
+    if (!fn.blocks.empty()) {
+        const ir::BasicBlock& last = fn.blocks.back();
+        const bool falls_through =
+            last.insns.empty() ||
+            (last.insns.back().op != ir::Op::Jmp &&
+             last.insns.back().op != ir::Op::Ret);
+        if (falls_through && d != 0)
+            fail(fn.end_rva, "Halt 出口栈不平衡 (d != 0，区外延迟清栈形态)");
+    }
+    (void)max_d;
+    return v;
+}
+
 } // namespace
 
 TranslateResult translate_function(const ir::FunctionRegion& fn) {
@@ -3120,6 +3392,20 @@ TranslateResult translate_function(const ir::FunctionRegion& fn,
     }
 
     // 本地块副本：按预扫描切分点切块（无命中时不切，行为与主 bbc93e6 全等）。
+    // MIT-451 (X5b) B.2：栈深 walk（D1 (i) 兜底层，双 arch，D4）。跳表预扫描
+    // 之后、翻译之前——违例即 gate note（整函数保原生，virtualize 既有 note
+    // 通道消费），翻译照常完成（note 触发上层放弃，字节码仅诊断可见）。
+    // 预算 = x86 kX86GuardBytes（guard 区实际容量，runtime_x86.hpp 单一来源）
+    // / x64 0（无 guard，任何区内栈下探即 gate）。
+    {
+        const i64 budget =
+            fn.arch == ir::Arch::X86
+                ? static_cast<i64>(wvmp::regvm::runtime::kX86GuardBytes)
+                : 0;
+        StackWalkVerdict walk =
+            walk_region_stack_depth(fn, budget, jump_tables);
+        if (!walk.ok) result.notes.emplace_back(std::move(walk.violation));
+    }
     std::vector<ir::BasicBlock> blocks = split_blocks(fn.blocks, split_addrs);
 
     // 地址 -> 块下标（块按向量顺序即布局顺序排放）。预扫描切分后重建。

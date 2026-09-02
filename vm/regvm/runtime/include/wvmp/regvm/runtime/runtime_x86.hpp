@@ -14,11 +14,27 @@ namespace wvmp::regvm::runtime {
 // ——本常量 = x86 面私有单一来源（原定义在 asmgen.cpp 匿名 namespace，X4
 // stub_gen 读侧对接需跨 TU 消费，按 B2 单一来源纪律上移本头；asmgen.cpp 保留
 // static_assert 防漂移）。
-//   stub 入口（esp = ns - 0x10 - kCtxSize）:  mov [esp - 0x80], <VA>
-//   stub HALT 段（esp = ns）:                 jmp dword ptr [esp - 0x258]
-//   ExitNative handler（native_sp 基准）:     [ns - 0x258]
-inline constexpr u64 kX86ExitSlotDepth = 4 * 4 + kCtxSize + 0x80;  // 0x10+0x1C8+0x80 = 0x258
-static_assert(kX86ExitSlotDepth == 0x258, "x86 exit slot depth regressed");
+//   stub 入口（esp = ns - kX86GuardBytes - 0x10 - kCtxSize）:
+//                                            mov [esp - 0x80], <VA>
+//   stub HALT 段（esp = ns）:                jmp dword ptr [esp - 0x2D8]
+//   ExitNative handler（native_sp 基准）:     [ns - 0x2D8]
+//
+// MIT-451 (X5b) B.2：entry guard 垫栈（D1 路线 (v)）。真实 /Od x86 产物在
+// 区域内发 push（mul64hi 的 call-arg push 形）→ guest push 从 ns 下探写穿
+// stub 保存区 [ns-4..ns-0x10] + ctx 区 → VM 退出还原垃圾 → 确定性 AV（X5
+// B.2 缺陷实录，442"guest 栈写恒 >= ns"规则对真实产物升级为产品正确性边
+// 界）。修复 = stub 序言最前 `sub esp, kX86GuardBytes`：guard 区 [ns-G..ns-4]
+// 吸收 guest push（净深 <= G 字节由翻译期栈深 gate 保证，见 translator.cpp
+// 栈深 walk），保存区/ctx/执行帧整体下移 G。N 由 B.1 实测 p99(=64B) 定 +
+// 2 倍固定余量 = 128（32 dword；x86 池与 wvmpTest 语料 (v)@128 存活率
+// 13/14，@256/@512 无增益）。x64 面无 guard（dump ffd47289 恒等约束），
+// x64 侧由 translator 栈深 walk budget=0 兜底（D4 双 arch 对称纪律）。
+inline constexpr u64 kX86GuardBytes = 128;
+// 派生式：guard + 4 callee-saved push + ctx + 0x80 余量（余量含义不变：槽位
+// 落在 host 帧一切栈活动之下）。B.1 前原值 0x258 = 0x10+0x1C8+0x80。
+inline constexpr u64 kX86ExitSlotDepth =
+    kX86GuardBytes + 4 * 4 + kCtxSize + 0x80;
+static_assert(kX86ExitSlotDepth == 0x2D8, "x86 exit slot depth regressed");
 
 // =============================================================================
 // MIT-443 (X3a)：x86 (KS_MODE_32) 解释器码体生成入口 —— asmgen 双模的 32 位面。

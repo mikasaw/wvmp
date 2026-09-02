@@ -9,6 +9,10 @@ target_include_directories(wvmp_regvm_translator PUBLIC
 # 聚合器 wvmp_regvm 与下方测试均显式挂 $<TARGET_OBJECTS:wvmp_regvm_isa>。
 target_link_libraries(wvmp_regvm_translator PUBLIC
     wvmp_regvm_isa
+    wvmp_regvm_runtime
+    # MIT-451 (X5b) B.2：translator 栈深 walk 预算消费 runtime_x86.hpp 的
+    # kX86GuardBytes（单一来源）——本链接仅为头路径传播（OBJECT 库对象文件
+    # 由聚合器显式挂，注释见上）。
     wvmp::vm
     wvmp::ir
     wvmp::common

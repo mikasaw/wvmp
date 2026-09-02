@@ -260,14 +260,21 @@ static_assert(kX86CallgateWindow % 16 == 0,
 //   dword 到 callee 窗口（i 逆序 push → arg0 落最低），cdecl caller-cleans
 //   语义下多预置无害：0-arg callee 不读参数、esp 由 host_rsp 重基统一回收。
 //   固定宽 = 翻译层无需 arg_count 通路（cond_or_size 维持 0），零协议新面。
-constexpr u64 kX86CallgateArgDwords = 4;
+// MIT-451 (X5b) B.2：窗宽 4→8（X5 B.4 留 X5b 备选，随 guard 垫栈一并行使）。
+// guard 使真实 /Od 的 push 形参数（push arg; call f，参数落 [v4..] = guard
+// 区）行为安全后，4 dword 窗成为 5+ 参调用的确定性丢参点（X5 B.4 实测
+// arg4 丢失）。8 dword = 32B 覆盖实测形态 + 余量；多预置 cdecl 无害语义
+// 不变；**> 8 dword 仍超窗静默丢参**（宁窄勿宽边界，如实披露——arg_count
+// 静态通路仍为零新面，超窗形态归 translator 后续单裁决）。
+constexpr u64 kX86CallgateArgDwords = 8;
 static_assert(kX86CallgateArgDwords * 4 <= kX86CallgateWindow,
               "x86 callgate fixed argument window must fit the callee window");
 
 // MIT-445 (X3c B.2)：x86 4B 退出槽深度 —— MIT-446 (X4) 起定义上移
 // runtime_x86.hpp（stub_gen 读侧跨 TU 消费的单一来源）；本文件保留
-// static_assert 防漂移。
-static_assert(kX86ExitSlotDepth == 4 * 4 + kCtxSize + 0x80,
+// static_assert 防漂移。MIT-451 (X5b) B.2：派生式含 kX86GuardBytes 项
+// （guard 垫栈，runtime_x86.hpp 注）。
+static_assert(kX86ExitSlotDepth == kX86GuardBytes + 4 * 4 + kCtxSize + 0x80,
               "kX86ExitSlotDepth derivation drifted from runtime_x86.hpp");
 
 // MIT-445 (X3c B.3)：Ret x86 出口栈坐标（build_ret_x86 专用派生）。

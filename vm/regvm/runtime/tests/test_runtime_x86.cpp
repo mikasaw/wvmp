@@ -144,10 +144,11 @@ static u32 __cdecl xcg_probe(void) {
     ++g_xcg_calls;
     return 0x5A5u;
 }
-// MIT-446 (X4) B.1：参数窗读取面 = guest [v4..v4+0xC]（固定 4 dword 预置）。
-// 电池 ctx 的 v4 必须指向真实映射缓冲（旧用例 v4=0 在新协议下读 NULL 页）；
-// 0-arg callee 不读参数，窗口内容无关，esp 由 host_rsp 重基统一回收。
-static alignas(16) u8 g_xcg_stack[0x40];
+// MIT-446 (X4) B.1：参数窗读取面 = guest [v4..v4+4*(N-1)]（固定预置，
+// MIT-451 (X5b) B.2 起窗口 8 dword = [v4..v4+0x1C]）。电池 ctx 的 v4 必须指
+// 向真实映射缓冲（旧用例 v4=0 在新协议下读 NULL 页）；0-arg callee 不读参
+// 数，窗口内容无关，esp 由 host_rsp 重基统一回收。
+static alignas(16) u8 g_xcg_stack[0x60];
 isa::VmInsn callgate_rva(u32 rva) {
     return isa::make_insn(isa::VmOp::CallGate, isa::OpKind::None, 0,
                           isa::OpKind::None, 0, rva, 0);
@@ -1977,7 +1978,8 @@ TEST(X86Battery, CallGateRvaFormRealCall) {
     ctx.pc = 0;
     ctx.scratch_mem = kFakeBase;
     ctx.regs[isa::vm_reg_of(ir::Reg::Rsp)] =
-        reinterpret_cast<u64>(g_xcg_stack + 0x30);  // X4 参数窗: v4 = 真实映射栈
+        reinterpret_cast<u64>(g_xcg_stack + 0x20);  // X4 参数窗: v4 = 真实映射栈
+                                     // （X5b 8 dword 窗 = [v4..v4+0x1C] 落缓冲内）
     g_xcg_calls = 0;
     rwx.entry()(&ctx);
     EXPECT_EQ(g_xcg_calls, 1u);          // 真调用（ callee 执行）
@@ -2005,7 +2007,8 @@ TEST(X86Battery, CallGateRegFormRealCall) {
     ctx.pc = 0;
     ctx.scratch_mem = 0;
     ctx.regs[isa::vm_reg_of(ir::Reg::Rsp)] =
-        reinterpret_cast<u64>(g_xcg_stack + 0x30);  // X4 参数窗: v4 = 真实映射栈
+        reinterpret_cast<u64>(g_xcg_stack + 0x20);  // X4 参数窗: v4 = 真实映射栈
+                                     // （X5b 8 dword 窗 = [v4..v4+0x1C] 落缓冲内）
     g_xcg_calls = 0;
     rwx.entry()(&ctx);
     EXPECT_EQ(g_xcg_calls, 1u);          // 真调用
@@ -2036,7 +2039,8 @@ TEST(X86Battery, CallGateRegFormComputedTarget) {
     ctx.pc = 0;
     ctx.scratch_mem = kFakeBase;
     ctx.regs[isa::vm_reg_of(ir::Reg::Rsp)] =
-        reinterpret_cast<u64>(g_xcg_stack + 0x30);  // X4 参数窗: v4 = 真实映射栈
+        reinterpret_cast<u64>(g_xcg_stack + 0x20);  // X4 参数窗: v4 = 真实映射栈
+                                     // （X5b 8 dword 窗 = [v4..v4+0x1C] 落缓冲内）
     g_xcg_calls = 0;
     rwx.entry()(&ctx);
     EXPECT_EQ(g_xcg_calls, 1u);
@@ -2046,13 +2050,14 @@ TEST(X86Battery, CallGateRegFormComputedTarget) {
 
 // ---------------------------------------------------------------------------
 // (32) X3c B.2：ExitNative 无条件直退 + 4B 退出槽协议（真执行断言）。
-//      槽地址 = native_sp - 0x258（kX86ExitSlotDepth，X4 stub_gen 读侧对接
+//      槽地址 = native_sp - kX86ExitSlotDepth（X4 stub_gen 读侧对接
 //      锚）；槽内容 = aux + image_base（目标 VA dword）。epilogue（帧回收 +
 //      4 callee-saved pop + ret）后控制返回测试进程。
 // ---------------------------------------------------------------------------
-// 退出槽承载区：静态缓冲（native_sp = 缓冲末端，槽 = 末端 - 0x258 落缓冲内
-// ——电池无 stub，native_sp 由测试预置 [ctx+0x120]）。
-static unsigned long g_xen_area[0x260 / sizeof(unsigned long)];
+// 退出槽承载区：静态缓冲（native_sp = 缓冲末端，槽 = 末端 - kX86ExitSlotDepth
+// 落缓冲内 ——电池无 stub，native_sp 由测试预置 [ctx+0x120]）。MIT-451 (X5b)
+// B.2：kX86ExitSlotDepth 0x258→0x2D8（guard 垫栈派生），缓冲随之扩容。
+static unsigned long g_xen_area[0x2E0 / sizeof(unsigned long)];
 
 static isa::VmInsn exitnative_uncond(u32 rva) {
     return isa::make_insn(isa::VmOp::ExitNative, isa::OpKind::Imm, 0,
@@ -2074,7 +2079,7 @@ TEST(X86Battery, ExitNativeUncondSlotProtocol) {
     RwxImage rwx(gen.image.code);
     constexpr u64 kFakeBase = 0x400000;
     const u64 kNs = reinterpret_cast<u64>(g_xen_area) + sizeof(g_xen_area);
-    const u64 kSlot = kNs - 0x258;   // kX86ExitSlotDepth（同 static_assert 锚）
+    const u64 kSlot = kNs - rt::kX86ExitSlotDepth;  // 单一来源（runtime_x86.hpp）
     std::vector<u8> s;
     isa::append_insn(s, exitnative_uncond(0x1234));                      // 0
     isa::append_insn(s, halt());                                         // 1 (不可达)
@@ -2086,7 +2091,7 @@ TEST(X86Battery, ExitNativeUncondSlotProtocol) {
     ctx.regs[isa::vm_reg_of(ir::Reg::Rsp)] = 0;
     *reinterpret_cast<unsigned long*>(kSlot) = 0xBBBBBBBBul;             // 哨兵
     rwx.entry()(&ctx);
-    // 4B 槽协议：目标 VA = aux + image_base 落 [ns-0x258]。
+    // 4B 槽协议：目标 VA = aux + image_base 落 [ns - kX86ExitSlotDepth]。
     EXPECT_EQ(*reinterpret_cast<unsigned long*>(kSlot), 0x401234ul);
     // 退出路径不 advance（pc 不写回；x64 build_exitnative 同语义）。
     EXPECT_EQ(ctx.pc, 0u);
@@ -2101,7 +2106,7 @@ TEST(X86Battery, ExitNativeCondTakenAndFallthrough) {
     RwxImage rwx(gen.image.code);
     constexpr u64 kFakeBase = 0x400000;
     const u64 kNs = reinterpret_cast<u64>(g_xen_area) + sizeof(g_xen_area);
-    const u64 kSlot = kNs - 0x258;
+    const u64 kSlot = kNs - rt::kX86ExitSlotDepth;  // 单一来源（runtime_x86.hpp）
     // 路 1: ZF=1（SetFlags v2=1）→ cond E 满足 → 退出。
     {
         std::vector<u8> s;

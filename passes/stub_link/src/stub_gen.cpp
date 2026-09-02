@@ -40,6 +40,8 @@ using wvmp::regvm::runtime::kExitSlotDepth;
 // MIT-446 (X4) B.1：x86 退出槽深度单一来源迁至 runtime_x86.hpp（原 asmgen
 // 匿名 namespace 常量上移），x86 stub 两处消费点据此换算。
 using wvmp::regvm::runtime::kX86ExitSlotDepth;
+// MIT-451 (X5b) B.2：entry guard 垫栈深度（单一来源 runtime_x86.hpp）。
+using wvmp::regvm::runtime::kX86GuardBytes;
 
 // 占位 disp32（回填目标 = blob 指令流）：选罕见值便于汇编后定位。
 constexpr u32 kBlobDispDummy = 0xDEAD'0001;
@@ -54,19 +56,26 @@ constexpr u64 kStubPushBytes = wvmp::regvm::runtime::kCalleeSavedIdx.size() * 8;
 // 纪律）。x86 ABI callee-saved = ebx/ebp/esi/edi 4 个（= asmgen kX86CalleeSaved
 // 同集合），4×4B = 0x10；kX86ExitSlotDepth 的派生式（runtime_x86.hpp）内含
 // 同一 push 面，两处由 static_assert 锁死零漂移。
+// MIT-451 (X5b) B.2：entry guard 垫栈（runtime_x86.hpp kX86GuardBytes 单一
+// 来源）——序言最前 sub esp,G 使保存区/ctx 下移，guest push（净深 <= G，由
+// translator 栈深 walk gate 保证）先吃 guard 区 [ns-G..ns-4]，不再写穿保存
+// 区 + ctx 区（X5 mul64hi 缺陷修复，见 runtime_x86.hpp 注）。出口槽换算、
+// v4/native_sp 还原、尾声 unwind 三处随 G 联动，全部由派生式表达，禁字面
+// 量第二份。
 constexpr u64 kStubPushBytesX86 = 4 * 4;  // ebx/ebp/esi/edi
 static_assert(kStubPushBytesX86 % 16 == 0, "x86 stub push face must stay 16-aligned");
-static_assert(kX86ExitSlotDepth == kStubPushBytesX86 + kCtxSize + 0x80,
+static_assert(kX86ExitSlotDepth ==
+                  kX86GuardBytes + kStubPushBytesX86 + kCtxSize + 0x80,
               "x86 stub push face drifted from kX86ExitSlotDepth derivation");
 static_assert(kCtxSize % 4 == 0, "x86 stub ctx zero-fill must be dword-granular");
 
-// 入口预写相对当前 rsp（= ns - kStubPushBytes - kCtxSize）的槽偏移。
-// 选 0x80：disp8 恰好 -128 可编码（keystone 大负 disp 截断坑规避），且
-// 换算到 native_sp 坐标系恰为 kExitSlotDepth（见 runtime.hpp 注释）。
+// 入口预写相对当前 rsp（= ns - kX86GuardBytes - kStubPushBytesX86 - kCtxSize）
+// 的槽偏移。guard 下移后 esp 与槽同步位移，差值恒 0x80（disp8 编码边界纪律
+// 不变；keystone 大负 disp 截断坑规避）。
 constexpr u64 kExitSlotFromStubEntry = kExitSlotDepth - kStubPushBytes - kCtxSize;
-// x86 同构换算（kX86ExitSlotDepth - 0x10 - 0x1C8 = 0x80，disp8 边界同款）。
+// x86 同构换算（kX86ExitSlotDepth - G - 0x10 - 0x1C8 = 0x80）。
 constexpr u64 kX86ExitSlotFromStubEntry =
-    kX86ExitSlotDepth - kStubPushBytesX86 - kCtxSize;
+    kX86ExitSlotDepth - kX86GuardBytes - kStubPushBytesX86 - kCtxSize;
 static_assert(kX86ExitSlotFromStubEntry == 0x80,
               "x86 exit slot entry prewrite must stay disp8-encodable");
 
@@ -191,15 +200,29 @@ std::string build_stub_asm_x64(u64 rt_entry_rva, u64 resume_rva, u64 image_base)
 //   8. xmm 同步不适用（x86 运行时无 SSE handler，ctx.xmm 面未消费；
 //      Win32 ABI xmm 全易失，callgate callee 副作用不建模）。
 //
-// guest 栈写恒 ≥ ns 规则（442 区1 实证）下，Guest cdecl 栈参数经
-// build_callgate_x86 的固定参数窗预置消费（kX86CallgateArgDwords 协议，
-// stub 帧形 = 锚③不变量 "entry 4 push + kCtxSize"）。
+// MIT-451 (X5b) B.2：帧形更新（guard 垫栈）。序言最前 `sub esp,
+// kX86GuardBytes` 垫出保护区 [ns-G..ns-4]，4 callee-saved push 与 ctx 区整体
+// 下移 G；guest push（净深 <= G，translator 栈深 walk gate 保证）先吃 guard，
+// 不再写穿保存区 + ctx 区。联动点（全部派生式，禁字面量第二份）：
+//   - 保存区读回偏移 esp-相对公式不变（esp 与保存区同步下移）；
+//   - v4/native_sp 还原 lea 补 G（v4 恒 = ns = 区域进入时刻 esp）；
+//   - 出口槽预写 [esp-0x80] 不变（esp 与槽同步位移，kX86ExitSlotFromStubEntry
+//     派生式含 G 项）；
+//   - 尾声 4 pop 后 `add esp, G` 回到 esp = ns 再终态 jmp（ExitNative 落点
+//     esp = ns 语义不变；guard 区此时为纯 scratch，Halt d==0 walk gate 保证
+//     guest 未写）。
+// guest 栈写语义（X5b 后）: 净深 <= G 的 push/[esp-负位移]/[ebp-X] 落 guard
+// 区 = 真实内存真实写，行为保真；净深 > G 的函数由 translator 栈深 walk
+// 整函数 C1 gate 保原生（translator.cpp stack-walk）。
 // =============================================================================
 std::string build_stub_asm_x86(u64 rt_entry_rva, u64 blob_stream_rva,
                                u64 resume_rva, u64 image_base) {
     std::string o;
-    // —— 序言：4 callee-saved push + ctx 区（kStubPushBytesX86 + kCtxSize
-    //      参与出口槽换算，禁字面量第二份）。push 序固定 ebx→edi。——
+    // —— 序言：guard 垫栈（X5b）+ 4 callee-saved push + ctx 区（kStubPushBytesX86
+    //      + kCtxSize + kX86GuardBytes 参与出口槽换算，禁字面量第二份）。
+    //      guard 最前垫（[ns-G..ns-4] 吸收 guest push），push 序固定 ebx→edi
+    //      （先 push 在高址）。——
+    o += "sub esp, " + hex(kX86GuardBytes) + "\n";
     o += "push ebx\n push ebp\n push esi\n push edi\n";
     o += "sub esp, " + hex(kCtxSize) + "\n";
     // —— ctx 区清零（槽高半字恒 0 不变量的栈帧来源）。eax/ecx/edx/edi 是
@@ -239,10 +262,11 @@ std::string build_stub_asm_x86(u64 rt_entry_rva, u64 blob_stream_rva,
          hex(kCtxSize + kStubPushBytesX86 - 4 * 4) + "]\n";  // 原 edi（第 4 push）
     o += "mov [esp + " + hex(kCtxRegs + 7 * 8) + "], eax\n";
     // v4 = 原始 rsp（区域代码按原函数帧的 rsp 相对寻址）：当前 esp 比原始
-    // 值低 kStubPushBytesX86(0x10) + kCtxSize(0x1C8) = 0x1D8，用 lea 还原。
-    // 同一原始 esp 写 native_sp（callgate 窗口锚/ExitNative 槽基准，跨指令
+    // 值低 kX86GuardBytes + kStubPushBytesX86(0x10) + kCtxSize(0x1C8)，用 lea
+    // 还原（X5b：lea 补 guard 项——v4 恒 = ns，与 guard 深度无关）。同一
+    // 原始 esp 写 native_sp（callgate 窗口锚/ExitNative 槽基准，跨指令
     // 不变）。eax 原值已在 slot0 保存，可复用。
-    o += "lea eax, [esp + " + hex(kStubPushBytesX86 + kCtxSize) + "]\n";
+    o += "lea eax, [esp + " + hex(kX86GuardBytes + kStubPushBytesX86 + kCtxSize) + "]\n";
     o += "mov [esp + " + hex(kCtxRsp) + "], eax\n";
     o += "mov [esp + " + hex(kCtxNativeSp) + "], eax\n";
     // image_base → scratch_mem 槽（PE32 ImageBase 恒 imm32 可编码；Load/
@@ -251,7 +275,8 @@ std::string build_stub_asm_x86(u64 rt_entry_rva, u64 blob_stream_rva,
     o += "mov dword ptr [esp + " + hex(kCtxScratch) + "], " + hex(image_base) + "\n";
     // ExitNative 退出槽入口预写：生成期常量 VA = image_base + resume_rva
     // （407 v2 铁律：裸 RVA 进槽 = 野跳）。槽地址 = [esp - 0x80]
-    // （esp = ns - 0x1D8 → ns - kX86ExitSlotDepth）。
+    // （esp = ns - G - 0x1D8 → 槽 = ns - kX86ExitSlotDepth，差值恒 0x80，
+    //   G 双侧同消）。
     o += "mov eax, " + hex(image_base + resume_rva) + "\n";
     o += "mov [esp - " + hex(kX86ExitSlotFromStubEntry) + "], eax\n";
     o += "mov dword ptr [esp + 0x8], 0\n";                  // pc = 0（高半字已清零）
@@ -270,6 +295,10 @@ std::string build_stub_asm_x86(u64 rt_entry_rva, u64 blob_stream_rva,
     o += "mov edx, [esp + " + hex(kCtxRegs + 2 * 8) + "]\n";
     o += "add esp, " + hex(kCtxSize) + "\n";
     o += "pop edi\n pop esi\n pop ebp\n pop ebx\n";
+    // X5b：unwind guard 区回到 esp = ns 再终态跳（ExitNative 落点 esp = ns
+    // 语义不变；此时 guard 区为纯 scratch——Halt d==0 由 translator 栈深
+    // walk gate 保证 guest 未写）。
+    o += "add esp, " + hex(kX86GuardBytes) + "\n";
     // 终态：esp = entry rsp = native_sp；经 4B 退出槽间接跳（入口已预写
     // VA(resume_rva)，ExitNative handler 命中时覆写为目标 VA）。Halt 与
     // ExitNative 两条出口共用此通道（x64 形同构）。

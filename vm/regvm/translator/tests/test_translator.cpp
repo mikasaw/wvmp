@@ -216,7 +216,10 @@ TEST(Translate, PushPopExpansion) {
                    v.push_back(q);
                    return v;
                }())}));
-    EXPECT_TRUE(r.notes.empty());
+    // MIT-451 (X5b) B.2：x64 栈深 walk budget=0（无 guard）——区内 push 即
+    // gate note（D4 双 arch 对称；展开形本身不变，本用例继续钉字节码形状）。
+    ASSERT_EQ(r.notes.size(), static_cast<size_t>(1));
+    EXPECT_NE(r.notes[0].find("stack-depth-gate"), std::string::npos);
     const Decoded d = decode_program(r.program);
     ASSERT_EQ(d.insns.size(), static_cast<size_t>(6)); // 4 + Jmp + Halt
     expect_is(d.insns[0], VmOp::Sub, OpKind::Reg, kRsp, OpKind::Imm, 0, 8, kS64);
@@ -1830,6 +1833,8 @@ TEST(Translate, BmiNativeShiftImmNotIntercepted) {
 TEST(Translate, PushPopArchForkX86) {
     // B.2 栈宽分叉: x86 (S32 push/pop) → stride 4 + S32 访存; rsp 算术恒 S64。
     // x64 (S64) 路径已由 PushPopExpansion 钉死 (8/S64, 逐字节不变)。
+    // MIT-451 (X5b) B.2：本用例 arch = x64（fn_of 默认），S32 push 走 4B 下探
+    // → walk budget=0 gate note（x64 无 guard，任何区内栈下探即 gate）。
     const auto r = wvmp::regvm::translator::translate_function(
         fn_of({blk(0x1000, [] {
                    std::vector<ir::Insn> v;
@@ -1841,7 +1846,8 @@ TEST(Translate, PushPopArchForkX86) {
                    v.push_back(q);
                    return v;
                }())}));
-    EXPECT_TRUE(r.notes.empty());
+    ASSERT_EQ(r.notes.size(), static_cast<size_t>(1));
+    EXPECT_NE(r.notes[0].find("stack-depth-gate"), std::string::npos);
     const Decoded d = decode_program(r.program);
     ASSERT_EQ(d.insns.size(), static_cast<size_t>(6));
     expect_is(d.insns[0], VmOp::Sub, OpKind::Reg, kRsp, OpKind::Imm, 0, 4, kS64);
@@ -1870,7 +1876,12 @@ TEST(Translate, LeaveFoldTwoInsnWords) {
     pp.dst = ir::Operand::reg_(ir::Reg::Rbp);
     const auto r = wvmp::regvm::translator::translate_function(fn_of({blk(
         0x1000, {mov(ir::Reg::Rsp, ir::Reg::Rbp, ir::Size::S64), pp})}));
-    EXPECT_TRUE(r.notes.empty());
+    // MIT-451 (X5b) B.2：本用例为合成截断形（leave 无 ret 落 Halt，d=-8）——
+    // 出口平衡规则双向生效（物理 esp = ns，d 任意非 0 皆失配），gate note 为
+    // 预期；折条字节码形状照旧钉死。真实形态 leave;ret 走 Ret 出口自配平，
+    // 不触发本 note（见 RetTerminatorNeedsNoFallthrough 形状）。
+    ASSERT_EQ(r.notes.size(), static_cast<size_t>(1));
+    EXPECT_NE(r.notes[0].find("stack-depth-gate"), std::string::npos);
     const Decoded d = decode_program(r.program);
     ASSERT_EQ(d.insns.size(), static_cast<size_t>(5));  // 3 + Jmp + Halt
     expect_is(d.insns[0], VmOp::Mov, OpKind::Reg, kRsp, OpKind::Reg, kRbp, 0, kS64);
@@ -2027,13 +2038,138 @@ TEST(Translate, X86PushPopSingleOpForm) {
     expect_is(d.insns[1], VmOp::Pop, OpKind::Reg, kRbx, OpKind::None, 0, 0, kS32);
 }
 
+// ==================== MIT-451 (X5b) B.2: 栈深 walk 正反例 ====================
+
+namespace {
+ir::FunctionRegion fn86_of(std::vector<ir::BasicBlock> blocks) {
+    ir::FunctionRegion fn = fn_of(std::move(blocks));
+    fn.arch = ir::Arch::X86;
+    return fn;
+}
+ir::Insn alu_ri(ir::Op op, ir::Reg d, i64 imm, ir::Size sz) {
+    return alu(op, ir::Operand::reg_(d), ir::Operand::imm_(imm), sz);
+}
+ir::Insn store_mem(ir::Reg base, i64 disp, ir::Reg src, ir::Size sz) {
+    ir::Insn i = I(ir::Op::Store, sz);
+    i.dst = ir::Operand::mem_(m(base, ir::Reg::Flags, 0, disp));
+    i.src = ir::Operand::reg_(src);
+    return i;
+}
+bool has_stack_depth_gate(const wvmp::regvm::translator::TranslateResult& r) {
+    for (const auto& n : r.notes)
+        if (n.find("stack-depth-gate") != std::string::npos) return true;
+    return false;
+}
+} // namespace
+
+TEST(Translate, StackWalkX86BalancedPushesPass) {
+    // 正例：平衡 push/pop（真实 /Od spill 形）在 guard 预算内 → 无 note。
+    // 覆盖 mul64hi 之外的 4 个 wvmpTest 翻正区的静态形态。
+    ir::FunctionRegion fn = fn86_of({blk(0x1000, {
+        push_insn(ir::Reg::Rbx, ir::Size::S32),
+        push_insn(ir::Reg::Rsi, ir::Size::S32),
+        pop_insn(ir::Reg::Rsi, ir::Size::S32),
+        pop_insn(ir::Reg::Rbx, ir::Size::S32),
+    })});
+    const auto r = wvmp::regvm::translator::translate_function(fn);
+    EXPECT_TRUE(r.notes.empty());
+}
+
+TEST(Translate, StackWalkX86SubEspOverBudgetGates) {
+    // 反例①：sub esp,0x200 净深 512 > kX86GuardBytes(128) → 整函数 gate。
+    const auto r = wvmp::regvm::translator::translate_function(
+        fn86_of({blk(0x1000, {alu_ri(ir::Op::Sub, ir::Reg::Rsp, 0x200, ir::Size::S32)})}));
+    EXPECT_TRUE(has_stack_depth_gate(r));
+}
+
+TEST(Translate, StackWalkX86FrameReachOverBudgetGates) {
+    // 反例②：mov ebp,esp + [ebp-0x200] 别名 reach 0x204 > 预算 → gate。
+    const auto r = wvmp::regvm::translator::translate_function(
+        fn86_of({blk(0x1000, {mov(ir::Reg::Rbp, ir::Reg::Rsp, ir::Size::S32),
+                              store_mem(ir::Reg::Rbp, -0x200, ir::Reg::Rax, ir::Size::S32)})}));
+    EXPECT_TRUE(has_stack_depth_gate(r));
+}
+
+TEST(Translate, StackWalkX86FrameReachWithinBudgetPass) {
+    // 正例：mov ebp,esp + [ebp-0x28]（mul64hi 局部帧形态）reach 0x2C ≤ 预算
+    // → 无 note（guard 区吸收）。
+    const auto r = wvmp::regvm::translator::translate_function(
+        fn86_of({blk(0x1000, {mov(ir::Reg::Rbp, ir::Reg::Rsp, ir::Size::S32),
+                              store_mem(ir::Reg::Rbp, -0x28, ir::Reg::Rax, ir::Size::S32)})}));
+    EXPECT_TRUE(r.notes.empty());
+}
+
+TEST(Translate, StackWalkX86BackEdgeGrowthGates) {
+    // 反例③：回边净深无界增长（循环体内 push 不配平）→ gate（D5 宁窄勿宽）。
+    // b0@0x1000: push eax; add eax,1; jne 0x1000（回边时 d=4 > 目标 d=0）。
+    // ⚠️ 显式真实 addr：回边检查按 d_at（insn.addr → d）对账，测试 helper
+    // 默认固定 addr 会令目标 miss 而跳过（lifter 不变量下真实 IR 无此形态）。
+    ir::Insn p = push_insn(ir::Reg::Rax, ir::Size::S32);
+    ir::Insn a = alu_ri(ir::Op::Add, ir::Reg::Rax, 1, ir::Size::S32);
+    ir::Insn j = jump(ir::Op::Jcc, 0x1000, ir::Cond::Ne);
+    p.addr = 0x1000;
+    a.addr = 0x1004;
+    j.addr = 0x1007;
+    const auto r = wvmp::regvm::translator::translate_function(
+        fn86_of({blk(0x1000, {p, a, j})}));
+    EXPECT_TRUE(has_stack_depth_gate(r));
+}
+
+TEST(Translate, StackWalkX86BalancedLoopPass) {
+    // 正例：环内 push/pop 配平（回边 d == 目标 d）→ 无 note。
+    // b0@0x1000: push; pop; add; jne 0x1000（回边 d=0）。
+    ir::Insn p = push_insn(ir::Reg::Rax, ir::Size::S32);
+    ir::Insn q = pop_insn(ir::Reg::Rax, ir::Size::S32);
+    ir::Insn a = alu_ri(ir::Op::Add, ir::Reg::Rax, 1, ir::Size::S32);
+    ir::Insn j = jump(ir::Op::Jcc, 0x1000, ir::Cond::Ne);
+    p.addr = 0x1000;
+    q.addr = 0x1004;
+    a.addr = 0x1008;
+    j.addr = 0x100b;
+    const auto r = wvmp::regvm::translator::translate_function(
+        fn86_of({blk(0x1000, {p, q, a, j})}));
+    EXPECT_TRUE(r.notes.empty());
+}
+
+TEST(Translate, StackWalkX86ExitNativeUnbalancedGates) {
+    // 反例④：ExitNative 出口 d != 0（出口物理 esp = ns，真实 = ns-d）→ gate。
+    // push 后 jcc 0x8000（越区，begin=0x1000/end=0x3000 外）。
+    const auto r = wvmp::regvm::translator::translate_function(fn86_of({
+        blk(0x1000, {push_insn(ir::Reg::Rax, ir::Size::S32),
+                     jump(ir::Op::Jcc, 0x8000, ir::Cond::Ne)})}));
+    EXPECT_TRUE(has_stack_depth_gate(r));
+}
+
+TEST(Translate, StackWalkX86HaltUnbalancedGatesMul64hiShape) {
+    // 反例⑤：mul64hi 形（call-arg push ×N、清栈在区外延迟执行）→ Halt 出口
+    // d=0x40 ≠ 0 → gate（行为保真：修复前该形写穿保存区确定性 AV）。
+    std::vector<ir::Insn> v;
+    for (int i = 0; i < 16; ++i) v.push_back(push_insn(ir::Reg::Rax, ir::Size::S32));
+    const auto r = wvmp::regvm::translator::translate_function(
+        fn86_of({blk(0x1000, v)}));
+    EXPECT_TRUE(has_stack_depth_gate(r));
+}
+
+TEST(Translate, StackWalkX64ZeroBudgetGatesAnyPush) {
+    // D4 双 arch 对称：x64 无 guard（budget=0）→ 任何区内 push 即 gate
+    // （手写/第三方 x64 形态的现网盲区预防；MSVC x64 产物 sub rsp 形不受扰
+    // —— sub rsp 仅在净深 > 0 时由本 walk 记账，budget=0 下同样 gate，
+    // wvmpTest x64 0 gate 基线由 multiseed 双跑对账）。
+    const auto r = wvmp::regvm::translator::translate_function(
+        fn_of({blk(0x1000, {push_insn(ir::Reg::Rax, ir::Size::S64)})}));
+    EXPECT_TRUE(has_stack_depth_gate(r));
+}
+
 TEST(Translate, X64PushPopLegacyShapeUnchanged) {
     // D2 恒等铁约束：x64 push/pop 维持 Sub rsp/Load+Add 现形（S64 tag）。
+    // MIT-451 (X5b) B.2：x64 walk budget=0 → 区内 push 附 gate note（展开形
+    // 逐字节不变；gate 语义见 PushPopExpansion 注）。
     const auto r = wvmp::regvm::translator::translate_function(fn_of({
         blk(0x1000, {push_insn(ir::Reg::Rax, ir::Size::S64),
                      pop_insn(ir::Reg::Rbx, ir::Size::S64)}),
     }));
-    EXPECT_TRUE(r.notes.empty());
+    ASSERT_EQ(r.notes.size(), static_cast<size_t>(1));
+    EXPECT_NE(r.notes[0].find("stack-depth-gate"), std::string::npos);
     const Decoded d = decode_program(r.program);
     const u8 rsp = isa::vm_reg_of(ir::Reg::Rsp);
     ASSERT_EQ(d.insns.size(), static_cast<size_t>(6));  // Sub,Store,Load,Add,Jmp,Halt
