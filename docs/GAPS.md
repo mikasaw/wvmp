@@ -265,7 +265,7 @@
 | SIMD 尾族三行（pmovmskb / pcmpeq/pcmpgt / punpck 系） | ⛔ gate（分层定稿） | 频率分层：客户态新抽 14 exe 全零 vs SIMD/CRT 域 punpck 0.06–0.074% / pmovmskb 0.015–0.055% 密度；punpck 粒度分裂 d/q 88–100% hash/安全域 vs b/w 73% codec 域；lqdq/hqdq D1 拍板 gate 不折 | MIT-432 §1/§1.4（`.multica/mit-G9r-triage.md`）+ MIT-GZ D1 |
 | G8b 三条（mulx/pdep/pext）+ blsr 族四条（blsr/blsi/blsmsk/bextr） | ⛔ gate（挂账/永久） | mulx/pdep/pext = G8b 档 native 直执行 + CPUID gate 基建挂账，mulx CF Zen5 实测不写 vs SDM 厂商分叉待决；blsr 族 27 文件语料 0 永久 gate | MIT-432 §2/§6.4 + MIT-GZ B.1 |
 | ymm / EVEX / FMA / 加密（AES 等） | ⛔ gate（档B） | xmm 跟踪区 kCtxSize 0x1C8 冻结面；档B 立项即触发跳表扩容评估 | MIT-424 (档B) |
-| x86 (PE32) 平台（MIT-446 (X4) 翻正，取代上行"显式硬拒绝"旧态） | ✅ 支持 | 全管道首通：D1 解禁（auto/x86 声明双形放行）+ stub x86 cdecl + S64 tag 改形 + cdecl callgate 参数窗 + x86 白名单 gate；E2E 首批 3 族级样本 WOW64 byte-exact；残余 gate 面 = SSE 族 32 / Div / Idiv（见「x86 战役已知 gate 清单」G7/G8） | MIT-446 (X4) |
+| x86 (PE32) 平台（MIT-446 (X4) 翻正，MIT-450 (X5) 收口扩证） | ✅ 支持 | 全管道：D1 解禁 + stub x86 cdecl + cdecl callgate 参数窗（X5 裁决 = 可见参数桥，4 dword）+ x86 白名单 gate；样本池 11 族级样本 byte-exact（X5）；残余 gate 面 = SSE 族 32 / Div / Idiv + X5 新实测三条（跳表匹配器 S64 硬编码 / REG-REG 位测试族不在 lifter 面 / 真实产物 in-region push，见 X5 收口节） | MIT-446 (X4) / MIT-450 (X5) |
 | 16-bit 目标 | ⛔ 不可行 | PE 格式白名单只收 0x014C/0x8664 | MIT-412（GAPS C5 交叉引用） |
 
 > 观察清单与挂账联动见 `docs/STATUS.md`「指令虚拟化阶段（M2.5-G）收口」节；
@@ -1138,3 +1138,45 @@ NotIntercepted 双锁）；Inc/Dec 唯一构造点 translate_unary 不写 src2
 5. C5 x86：**安全拒绝面已收口（MIT-414：PE32 bug 修复 + 显式硬 gate + 文档）**；
    全量对齐 = P1 backlog（G7x-1..8，asmgen 为排期锚）
 6. 与 M3 插件池并行推进不冲突（不同代码面）
+
+## X5 收口（MIT-450）——x86 战役终稿与缺陷实录
+
+**状态（2026-09-02，分支 mit-x5-closure）**：多目标平台 M2.5-X 收口单交付。
+产品代码零 diff；multiseed 305/305（x64 250 + x86 55）；x64 dump `ffd47289…`
+恒等维持。收口全文见 STATUS「多目标平台（M2.5-X）收口」节，此处登记 GAPS 面：
+
+1. **x86 跳转表匹配器 S64 硬编码（新实测 gate 面，X5b 按族提单素材）**：
+   `try_match_jump_table`（translator.cpp）基址载入判据（lea/movabs
+   `size != ir::Size::S64` → nullopt）与 delta 判据（`add.size != S64` →
+   nullopt）在 x86 S32 链上永不通过 → 一切 x86 跳表形态落"间接 jmp 未支持"
+   C1 gate（行为保真）。X4 交接注记"x86 链已随 B.2 参数化真块"实测修正：
+   参数化覆盖步进 tag（点位①-⑤），不含匹配器尺寸判据。样本
+   `wvmp_x86_jmptbl_sample`（REG-abs/REG-delta/MEM-abs + undef/oob 负例，
+   全 gate byte-exact + helper 真 1 stub）。
+2. **REG-REG bts/btr/btc/xadd 不在 x86 lifter 面**：X86_INS_XADD/BTS/BTR/BTC
+   用例仅收 MEM-dst（= G4 lock 族翻译，kLockXadd 载体标记）；REG-REG 形
+   unsupported → C1 gate。lock mem 形在 x86 通（strip-and-execute，样本
+   `wvmp_x86_bitops_sample` lock 探针区 3 note 真虚拟化）。REG-REG 位测试
+   开面归 X5b/lifter 族单。
+3. **真实产物 in-region push = C2 类静默帧破坏（X5 核心缺陷实录）**：
+   wvmpTest x86 打包唯一虚拟化 kernel `kern.mul64hi_closed_forms` 打壳后
+   确定性崩溃（cdb：崩溃点 `mov eax,[ebp-0x28]`、ebp=FFFFFFFF、eax/ecx =
+   "WVMP"/"END1" marker magic；症状随栈残渣 ASLR 摆动）。根因与
+   `wvmp_x86_jmptbl_sample` 同单的 5 参探针③同链（实测 post 寄存器
+   ebx=00010000/esi=00000100/edi=00000010 = push 值精确落位
+   [v4-4..v4-0x10]）：区域内 push 写真实内存 < ns → 覆写 stub callee-saved
+   保存区 → VM 退出还原垃圾。**442 规则升级为产品正确性边界**；修复 =
+   X5b 翻译期栈深 gate（v4 将 < ns 的函数整函数 C1 gate）。
+4. **callgate 参数窗裁决（X5 B.4）**：kX86CallgateArgDwords=4 = 每调用
+   可见参数桥非调用上限；mov 形 >4 参 arg4 确定性丢失、push-imm 形 C1 gate、
+   push-reg 形帧破坏（上条）→ 维持 4 dword 窗，扩窗最小 diff = 单常量
+   （asmgen loop 已参数化、stub_gen 无第二份），留 X5b 备选。
+5. **x86 样本池终稿（11 样本，machine=0x14C 全验）**：X4 三样本 + deepcall /
+   jmptbl / strops / bitops / looplea / x87gate / sehgate / std67gate，
+   全数 native rc=0 哨兵 + protect stub 计数 1-2 + 双跑 byte-exact；
+   gate 负例（x87/SEH-fs/std/67/跳表/无防御）行为保真 note 断言。
+   x87 R-SSE-only 定稿面复核：入册完整（本节 + 上节 x87 小节），无遗漏。
+6. **wvmpTest x86 全量 E2E（缺陷实录）**：重建对齐源 103 kernel native
+   全绿；打包 13/14 位点 gate（分布：跳转目标块未找到 17 / push-imm 11 /
+   间接 jmp 1）+ 1 stub mul64hi 崩溃（第 3 条）→ 全量双跑 diff-0 口径在
+   X5b 修复前不可达成；x64 对照 14 stubs / 0 gate / 双跑 diff 0 复现。

@@ -2,7 +2,7 @@
 
 
 
-> 更新时间：2026-09-02（MIT-446 X4：**x86 全管道打通**——stub cdecl 重写 + S64 tag 改形 + D1 解禁 + x86 E2E 首批 3 族级样本入池；multiseed 250→265；x64 dump `ffd47289…` 恒等维持）
+> 更新时间：2026-09-02（MIT-450 X5：**多目标平台 M2.5-X 收口**——x86 池扩量 3→11 + wvmpTest x86 全量 E2E（mul64hi 缺陷实录）+ 参数窗裁决（可见参数桥，维持 4 dword）+ gate 负例族；multiseed 265→**305**；产品代码零 diff，x64 dump `ffd47289…`/161,861B sha256 逐字节恒等）
 
 
 
@@ -293,6 +293,8 @@ gate 边界文档化——不承诺“全部 x86-64 指令”（那是 ymm/EVEX/
 **M3（MIT-410 插件池：crypt / mutate / anti_debug / integrity_crc /
 import_protect）恢复为主推线。**
 
+| **多目标平台 X5 (MIT-450)：M2.5-X 收口——x86 池扩量 3→11 + wvmpTest x86 全量 E2E + 参数窗裁决 + gate 负例族** | ✅ | mit-x5-closure | **B.1** 五族样本入池：deepcall（callgate 递归 32 层×0x38=0x700<0x1000 窗口，C 镜像 rc=0 哨兵；首通实录: 递归参数误写进参槽该写出参槽，原生镜像哨兵当场抓获）/ jmptbl（4B 表 REG-abs/REG-delta/MEM-abs 3 正形 + 无防御/出区 2 负例）/ strops（rep movsd 对齐+非对齐/stosd/repe cmpsd 早退/repne scasd/lodsd/plain movsd×2）/ bitops（popcnt/tzcnt/lzcnt——MASM .686p 无助记符 db F3 0F B8/BC/BD 手编码 + bswap/cmpxchg 双路/xchg；lock mem 形经 strip-and-execute 真虚拟化）/ looplea（嵌套循环+复杂 LEA）；首通实录: 9 位十六进制立即数×3 处。**B.3** x87gate（R-SSE-only 专属）/sehgate（真 __try/__except + fs:[18h] 区内 TEB 读 = G1 gate + except 实弹路径）/std67gate（std D5 + 67 G2 禁调用）三负例族 + gate note 断言 + 双跑 byte-exact。**B.2** wvmpTest x86 重建对齐源（94→103 kernel，旧产物 9 kernel 陈旧）native 103/103；打包 13/14 位点 gate（分布: 跳转目标块未找到 17 / push-imm 11 / 间接 jmp 1）+ **1 stub = kern.mul64hi_closed_forms 确定性崩溃实录**（cdb 铁证: 崩溃点 `mov eax,[ebp-0x28]`、ebp=FFFFFFFF、eax=504D5657" WVMP"/ecx=31444E45" END1" marker magic 活在寄存器；根因 = 真实 /Od codegen 在区域内发 push → stub callee-saved 保存区破坏（C2 类）→ X5b 修复单素材，本单 D5 零产品 diff 不修）；x64 对照: 14 stubs / 0 gate / 双跑 diff 0（X4 基线复现）。**B.4** 参数窗裁决: kX86CallgateArgDwords=4 = 每调用"可见参数桥"非调用次数上限（step 2.5 每调用从 guest [v4+4i] 预置 + host_rsp 重基 caller-cleans 回收）；5 参 cdecl 三形实测: mov 形 arg4 确定性丢失（0x11111→0x01111，帧完好）/ push-imm 形整函数 C1 gate（translate_push 拒 imm）/ push-reg 形真虚拟化但 callee-saved 破坏实证（post: ebx=00010000/esi=00000100/edi=00000010 = push 值精确落位 [v4-4..v4-0x10]）→ **裁决 = 维持 4 dword 窗**（真实 /Od 以 push 形为主，扩窗救不了 push 形；mov 形扩窗最小 diff = 单常量 kX86CallgateArgDwords（loop 已参数化、stub 侧无第二份）留 X5b 备选）+ **442 规则升级为产品正确性边界**（guest 栈写 < ns = 静默帧破坏，X5b 立翻译期栈深 gate）。**B.6 六件套**: build 0/0、ctest 16/16、multiseed **305/305**（REQUIRE_REAL=1，x64 250 + x86 55）、wvmpTest x64 14 stubs 双跑 diff 0、x86 11 样本 machine=0x14C dumpbin 全验 + protect stub 1-2 + 双跑 byte-exact、**x64 dump `ffd4728901812932…`/161,861B sha256 逐字节恒等 = D5 机器证明**。冻结契约零 diff；**产品代码零 diff（本单交付全为样本/测试脚本/文档面）**。新实测 gate 面（X5b/按族提单素材）: ① x86 跳转表匹配器 S64 硬编码 2 点位（try_match_jump_table 基址载入与 delta add 的 size!=S64 → S32 链永不匹配；446"参数化"仅指步进 tag，本单实测修正）；② REG-REG bts/btr/btc/xadd 不在 x86 lifter 面（仅收 G4 lock MEM 形）|
+
 ## X4 交付与 X5 交接（MIT-446，2026-09-02）
 
 **x86 生产能力就绪宣告面**：main 在 X4 合入后即具备 x86 (PE32) 生产能力
@@ -318,3 +320,17 @@ import_protect）恢复为主推线。**
    序（ebx→edi，先 push 在高址）+ kX86ExitSlotDepth=0x258（runtime_x86.hpp
    单一来源）+ kX86CallgateArgDwords=4 参数窗协议（asmgen/stub 两处同步）+
    kX86RetV4SlotFromExitRsp=0x38（runtime 帧自洽，stub 帧形若变须重核）。
+
+## 多目标平台（M2.5-X）收口（MIT-450, X5, 2026-09-02）
+
+**完成口径**：x86 (PE32) 生产可用宣告维持 X4 定稿；X5 完成池扩量、wvmpTest
+x86 全量 E2E、参数窗真语义对账、gate 负例族与本文档收口。权威基线 = 分支
+`mit-x5-closure`（main `dc2f21a` + X5 批次，产品代码零 diff）：build 0/0、
+ctest 16/16、multiseed **305/305**（REQUIRE_REAL=1，x64 250 + x86 55）、
+x64 dump `ffd4728901812932…`/161,861B sha256 逐字节恒等、wvmpTest x64
+14 stubs 双跑 diff 0。
+
+**触发条件（下一战役）**：410(M3 插件池) 或 X3d(SSE 32 折叠) 恢复/立项；
+X3d 立项数据 = 本单 x86 客户态分布表（wrapped 位点 14，gate 13/14，
+gate 率 92.9%）；X5b（区域内 push 栈深 gate + 可选参数窗扩宽 + 跳表匹配器
+S32 参数化 + REG-REG 位测试 lifter 面）按缺陷优先级另立项。
