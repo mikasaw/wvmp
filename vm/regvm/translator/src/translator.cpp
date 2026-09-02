@@ -252,8 +252,12 @@ enum : u8 { kJtSemDeltaBase = 0, kJtSemDeltaJmp = 1, kJtSemAbsVa = 2 };
             out = e32 - image_base;
         } else {
             const u64 anchor = (sem == kJtSemDeltaBase) ? base_rva : jmp_rva;
-            if (e32 > std::numeric_limits<u32>::max() - anchor) return false;
-            out = anchor + e32;
+            // MIT-451 (X5b) B.3：4B delta = native dword 回绕加法语义（x86
+            // `add edx, ecx` 32 位回绕；表在 .text 尾随函数时 case < 表址 →
+            // delta 负值以 2 的补码存储——MSVC x86 布局常态）。旧 unsigned-only
+            // 判（e32 > u32max − anchor → false）把负 delta 全拒，x86 4B
+            // delta 表永不验证通过。8B 表维持 signed i64 语义（x64 面）。
+            out = (anchor + e32) & 0xFFFF'FFFFull;
         }
     } else {
         const i64 es = static_cast<i64>(e);
@@ -364,8 +368,13 @@ std::optional<JumpTableHandle> try_match_jump_table(
     const ir::BasicBlock& cur, const ir::BasicBlock& prev,
     const std::unordered_map<u64, u64>& next_ip_of,
     const std::unordered_set<u64>& insn_addrs, u64 begin_rva, u64 end_rva,
-    const JumpTableReadFn& read_fn, u64 image_base) {
+    const JumpTableReadFn& read_fn, u64 image_base, ir::Arch arch) {
     const auto& ins = cur.insns;
+    // MIT-451 (X5b) B.3：匹配器尺寸判据按 arch 参数化（X5 实测修正 X4 交接
+    // 注记"参数化仅步进 tag"——匹配器本体三点 S64 硬判未及）。指针宽 =
+    // x64 S64 / x86 S32；表项读宽（4/8）判据与 scale 判据按既有口径不变
+    // （x86 表 = 4B 项，8B 项 scale 判据自然排除）。
+    const ir::Size ptr_sz = arch == ir::Arch::X86 ? ir::Size::S32 : ir::Size::S64;
     if (ins.size() < 3) return std::nullopt; // MEM 源最少 [il,lea,jmp] 3 条
     const ir::Insn& jmp = ins.back();
     if (jmp.op != ir::Op::Jmp) return std::nullopt;
@@ -402,7 +411,8 @@ std::optional<JumpTableHandle> try_match_jump_table(
         const ir::Insn& ld = ins[ins.size() - 3];
         if (add.op == ir::Op::Add) {
             // 带 add → delta 语义（409 原模板；G2-a 8B delta 同款）
-            if (add.size != ir::Size::S64 ||
+            // MIT-451 (X5b) B.3：S64 硬判 → ptr_sz（x86 4B delta 表翻正面）
+            if (add.size != ptr_sz ||
                 add.dst.kind != ir::Operand::Kind::Reg ||
                 add.src.kind != ir::Operand::Kind::Reg)
                 return std::nullopt;
@@ -452,11 +462,14 @@ std::optional<JumpTableHandle> try_match_jump_table(
         }
     }
 
-    // ---- ② 基址载入：lea <b>,[rip+T]（S64）或 mov <b>, imm64（movabs）----
+    // ---- ② 基址载入：lea <b>,[rip+T]（指针宽）或 mov <b>, imm（x86 =
+    //         `mov ecx, OFFSET tbl` imm32 绝对 VA / x64 movabs）----
     u64 base_rva = 0;
     bool have_base = false;
     if (lea_p != nullptr && lea_p->op == ir::Op::Lea) {
-        if (lea_p->size != ir::Size::S64 ||
+        // MIT-451 (X5b) B.3：S64 硬判 → ptr_sz（x86 无 rip 寻址，本形 x86
+        // 不可达，参数化为对称面）。
+        if (lea_p->size != ptr_sz ||
             lea_p->dst.kind != ir::Operand::Kind::Reg || lea_p->dst.reg != b ||
             lea_p->src.kind != ir::Operand::Kind::Mem ||
             lea_p->src.mem.base != ir::Reg::Rip)
@@ -470,11 +483,13 @@ std::optional<JumpTableHandle> try_match_jump_table(
         base_rva = static_cast<u64>(lea_tgt);
         have_base = true;
     } else if (lea_p != nullptr && lea_p->op == ir::Op::Mov &&
-               lea_p->size == ir::Size::S64 &&
+               lea_p->size == ptr_sz &&
                lea_p->dst.kind == ir::Operand::Kind::Reg &&
                lea_p->dst.reg == b &&
                lea_p->src.kind == ir::Operand::Kind::Imm) {
-        // movabs 基址：imm64 = 链接期 VA → 减 image_base 还原 RVA
+        // mov-abs 基址（x64 movabs imm64 / x86 mov imm32 OFFSET）：链接期 VA
+        // → 减 image_base 还原 RVA。MIT-451 (X5b) B.3：S64 硬判 → ptr_sz
+        // （x86 REG-abs/MEM-abs 两正形的翻正面）。
         if (image_base != 0 &&
             static_cast<u64>(lea_p->src.imm) >= image_base) {
             base_rva = static_cast<u64>(lea_p->src.imm) - image_base;
@@ -3374,7 +3389,7 @@ TranslateResult translate_function(const ir::FunctionRegion& fn,
                 continue;
             auto h = try_match_jump_table(cur, prev, next_ip_of, insn_addrs,
                                           fn.begin_rva, fn.end_rva, table_read_fn,
-                                          image_base);
+                                          image_base, fn.arch);
             if (!h) continue; // 非跳转表形态 → 维持原 gate note
             if (h->ok) {
                 char note[192];

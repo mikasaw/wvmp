@@ -928,6 +928,152 @@ std::vector<u64> g2_targets() {
     return v;
 }
 
+// ---- MIT-451 (X5b) B.3: x86 S32 匹配器翻正单测 -----------------------
+// x86 尾块形态（MSVC x86 布局）：il(S32) + mov ecx, imm32 绝对 VA 基址 +
+// 表读(S32) [+ add edx,ecx] + jmp edx。防御块同构 S32。
+
+ir::BasicBlock g2x_defense_block() {
+    return blk(0x1000, {at(mov(ir::Reg::Rax, ir::Reg::Rsp, ir::Size::S32), 0x1000),
+                        at(alu(ir::Op::Cmp, ir::Operand::reg_(ir::Reg::Rax),
+                               ir::Operand::imm_(7), ir::Size::S32),
+                           0x1003),
+                        at(jump(ir::Op::Jcc, 0x2008, ir::Cond::A), 0x1006)});
+}
+
+// x86 delta 4B 尾块：mov ecx, VA(0x402000) / mov edx,[ecx+eax*4] /
+// add edx,ecx / jmp edx。
+ir::BasicBlock g2x_delta4_tail_block() {
+    const ir::Insn il = at([] {
+        ir::Insn i = I(ir::Op::Load, ir::Size::S32);
+        i.dst = ir::Operand::reg_(ir::Reg::Rax);
+        i.src = ir::Operand::mem_(m(ir::Reg::Rsp, ir::Reg::Flags, 0, 8));
+        return i;
+    }(), 0x1020);
+    const ir::Insn base = at(mov_imm(ir::Reg::Rcx, 0x402000, ir::Size::S32), 0x1027);
+    const ir::Insn ld = at([] {
+        ir::Insn i = I(ir::Op::Load, ir::Size::S32);
+        i.dst = ir::Operand::reg_(ir::Reg::Rdx);
+        i.src = ir::Operand::mem_(m(ir::Reg::Rcx, ir::Reg::Rax, 4, 0));
+        return i;
+    }(), 0x102c);
+    const ir::Insn add_i = at(alu(ir::Op::Add, ir::Operand::reg_(ir::Reg::Rdx),
+                                  ir::Operand::reg_(ir::Reg::Rcx), ir::Size::S32),
+                              0x1031);
+    const ir::Insn j = at([] {
+        ir::Insn i = I(ir::Op::Jmp, ir::Size::S32);
+        i.dst = ir::Operand::reg_(ir::Reg::Rdx);
+        return i;
+    }(), 0x1034);
+    return blk(0x1020, {il, base, ld, add_i, j});
+}
+
+// x86 abs 4B 尾块（无 add）。
+ir::BasicBlock g2x_abs4_tail_block() {
+    const ir::Insn il = at([] {
+        ir::Insn i = I(ir::Op::Load, ir::Size::S32);
+        i.dst = ir::Operand::reg_(ir::Reg::Rax);
+        i.src = ir::Operand::mem_(m(ir::Reg::Rsp, ir::Reg::Flags, 0, 8));
+        return i;
+    }(), 0x1020);
+    const ir::Insn base = at(mov_imm(ir::Reg::Rcx, 0x402000, ir::Size::S32), 0x1027);
+    const ir::Insn ld = at([] {
+        ir::Insn i = I(ir::Op::Load, ir::Size::S32);
+        i.dst = ir::Operand::reg_(ir::Reg::Rdx);
+        i.src = ir::Operand::mem_(m(ir::Reg::Rcx, ir::Reg::Rax, 4, 0));
+        return i;
+    }(), 0x102c);
+    const ir::Insn j = at([] {
+        ir::Insn i = I(ir::Op::Jmp, ir::Size::S32);
+        i.dst = ir::Operand::reg_(ir::Reg::Rdx);
+        return i;
+    }(), 0x1031);
+    return blk(0x1020, {il, base, ld, j});
+}
+
+ir::FunctionRegion g2x_fn_of(ir::BasicBlock tail, ir::BasicBlock prev) {
+    ir::FunctionRegion fn = fn_of({std::move(prev), std::move(tail)});
+    // case body / default / join 块复用 x64 夹具布局（x86 匹配器只看尾块
+    // 形态 + 目标区判据；case body 指令尺寸不参与匹配）。
+    std::vector<ir::BasicBlock> blocks;
+    blocks.push_back(fn.blocks[0]);
+    blocks.push_back(fn.blocks[1]);
+    for (u64 a = 0x1100; a < 0x1180; a += 0x10)
+        blocks.push_back(blk(a, {at(mov_imm(ir::Reg::Rax, 0x10 + a, ir::Size::S32), a),
+                                 at(jump(ir::Op::Jmp, 0x2010), a + 0xE)}));
+    blocks.push_back(blk(0x2008,
+                         {at(mov_imm(ir::Reg::Rax, 0xA5, ir::Size::S32), 0x2008),
+                          at(jump(ir::Op::Jmp, 0x2010), 0x2010 - 2)}));
+    blocks.push_back(blk(0x2010, {at(I(ir::Op::Nop, ir::Size::S32), 0x2010)}));
+    fn.blocks = std::move(blocks);
+    fn.arch = ir::Arch::X86;
+    return fn;
+}
+
+TEST(Translate, JumpTableX86Delta4RegExpandsChain) {
+    // B.3 翻正面①：x86 4B delta 表（负 delta = dword 回绕，MSVC .text 尾
+    // 随表布局）→ 匹配 + 8 拍比较链；X4 交接注记"匹配器 S64 硬判"修正面。
+    ir::FunctionRegion fn = g2x_fn_of(g2x_delta4_tail_block(), g2x_defense_block());
+    std::vector<u64> tbl;
+    for (u64 t : g2_targets())
+        tbl.push_back(static_cast<u32>(t - 0x2000));  // 负 delta 2 的补码
+    const auto r = wvmp::regvm::translator::translate_function(
+        fn, wvmp::regvm::translator::FunctionUpperBoundFn{}, g2_read_fn(tbl),
+        0x400000);
+    ASSERT_EQ(r.notes.size(), static_cast<size_t>(1));
+    EXPECT_NE(r.notes[0].find("jump-table @ 0x2000 entries=8 reg-4B-delta"),
+              std::string::npos);
+    const Decoded d = decode_program(r.program);
+    size_t first = d.insns.size();
+    for (size_t i = 0; i < d.insns.size(); ++i)
+        if (d.insns[i].op == VmOp::Mov && d.insns[i].b_kind == OpKind::Imm &&
+            d.insns[i].aux == 0x1100) {
+            first = i;
+            break;
+        }
+    ASSERT_LT(first, d.insns.size());
+    const auto& g = d.insns;
+    size_t jcc_e = 0;
+    for (size_t i = first; i + 4 <= g.size() && jcc_e < 8; i += 4) {
+        if (g[i].op == VmOp::Mov && g[i + 1].op == VmOp::LeaRva &&
+            g[i + 2].op == VmOp::Cmp && g[i + 3].op == VmOp::Jcc &&
+            g[i + 3].cond_or_size == static_cast<u8>(ir::Cond::E))
+            ++jcc_e;
+    }
+    EXPECT_EQ(jcc_e, 8u);
+    EXPECT_EQ(g.back().op, VmOp::Halt);
+}
+
+TEST(Translate, JumpTableX86Abs4RegExpandsChain) {
+    // B.3 翻正面②：x86 4B 绝对 VA 表（无 add）→ AbsVa 语义（项 − image_base）。
+    ir::FunctionRegion fn = g2x_fn_of(g2x_abs4_tail_block(), g2x_defense_block());
+    std::vector<u64> tbl;
+    for (u64 t : g2_targets()) tbl.push_back(0x400000 + t);  // 绝对 VA 项
+    const auto r = wvmp::regvm::translator::translate_function(
+        fn, wvmp::regvm::translator::FunctionUpperBoundFn{}, g2_read_fn(tbl),
+        0x400000);
+    ASSERT_EQ(r.notes.size(), static_cast<size_t>(1));
+    EXPECT_NE(r.notes[0].find("jump-table @ 0x2000 entries=8 reg-4B-abs"),
+              std::string::npos);
+}
+
+TEST(Translate, JumpTableX64Delta4WrapStaysS64Face) {
+    // 对账面：x64 8B delta signed 语义不受 4B 回绕修正影响（既有用例
+    // JumpTable8DeltaRegExpandsChain 继续钉 x64 面；本用例钉 4B 回绕只在
+    // width==4 分支）。
+    ir::FunctionRegion fn = g2x_fn_of(g2x_delta4_tail_block(), g2x_defense_block());
+    fn.arch = ir::Arch::X64;  // x64 匹配器要求 S64 形态 → S32 尾块不匹配
+    std::vector<u64> tbl;
+    for (u64 t : g2_targets()) tbl.push_back(static_cast<u32>(t - 0x2000));
+    const auto r = wvmp::regvm::translator::translate_function(
+        fn, wvmp::regvm::translator::FunctionUpperBoundFn{}, g2_read_fn(tbl),
+        0x400000);
+    // S32 add 不满足 x64 ptr_sz → 匹配器 nullopt → 间接 jmp 既有 gate note
+    // （x64 形态面零变化对账）。
+    ASSERT_GE(r.notes.size(), static_cast<size_t>(1));
+    EXPECT_NE(r.notes[0].find("间接 jmp 未支持"), std::string::npos);
+}
+
+
 TEST(Translate, JumpTable8DeltaRegExpandsChain) {
     // G2-a: 8B delta（REG 源带 add）。表项 = 目标 − 表基址(0x2000)（负值
     // 两补码——8B signed 语义）。验证: ok note + 8×[Mov s,rva; LeaRva;
