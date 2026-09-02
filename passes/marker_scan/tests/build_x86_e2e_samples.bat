@@ -30,6 +30,43 @@ cl /nologo /utf-8 /O1 /MD /c "%~dp0x86_callgate_main.c" || goto :fail
 link /nologo /SUBSYSTEM:CONSOLE /MACHINE:X86 x86_callgate_main.obj x86_callgate_sample.obj /OUT:"%~1\wvmp_x86_callgate_sample.exe" || goto :fail
 .\wvmp_x86_callgate_sample.exe || goto :fail
 
+rem ---- MIT-450 (X5) B.1: pool expansion 3 -> 10ish (family matrix) ----
+
+rem (1) deepcall: callgate recursion depth, 32-level native tree in the
+rem 0x1000 callee window (x64 406/E1 counterpart, 4B accounting).
+ml /nologo /c /Coff "%~dp0x86_deepcall_sample.asm" || goto :fail
+cl /nologo /utf-8 /O1 /MD /c "%~dp0x86_deepcall_main.c" || goto :fail
+link /nologo /SUBSYSTEM:CONSOLE /MACHINE:X86 x86_deepcall_main.obj x86_deepcall_sample.obj /OUT:"%~1\wvmp_x86_deepcall_sample.exe" || goto :fail
+.\wvmp_x86_deepcall_sample.exe || goto :fail
+
+rem (2) jmptbl: 4B jump tables (REG abs / REG delta / MEM abs) + 2 gate
+rem negatives (no-defense / out-of-region target), x64 413 counterpart.
+ml /nologo /c /Coff "%~dp0x86_jmptbl_sample.asm" || goto :fail
+cl /nologo /utf-8 /O1 /MD /c "%~dp0x86_jmptbl_main.c" || goto :fail
+link /nologo /SUBSYSTEM:CONSOLE /MACHINE:X86 x86_jmptbl_main.obj x86_jmptbl_sample.obj /OUT:"%~1\wvmp_x86_jmptbl_sample.exe" || goto :fail
+.\wvmp_x86_jmptbl_sample.exe || goto :fail
+
+rem (3) strops: dword string family mix (rep movsd aligned+unaligned / stosd /
+rem repe cmpsd early-exit / repne scasd / lodsd / plain movsd x2).
+ml /nologo /c /Coff "%~dp0x86_strops_sample.asm" || goto :fail
+cl /nologo /utf-8 /O1 /MD /c "%~dp0x86_strops_main.c" || goto :fail
+link /nologo /SUBSYSTEM:CONSOLE /MACHINE:X86 x86_strops_main.obj x86_strops_sample.obj /OUT:"%~1\wvmp_x86_strops_sample.exe" || goto :fail
+.\wvmp_x86_strops_sample.exe || goto :fail
+
+rem (4) bitops: popcnt/tzcnt/lzcnt/bswap/cmpxchg/xadd/bts/btr/btc/xchg
+rem REG-REG + a callable mem-dest probe (virtualize or gate, both valid).
+ml /nologo /c /Coff "%~dp0x86_bitops_sample.asm" || goto :fail
+cl /nologo /utf-8 /O1 /MD /c "%~dp0x86_bitops_main.c" || goto :fail
+link /nologo /SUBSYSTEM:CONSOLE /MACHINE:X86 x86_bitops_main.obj x86_bitops_sample.obj /OUT:"%~1\wvmp_x86_bitops_sample.exe" || goto :fail
+.\wvmp_x86_bitops_sample.exe || goto :fail
+
+rem (5) looplea: nested loops + complex LEA (base+index*scale+disp) + disp
+rem index-scale memory ALU operands.
+ml /nologo /c /Coff "%~dp0x86_looplea_sample.asm" || goto :fail
+cl /nologo /utf-8 /O1 /MD /c "%~dp0x86_looplea_main.c" || goto :fail
+link /nologo /SUBSYSTEM:CONSOLE /MACHINE:X86 x86_looplea_main.obj x86_looplea_sample.obj /OUT:"%~1\wvmp_x86_looplea_sample.exe" || goto :fail
+.\wvmp_x86_looplea_sample.exe || goto :fail
+
 popd
 exit /b 0
 :fail

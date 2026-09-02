@@ -283,10 +283,17 @@ samples=(
 # 2 stub; sse 样本 = 1 stub (SSE 函数走 x86 白名单 gate 整函数原生 —
 # 池判据只要求 ≥1 stub, helper 真虚拟化满足)。每样本 protect 日志附
 # machine=0x14C 断言见 .multica 交付报告 (dumpbin 亲验)。
+# MIT-450 (X5) B.1: 池扩量 3→8 — 五族 (deepcall / jmptbl / strops /
+# bitops / looplea), 8 × 5 = 40 runs (基线 250 → 290)。
 x86_samples=(
     "build/x86_samples/wvmp_x86_forkface_sample.exe"
     "build/x86_samples/wvmp_x86_sse_sample.exe"
     "build/x86_samples/wvmp_x86_callgate_sample.exe"
+    "build/x86_samples/wvmp_x86_deepcall_sample.exe"
+    "build/x86_samples/wvmp_x86_jmptbl_sample.exe"
+    "build/x86_samples/wvmp_x86_strops_sample.exe"
+    "build/x86_samples/wvmp_x86_bitops_sample.exe"
+    "build/x86_samples/wvmp_x86_looplea_sample.exe"
 )
 
 # Seeds: 1 (small), 12345 (default), 99999 (large), 0xDEADBEEF (magic), 0xCAFEBABE (magic).
