@@ -130,3 +130,187 @@ TEST(RegVmBackendMetadata, FrontBugRegression) {
     EXPECT_NE(notes4[0].find("C1 gate"), std::string::npos);
     EXPECT_TRUE(prog4.bytecode.empty());
 }
+
+// ==================== MIT-453 (X5c) B.3: 上界 lambda 病态形防护 ====================
+//
+// F1 回退链 (regvm_backend.cpp pdata_empty 分支) 的定义域与保守性钉:
+//   ub = min{fr.begin_rva > begin_rva} (不依赖排序), 无后继 → 所在节节尾
+//   (VirtualAddress + VirtualSize), 节尾兼作收紧上界 (cap)。pe==nullptr /
+//   无 .text / 回跳检出 / 目标越节尾一律 nullopt → C1 gate (保守正确)。
+// 观测面: ExitNative 站点 note 经过滤槽转 diag (notes 空 = 放行),
+//   gate note "跳转目标块未找到" 留在 kLastTranslateNotes (notes 非空)。
+
+#include "wvmp/passes/pe_loader/pe_image.hpp"
+#include "wvmp/framework/keys.hpp"
+
+namespace {
+
+using wvmp::kPeImage;
+using wvmp::passes::PeImage;
+using wvmp::passes::SectionInfo;
+
+// 带 end_rva 的函数区 (Jmp Imm 越区单条, 无栈操作 → 栈深 walk d=0)。
+ir::FunctionRegion MakeFnX(const std::string& name, wvmp::u64 begin_rva,
+                           wvmp::u64 end_rva) {
+    ir::Insn jmp;
+    jmp.op = ir::Op::Jmp;
+    jmp.size = ir::Size::S32;
+    jmp.dst = ir::Operand::imm_(static_cast<wvmp::i64>(end_rva + 0x40));
+    ir::BasicBlock b;
+    b.addr = begin_rva;
+    b.insns = {jmp};
+    ir::FunctionRegion fn;
+    fn.name = name;
+    fn.arch = ir::Arch::X86;
+    fn.begin_rva = begin_rva;
+    fn.end_rva = end_rva;
+    fn.blocks = {b};
+    return fn;
+}
+
+PeImage MakeX86Pe() {
+    PeImage pe;
+    pe.pdata_empty = true;  // x86 PE32: DataDirectory[3] = 0/0
+    SectionInfo text;
+    text.name = ".text";
+    text.characteristics = 0x60000020;
+    text.virtual_addr = 0x1000;
+    text.virtual_size = 0x3000;  // 节尾 = 0x4000
+    text.raw_size = 0x3000;
+    text.raw_ptr = 0x400;
+    pe.sections = {text};
+    return pe;
+}
+
+// F1 回退链放行判据: notes 空 (exit-native note 已过滤进 diag) 且产码非空。
+::testing::AssertionResult F1ExitEmitted(wvmp::ProtectionContext& ctx,
+                                         ir::FunctionRegion fn) {
+    auto backend = make_regvm();
+    const wvmp::vm::VmProgram prog = backend->compile(fn, ctx);
+    const std::vector<std::string> notes = LastNotes(ctx);
+    if (!notes.empty())
+        return ::testing::AssertionFailure()
+               << "期望 ExitNative 放行 (notes 空), 实得 gate note: "
+               << (notes.empty() ? std::string("<none>") : notes.front());
+    if (prog.bytecode.empty())
+        return ::testing::AssertionFailure() << "期望产码非空, 实得空";
+    return ::testing::AssertionSuccess();
+}
+
+// 保守 gate 判据: notes 含 "跳转目标块未找到"。
+::testing::AssertionResult F1Gated(wvmp::ProtectionContext& ctx,
+                                   ir::FunctionRegion fn) {
+    auto backend = make_regvm();
+    backend->compile(fn, ctx);
+    const std::vector<std::string> notes = LastNotes(ctx);
+    for (const auto& n : notes)
+        if (n.find("跳转目标块未找到") != std::string::npos)
+            return ::testing::AssertionSuccess();
+    return ::testing::AssertionFailure()
+           << "期望 C1 gate note, 实得 notes 数=" << notes.size();
+}
+
+} // namespace
+
+// 病态形 ①: 下一区域 begin 兜底 (常规面)——target 落本函数尾 gap
+// [end_rva, next_begin) → ExitNative 放行 (wvmpTest 17 处同形)。
+TEST(RegVmBackendUpperBound, PdataEmptyNextRegionBeginExits) {
+    wvmp::ProtectionContext ctx;
+    ctx.slot<PeImage>(kPeImage) = MakeX86Pe();
+    ctx.functions = {MakeFnX("f0", 0x1000, 0x1010),
+                     MakeFnX("f1", 0x2000, 0x2010)};
+    EXPECT_TRUE(F1ExitEmitted(ctx, ctx.functions[0]));  // 0x1050 < 0x2000
+}
+
+// 病态形 ② (X5c D1 核心): 区域表仅自身 (无后继) → .text 节尾兜底,
+// target < 节尾 → ExitNative 放行 (wvmpTest 末区 0xC972 形)。
+TEST(RegVmBackendUpperBound, PdataEmptyLastRegionTextTailFallback) {
+    wvmp::ProtectionContext ctx;
+    ctx.slot<PeImage>(kPeImage) = MakeX86Pe();
+    ctx.functions = {MakeFnX("solo", 0x1000, 0x1010)};
+    EXPECT_TRUE(F1ExitEmitted(ctx, ctx.functions[0]));  // 0x1050 < 节尾 0x4000
+}
+
+// 病态形 ③: 目标越 .text 节尾 → 裁决表 "目标出节尾 = gate"。
+TEST(RegVmBackendUpperBound, PdataEmptyTargetBeyondTextTailGates) {
+    wvmp::ProtectionContext ctx;
+    ctx.slot<PeImage>(kPeImage) = MakeX86Pe();
+    ctx.functions = {MakeFnX("solo", 0x1000, 0x1010)};
+    ir::FunctionRegion fn = ctx.functions[0];
+    fn.blocks.front().insns.front().dst = ir::Operand::imm_(0x5000);  // > 0x4000
+    EXPECT_TRUE(F1Gated(ctx, fn));
+}
+
+// 病态形 ④: 下一区域 begin 落在节尾之后 (多执行节病态布局) → cap 收紧,
+// 不得放行 [节尾, next_begin) 零填充/他节内存。
+TEST(RegVmBackendUpperBound, TailCapOverridesFarNextBegin) {
+    wvmp::ProtectionContext ctx;
+    ctx.slot<PeImage>(kPeImage) = MakeX86Pe();
+    ctx.functions = {MakeFnX("f0", 0x1000, 0x1010),
+                     MakeFnX("far", 0x8000, 0x8010)};  // begin > 节尾 0x4000
+    ir::FunctionRegion fn = ctx.functions[0];
+    fn.blocks.front().insns.front().dst = ir::Operand::imm_(0x6000);  // ∈ [tail, next_begin)
+    EXPECT_TRUE(F1Gated(ctx, fn));  // cap → ub=0x4000 → D 失败
+}
+
+// 病态形 ⑤: 嵌套区域——min{begin > fn.begin} = 内层 begin < fn.end_rva,
+// C/D 联合不可满足 → 外层函数任何越区目标保守 gate (零 ExitNative 进嵌套区)。
+TEST(RegVmBackendUpperBound, NestedRegionOuterGates) {
+    wvmp::ProtectionContext ctx;
+    ctx.slot<PeImage>(kPeImage) = MakeX86Pe();
+    ctx.functions = {MakeFnX("outer", 0x1000, 0x1100),
+                     MakeFnX("inner", 0x1050, 0x1080)};  // 嵌套于 outer
+    ir::FunctionRegion fn = ctx.functions[0];
+    fn.blocks.front().insns.front().dst = ir::Operand::imm_(0x1200);
+    EXPECT_TRUE(F1Gated(ctx, fn));  // ub=0x1050 < end_rva=0x1100 → D 恒败
+}
+
+// 病态形 ⑥: 区域表为空 (fn 不在表内) → 无后继 → 节尾兜底仍生效
+// (min 定义式对空表自然退化, 不依赖 fn 自身入表)。
+TEST(RegVmBackendUpperBound, RegionTableEmptyFallsToTextTail) {
+    wvmp::ProtectionContext ctx;
+    ctx.slot<PeImage>(kPeImage) = MakeX86Pe();
+    ctx.functions = {};  // 空
+    EXPECT_TRUE(F1ExitEmitted(ctx, MakeFnX("orphan", 0x1000, 0x1010)));
+}
+
+// 病态形 ⑦: pe == nullptr (无 kPeImage 槽) → 维持 nullopt, 保守 gate。
+TEST(RegVmBackendUpperBound, PeNullStaysConservative) {
+    wvmp::ProtectionContext ctx;  // 不设 kPeImage
+    EXPECT_TRUE(F1Gated(ctx, MakeFnX("solo", 0x1000, 0x1010)));
+}
+
+// 病态形 ⑧: 回跳检出 (exit_native_blocked) 与 pdata_empty 组合——BFS 是
+// arch 共享码 (452 §3.4), x86 回退链前同样拦截。
+TEST(RegVmBackendUpperBound, PdataEmptyBlockedStillGates) {
+    wvmp::ProtectionContext ctx;
+    ctx.slot<PeImage>(kPeImage) = MakeX86Pe();
+    ctx.functions = {MakeFnX("solo", 0x1000, 0x1010)};
+    LiftMetadata m;
+    m.exit_native_blocked = true;  // lifter BFS 检出越区目标回跳本区
+    SetMetadata(ctx, {m});
+    EXPECT_TRUE(F1Gated(ctx, ctx.functions[0]));
+}
+
+// 病态形 ⑨: 节表无 .text (区域不在任何节内容面) → 无可靠上界 → 保守 gate。
+TEST(RegVmBackendUpperBound, NoTextSectionGates) {
+    wvmp::ProtectionContext ctx;
+    PeImage pe = MakeX86Pe();
+    pe.sections.clear();
+    ctx.slot<PeImage>(kPeImage) = pe;
+    EXPECT_TRUE(F1Gated(ctx, MakeFnX("solo", 0x1000, 0x1010)));
+}
+
+// 对照组: pdata 非空路径原样在前 (D2)——region end_rva 收窄于 .pdata
+// EndAddress 时, gap 内目标经 find_function_end_rva 放行, 字节不变。
+TEST(RegVmBackendUpperBound, PdataNonEmptyKeepsPdataPath) {
+    wvmp::ProtectionContext ctx;
+    PeImage pe = MakeX86Pe();
+    pe.pdata = {{0x1000, 0x1010, 0}};
+    pe.pdata_empty = false;
+    ctx.slot<PeImage>(kPeImage) = pe;
+    ctx.functions = {MakeFnX("f0", 0x1000, 0x1008)};
+    ir::FunctionRegion fn = ctx.functions[0];
+    fn.blocks.front().insns.front().dst = ir::Operand::imm_(0x100C);  // ∈ [0x1008, 0x1010)
+    EXPECT_TRUE(F1ExitEmitted(ctx, fn));
+}
