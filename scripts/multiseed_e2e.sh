@@ -299,6 +299,13 @@ x86_samples=(
     "build/x86_samples/wvmp_x86_x87gate_sample.exe"
     "build/x86_samples/wvmp_x86_sehgate_sample.exe"
     "build/x86_samples/wvmp_x86_std67gate_sample.exe"
+    # MIT-451 (X5b) B.5: stack-fix pair (pool 11 -> 13, x86 65 runs, total
+    # 315). pushform = guard-pad virtualization positive (call-arg push +
+    # transient spill + callgate window from the guard zone); guardover =
+    # stack-depth walk gate-negative (sub esp,200h > 128B budget, whole
+    # function native, protect-log gate note).
+    "build/x86_samples/wvmp_x86_pushform_sample.exe"
+    "build/x86_samples/wvmp_x86_guardover_sample.exe"
 )
 
 # Seeds: 1 (small), 12345 (default), 99999 (large), 0xDEADBEEF (magic), 0xCAFEBABE (magic).

@@ -90,6 +90,24 @@ cl /nologo /utf-8 /O1 /MD /c "%~dp0x86_std67gate_main.c" || goto :fail
 link /nologo /SUBSYSTEM:CONSOLE /MACHINE:X86 x86_std67gate_main.obj x86_std67gate_sample.obj /OUT:"%~1\wvmp_x86_std67gate_sample.exe" || goto :fail
 .\wvmp_x86_std67gate_sample.exe || goto :fail
 
+rem ---- MIT-451 (X5b) B.5: pool 11 -> 13 (stack-fix pair) ----
+
+rem (12) pushform: real in-region push shapes (call-arg push + transient
+rem spill) virtualized through the entry guard pad; callgate args read from
+rem the pushed dwords in the guard zone; cdecl cleanup inside the region.
+ml /nologo /c /Coff "%~dp0x86_pushform_sample.asm" || goto :fail
+cl /nologo /utf-8 /O1 /MD /c "%~dp0x86_pushform_main.c" || goto :fail
+link /nologo /SUBSYSTEM:CONSOLE /MACHINE:X86 x86_pushform_main.obj x86_pushform_sample.obj /OUT:"%~1\wvmp_x86_pushform_sample.exe" || goto :fail
+.\wvmp_x86_pushform_sample.exe || goto :fail
+
+rem (13) guardover: stack-depth walk gate-negative (sub esp,200h = 512B >
+rem 128B budget) -> whole function stays native; deep write would corrupt
+rem the stub save area if virtualized (the mul64hi crash shape).
+ml /nologo /c /Coff "%~dp0x86_guardover_sample.asm" || goto :fail
+cl /nologo /utf-8 /O1 /MD /c "%~dp0x86_guardover_main.c" || goto :fail
+link /nologo /SUBSYSTEM:CONSOLE /MACHINE:X86 x86_guardover_main.obj x86_guardover_sample.obj /OUT:"%~1\wvmp_x86_guardover_sample.exe" || goto :fail
+.\wvmp_x86_guardover_sample.exe || goto :fail
+
 popd
 exit /b 0
 :fail

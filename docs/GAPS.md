@@ -1180,3 +1180,76 @@ NotIntercepted 双锁）；Inc/Dec 唯一构造点 translate_unary 不写 src2
    全绿；打包 13/14 位点 gate（分布：跳转目标块未找到 17 / push-imm 11 /
    间接 jmp 1）+ 1 stub mul64hi 崩溃（第 3 条）→ 全量双跑 diff-0 口径在
    X5b 修复前不可达成；x64 对照 14 stubs / 0 gate / 双跑 diff 0 复现。
+
+## X5b 收口（MIT-451）——x86 保存区冲突修复（guard 垫栈 + 栈深 gate）+ 两缺口顺收
+
+**状态（2026-09-02，分支 `mit-x5b-stackfix`，批次一~五 8a44ca1…批次五）**：
+X5 三条实测 gate 面（in-region push / 跳表匹配器 S64 硬编码 / REG-REG 位
+测试族）全数收口。**mul64hi 崩溃销账**（修复前 main CLI 打包 rc=139 复现 →
+修复后 rc=0 byte-exact）。
+
+1. **entry guard 垫栈（D1 路线 (v)，B.2 主修复）**：stub x86 序言最前
+   `sub esp, kX86GuardBytes(=128)`——guard 区 [ns-128..ns-4] 吸收 guest
+   push/[esp-负位移]/[ebp-X]（别名帧指针）写，保存区/ctx 整体下移；保存区
+   读回偏移 esp-相对公式不变；v4/native_sp 恒 = ns（lea 补 G）；出口槽
+   kX86ExitSlotDepth = G+0x10+kCtxSize+0x80 = **0x2D8**（runtime_x86.hpp
+   单一来源派生）；尾声 4 pop 后 `add esp,G` 回 esp=ns 再终态 jmp
+   （ExitNative 落点 esp=ns 语义保持）。N=128 = B.1 实测 p99(64B) × 2
+   （wvmpTest x86 14 区：net p50=0/p90=8/p99=64/max=64，reach 全 0；
+   (i)@0 存活 9/14=64.3%，(v)@128 = 13/14=92.9%，@256/@512 无增益）。
+   工具 = scripts/verifier/measure_x86_stack_depth.py（离线镜像产品 walk）。
+2. **翻译期栈深 walk gate（D1 路线 (i)，双 arch 共享 D4）**：
+   translator walk_region_stack_depth——push/pop 净值(字节) + rsp-ALU
+   (Sub/Add imm) + rsp/别名基负位移 reach（mov ebp,esp 别名跟踪，
+   caller-saved 跨 call 失效）+ 回边增长检查 + **ExitNative/Halt 出口
+   d==0硬检查** + rsp 绝对改写 gate。预算：x86 = kX86GuardBytes、
+   **x64 = 0**（无 guard，区内栈下探即 gate——手写/第三方 x64 盲区预防；
+   wvmpTest x64 实测 0 新增 gate）。违例 → stack-depth-gate note → 整函数
+   C1 gate（既有 note 通道）。S16/S8 push/pop 不建模（translate 既有 gate
+   兜底，避免双 note）。**披露折打面**：值未知基（未跟踪寄存器）负位移不
+   检查；diamond 路径不平衡按线性 carry 保守 gate；未别名 mov esp,reg 按
+   "帧上移"假定 d 不变。
+3. **Halt/ExitNative 出口平衡规则的 mul64hi 裁决**：mul64hi（16 个
+   call-arg push、`add esp` 清栈在区域外延迟执行）→ Halt时 d=64 ≠ 0 →
+   gate。理由 = 出口物理 esp=ns 而真实 esp=ns-d，延续代码 esp 敏感（/O2
+   esp 帧 [esp±X]）即静默错——**宁 gate 勿错**（D5）。行为保真（崩溃→
+   gate-native byte-exact）。后续项挂账：esp-resync 前瞻（静态验证
+   end_rva 后延续代码 `mov esp,ebp` 型重同步后放行 d≠0 形态）。
+4. **callgate 参数窗 4→8 dword（X5 B.4 留 X5b 备选行使）**：guard 使
+   push 形参数安全后，4 dword 窗成 5+ 参调用确定性丢参点；扩窗 =
+   单常量 kX86CallgateArgDwords=8（多预置 cdecl 无害语义不变）；
+   **>8 dword 仍超窗静默丢参**（披露，arg_count 静态通路 = 后续单裁决面）。
+5. **跳表匹配器 S32 参数化（B.3）**：try_match_jump_table 三点尺寸判据
+   （delta add / lea rip / mov-imm 基址——第三点 = 派单点名两处外的实测
+   同族）按 ptr_sz 派生（x86 S32 / x64 S64，与 sz_step_ 同机制）；
+   jt_entry_to_rva 4B delta 分支改 native dword 回绕加法（表 .text 尾随
+   函数 → 负 delta 2 的补码为 MSVC x86 常态；8B 分支维持 signed i64）。
+   jmptbl 池样本三正形翻正（stub 1→4），2 负例维持 gate，byte-exact。
+6. **REG-REG 位测试族（B.4）**：lifter 四 case（x86 专属，x64 照旧 G4
+   残余 gate）→ 载体域 5..8 零新增 → translator dst=Reg 分支单 VmOp
+   **b_kind=None 判别**（编码零改动、vm_op.hpp 冻结面零触碰）→ asmgen
+   x86 handler b_kind==0 分支（lea 槽址 + native lock RMW 直打 ctx 槽）。
+   **位号 and 0x1F 语义修正**（电池 v2=35 当场炸出 0x800000000）：槽实现
+   RMW 目标 = 内存形（位号不掩码跨界摸邻槽），寄存器形 native 语义须掩码
+   ——and 后对齐。同寄存器 xadd gate（写序冲突）；REG-IMM / REG-MEM 裸形
+   照旧 gate。bitops 池样本 stub 2→3（rgn_bitops_reg 三区真虚拟化 +
+   掩码探针）。
+7. **wvmpTest x86 全量双跑 diff-0 达成（450 遗留 1 销账）**：native rc=0 /
+   packed rc=0 ×2 / native-vs-packed 逐字节恒等 / SUMMARY 103/103。
+   gate 位点分布（修复后）：跳转目标块未找到 17 / push-imm 11 / 间接 jmp 1
+   （既有面不变）+ stack-depth-gate 1（mul64hi）= 14/14 位点全 gate。
+   **wvmpTest 翻正数 = 0**——主导 gate = 既有 lifter 面"跳转目标块未找到"
+   （X5 已实录，非本单范围），guard 翻正价值落在池样本（jmptbl 3 正形 +
+   bitops REG 区 + pushform 新样本）。**"跳转目标块未找到"= x86 下一最大
+   gate 面**（按族提单素材）。
+8. **样本池 11→13**：pushform（call-arg push + callgate 窗 + 瞬态
+   push/pop，guard 垫栈真虚拟化正形）+ guardover（sub esp,0x200 > 预算 →
+   walk gate 负形 + GP helper 满足 REQUIRE_REAL）。multiseed 口径 =
+   **63 样本 × 5 = 315/315**（x64 250 + x86 65，REQUIRE_REAL=1）。
+9. **B.6 六件套**：build 0/0（产品面；keystone 第三方告警既有）、ctest
+   16/16（lifter 159 / translator 91 用例）、multiseed 315/315、
+   wvmpTest x64 14 stubs / 0 gate / 双跑 diff-0、x86 电池 37 用例 PASS +
+   dump 门 60 登记 PASS + 静态立即数扫描双面 PASS、**x64 dump
+   `ffd4728901812932…`/161,861B sha256 逐字节恒等 = D6 机器证明**。
+   冻结契约零 diff（kCtxSize 0x1C8 / runtime.hpp / vm_op 97 / 载体域
+   0..28 / 跳表 128）。
