@@ -4658,6 +4658,10 @@ public:
     // [addr], src" 单指令读改写（硬件原子性保真，x64 同口径）—— 旧值回写
     // reg_b 槽（writeback_x86 帧槽索引 RMW）。flags = add 语义全量。
     // S16 块防御（66 前缀 lifter 入口拒 —— x64 s=1 同款）。
+    // MIT-451 (X5b) B.4：REG-dst 形（b_kind==None 判别 — MEM 形恒 Reg/Imm）
+    // —— reg_a 域 = dst VM 槽索引、reg_b 域 = src VM 槽索引：lea 出 dst 槽
+    // 地址做 native RMW（ctx 槽即内存），旧值写回 src 槽（序 = xadd r,r
+    // 同寄存器病态形已在 translator gate，此处无需分叉）。S8/S32 同构。
     std::string build_xadd_x86(u64 dispatch) const {
         const std::string tag = "xxadd" + std::to_string(seq());
         const std::string tail_lbl = "xtail_" + tag;
@@ -4671,6 +4675,13 @@ public:
                 blocks[s] = o;
                 continue;
             }
+            const std::string l_reg = "xxregr_" + stag;
+            const std::string l_done = "xxregd_" + stag;
+            // b_kind 判别：0 = REG-dst 形（B.4），1/2 = MEM 形（既有路径）。
+            o += std::string("    mov ") + r32x(t_[2]) + ", " + xf(kX86FBKind) + "\n";
+            o += "    test " + std::string(r32x(t_[2])) + ", " + r32x(t_[2]) + "\n";
+            o += "    jz " + l_reg + "\n";
+            // —— MEM 形（既有路径逐字节不变）——
             // 1) guest 地址 → t_[1]；2) src → t_[0]。
             o += std::string("    mov ") + r32x(t_[2]) + ", " + xf(kX86FRegA) + "\n";
             o += std::string("    mov ") + r32x(t_[1]) + ", dword ptr " + xslot(t_[2]) + "\n";
@@ -4682,6 +4693,23 @@ public:
             //    —— kX86FBKind 是 b_kind 值槽，误用会把旧值写进槽 0/1）。
             o += setcc5_x86();
             o += writeback_x86(s, kX86FRegB, t_[0], t_[1]);
+            o += "    jmp " + l_done + "\n";
+            // —— REG-dst 形（B.4）：dst/src = VM 槽，槽址 lea 自 reg_a/reg_b 域。
+            o += l_reg + ":\n";
+            o += std::string("    mov ") + r32x(t_[2]) + ", " + xf(kX86FRegA) + "\n";
+            o += std::string("    lea ") + r32x(t_[1]) + ", [" + r32x(ctx_) + " + " +
+                 r32x(t_[2]) + "*8 + 0x10]\n";
+            o += std::string("    mov ") + r32x(t_[2]) + ", " + xf(kX86FRegB) + "\n";
+            o += (s == 0
+                      ? std::string("    movzx ") + r32x(t_[0]) + ", byte ptr " +
+                            xslot(t_[2]) + "\n"
+                      : std::string("    mov ") + r32x(t_[0]) + ", dword ptr " +
+                            xslot(t_[2]) + "\n");
+            o += std::string("    lock xadd ") + mptr(s) + " [" + r32x(t_[1]) + "], " +
+                 rs(t_[0], s) + "\n";
+            o += setcc5_x86();
+            o += writeback_x86(s, kX86FRegB, t_[0], t_[1]);
+            o += l_done + ":\n";
             o += "    jmp " + tail_lbl + "\n";
             blocks[s] = o;
         }
@@ -4695,6 +4723,9 @@ public:
     // （keystone 拒 [m], imm8 静态形式 —— x64 416 注同源）；CPU 按操作数宽
     // 度自动掩码位号。flags 仅 CF 有定义（SDM），setcc5 捕宿主真值装配。
     // S8/S16 块防御（x64 同口径：G4 派活单 S32/S64 面）。
+    // MIT-451 (X5b) B.4：REG-dst 形（b_kind==None 判别）—— reg_a 域 = dst
+    // 槽索引、reg_b 域 = src（位号）槽索引；位号先读后 RMW（bts r,r 自测
+    // 语义 = native，无 xadd 同槽写序问题）。
     std::string build_bit_op_x86(const char* native, u64 dispatch) const {
         const std::string tag = std::string(native) + std::to_string(seq());
         const std::string tail_lbl = "xtail_" + tag;
@@ -4703,6 +4734,13 @@ public:
             const std::string stag = tag + "_" + std::to_string(s);
             std::string o;
             if (s == 2) {
+                const std::string l_reg = "xbregr_" + stag;
+                const std::string l_done = "xbregd_" + stag;
+                // b_kind 判别：0 = REG-dst 形（B.4），1/2 = MEM 形（既有路径）。
+                o += std::string("    mov ") + r32x(t_[2]) + ", " + xf(kX86FBKind) + "\n";
+                o += "    test " + std::string(r32x(t_[2])) + ", " + r32x(t_[2]) + "\n";
+                o += "    jz " + l_reg + "\n";
+                // —— MEM 形（既有路径逐字节不变）——
                 // 1) guest 地址 → t_[1]。
                 o += std::string("    mov ") + r32x(t_[2]) + ", " + xf(kX86FRegA) + "\n";
                 o += std::string("    mov ") + r32x(t_[1]) + ", dword ptr " + xslot(t_[2]) + "\n";
@@ -4721,6 +4759,24 @@ public:
                      "], " + rs(t_[0], 2) + "\n";
                 // 4) flags 捕获（CF）。
                 o += setcc5_x86();
+                o += "    jmp " + l_done + "\n";
+                // —— REG-dst 形（B.4）：dst 槽址 lea 自 reg_a 域，位号读自
+                //     reg_b 域槽（先读后 RMW）。⚠️ 位号必须显式 and 0x1F：
+                //     native 寄存器形 bts r,r 按操作数宽掩码位号，而槽实现
+                //     的 RMW 目标 = 内存形（[slot]）——内存形位号不掩码（≥32
+                //     时跨界触碰后续字节 = 摸邻槽，电池 XaddBitOpsRegDstForm
+                //     v2=35 当场炸出 0x800000000）。and 后 = 寄存器形语义。
+                o += l_reg + ":\n";
+                o += std::string("    mov ") + r32x(t_[2]) + ", " + xf(kX86FRegA) + "\n";
+                o += std::string("    lea ") + r32x(t_[1]) + ", [" + r32x(ctx_) + " + " +
+                     r32x(t_[2]) + "*8 + 0x10]\n";
+                o += std::string("    mov ") + r32x(t_[2]) + ", " + xf(kX86FRegB) + "\n";
+                o += std::string("    mov ") + r32x(t_[0]) + ", dword ptr " + xslot(t_[2]) + "\n";
+                o += std::string("    and ") + r32x(t_[0]) + ", " + imm(0x1F) + "\n";
+                o += std::string("    lock ") + native + " dword ptr [" + r32x(t_[1]) +
+                     "], " + rs(t_[0], 2) + "\n";
+                o += setcc5_x86();
+                o += l_done + ":\n";
             }
             // s=0/1：防御空块
             o += "    jmp " + tail_lbl + "\n";

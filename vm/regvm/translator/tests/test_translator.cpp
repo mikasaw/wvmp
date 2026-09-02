@@ -2206,6 +2206,70 @@ bool has_stack_depth_gate(const wvmp::regvm::translator::TranslateResult& r) {
         if (n.find("stack-depth-gate") != std::string::npos) return true;
     return false;
 }
+// ---- MIT-451 (X5b) B.4: REG-REG 位测试族翻译层用例 ---------------------
+// 载体 IR（lifter B.4 产物：Op::Mov + src2=族标记 + dst/src Reg）→ 单
+// VmOp::Xadd/Bts/Btr/Btc，b_kind=None 判别（reg_a = dst 槽、reg_b = src 槽）。
+
+ir::Insn bitreg_carrier(i64 marker, ir::Reg d, ir::Reg sr, ir::Size sz) {
+    ir::Insn i = I(ir::Op::Mov, sz);
+    i.dst = ir::Operand::reg_(d);
+    i.src = ir::Operand::reg_(sr);
+    i.src2 = ir::Operand::imm_(marker);
+    i.updates_flags = true;
+    return i;
+}
+
+TEST(Translate, BitRegRegX86EmitsBKindNoneSingleOp) {
+    // x86 xadd ebx, eax（载体 5）→ 单 VmOp::Xadd，b_kind=None、reg_a=ebx 槽、
+    // reg_b=eax 槽；lock-strip note 照发（载体族既有 note 通道）。
+    ir::FunctionRegion fn = fn86_of({blk(0x1000, {
+        bitreg_carrier(5, ir::Reg::Rbx, ir::Reg::Rax, ir::Size::S32)})});
+    const auto r = wvmp::regvm::translator::translate_function(fn);
+    ASSERT_EQ(r.notes.size(), static_cast<size_t>(1));
+    EXPECT_NE(r.notes[0].find("lock-strip"), std::string::npos);
+    const Decoded d = decode_program(r.program);
+    ASSERT_EQ(d.insns.size(), static_cast<size_t>(3));  // 1 + Jmp + Halt
+    expect_is(d.insns[0], VmOp::Xadd, OpKind::Reg,
+              isa::vm_reg_of(ir::Reg::Rbx), OpKind::None,
+              isa::vm_reg_of(ir::Reg::Rax), 0, kS32);
+}
+
+TEST(Translate, BitRegRegX86BitOpsBKindNone) {
+    // bts/btr/btc（载体 6/7/8）同构单 op 形。
+    const std::pair<i64, VmOp> fams[] = {{6, VmOp::Bts}, {7, VmOp::Btr},
+                                         {8, VmOp::Btc}};
+    for (const auto& [marker, vop] : fams) {
+        ir::FunctionRegion fn = fn86_of({blk(0x1000, {
+            bitreg_carrier(marker, ir::Reg::Rbx, ir::Reg::Rax, ir::Size::S32)})});
+        const auto r = wvmp::regvm::translator::translate_function(fn);
+        ASSERT_EQ(r.notes.size(), static_cast<size_t>(1));
+        const Decoded d = decode_program(r.program);
+        ASSERT_EQ(d.insns.size(), static_cast<size_t>(3));
+        expect_is(d.insns[0], vop, OpKind::Reg,
+                  isa::vm_reg_of(ir::Reg::Rbx), OpKind::None,
+                  isa::vm_reg_of(ir::Reg::Rax), 0, kS32);
+    }
+}
+
+TEST(Translate, BitRegRegX64StaysGated) {
+    // x64 载体 REG-REG（lifter 不产，防御面）→ 照旧 skip gate。
+    ir::FunctionRegion fn = fn_of({blk(0x1000, {
+        bitreg_carrier(6, ir::Reg::Rbx, ir::Reg::Rax, ir::Size::S64)})});
+    const auto r = wvmp::regvm::translator::translate_function(fn);
+    // notes = [lock-strip 载体 note, skip gate note]（run() 入口先发 strip 披露）。
+    ASSERT_EQ(r.notes.size(), static_cast<size_t>(2));
+    EXPECT_NE(r.notes[1].find("lock bit 操作数形态未支持"), std::string::npos);
+}
+
+TEST(Translate, BitRegRegSameRegXaddStaysGated) {
+    // 同寄存器 xadd（写序冲突面）→ translator gate（宁窄勿宽）。
+    ir::FunctionRegion fn = fn86_of({blk(0x1000, {
+        bitreg_carrier(5, ir::Reg::Rax, ir::Reg::Rax, ir::Size::S32)})});
+    const auto r = wvmp::regvm::translator::translate_function(fn);
+    ASSERT_EQ(r.notes.size(), static_cast<size_t>(2));
+    EXPECT_NE(r.notes[1].find("lock xadd 操作数形态未支持"), std::string::npos);
+}
+
 } // namespace
 
 TEST(Translate, StackWalkX86BalancedPushesPass) {

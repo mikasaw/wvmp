@@ -1782,6 +1782,119 @@ TEST(X86Battery, XaddBitOps) {
 }
 
 // ---------------------------------------------------------------------------
+// (29b) MIT-451 (X5b) B.4：Xadd/Bts/Btr/Btc REG-dst 形真执行（b_kind=None
+//       判别 — reg_a = dst VM 槽索引、reg_b = src VM 槽索引，native RMW 落
+//       ctx 槽内存）。xadd = 旧值写回 src 槽 + add 全量 flags；bts 系 =
+//       CF 有定义。同寄存器 xadd 形 translator 已 gate（写序冲突），电池
+//       不覆盖。
+// ---------------------------------------------------------------------------
+TEST(X86Battery, XaddBitOpsRegDstForm) {
+    wvmp::Rng rng(12345);
+    const auto gen = rt::generate_runtime_x86(rng);
+    alignas(4) std::array<u8, 0x40> scratch{};
+    scratch.fill(0);
+    RwxImage rwx(gen.image.code);
+    const auto entry = rwx.entry();
+
+    auto bitop_regdst = [](isa::VmOp op, u8 dst, u8 src, ir::Size s) {
+        return isa::make_insn(op, isa::OpKind::Reg, dst, isa::OpKind::None, src, 0,
+                              isa::size_field(s));
+    };
+    // REG-dst 形槽 = VM 寄存器槽（槽高半字恒 0 不变量下 dword 读即全值）。
+    const u8 v1 = 1, v2 = 2;
+
+    // xadd REG-REG S32：v1=10、v2=5 → v1=15、v2=10（旧值）；flags=add 语义。
+    {
+        std::vector<u8> s;
+        isa::append_insn(s, mov_imm(v1, 10));
+        isa::append_insn(s, mov_imm(v2, 5));
+        isa::append_insn(s, bitop_regdst(isa::VmOp::Xadd, v1, v2, ir::Size::S32));
+        isa::append_insn(s, getflags(3));
+        isa::append_insn(s, halt());
+        const auto ctx = run_stream(entry, s, scratch.data());
+        expect_slot32(ctx, v1, 15u);
+        expect_slot32(ctx, v2, 10u);
+        EXPECT_EQ(ctx.regs[3] & isa::kFlagZF, 0u);
+        EXPECT_EQ(ctx.regs[3] & isa::kFlagCF, 0u);
+        EXPECT_EQ(ctx.regs[v1] >> 32, 0u);    // 槽高半字恒 0
+    }
+    // xadd REG-REG S8：v1 低字节 0xFF、v2=2 → v1 低字节 0x01（高 7 字节保持
+    // —— 字节 RMW）、v2=0xFF；CF=1（8 位进位）。
+    {
+        std::vector<u8> s;
+        isa::append_insn(s, mov_imm(v1, 0xFF));
+        isa::append_insn(s, mov_imm(v2, 2));
+        isa::append_insn(s, bitop_regdst(isa::VmOp::Xadd, v1, v2, ir::Size::S8));
+        isa::append_insn(s, getflags(3));
+        isa::append_insn(s, halt());
+        const auto ctx = run_stream(entry, s, scratch.data());
+        expect_slot32(ctx, v1, 0x01u);
+        expect_slot32(ctx, v2, 0xFFu);
+        EXPECT_EQ(ctx.regs[3] & isa::kFlagCF, isa::kFlagCF);
+    }
+    // bts REG-REG：v1=0、v2=3 → v1=8、CF=0；重复 → v1 不变、CF=1。
+    {
+        std::vector<u8> s;
+        isa::append_insn(s, mov_imm(v1, 0));
+        isa::append_insn(s, mov_imm(v2, 3));
+        isa::append_insn(s, bitop_regdst(isa::VmOp::Bts, v1, v2, ir::Size::S32));
+        isa::append_insn(s, getflags(3));
+        isa::append_insn(s, halt());
+        const auto ctx = run_stream(entry, s, scratch.data());
+        expect_slot32(ctx, v1, 8u);
+        EXPECT_EQ(ctx.regs[3] & isa::kFlagCF, 0u);
+    }
+    {
+        std::vector<u8> s;
+        isa::append_insn(s, mov_imm(v1, 8));
+        isa::append_insn(s, mov_imm(v2, 3));
+        isa::append_insn(s, bitop_regdst(isa::VmOp::Bts, v1, v2, ir::Size::S32));
+        isa::append_insn(s, getflags(3));
+        isa::append_insn(s, halt());
+        const auto ctx = run_stream(entry, s, scratch.data());
+        expect_slot32(ctx, v1, 8u);
+        EXPECT_EQ(ctx.regs[3] & isa::kFlagCF, isa::kFlagCF);
+    }
+    // btr REG-REG：v1=0xFF、v2=6 → 清位、CF=1。
+    {
+        std::vector<u8> s;
+        isa::append_insn(s, mov_imm(v1, 0xFF));
+        isa::append_insn(s, mov_imm(v2, 6));
+        isa::append_insn(s, bitop_regdst(isa::VmOp::Btr, v1, v2, ir::Size::S32));
+        isa::append_insn(s, getflags(3));
+        isa::append_insn(s, halt());
+        const auto ctx = run_stream(entry, s, scratch.data());
+        expect_slot32(ctx, v1, 0xFFu & ~0x40u);
+        EXPECT_EQ(ctx.regs[3] & isa::kFlagCF, isa::kFlagCF);
+    }
+    // btc REG-REG：v1=0x04、v2=2 → 取反、CF=1（原位）。
+    {
+        std::vector<u8> s;
+        isa::append_insn(s, mov_imm(v1, 0x04));
+        isa::append_insn(s, mov_imm(v2, 2));
+        isa::append_insn(s, bitop_regdst(isa::VmOp::Btc, v1, v2, ir::Size::S32));
+        isa::append_insn(s, getflags(3));
+        isa::append_insn(s, halt());
+        const auto ctx = run_stream(entry, s, scratch.data());
+        expect_slot32(ctx, v1, 0u);
+        EXPECT_EQ(ctx.regs[3] & isa::kFlagCF, isa::kFlagCF);
+    }
+    // 位号 >31：CPU 按宽度掩码（bts dword 位号 &31）— v1=0、v2=32+3=35 →
+    // 置 bit3、CF=0。
+    {
+        std::vector<u8> s;
+        isa::append_insn(s, mov_imm(v1, 0));
+        isa::append_insn(s, mov_imm(v2, 35));
+        isa::append_insn(s, bitop_regdst(isa::VmOp::Bts, v1, v2, ir::Size::S32));
+        isa::append_insn(s, getflags(3));
+        isa::append_insn(s, halt());
+        const auto ctx = run_stream(entry, s, scratch.data());
+        expect_slot32(ctx, v1, 8u);
+        EXPECT_EQ(ctx.regs[3] & isa::kFlagCF, 0u);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // (26) X3b 批次六：Push/Pop（4B 槽裁决 —— esp 步进 4B / ctx 槽 8B，LIFO 闭环）
 // ---------------------------------------------------------------------------
 TEST(X86Battery, PushPopStack) {

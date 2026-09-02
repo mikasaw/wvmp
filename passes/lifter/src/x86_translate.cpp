@@ -2177,6 +2177,43 @@ TranslateResult translate_string_op(const cs_insn& ci, const cs_x86& x, ir::Arch
 //     地址宽) 照旧拒 → C1 gate。
 //
 // IR 编码 (ir::Insn 冻结契约, 零碰撞):
+// MIT-451 (X5b) B.4：REG-REG 位测试族提升（x86 专属）。`xadd r,r` /
+// `bts/btr/btc r,r`（无 lock）→ Op::Mov 载体 + src2=G4 族标记 + dst/src =
+// Reg 双形。判据：op_count==2 且两操作数皆 REG；arch 必须 x86（x64 REG-REG
+// 照旧 unsupported → C1 gate，与 G4 残余清单一致）；宽度 xadd S8/S32、
+// bts 系 S32（S16 66 前缀维持 gate 口径；bts 无字节形式）。updates_flags =
+// true（xadd = add 语义全量；bts 系 CF 有定义，handler setcc5 捕宿主真值 —
+// 与 lock MEM 形同源）。
+TranslateResult translate_bitreg(const cs_insn& ci, const cs_x86& x, ir::Arch arch) {
+    if (arch != ir::Arch::X86) return unsupported(ci.address, ci.size);
+    if (x.op_count != 2 || x.operands[0].type != X86_OP_REG ||
+        x.operands[1].type != X86_OP_REG)
+        return unsupported(ci.address, ci.size);
+    const auto d = map_reg(x.operands[0].reg);
+    const auto sr = map_reg(x.operands[1].reg);
+    if (!d || !sr) return unsupported(ci.address, ci.size);
+    ir::Insn out;
+    out.op = Op::Mov;  // 载体（src2=族标记区分，与 lock MEM 形同域零碰撞）
+    out.addr = ci.address;
+    out.size = data_size(x.operands, x.op_count, arch);
+    const bool is_xadd = ci.id == X86_INS_XADD;
+    if (is_xadd) {
+        if (out.size != ir::Size::S8 && out.size != ir::Size::S32)
+            return unsupported(ci.address, ci.size);  // S16/S64 gate（S16 口径维持）
+        out.src2 = Operand::imm_(kLockXadd);
+    } else {
+        if (out.size != ir::Size::S32)
+            return unsupported(ci.address, ci.size);  // bts 系无 S8 形；S16 gate
+        out.src2 = Operand::imm_(ci.id == X86_INS_BTS   ? kLockBts
+                                 : ci.id == X86_INS_BTR ? kLockBtr
+                                                        : kLockBtc);
+    }
+    out.dst = Operand::reg_(*d);
+    out.src = Operand::reg_(*sr);
+    out.updates_flags = true;
+    return ok(out);
+}
+
 //   - 本体 op 族: op 不变 + src2=imm(kLockStrip*) — 普通 alu/cmpxchg/xchg 的
 //     src2 恒空 (imul 的 src2 在 Op::Imul 上; 串指令载体 Op::Mov 的 src2 是
 //     family 0..4 — 分域 9..11 零碰撞)
@@ -2981,6 +3018,16 @@ TranslateResult translate_insn(const cs_insn& ci, ir::Arch arch) {
     // 隐式 acc 字段不入 IR (沿用 pitfall #34 additive enum append-only);
     // handler 硬编码 regs[Rax] 槽位 + IR.size 决定宽度.
     case X86_INS_CMPXCHG: return translate_cmpxchg(ci, x, arch);
+    // MIT-451 (X5b) B.4：REG-REG 位测试族翻正面 — X86_INS_XADD/BTS/BTR/BTC
+    // REG-REG 形（无 lock 前缀；**仅 x86 arch**，x64 维持 G4 残余 gate 面不
+    // 变 — "无锁 bts reg 形式未入面照旧 gate" 口径不动）。载体复用 G4 标记
+    // 域（kLockXadd/kLockBts/Btr/Btc 值域 5..8 零新增，D3），dst=Reg 形由
+    // translator translate_lock_xadd/lock_bit 的 REG 分支单 VmOp 直执行
+    // （419/432 单 VmOp native 直执行先例；b_kind=None 判别，编码零改动）。
+    // 其余形态（REG-IMM / REG-MEM 裸形 / MEM 形无 lock）照旧 unsupported →
+    // C1 gate（MEM 仅 lock 白名单面，G4）。S16（66 0F C1/AB）维持 gate 口径。
+    case X86_INS_XADD: case X86_INS_BTS: case X86_INS_BTR: case X86_INS_BTC:
+        return translate_bitreg(ci, x, arch);
     case X86_INS_NOP: {
         ir::Insn out;
         out.op = Op::Nop;

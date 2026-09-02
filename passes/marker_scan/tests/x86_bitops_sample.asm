@@ -119,9 +119,46 @@ rgn_bitops_lock PROC
     ret
 rgn_bitops_lock ENDP
 
+; ---- 3: REG-REG bit-op family (MIT-451 X5b B.4) — xadd/bts/btr/btc reg,reg
+;      forms (no lock prefix). Virtualized via the REG-dst VmOp path
+;      (b_kind=None discriminant); observable output = globals below. Also
+;      probes the bit-index masking (index 35 -> bit 3, register-form &31).
+rgn_bitops_reg PROC
+    call    marker_begin
+    mov     eax, 1000h
+    mov     ecx, 20h
+    xadd    eax, ecx                          ; eax=1020h, ecx=1000h (old)
+    mov     [g_br_xa], eax
+    mov     [g_br_old], ecx
+    mov     edx, 0
+    mov     ebx, 5
+    bts     edx, ebx                          ; CF=0 (bit5 of 0), edx=20h
+    setc    al
+    movzx   ecx, al
+    mov     [g_br_cf], ecx
+    mov     [g_br_bts], edx
+    mov     edx, 20h
+    mov     ebx, 5
+    btr     edx, ebx                          ; CF=1 (bit was set), edx=0
+    setc    al
+    movzx   ecx, al
+    mov     [g_br_cf2], ecx
+    mov     [g_br_btr], edx
+    mov     edx, 8
+    mov     ebx, 3
+    btc     edx, ebx                          ; CF=1, edx=0
+    mov     [g_br_btc], edx
+    mov     edx, 0
+    mov     ebx, 35                           ; index 35: register-form masks &31
+    bts     edx, ebx                          ; -> bit 3, edx=8, CF=0
+    mov     [g_br_msk], edx
+    call    marker_end
+    ret
+rgn_bitops_reg ENDP
+
 .data
 PUBLIC g_b_pc, g_b_tz, g_b_lz, g_b_bs, g_b_cx, g_b_cx2, g_b_xg
-PUBLIC g_bm_slot, g_bm_cx, g_bm_xa, g_bm_cf, g_bm_bts
+PUBLIC g_bm_slot, g_bm_cx, g_bm_xa, g_bm_cf, g_bm_bts, g_br_xa, g_br_old, g_br_cf, g_br_bts, g_br_cf2, g_br_btr, g_br_btc, g_br_msk
 ALIGN 4
 g_b_pc    dword 0
 g_b_tz    dword 0
@@ -135,5 +172,13 @@ g_bm_cx   dword 0
 g_bm_xa   dword 0
 g_bm_cf   dword 0
 g_bm_bts  dword 0
+g_br_xa   dword 0
+g_br_old  dword 0
+g_br_cf   dword 0
+g_br_bts  dword 0
+g_br_cf2  dword 0
+g_br_btr  dword 0
+g_br_btc  dword 0
+g_br_msk  dword 0
 
 END

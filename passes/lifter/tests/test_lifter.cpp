@@ -1328,6 +1328,75 @@ TEST_F(LifterTranslate, SkippedInstructions) {
 // MIT-419 (G4): capstone 对非法 lock 组合 (lock mov / lock nop) 直接拒解码
 // (无 detail 输出) — 上游 disassemble_and_lift 走 skipped_ranges → C1 gate。
 // 单测钉死该通道: decode_first 返回 nullptr 即 gate 机制本身。
+// MIT-451 (X5b) B.4：REG-REG 位测试族 lift（x86 专属）— 载体 = Op::Mov +
+// src2=G4 族标记（5..8 零新增），dst/src = Reg 双形。负形面：x64 arch /
+// REG-IMM / S16 均维持 unsupported → C1 gate（G4 残余口径不动）。
+TEST_F(LifterTranslate, BitRegRegFamilyX86) {
+    // ① 0F C1 C3 (x86): xadd ebx, eax → 载体 Mov + src2=5(kLockXadd) + S32
+    const wvmp::u8 xadd86[] = {0x0F, 0xC1, 0xC3};
+    auto r = translate_bytes(x86, xadd86, ir::Arch::X86);
+    ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r.insn.op, ir::Op::Mov);
+    EXPECT_EQ(r.insn.size, ir::Size::S32);
+    EXPECT_TRUE(r.insn.updates_flags);
+    ASSERT_EQ(r.insn.dst.kind, ir::Operand::Kind::Reg);
+    EXPECT_EQ(r.insn.dst.reg, ir::Reg::Rbx);
+    ASSERT_EQ(r.insn.src.kind, ir::Operand::Kind::Reg);
+    EXPECT_EQ(r.insn.src.reg, ir::Reg::Rax);
+    ASSERT_EQ(r.insn.src2.kind, ir::Operand::Kind::Imm);
+    EXPECT_EQ(r.insn.src2.imm, 5);
+
+    // ② 0F AB C3 (x86): bts ebx, eax → src2=6(kLockBts)
+    const wvmp::u8 bts86[] = {0x0F, 0xAB, 0xC3};
+    auto r2 = translate_bytes(x86, bts86, ir::Arch::X86);
+    ASSERT_EQ(r2.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r2.insn.op, ir::Op::Mov);
+    ASSERT_EQ(r2.insn.src2.kind, ir::Operand::Kind::Imm);
+    EXPECT_EQ(r2.insn.src2.imm, 6);
+    EXPECT_EQ(r2.insn.dst.reg, ir::Reg::Rbx);
+    EXPECT_EQ(r2.insn.src.reg, ir::Reg::Rax);
+
+    // ③ 0F B3 C3 (x86): btr ebx, eax → src2=7
+    const wvmp::u8 btr86[] = {0x0F, 0xB3, 0xC3};
+    auto r3 = translate_bytes(x86, btr86, ir::Arch::X86);
+    ASSERT_EQ(r3.status, lifter::TranslateStatus::Ok);
+    ASSERT_EQ(r3.insn.src2.kind, ir::Operand::Kind::Imm);
+    EXPECT_EQ(r3.insn.src2.imm, 7);
+
+    // ④ 0F BB C3 (x86): btc ebx, eax → src2=8
+    const wvmp::u8 btc86[] = {0x0F, 0xBB, 0xC3};
+    auto r4 = translate_bytes(x86, btc86, ir::Arch::X86);
+    ASSERT_EQ(r4.status, lifter::TranslateStatus::Ok);
+    ASSERT_EQ(r4.insn.src2.kind, ir::Operand::Kind::Imm);
+    EXPECT_EQ(r4.insn.src2.imm, 8);
+
+    // ⑤ 0F C0 C3 (x86): xadd bl, al → S8 面放行
+    const wvmp::u8 xadd8[] = {0x0F, 0xC0, 0xC3};
+    auto r5 = translate_bytes(x86, xadd8, ir::Arch::X86);
+    ASSERT_EQ(r5.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r5.insn.size, ir::Size::S8);
+
+    // ⑥ 66 0F C1 C3 (x86): 66 xadd bx, ax → S16 维持 gate 口径
+    const wvmp::u8 xadd16[] = {0x66, 0x0F, 0xC1, 0xC3};
+    EXPECT_EQ(translate_bytes(x86, xadd16, ir::Arch::X86).status,
+              lifter::TranslateStatus::Unsupported);
+
+    // ⑦ 48 0F C1 C3 (x64): REX.W xadd rbx, rax → x64 REG-REG 照旧 gate
+    const wvmp::u8 xadd64[] = {0x48, 0x0F, 0xC1, 0xC3};
+    EXPECT_EQ(translate_bytes(x64, xadd64, ir::Arch::X64).status,
+              lifter::TranslateStatus::Unsupported);
+
+    // ⑧ 0F BA E0 05 (x86): bts eax, 5 → REG-IMM 不在本单面内照旧 gate
+    const wvmp::u8 bts_imm[] = {0x0F, 0xBA, 0xE0, 0x05};
+    EXPECT_EQ(translate_bytes(x86, bts_imm, ir::Arch::X86).status,
+              lifter::TranslateStatus::Unsupported);
+
+    // ⑨ 0F AB 03 (x86): bts [ebx], eax → REG-MEM 裸形照旧 gate（MEM 仅 lock 面）
+    const wvmp::u8 bts_mem[] = {0x0F, 0xAB, 0x03};
+    EXPECT_EQ(translate_bytes(x86, bts_mem, ir::Arch::X86).status,
+              lifter::TranslateStatus::Unsupported);
+}
+
 TEST_F(LifterTranslate, LockIllegalCombosUndecodable) {
     // F0 89 18: lock mov [rax], ebx —— 不可锁助记符 (capstone 拒解码)
     const wvmp::u8 lock_mov[] = {0xF0, 0x89, 0x18};

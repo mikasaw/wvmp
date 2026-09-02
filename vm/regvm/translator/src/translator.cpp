@@ -1378,6 +1378,19 @@ struct Translator {
     // 64 位全局 Interlocked* 直出 lock xadd/cmpxchg [rip+disp] 形态)。
     bool translate_lock_xadd(Emitter& em, Scratch& sc, const ir::Insn& in,
                              u64 current_rva, u64 next_ip) {
+        // B.4：REG-REG 形（x86 专属；x64 REG-REG 照旧 gate — G4 残余面）。
+        if (in.dst.kind == ir::Operand::Kind::Reg &&
+            in.src.kind == ir::Operand::Kind::Reg) {
+            // 同寄存器形 gate：handler 出口旧值写回 src 槽与 native xadd 的
+            // dst 槽写同址，序上会以旧值覆盖 2*old（native xadd r,r = 2*old
+            // 赢）——病态形保守 gate（宁窄勿宽）。
+            if (arch_ != ir::Arch::X86 || in.dst.reg == in.src.reg)
+                return skip(in, "lock xadd 操作数形态未支持", nullptr);
+            em.emit(VmOp::Xadd, OpKind::Reg, isa::vm_reg_of(in.dst.reg),
+                    OpKind::None, isa::vm_reg_of(in.src.reg), 0,
+                    isa::size_field(in.size));
+            return true;
+        }
         if (in.dst.kind != ir::Operand::Kind::Mem ||
             in.src.kind != ir::Operand::Kind::Reg)
             return skip(in, "lock xadd 操作数形态未支持", nullptr);
@@ -1396,11 +1409,34 @@ struct Translator {
     // [m] = 1/0/^1 (按族)。单 VmOp::Bts/Btr/Btc (a=地址槽; b_kind=Reg 位号
     // 槽低 8 位 或 Imm aux=imm8)。handler 内 native lock bts [addr], reg
     // 直执行 (imm 位号经 aux 装载进寄存器, reg 形式是超集语义一致)。
+    //
+    // MIT-451 (X5b) B.4：REG-REG 形（B.4 lifter 翻正面，x86 专属）——
+    // dst=Reg 时 emit 单 VmOp::Bts/Btr/Btc/Xadd，**b_kind=None 判别**
+    // （b_kind 0 值为编码合法域且 MEM 形从不使用——MEM 形恒 Reg/Imm；
+    // reg_a = dst VM 槽索引、reg_b = src VM 槽索引，handler 据此 lea 出
+    // dst 槽地址做 native RMW，xadd 旧值写回 src 槽）。零新 VmOp、零编码
+    // 改动、vm_op.hpp 冻结面零触碰。x64 不走本分支（G4 残余 gate 面不变；
+    // x64 handler 逐字节不动 = dump ffd47289 恒等约束）。REG-IMM（bts
+    // reg, imm8）不在本单面内，照旧 gate。
+    bool emit_lock_bit_reg_dst(Emitter& em, const ir::Insn& in, VmOp vop) {
+        const u8 sz = isa::size_field(in.size);
+        em.emit(vop, OpKind::Reg, isa::vm_reg_of(in.dst.reg), OpKind::None,
+                isa::vm_reg_of(in.src.reg), 0, sz);
+        return true;
+    }
     bool translate_lock_bit(Emitter& em, Scratch& sc, const ir::Insn& in, i64 marker,
                             u64 current_rva, u64 next_ip) {
         const VmOp vop = marker == kLockBts ? VmOp::Bts
                          : marker == kLockBtr ? VmOp::Btr
                                               : VmOp::Btc;
+        // B.4：REG-REG 形（lifter 翻正面仅产 x86 + 双 Reg 形；判别形见
+        // emit_lock_bit_reg_dst 注）。arch 防御：x64 REG-REG 照旧 gate。
+        if (in.dst.kind == ir::Operand::Kind::Reg &&
+            in.src.kind == ir::Operand::Kind::Reg) {
+            if (arch_ != ir::Arch::X86)
+                return skip(in, "lock bit 操作数形态未支持", nullptr);
+            return emit_lock_bit_reg_dst(em, in, vop);
+        }
         if (in.dst.kind != ir::Operand::Kind::Mem)
             return skip(in, "lock bit 操作数形态未支持", nullptr);
         u8 acc = 0;
