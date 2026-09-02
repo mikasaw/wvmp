@@ -265,7 +265,7 @@
 | SIMD 尾族三行（pmovmskb / pcmpeq/pcmpgt / punpck 系） | ⛔ gate（分层定稿） | 频率分层：客户态新抽 14 exe 全零 vs SIMD/CRT 域 punpck 0.06–0.074% / pmovmskb 0.015–0.055% 密度；punpck 粒度分裂 d/q 88–100% hash/安全域 vs b/w 73% codec 域；lqdq/hqdq D1 拍板 gate 不折 | MIT-432 §1/§1.4（`.multica/mit-G9r-triage.md`）+ MIT-GZ D1 |
 | G8b 三条（mulx/pdep/pext）+ blsr 族四条（blsr/blsi/blsmsk/bextr） | ⛔ gate（挂账/永久） | mulx/pdep/pext = G8b 档 native 直执行 + CPUID gate 基建挂账，mulx CF Zen5 实测不写 vs SDM 厂商分叉待决；blsr 族 27 文件语料 0 永久 gate | MIT-432 §2/§6.4 + MIT-GZ B.1 |
 | ymm / EVEX / FMA / 加密（AES 等） | ⛔ gate（档B） | xmm 跟踪区 kCtxSize 0x1C8 冻结面；档B 立项即触发跳表扩容评估 | MIT-424 (档B) |
-| x86 (PE32) 平台（MIT-446 (X4) 翻正，MIT-450 (X5) 收口扩证，MIT-454 (X6) SSE+push-imm 翻正） | ✅ 支持 | 全管道：D1 解禁 + stub x86 cdecl + cdecl callgate 参数窗（X5 裁决 = 可见参数桥，8 dword）+ x86 白名单 gate；样本池 15 族级样本 byte-exact（X6 池 14→15 pushimm）；ExitNative x86 上界接线已翻正（X5c F1）；SSE 32 op x86 全入面 + push-imm x86 开面（X6：wvmpTest 103-kernel 14 标记区真虚拟化 11 = 78.6%，全 103 面 10.7%）；残余 gate 面 = Div / Idiv（b59b 实撞，G8 D2 除零折叠维持）/ 间接 jmp 1（aebb）/ 栈深 1（mul64hi，X5b 永久 gate）（13→3，见 X6 收口节） | MIT-446 (X4) / MIT-450 (X5) / MIT-453 (X5c) / MIT-454 (X6) |
+| x86 (PE32) 平台（MIT-446 (X4) 翻正，MIT-450 (X5) 收口扩证，MIT-454 (X6) SSE+push-imm 翻正，MIT-455 (X7) Div 族+重扫收官） | ✅ 支持 | 全管道：D1 解禁 + stub x86 cdecl + cdecl callgate 参数窗（X5 裁决 = 可见参数桥，8 dword）+ x86 白名单 gate；样本池 16 族级样本 byte-exact（X6 池 14→15 pushimm，X7 15→16 div）；ExitNative x86 上界接线已翻正（X5c F1）；SSE 32 op x86 全入面 + push-imm x86 开面（X6）+ Div/Idiv x86 真 handler（X7 批二：cdq x86 开面随之）；wvmpTest 103-kernel 14 标记区真虚拟化 **12 = 85.7%**（全 103 面 11.7%）；残余 gate 面 = 间接 jmp 1（aebb）+ 栈深 1（mul64hi，X5b 永久 gate）（3→2，见 X7 收口节）；X7 客户态重扫：x64 direct 99.26% / x86 95.15%（形级口径，留样入仓） | MIT-446 (X4) / MIT-450 (X5) / MIT-453 (X5c) / MIT-454 (X6) / MIT-455 (X7) |
 | 16-bit 目标 | ⛔ 不可行 | PE 格式白名单只收 0x014C/0x8664 | MIT-412（GAPS C5 交叉引用） |
 
 > 观察清单与挂账联动见 `docs/STATUS.md`「指令虚拟化阶段（M2.5-G）收口」节；
@@ -537,7 +537,7 @@ gate，整函数原生 byte-identical 零逃逸）**：
 | G5 | call [mem] / call reg（目标 = 运行时值）——CallGate 协议仅吃 aux RVA（asmgen build_callgate step1 直读），reg-target 通路需 asmgen 改动 → **D4 停手归 X3**（IAT thunk `call [__imp_x]` msvbvm60 35% of call / vtable call reg dxcompiler 4167 级） | lifter 已 lift（Call dst=Mem/Reg，409 Jmp 先例）→ translator skip 带 X3 披露 note → C1 整函数原生 | MIT-442 (X2a) ① #33 实测推翻「Load+Call(reg) 零新 VmOp 高置信」预判（call-reg "可直用" 系 lifter 白名单级，runtime 从未有 E2E）；单测 CallMemGateNoteX3；样本负例区2/2b |
 | G6 | cbw 之外的低频尾族：shld/shrd（X3 结构性必收）/ enter（噪声）/ cwd（66 99，无折条）——X0 §1.4 缺失行维持 | lifter default | X0 §1.4 + MIT-442 分工（shld/shrd 归 X3，本单不动）；单测 CwdeCbwFoldForkFace（cwd 66 99 gate 钉） |
 | G7 | SSE 全族（x86 面 32 op：Addss..GpFromXmm + Ucomiss/Ucomisd）——**MIT-454 (X6) 翻正**：32 VmOp 全部入 x86 handler 表（表 60→92 行，加行即自动放行，stub_link 零改动），批迁含 stub xmm 同步（x86 stub 入口 host→ctx.xmm + 出口 ctx→host，X6 A 面配套）+ ExitNative/Ret 直退 handler 内联 xmm 恢复；样本 wvmp_x86_sse_sample 翻案 gate→真虚拟化（stub 1→2，输出 byte-exact，428 翻转先例） | ~~stub_link emit 层 gate~~ → 真虚拟化；Cvt/Sqrt/Unpck/Shuf 指令面无 ir 载体无 VmOp（冻结枚举域内不存在），双 arch 同为 lifter 层 gate | MIT-446 (X4) 立面 → MIT-454 (X6) A=X3d 批次二/三收口 |
-| G8 | Div/Idiv（x86 面）——D2 除零折叠维持（真 #DE 语义未定义），跳表缺项 | stub_link x86 白名单 gate（同 G7 通道） | MIT-444 (X3b) D2 拍板 + MIT-446 (X4) gate 化；开面归未来单评估 |
+| G8 | Div/Idiv（x86 面）——**MIT-X7 (MIT-455) 批二翻正**：`build_div_idiv_x86` 真 handler 入 x86 表（92→94 行，除零/商溢出 = 真 #DE 直通 = x64 build_div_idiv D2.1 同口径镜像，flags setcc5_x86 捕真值；除数临时静态避 {eax,edx} 双位）+ lifter translate_cdq x86 S32 开面（真实 idiv 恒有 cdq 前置，Div face 必要条件；cqo REX.W 防御拒维持）+ 样本 wvmp_x86_div_sample（div reg/mem + idiv cdq + 负除数，池 15→16）+ 电池 DivIdivQuotRem（43→44）；wvmpTest b59b 翻正 stubs 11→12 | ~~stub_link x86 白名单 gate（同 G7 通道）~~ → 真虚拟化 | MIT-444 (X3b) D2 拍板 + MIT-446 (X4) gate 化 → MIT-X7 批二翻正（X7 批一 triage §3.3：x86 div 族 89/112 文件命中，D4 x64 真行为实读后镜像） |
 
 ## X2a 形级 fork 面收口（MIT-442）：六形态折叠 + x64 全链实证
 
@@ -1397,3 +1397,83 @@ SSE 32 op）分批全绿收口，wvmpTest x86 残面 **13→3**，stubs **9→11
    清单，依据 = 派单 A.2 "stub xmm 同步 Win64 ABI 面 371" + 446 交接
    原文"槽偏移公式按 x86 帧重核" + stub 注释自带的条件翻转句；x64 路径
    逐字未动（D2 恒等机器证明）。
+
+## X7 收口（MIT-455）——客户态重扫（双 arch 三层口径）+ X6b 三面数据裁决 + Div 族 x86 开面
+
+**状态（2026-09-03，分支 `mit-x7-rescan-x6b` 基于 main bf2a41d，三批
+2cd5fad / f6c9277 / 本节）**：批一零产品代码重扫 + 批二数据裁决制实施 +
+批三文档收口。x86 战役残面收官读数：wvmpTest x86 stubs **11→12**，残面
+**3→2**（间接 jmp 1 + 栈深 1，均为永久/挂账 gate），103-kernel 14 标记区
+真虚拟化率 78.6%→**85.7%**。
+
+### 批一：客户态重扫（`scripts/verifier/mit_x7_rescan.py` + 留样入仓）
+
+- **语料**（X0 §1.2 口径重建，X0 留样 jsonl 已随 %TEMP% 失效）：x86 = SysWOW64
+  点名 core_os 37 + old_runtime 12 + modern_ucrt 7 + random 48（八分位
+  seed=436）+ 436 第三方家族现存子集 8（PhysX/Steam/dxcompiler/hha/wab32
+  缺位如实披露）= 112 文件 27.41M clean 指令；x64 = System32 对称层 103
+  文件 17.63M clean（**X0 从未扫过 x64 域，本单新数据**）。
+- **覆盖率读数（X6 后白名单，形级口径）**：x64 direct **99.26%**（core_os
+  99.68% / old_runtime 98.67% / ucrt 99.48% / random 99.30%）；x86 direct
+  **95.15%**（库域 94.26% / third_party 97.55%）——落 X0 自报诚实下界带
+  92-94% 上沿且构成翻新（call mem/reg、ret imm16、plain 串、S16 GP、
+  push-imm、SSE 32 op 全入面；gate 面全部可点名）。
+- **区域级（x64 .pdata 真函数域 240,277 函数）**：任一 gate 族命中
+  12,650（5.26%）→ 纸面无 gate 函数 94.74%；分族：sse_residual 2.41% /
+  indirect_jmp 1.79% / system_legacy 1.35% / push_imm 0.049% / **x87 0%**。
+  x86 无 .pdata：文件级 any-hit 代理 + 递归对账（X0 §1.1 纪律）。
+- **一致性断言（§E）**：脚本 direct 151 助记符 ⊆ 产品 lifter case 208 id
+  （不等即 Fatal）+ 形级双通道交叉校验（disasm_lite/op_str vs detail/
+  operands，双文件 47,705 shape 项零 diff）。
+
+### 批二裁决（预登记阈值 D2 机械执行，数据→裁决→实施链闭环）
+
+| 面 | 读数 | 判定 |
+|---|---|---|
+| push-imm x64 | 5,009 / 17,626,439 = **0.0284%** < 0.5%（最高层 old_runtime 0.084% 仍差 6 倍；68 形 3,314 / 6A 形 791） | **维持 gate 销案**（translator :1611 skip 维持；D2：销案 = 满分结论） |
+| 间接 jmp | 门1 x64 函数占比 **1.787%**（4,294/240,277）≥1% 过门；门2 表形（mem 带 index×8）全语料仅 **28 条（0.0002%）**，任意 mem 形 84.7% + reg 形 15.2% 主导 | **门2 败 → 维持 gate 销案**（任意/reg 形 = call 表分发 D6 边界 = L 拒做挂账；413 跳表匹配器现网三正形维持） |
+| Div 族 x86 | x86 div/idiv 8,976 条（0.033%），**89/112 文件命中**；453 b59b 实撞在案；D4 实读 x64 = build_div_idiv 真 handler（#DE 直通，setcc5 捕真值） | **批二实施**（见下） |
+| x87 B 路线（445 §6 触发判定） | x86 密度与 X0 同构（old_runtime 7.81% / ucrt 1.00% / core_os 0.115%）；x64 0.033% 且 **.pdata 函数域含 x87 函数 = 0 个**（d3dx9 x64 版已 SSE 化，x87 命中全为 .pdata 外数据噪声） | **B 路线（x87 L0）触发条件不满足，维持 R-SSE-only（A 路线）**——本读数即 445 §6 B 路线立项数据，append-only 入册 |
+
+### 批二实施：Div/Idiv x86 真 handler（G8 行翻正，见上表）
+
+- `build_div_idiv_x86`（asmgen.cpp）：x64 build_div_idiv D4 镜像——native
+  `div/idiv r/m32` 直通（dividend edx:eax，商 eax/余 edx 双槽写回）、除零/
+  商溢出 = 真 #DE 崩溃形态与未加壳一致（D2.1，不做 VM 内拦截）、flags
+  Intel undefined = setcc5_x86 捕 native 真值（照抄 build_imul 处置）。
+  排布纪律新增：除数临时 ts 静态避 {eax,edx} **双位**（build_mul_x86 只避
+  eax；div 装载 EDX:EAX，ts 与 EDX 重合会被 dividend 装载覆盖）。
+- lifter `translate_cdq` x86 S32 开面（**D3 字面清单超出披露**，454
+  stub_gen xmm 同步先例）：真实 idiv 代码恒有 cdq 前置，无 cdq lift 则
+  Div face 只剩无符号 div 孤形，派单 §B.2 交付不成形；MIT-404 时点 x86
+  asmgen 未存在故当时限 x64，X3b 已备 build_cdq_x86 S32 真面，本单接线；
+  cqo（REX.W）x64 专属维持（32 位模式无 REX，防御拒）。
+- 联动：x86 handler 表 92→**94** 行（stub_link 白名单单源自动跟随）；
+  电池 DivIdivQuotRem ×6 组（43→44）；lifter 钉测试
+  CdqX86LiftAndCqoBoundary（x86 cdq lift + cqo/cwd 边界 + idiv reg/mem/S8
+  钉）；dump 门 BATTERY_HANDLERS +2；静态立即数扫描双面 PASS；样本
+  `wvmp_x86_div_sample`（div reg + div mem + idiv cdq + 负除数，native
+  首绿 byte-exact，池 15→16）。
+
+### 新数据行（非本单范围，留档供裁量）
+
+- **push_mem x86（`push [mem]`，translate_push Mem skip 残面）**：505,828
+  条 = 1.845%（92.9% 文件命中）——X0 估 ~0.5%，实测 3 倍余（core_os IAT/
+  栈窗惯用面重），为 x86 第一大非 x87 shape gate。不在 X6b 三面（D2 未
+  含），维持 gate，后续派单按族评估。
+
+### 验证六件套（X7 收口读数）
+
+build 0/0（本方源零警告）/ ctest 16/16 / multiseed **330/330**（REQUIRE_REAL=1，
+x64 250 + x86 80，池 50+16）/ wvmpTest x64 14 stubs 0 gate 双跑 diff-0、
+x86 **12 stubs** 双跑 diff-0（103×3 全 PASS）/ x86 电池 44 + dump 门 94
+登记项 PASS / **x64 dump @12345 `ffd4728901812932…`/161,861B sha256 逐字节
+恒等**（底稿复跑锚 = 新增 WVMP_X64_ASM_DUMP 落盘钩子 +
+`--gtest_filter=Interpreter.MovdBridgeSemantic`，生成命令首次入仓）。
+
+冻结契约零 diff（kVmOpMax=97 / 载体域 0..28 / kCtxSize / runtime.hpp /
+backend.hpp / 判定链 / ExitNative 协议 / 跳表 128）。解禁清单披露：lifter
+x86_translate.cpp（translate_cdq x86 开面）超出 D3 字面清单（原文仅"间接
+jmp 需 lift 形"），依据 = Div face 交付必要条件 + 404 注释自带的时点前提
+（"x86 asmgen 未存在"已随 X3a 翻转）；x64 路径行为逐字节不动（dump 恒等
+机器证明）。
