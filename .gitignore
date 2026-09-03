@@ -12,6 +12,9 @@ build*/
 .hermes/plans/
 .hermes/triage/
 
+# Multica tarball extraction byproducts (tarfile.extractall leakage — already a tar.gz at docs/multica-archive.tar.gz)
+/docs/multica-archive/
+
 # Developer handoff doc (not for public release)
 /WVmp_HANDOVER_*.md
 

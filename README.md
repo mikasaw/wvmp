@@ -51,10 +51,11 @@ scripts\test.bat
 The smoke test exercises the entire pipeline: build wvmpTest target, run native, pack with WVmp CLI, run packed, diff outputs.
 
 ```bat
-:: Clone wvmpTest sibling repo first:
-git clone https://github.com/YOUR/wvmpTest ..\wvmpTest
-
-:: From WVmp repo root:
+:: tests/wvmpTest/ lives inside this repo (no external clone needed).
+:: Build the test target, then run the smoke test:
+cd tests\wvmpTest
+call build.bat x64
+cd ..\..
 tests\wvmpTest\smoke_test.bat
 ```
 
@@ -101,72 +102,156 @@ For the full issue roster, discipline notes, and accumulated lessons see [docs/M
 |---|---|
 | M2.5-G instruction virtualization (x64) | Done (2026-08-31) |
 | M2.5-X multi-target platform (x86 production) | Done (2026-09-03) |
-| X3d SSE-32 refinement | Data ready, not scheduled |
-| `push_mem` x86 (1.845% — first non-x87 shape gate) | Data ready, candidate for next dispatch |
-| M3 cryptographic protection line (MIT-410) | Parked, awaiting prioritization |
+| M3 protection surface (Streams 1-5 below) | Six streams queued, ready to dispatch (see Roadmap) |
+| Extended surface (Streams 7-9 below) | Three streams parked, awaiting trigger (see Roadmap) |
+| Product surface (Stream 6 below) | One stream, gated on Streams 1-5 (see Roadmap) |
 
 ## Roadmap
 
-Three work streams are queued beyond the current M2.5-G + M2.5-X close-out, ordered by readiness (data → decision → execution).
+Nine capability streams are queued beyond the current M2.5-G + M2.5-X close-out. They are **independent products** of WVmp (not "stages" of M2.5-X) — each has its own scope, prerequisites, and dispatch plan. They are listed in **roadmap order** (data-side → product surface), not priority order.
 
-### Stream 1: `push_mem` x86 (next-dispatch candidate)
+The five protective passes in `passes/` (`anti_debug`, `crypt`, `integrity_crc`, `import_protect`, `mutate`) and the `vm/regvm/codecs/` module are all registered as placeholders today (per `docs/STATUS.md` "M3 plugin pool ⏳ not started"). Streams 1-5 are how those placeholders become real product. Streams 7-9 extend the protection surface to broader scopes (driver / VM-detection / host-OS surface) and are explicitly parked until external triggers.
 
-**Why first**: smallest blast radius, single-shape gate, highest ROI.
+### Stream 1: bytecode cryptographic obfuscation
 
-- **Target shape**: `push [mem]` — the largest non-x87 shape gate on x86, affecting **1.845%** of all instructions across **92.9%** of files in the corpus. (Measured at X7, 2026-09-03; revised 3.7× higher than the X0 pre-scan estimate.)
-- **Form breakdown** (x86-only, X7 data):
-  - `push_mem` is the dominant non-x87 shape gate, dwarfing every other gate (sse_residual 2.41%, indirect_jmp 1.79%, system_legacy 1.35%, push_imm 0.049% — all on x64; on x86 the picture is reversed).
-  - The `push_mem` family itself needs further shape-class breakdown before dispatch (memory operand forms: `[reg]`, `[reg+disp]`, `[reg+reg*scale+disp]`, segment overrides). This shape-class breakdown is the data-side prerequisite for Stream 1.
-- **Open questions** before dispatch:
-  - **Coverage**: would implementing `push_mem` move wvmpTest x86 true-virtualization from 12/14 → ? Need to measure per-shape coverage before sizing.
-  - **Stub-link dispatch cost**: how many new entries in the 128-slot jump table are consumed? Current free slots: 31 (97/128). `push_mem` is expected to consume ~3 slots if implemented as a single shape (split for memory operand forms may consume more).
-  - **x64 spillover**: should the same handler serve the x64 case for symmetry, or are x86 memory operand encodings different enough to require separate handlers? (Decision deferred to dispatch.)
-- **Expected effort**: 1 single-architect dispatch (X6-class), 1-2 days. No cross-arch implications.
+Replaces the placeholder in `passes/crypt/src/crypt_pass.cpp` and implements the placeholder codec interface in `vm/regvm/codecs/`.
 
-### Stream 2: X3d SSE-32 refinement
+- **What it does**: encrypts the VM bytecode stream after virtualization, embeds decrypt metadata into the stub, and decodes on entry. The marker-pair magic and the VM program become inseparable from the runtime decoder.
+- **Why first**: smallest blast radius (one pass + one codec module), no cross-pass dependencies, validates the codec/roundtrip contract end-to-end.
+- **Open design decisions** (must be locked before dispatch):
+  - **Cipher primitive** — AES-NI (fast, recognizable signature) / custom S-box (no signature, slower) / VM-emulated (homomorphic to current protection, slowest).
+  - **Key bundle** — per-target embed (current marker-magic approach, offline-runtime) / server-fetched (anti-tamper, online-runtime only).
+  - **Threat model** — interactive debugger / automated taint / mass-scanner — different models favor different cipher choices.
+- **Effort**: 1 single-architect dispatch, 2-3 days.
 
-**Why second**: already partially executed in X6 (32 SSE ops covered), refinement is incremental.
+### Stream 2: instruction-level code mutation
 
-- **Status today**: 32 SSE ops live in x86 handler table (X6, MIT-454). The "32" refers to VmOps in the existing enum that have SSE-form encodings; Cvt/Shuf/Unpck/Sqrt have no VmOp in the frozen enum and route through narrow-bar. (Per GAPS.md §Cvt)
-- **What refinement would target**:
-  - Memory-aligned SSE moves (`movaps` / `movaps` for unaligned forms) — currently folded into single `VmOp::Movups`; unaligned form correctness not separately verified.
-  - SSE comparison flags: `ucomiss` / `ucomisd` produce EFLAGS bits; full-flag carry semantics not separately verified.
-  - `cvt*` family (integer↔float / float-precision): no VmOp yet; currently narrow-bar routed.
+Replaces the placeholder in `passes/mutate/src/mutate_pass.cpp`.
+
+- **What it does**: rewrites the lifted IR before VM bytecode emission — dead-code insertion, equivalent substitutions, bogus control flow — deterministically from `ctx.seed`. Increases reverse-engineering cost without changing semantics.
+- **Why second**: low risk (pure IR transformation, no runtime dependency), builds on the existing frozen IR carrier domain.
 - **Open questions**:
-  - Real corpus frequency: how often do unaligned SSE moves vs `cvt*` appear in the X7 corpus? X0 estimated both as ~0.5% combined; X7 data did not separately enumerate these shapes.
-  - Flag-precision vs jump-table-cost tradeoff: implementing flags-correct `cvt*` may consume jump-table slots for marginal corpus benefit.
-- **Expected effort**: small/medium, depends on X3d-triage sub-task data; likely 2-3 days if dispatched.
+  - **Strength/cost tradeoff** — mutation density affects both runtime perf and reverse-engineering difficulty; calibrate to a target ratio.
+  - **Determinism** — seed-derived reproducibility is a hard requirement (test baseline stability).
+- **Effort**: 1 single-architect dispatch, 2-3 days.
 
-### Stream 3: M3 cryptographic protection line (MIT-410)
+### Stream 3: anti-debug / anti-instrumentation hardening
 
-**Why third (and currently parked)**: this is the next major research line, not a continuation of M2.5-X. Scope and prerequisites are different.
+Replaces the placeholder in `passes/anti_debug/src/anti_debug_pass.cpp`.
 
-- **Origin**: parked during W14 (2026-08-29, see `.multica/mit419-ruling.md` line 7 — backreference to "MIT-410 (M3 line)"). F1 (cryptographic obfuscation of marker-pair magic) and F2 (key-bundle in stub dispatch) were sketched as the two product features.
-- **Prerequisites before resuming**:
-  - **F1 design choice**: cryptographic primitive (AES-NI vs custom S-box vs VM-emulated cipher). Each has different threat-model and performance profiles.
-  - **Threat model definition**: who is the adversary? Reverse engineers with debugger? Automated taint analysis? Different models drive different cryptographic choices.
-  - **F2 key-bundle distribution**: where do keys live? Per-target embed (current approach for marker magic) vs server-fetched (anti-tamper). Affects offline-vs-online runtime model.
-- **Why parked now**: the M2.5-X close-out establishes the protection primitive is robust on the *non-cryptographic* axis (custom VM opcodes). The cryptographic layer is a strict upgrade, not a fix — there's no product bug forcing it. Parked for prioritization, not abandoned.
-- **Expected effort**: 5-10 days of design + 2-3 dispatch cycles, depending on F1/F2 split.
+- **What it does**: emits anti-debug checks (PEB.BeingDebugged, hardware breakpoints, NtQuery variants, timing attacks) and anti-instrumentation guards (ProcessInstrumentationCallback, debug break-in hooks) into the protected image.
+- **Why third**: independent from crypto/mutate, but requires **runtime stub surface** that the current stub_link interface doesn't yet provide. Needs a small stub extension before the pass is meaningful.
+- **Open questions**:
+  - **User-mode only** vs **user-mode + kernel-mode** — kernel hooks require a separate SYS runtime; current scope is user-mode only.
+  - **Anti-DBI strategy** — ProcessInstrumentationCallback is a Windows 10+ feature; XP/Vista coverage requires alternate approach.
+- **Effort**: 2 sub-dispatches (stub extension + pass implementation), 3-4 days total.
+
+### Stream 4: import protection (IAT hardening)
+
+Replaces the placeholder in `passes/import_protect/src/import_protect_pass.cpp`.
+
+- **What it does**: rewrites the import directory to route API calls through the protection stub. IAT entries are encrypted, resolved lazily on first call, with per-function keys.
+- **Why fourth**: complementary to bytecode crypto (Stream 1) — together they prevent static extraction of both VM program and API call surface. Builds on existing `passes/stub_link/` infrastructure.
+- **Open questions**:
+  - **Lazy vs eager resolution** — eager is simpler but leaks presence-of-imports; lazy requires runtime decoder in stub.
+  - **SDK API separation** — SDK functions (loader-time helpers) need a separate code path from user-imported APIs.
+- **Effort**: 1 single-architect dispatch, 2-3 days.
+
+### Stream 5: runtime integrity verification
+
+Replaces the placeholder in `passes/integrity_crc/src/integrity_crc_pass.cpp`.
+
+- **What it does**: computes digests over protected sections at build time, embeds verification data, and runs self-check on load (with anti-tamper response).
+- **Why fifth**: closes the loop on tamper detection — even if Streams 1-4 are bypassed, the runtime can detect that the protected image has been modified post-build.
+- **Open questions**:
+  - **Verification granularity** — whole-section vs per-function vs per-VM-region. Per-region is strongest but increases overhead.
+  - **Trigger strategy** — load-time-only / periodic / on-sensitive-call. Each has different performance/tamper-resistance tradeoffs.
+- **Effort**: 1 single-architect dispatch, 1-2 days.
+
+### Stream 6: standalone GUI
+
+A new top-level deliverable. CLI is currently the only interface (`cli/src/main.cpp`). Stream 6 adds a standalone GUI on top of the CLI subprocess.
+
+- **What it does**: project management (load/save WVmp project files), region selection visualization, pass-by-pass configuration panels, real-time compile log, code preview with marker highlighting.
+- **Why sixth**: depends on Streams 1-5 having real options to configure. A GUI without real pass options is just a CLI wrapper with chrome.
+- **Scope decisions** (must be locked before dispatch):
+  - **GUI framework** — Qt (industry standard, paid license for commercial use) / wxWidgets (permissive, smaller ecosystem) / Dear ImGui + native window (developer-friendly, less polished). License compatibility with WVmp's MIT license must be checked per choice.
+  - **OS targets** — Windows-only first, cross-platform deferred (matches current WVmp scope).
+  - **Process model** — GUI is a thin layer that spawns `wvmp_cli.exe` as a subprocess and parses its output. No direct in-process linking to passes/.
+- **Effort**: design + skeleton 2-3 days, feature-complete 5-7 days. This is a **single large dispatch** (or two — GUI skeleton + feature wiring), not multi-stream.
+
+### Stream 7: Windows kernel-driver protection
+
+A separate code path with its own SYS runtime. Currently WVmp operates strictly on user-mode PE executables.
+
+- **What it does**: protects `.sys` driver binaries — separate VM runtime that runs at IRQL ≥ DISPATCH_LEVEL, hardened against kernel debugger attach (KdDebuggerEnabled / KdTransportMaxPacketSize), and DriverUnload hook transparency.
+- **Status today**: parked, not dispatched.
+- **Why parked now**:
+  - **Independent SYS runtime** is required (existing user-mode runtime relies on user-mode API surface).
+  - **Different testing infrastructure** (kernel verifier, WinDbg kernel-mode, driver loading test harness).
+  - **Different threat model** (kernel-mode adversaries: kernel patch protection, PatchGuard, signed-driver bypass).
+  - **No current customer pull** for kernel-driver protection.
+- **Trigger to un-park** (any one):
+  - Customer request specifically for a `.sys` driver protection scenario.
+  - Internal decision to enter the driver-protection product line (commercial decision).
+  - Adjacent research need (e.g. a new technique that only makes sense in kernel mode).
+- **Effort**: 5-10 days of design + 2-3 dispatch cycles (independent of Streams 1-5).
+
+### Stream 8: anti-VM / anti-sandbox detection
+
+Detects whether the protected program is running inside an analysis environment (hypervisor, sandbox, DBI framework).
+
+- **What it does**: emits detection routines for analysis environments — CPUID hypervisor-present bit, firmware-table vendor scanning, sandbox API artifacts, timing-based detection variants. Hooks into the existing `passes/anti_debug/` infrastructure but operates on a different axis.
+- **Status today**: partially covered (CPUID vendor scan exists in some protection tooling), not yet dispatched as a focused effort.
+- **Why not a standalone stream earlier**:
+  - **Partial coverage already exists** in adjacent streams (anti-debug checks, integrity verification); promoting to standalone is incremental, not greenfield.
+  - **Heuristic maintenance cost**: VM/sandbox detection signatures churn faster than VM hardening (vendors add evasion to their analysis tooling). Requires ongoing maintenance, not a one-shot dispatch.
+  - **False-positive risk**: aggressive VM-detection breaks legitimate users (e.g. users running under Hyper-V, WSL2, or anti-virus sandboxing).
+- **Trigger to un-park** (any one):
+  - Customer request specifically for "defeat mass-scanner pipelines" (Stream 1 threat-model variant).
+  - Compelling real-world evasion event (a major analysis vendor successfully bypasses current protection).
+  - Internal decision to harden against a specific adversary class.
+- **Effort**: 1-2 design sessions + 1-2 dispatches, ongoing maintenance budget.
+
+### Stream 9: virtual file system / virtual registry
+
+Hook-based re-direction of host-OS file and registry I/O — emulated resources live encrypted inside the protected image.
+
+- **What it does**: rewrites Win32 file/registry API calls (`CreateFile`, `RegOpenKeyEx`, etc.) to route through a custom dispatcher. Resources appear to come from a "virtual" location while actually being decrypted on demand from an embedded bundle.
+- **Status today**: parked, not dispatched. No placeholder infrastructure exists for this.
+- **Why parked now**:
+  - **Host-OS surface, not VM-protect surface** — the protection primitive's value is in the IR→VM-bytecode layer; host-OS surface-level protection is a different product layer.
+  - **Requires inline API hook framework** — ntdll/kernel32 hook chains, hook-safety verification, WoW64 split. Significant infrastructure cost.
+  - **High maintenance burden** — Windows API surface changes between versions; hook locations shift.
+- **Trigger to un-park** (any one):
+  - Customer request for "encrypted embedded resources" (commercial product feature).
+  - Adjacent need from another stream (e.g. Stream 1 key bundle could naturally extend into a virtual-filesystem key).
+  - Internal decision to harden host-OS surface (product-line decision).
+- **Effort**: 2-3 weeks of design + 3-4 dispatch cycles. **Note**: this is roughly the same magnitude as all of Streams 1-5 combined — non-trivial commitment.
 
 ### Sequencing principle
 
-The three streams are listed in **readiness order**, not priority order:
+The nine streams are listed in **roadmap order**, not priority order:
 
-1. **`push_mem` x86** — execute side already has all the data; only the dispatch decision blocks.
-2. **X3d SSE-32 refinement** — incremental refinement on existing X6 work; reuses X6 baselines.
-3. **M3 cryptographic protection line** — new research line; needs design decisions before any data-side work.
+**Active surface (Streams 1-5)**: protective passes for user-mode PE executables.
 
-If the team receives a new external priority (e.g. a customer requests cryptographic protection), the order can flip — but `push_mem` will remain the next-dispatch candidate by default.
+1. **Stream 1 (crypt)** — execute side has the smallest scope; codec stub validates the roundtrip contract.
+2. **Stream 2 (mutate)** — IR-level, no runtime dependency, build on Stream 1's codec if roundtrip shapes overlap.
+3. **Stream 3 (anti_debug)** — needs stub surface extension, builds on Stream 1+2's emitter.
+4. **Stream 4 (import_protect)** — depends on Stream 1 for lazy resolution codec, builds on `passes/stub_link/`.
+5. **Stream 5 (integrity_crc)** — last protective layer, closes the tamper-detection loop.
 
-### Out of scope (explicitly deferred)
+**Product surface (Stream 6)**: standalone GUI consumes Streams 1-5.
 
-These are intentionally **not** on the roadmap because they're not aligned with current research direction:
+6. **Stream 6 (GUI)** — entirely dependent on Streams 1-5 having real options to expose.
 
-- **Cross-platform (Linux/macOS ELF/Mach-O)** — different toolchains, different calling conventions; would require a separate project line.
-- **Anti-debug / anti-VM / anti-DBI hardening** — anti-RE features are a different product layer; not pursued here.
-- **GUI / IDE plugin** — CLI-only is intentional.
-- **x87 implementation (B-route)** — formally closed at MIT-455 (X7 data: 0 x87-bearing functions in x64 .pdata domain). R-SSE-only is permanent.
+**Extended surface (Streams 7-9)**: parked, requires external trigger.
+
+7. **Stream 7 (kernel-driver)** — independent runtime; customer pull required.
+8. **Stream 8 (anti-VM/anti-sandbox)** — partial coverage; requires specific adversary decision.
+9. **Stream 9 (virtual FS / virtual registry)** — host-OS surface; non-trivial scope, requires product-line decision.
+
+If the team receives a new external priority (e.g. customer needs anti-debug urgently), Streams 1-5 can be reordered; if a customer pulls on Streams 7-9 specifically, those can jump ahead. Each stream's prerequisites should be respected. Streams 1-5 form the **M3 protection surface**; Stream 6 is the **M3 product surface**; Streams 7-9 form the **extended surface** parked pending external trigger.
 
 ## Architecture
 
