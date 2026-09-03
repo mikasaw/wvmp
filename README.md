@@ -2,6 +2,8 @@
 
 A self-researched PE virtual-machine protector. Translates marked regions of x86/x64 Windows executables into a custom register-based VM, with stub-link dispatch back into native code.
 
+> **Languages**: **English** | [简体中文](README.zh-CN.md)
+
 ![x64 direct](https://img.shields.io/badge/x64_direct-99.26%25-brightgreen)
 ![x86 direct](https://img.shields.io/badge/x86_direct-95.15%25-green)
 ![wvmpTest x86](https://img.shields.io/badge/wvmpTest_x86-85.7%25-yellowgreen)
