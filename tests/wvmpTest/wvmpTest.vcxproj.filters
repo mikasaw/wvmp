@@ -1,0 +1,89 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <Filter Include="framework">
+      <UniqueIdentifier>{1a2b3c4d-0001-4e5f-8a90-bcdef0123456}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="targets">
+      <UniqueIdentifier>{1a2b3c4d-0004-4e5f-8a90-bcdef0123456}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="tests">
+      <UniqueIdentifier>{1a2b3c4d-0002-4e5f-8a90-bcdef0123456}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="misc">
+      <UniqueIdentifier>{1a2b3c4d-0003-4e5f-8a90-bcdef0123456}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="src\main.cpp">
+      <Filter>framework</Filter>
+    </ClCompile>
+    <ClCompile Include="src\testfw.cpp">
+      <Filter>framework</Filter>
+    </ClCompile>
+    <ClCompile Include="src\targets\kernels.cpp">
+      <Filter>targets</Filter>
+    </ClCompile>
+    <ClCompile Include="src\tests\t_math.cpp">
+      <Filter>tests</Filter>
+    </ClCompile>
+    <ClCompile Include="src\tests\t_controlflow.cpp">
+      <Filter>tests</Filter>
+    </ClCompile>
+    <ClCompile Include="src\tests\t_string.cpp">
+      <Filter>tests</Filter>
+    </ClCompile>
+    <ClCompile Include="src\tests\t_memory.cpp">
+      <Filter>tests</Filter>
+    </ClCompile>
+    <ClCompile Include="src\tests\t_datastruct.cpp">
+      <Filter>tests</Filter>
+    </ClCompile>
+    <ClCompile Include="src\tests\t_hashcrypto.cpp">
+      <Filter>tests</Filter>
+    </ClCompile>
+    <ClCompile Include="src\tests\t_exception.cpp">
+      <Filter>tests</Filter>
+    </ClCompile>
+    <ClCompile Include="src\tests\t_stl.cpp">
+      <Filter>tests</Filter>
+    </ClCompile>
+    <ClCompile Include="src\tests\t_oop.cpp">
+      <Filter>tests</Filter>
+    </ClCompile>
+    <ClCompile Include="src\tests\t_thread.cpp">
+      <Filter>tests</Filter>
+    </ClCompile>
+    <ClCompile Include="src\tests\t_winapi.cpp">
+      <Filter>tests</Filter>
+    </ClCompile>
+    <ClCompile Include="src\tests\t_float_sse.cpp">
+      <Filter>tests</Filter>
+    </ClCompile>
+    <ClCompile Include="src\tests\t_kernels.cpp">
+      <Filter>tests</Filter>
+    </ClCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="src\common.h">
+      <Filter>framework</Filter>
+    </ClInclude>
+    <ClInclude Include="src\testfw.h">
+      <Filter>framework</Filter>
+    </ClInclude>
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="README.md">
+      <Filter>misc</Filter>
+    </None>
+    <None Include="CMakeLists.txt">
+      <Filter>misc</Filter>
+    </None>
+    <None Include="build.bat">
+      <Filter>misc</Filter>
+    </None>
+    <None Include="run_compare.cmd">
+      <Filter>misc</Filter>
+    </None>
+  </ItemGroup>
+</Project>

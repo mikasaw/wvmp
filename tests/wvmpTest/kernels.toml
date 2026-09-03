@@ -1,0 +1,25 @@
+# WVmp protection config - wvmpTest kernels target (MIT-379).
+#
+# Usage: wvmp_cli.exe protect --config <this file path>
+# Schema: see cli/include/wvmp/cli/config.hpp; pass order follows default.toml
+# (Pipeline by Phase: Load -> Analyze -> Transform -> Emit -> Write).
+#
+# Paths are relative to WVmp repo root.
+# smoke_test.bat writes output here when invoked from WVmp repo root.
+
+input  = "../wvmpTest/build/x64/test_target.exe"
+output = "../wvmpTest/build/x64/packed.exe"
+seed   = 12345
+
+[[passes]]
+name = "pe_loader"
+[[passes]]
+name = "marker_scan"
+[[passes]]
+name = "lifter"
+[[passes]]
+name = "virtualize"
+[[passes]]
+name = "stub_link"
+[[passes]]
+name = "pe_writer"

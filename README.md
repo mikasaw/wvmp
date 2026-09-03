@@ -1,91 +1,157 @@
 # WVmp
 
-WVmp 是一个完全插件化的 PE 虚拟机保护壳（参考 VMProtect/VMPilot 的自研实现）。
-**当前支持目标 = x64 PE（Machine 0x8664）**：32 位（x86 0x014C）输入会被
-显式硬拒绝（ERROR diag + 非零退出，不产出保护壳），见 docs/GAPS.md C5
-与 docs/STATUS.md。**浮点支持面：SSE 浮点族真虚拟化；x87 全族（D8-DF）
-永久 gate（文档化不保护）**——标记区域含 x87 指令时整函数保持原生执行，
-输出 byte-identical，见 docs/GAPS.md x87 节（MIT-418 R3 裁决）。
+A self-researched PE virtual-machine protector. Translates marked regions of x86/x64 Windows executables into a custom register-based VM, with stub-link dispatch back into native code.
 
-A fully pluginized PE virtual-machine protector (self-researched,
-VMProtect/VMPilot-inspired). **Supported target: x64 PE (Machine 0x8664)**
-— 32-bit (x86 0x014C) inputs are explicitly rejected (ERROR + non-zero exit,
-no output), see docs/GAPS.md C5. **Floating point: SSE families are truly
-virtualized; the whole x87 family (D8-DF) is permanently gated**
-(document-only non-protection, MIT-418 R3): a marked region containing x87
-stays fully native, byte-identical output — see docs/GAPS.md x87 section.
+![x64 direct](https://img.shields.io/badge/x64_direct-99.26%25-brightgreen)
+![x86 direct](https://img.shields.io/badge/x86_direct-95.15%25-green)
+![wvmpTest x86](https://img.shields.io/badge/wvmpTest_x86-85.7%25-yellowgreen)
+![main](https://img.shields.io/badge/main-0b6c5ba-blue)
+![baseline](https://img.shields.io/badge/baseline-330%2F330-brightgreen)
 
-## 构建（Windows / MSVC / Ninja，需 VS 18 Insiders）
+## Targets
 
-    scripts\build.bat
+| Architecture | Machine | Status |
+|---|---|---|
+| **x64 (PE32+)** | 0x8664 | **Production ready** |
+| **x86 (PE32)** | 0x14C | **Production ready** (WOW64 verified) |
 
-从 Git Bash 调用：
+Native client code paths are unchanged. Marked regions (two consecutive 8-byte markers) are translated to a custom register-based VM (97 ops, jump table 128 entries). Output preserves byte-identical behavior under `byte-exact` verification — see [docs/GAPS.md](docs/GAPS.md) for full support matrix.
 
-    cmd //c "$(cygpath -w scripts/build.bat)"
+## Permanent gate boundaries (documented, not bugs)
 
-首次构建会通过 CMake FetchContent 拉取第三方依赖（googletest / capstone /
-keystone / tomlplusplus）到 `.deps/`，keystone 编译较久。
+WVmp documents certain instruction families as **permanently gated** — regions containing them remain native and produce byte-identical output, but are not virtualized:
 
-## 测试
+| Family | Why permanent |
+|---|---|
+| **x87 FPU (D8-DF)** | MSVC defaults to SSE for floating-point; x87 only appears in legacy or /arch:IA32 builds. Implementing x87 handlers would consume jump-table slots for vanishingly rare real-world usage. (MIT-418 R3, MIT-445 §6 B-route, MIT-455 B-route closed.) |
+| **Indirect jmp (`jmp [mem]`/`jmp reg`)** | Static analyzable "table form" represents < 0.001% of all indirect jumps in System32 / SysWorld32. Dominant forms (arbitrary mem/reg) require L-level runtime analysis. (MIT-455 §3.2 closed as maintenance.) |
+| **Stack depth at mul64hi-like boundaries** | x86 stack frame save area is finite. Outer-frame dependencies require forward-looking ESP resync; deferred. |
+| **SEH (`fs:[...])` / segment overrides** | Requires cooperation with Windows exception dispatcher; out of scope for current research line. |
 
-    scripts\test.bat
+For the full picture see [docs/GAPS.md](docs/GAPS.md) §X7 closure and §Gate distribution table.
 
-## 现实世界 exe 回归测试集 (MIT-350)
+## Build (Windows / MSVC / Ninja, requires VS 18 Insiders)
 
-派活单核心目标: 让 protected notepad.exe / 7z.exe / tasklist.exe / cmd.exe /
-curl.exe 在 `scripts/real_world_exe/verify_real_world.sh` 下跑通 byte-exact
-native == protected, 验证 WVmp 在 16 个自测样本之外的真实 Windows exe 上能
-用, 同时推动发现派活单派发**前**未识别的指令集 / pitfall.
-
-### 验证步骤
-
-```
-bash scripts/real_world_exe/verify_real_world.sh
+```bat
+scripts\build.bat
 ```
 
-5 个现实世界 exe 覆盖 GUI + 命令行 + 文件压缩 + shell + HTTP:
+First run fetches CMake dependencies (googletest, capstone, keystone, tomlplusplus) into `.deps/` — keystone takes a while.
 
-| 配置 | 输入 | 测试参数 | 模式 |
-|---|---|---|---|
-| `notepad.toml`  | `C:/Windows/System32/notepad.exe`     | (默认)             | GUI (timeout + rc) |
-| `7z.toml`       | `C:/Program Files/7-Zip/7z.exe`        | `--help`           | stdout byte-exact |
-| `tasklist.toml` | `C:/Windows/System32/tasklist.exe`     | `/?`               | stdout byte-exact |
-| `cmd.toml`      | `C:/Windows/System32/cmd.exe`          | `/c echo WVMP_REAL_WORLD_OK` | stdout byte-exact |
-| `curl.toml`     | `C:/Program Files/Git/mingw64/bin/curl.exe` | `--version`   | stdout byte-exact |
+## Test
 
-每个 toml 配置沿用 `cli/configs/default.toml` 风格 (`pe_loader → marker_scan →
-lifter → virtualize → stub_link → pe_writer`). 输出统一到
-`build/real_world_exe/<name>.protected.exe`.
+```bat
+scripts\test.bat
+```
 
-### 派活单限定不支持 (verify_real_world.sh 会作为 pitfall 实证记录, 不算回归)
+## End-to-end smoke test (GitHub reproduction)
 
-- SSE / AVX / lock prefix / rep prefix（rep 串指令族已真虚拟化，MIT-415；
-  SSE 浮点族已真虚拟化，MIT-371~376/408/411——清单为 v1 派活单原始口径）
-- **x87 FPU：永久 gate（MIT-418 R3 裁决）**——区域含 x87 → 整函数保持原生，
-  byte-identical，属文档化承诺面而非 pitfall 回归
-- MFC / WTL / Qt GUI 框架 / DirectX / OpenGL
-- syscall / sysenter
-- DLL imports (派活单限定 EXE)
-- PE32 32-bit / Control Flow Guard / CET
+The smoke test exercises the entire pipeline: build wvmpTest target, run native, pack with WVmp CLI, run packed, diff outputs.
 
-### 派活单核心目标解读
+```bat
+:: Clone wvmpTest sibling repo first:
+git clone https://github.com/YOUR/wvmpTest ..\wvmpTest
 
-- **PASS byte-exact + 真虚拟化 (含 stub 生成标记)**: protected 跑通且 stub_link
-  生成至少 1 个 VirtualizedFunction, 派活单核心目标 byte-exact 真虚拟化达成
-- **PASS byte-exact but C1 gate fallback**: protected 跑通但 stub_link 走 C1
-  gate 兜底 (派活单限定不支持的指令集, protected PE 行为正确但未真虚拟化),
-  仍记录为 pass (不阻断回归) + 计入 pitfall data points
-- **FAIL stdout/rc mismatch**: protected PE 行为偏离 native, 这是派活单核心
-  目标**最希望发现的 pitfall**, 计入 pitfall data points
-- **SKIP**: 输入 exe 不存在 (e.g. 7-Zip 未安装), 不算失败
+:: From WVmp repo root:
+tests\wvmpTest\smoke_test.bat
+```
 
-### 沉淀 (从 MIT-300~355 教训)
+The script auto-detects `..\wvmpTest` by default; override with `set WVMPTEST_DIR=path\to\wvmpTest` if placed elsewhere. Expectation:
 
-- 派活单 §A 假设不一定是真根因 (pitfall #33, 实战 MIT-332/335/339/341/345/
-  347/349/353/355): 派活单描述错 agent 实际正确的情形下, verifier 必独立确认
-  native == protected 一致, 不盲反 agent, 也不盲采派活单描述
-- 派活单派发后 agent 跑了 8 步就 completed 模式 (pitfall #38 候选, MIT-339 v1
-  实证): 派活单红派送 note 强调 "agent 必跑 ≥ 30 分钟, 不要在 5 分钟内
-  completed"
-- MASM (.asm) helper / rax 栈守恒 / T1 clobber / kStubWindow 64-NOP 填充等
-  pitfall (#35-#39) 在本派活单范围外, 沿用现状
+- both native and packed return code = 0
+- diff line count = 0 (the `image   :` path line is excluded — it embeds an absolute path)
+- native SUMMARY shows `passed=94`
+
+See [tests/wvmpTest/](tests/wvmpTest/) for the test target source and build script.
+
+## Coverage (X7 rescan, 2026-09-03)
+
+| Metric | Value |
+|---|---|
+| **x64 mnemonic-level direct coverage** (System32 103 files / 17.6M clean insns) | **99.26%** |
+| **x86 mnemonic-level direct coverage** (SysWOW64 100 files + 3rd-party + extras / 27.4M clean insns) | **95.15%** |
+| **x64 function-level no-gate** (.pdata function domain, 240,277 functions) | **94.74%** |
+| **wvmpTest x86 truly virtualized** (103 kernels, marked regions) | **12/14 = 85.7%** |
+
+The rescan script lives at [`scripts/verifier/mit_x7_rescan.py`](scripts/verifier/mit_x7_rescan.py) with output in [`scripts/verifier/mit_x7_rescan_out/`](scripts/verifier/mit_x7_rescan_out/) (215-row jsonl + summary.json). It runs in ~4 minutes and is fully reproducible:
+
+```bat
+python scripts\verifier\mit_x7_rescan.py
+```
+
+For deep context on the methodology (three-layer replacement for unavailable strict function-level coverage on x86, dual-channel consistency assertion) see [docs/GAPS.md](docs/GAPS.md) §X7 closure.
+
+## Multica engineering workflow
+
+WVmp development is driven by [multica](https://github.com/multica-ai/multica) — every capability addition since 2026-08-29 has been a dispatched task with project-owner verification.
+
+**24 tasks ACCEPTED, 0 rejected, 0 cancelled across two milestones:**
+- **M2.5-G (instruction virtualization phase)** — MIT-419 through MIT-435, baseline 240/240, complete
+- **M2.5-X (multi-target platform phase)** — MIT-436 through MIT-455, baseline 330/330, complete
+
+For the full issue roster, discipline notes, and accumulated lessons see [docs/MULTICA_ISSUES.md](docs/MULTICA_ISSUES.md).
+
+**Raw multica artifacts** (155 files, 451 KB) are packaged separately for archive download: `docs/multica-archive.tar.gz`. This file is not under git (kept out of source tree to keep the repo lean). For ongoing users, the multica dashboard is the authoritative source.
+
+## Project status
+
+| Stage | Status |
+|---|---|
+| M2.5-G instruction virtualization (x64) | Done (2026-08-31) |
+| M2.5-X multi-target platform (x86 production) | Done (2026-09-03) |
+| X3d SSE-32 refinement | Data ready, not scheduled |
+| `push_mem` x86 (1.845% — first non-x87 shape gate) | Data ready, candidate for next dispatch |
+| M3 cryptographic protection line (MIT-410) | Parked, awaiting prioritization |
+
+## Architecture
+
+```
+[PE file]
+   ↓ pe_loader
+[Parsed image] (PE sections, imports, .pdata/.xdata)
+   ↓ marker_scan            ← detect two consecutive 8-byte markers
+[Marked regions]
+   ↓ lifter                 ← capstone decode → IR
+[IR]                       ← frozen carrier domain (ir::Op)
+   ↓ virtualize             ← IR → VmOp table (kVmOpMax=97)
+[VmOp sequence]
+   ↓ stub_link              ← generate stub dispatch entry
+[Protected PE]
+```
+
+The implementation lives in `vm/regvm/{backend,lifter,translator,runtime}/`, with passes registered in `passes/{pe_loader,marker_scan,lifter,virtualize,stub_link,pe_writer}/` and the CLI in `cli/`.
+
+## Repository layout
+
+```
+WVmp/
+├── cli/                       # WVmp CLI (protect subcommand)
+├── passes/                    # pipeline passes (pe_loader, marker_scan, ...)
+├── vm/regvm/                  # VM implementation (lifter, translator, runtime, backend)
+├── sdk/include/wvmp/          # public SDK headers
+├── docs/
+│   ├── STATUS.md              # current authoritative stage status
+│   ├── GAPS.md                # full support matrix + X7 closure
+│   ├── MULTICA_ISSUES.md      # multica task roster (24 tasks)
+│   └── multica-archive.tar.gz # raw multica artifacts (not under git)
+├── scripts/
+│   ├── build.bat              # MSVC + Ninja build
+│   ├── test.bat               # ctest
+│   ├── multiseed_e2e.sh       # 5-seed x 66 sample regression
+│   └── verifier/
+│       └── mit_x7_rescan.py   # client-state coverage scanner
+├── tests/wvmpTest/            # 103-kernel functional test target
+│   ├── src/                   # test kernels source
+│   ├── build.bat              # builds test_target.exe
+│   ├── kernels.toml           # WVmp CLI config for the test target
+│   └── smoke_test.bat         # end-to-end smoke test entry point
+└── LICENSE                    # MIT
+```
+
+## License
+
+MIT. See [LICENSE](LICENSE).
+
+## Acknowledgments
+
+The capstone, keystone, googletest, and tomlplusplus projects used as CMake FetchContent dependencies are included under their respective licenses.

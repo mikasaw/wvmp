@@ -3,8 +3,21 @@ build*/
 .deps/
 .deps-vs/
 
-# Multica local cache (issue descriptions, agent instructions, helpers)
+# Multica local cache (issue descriptions, agent instructions, helpers) — see docs/multica-archive.tar.gz for snapshot
 .multica/
+# Multica issue description files (派活单原文) — packed into docs/multica-archive.tar.gz
+.hermes/issues/
+# Multica monitor scripts (legacy) — packed into docs/multica-archive.tar.gz
+.hermes/issues/*.sh
+.hermes/plans/
+.hermes/triage/
+
+# Developer handoff doc (not for public release)
+/WVmp_HANDOVER_*.md
+
+# Stray Windows redirect artifacts
+/NUL
+/wvmp_runtime_dump.bin
 
 # IDE / editor state
 .vs/
