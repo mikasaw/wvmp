@@ -12,6 +12,14 @@ namespace wvmp::passes {
 // stub_link pass 按 PeImage.machine 派发（machine=0x014C → X86）。
 enum class StubArch { X64, X86 };
 
+// MIT-463 (anti_debug-v1)：stub 入口反调试检查块参数（PEB 面）。
+// techniques 位 = anti_debug::tech::*（BeingDebugged/NtGlobalFlag）；非空时
+// generate_entry_stub 在解密块/序言之前织入检查块（gs/fs → TEB → PEB 读，
+// 命中 = FailFast 写 [0] 确定性崩溃）。nullptr = 无检查（逐字节 v1 前现形）。
+struct StubAntiDebug {
+    u32 techniques;
+};
+
 // MIT-458 (crypt-v1)：stub 入口 one-shot 解密块参数（xor_chain）。
 // 非空时 generate_entry_stub 在序言**之前**织入解密块（保存/恢复全部被蹭
 // GP 寄存器与 esp 平衡；flags 不保全——序言 sub 既有先例）。nullptr = 无
@@ -54,6 +62,7 @@ struct StubCrypt {
                                                   u64 rt_entry_rva, u64 resume_rva,
                                                   u64 image_base,
                                                   StubArch arch = StubArch::X64,
-                                                  const StubCrypt* crypt = nullptr);
+                                                  const StubCrypt* crypt = nullptr,
+                                                  const StubAntiDebug* adb = nullptr);
 
 } // namespace wvmp::passes

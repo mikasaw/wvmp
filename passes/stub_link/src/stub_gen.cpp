@@ -1,5 +1,6 @@
 #include "stub_gen.hpp"
 
+#include "wvmp/passes/anti_debug/anti_debug_plan.hpp"
 #include "wvmp/regvm/codecs/xor_chain.hpp"
 #include "wvmp/regvm/runtime/runtime.hpp"
 #include "wvmp/regvm/runtime/runtime_x86.hpp"
@@ -142,14 +143,73 @@ std::string build_crypt_asm_x86(const StubCrypt& c) {
     return o;
 }
 
+// =============================================================================
+// MIT-463 (anti_debug-v1)：PEB 反调试检查块（stub 序言之前，解密块之前）。
+//
+// 双检查（零误报用户态面）：
+//   BeingDebugged: x64 PEB=[gs:0x30]+0x60 / x86 PEB=[fs:0x18]+0x30；byte [PEB+2]
+//   NtGlobalFlag:  & 0x70 != 0；x64 [PEB+0xBC] / x86 [PEB+0x68]
+// 命中响应 = FailFast（清零 acc 后写 [0] → 确定性 AV 终止；与天然空指针
+// 崩溃不可区分 = 无反调试行为泄露，D1 披露）。被蹭 acc 寄存器 push/pop
+// 保存恢复（预载面纪律同解密块）；flags 不保全（序言先例）。检查每次
+// stub 进入都执行（十余条指令/调用，v1 接受）。
+// =============================================================================
+std::string build_adb_asm_x64(u32 techniques) {
+    std::string o;
+    o += "push rax\n";
+    o += "mov rax, qword ptr gs:[0x30]\n";   // TEB
+    o += "mov rax, qword ptr [rax+0x60]\n";  // PEB
+    if (techniques & wvmp::passes::anti_debug::tech::kBeingDebugged) {
+        o += "cmp byte ptr [rax+2], 0\n";
+        o += "jne wvadb_fail\n";
+    }
+    if (techniques & wvmp::passes::anti_debug::tech::kNtGlobalFlag) {
+        o += "mov eax, dword ptr [rax+0xBC]\n";
+        o += "test eax, " + hex(0x70) + "\n";
+        o += "jne wvadb_fail\n";
+    }
+    o += "pop rax\n";
+    o += "jmp wvadb_done\n";
+    o += "wvadb_fail:\n";
+    o += "xor eax, eax\n";
+    o += "mov qword ptr [rax], 0\n";
+    o += "wvadb_done:\n";
+    return o;
+}
+
+std::string build_adb_asm_x86(u32 techniques) {
+    std::string o;
+    o += "push eax\n";
+    o += "mov eax, dword ptr fs:[0x18]\n";   // TEB
+    o += "mov eax, dword ptr [eax+0x30]\n";  // PEB
+    if (techniques & wvmp::passes::anti_debug::tech::kBeingDebugged) {
+        o += "cmp byte ptr [eax+2], 0\n";
+        o += "jne wvadb_fail\n";
+    }
+    if (techniques & wvmp::passes::anti_debug::tech::kNtGlobalFlag) {
+        o += "mov eax, dword ptr [eax+0x68]\n";
+        o += "test eax, " + hex(0x70) + "\n";
+        o += "jne wvadb_fail\n";
+    }
+    o += "pop eax\n";
+    o += "jmp wvadb_done\n";
+    o += "wvadb_fail:\n";
+    o += "xor eax, eax\n";
+    o += "mov dword ptr [eax], 0\n";
+    o += "wvadb_done:\n";
+    return o;
+}
+
 // x64 stub 汇编（MIT-446 (X4) B.1 起更名 x64 专形；D2 恒等铁约束：函数体
 // 逐字保留，x64 asm_dump sha ffd47289… 恒等是机器证明项）。
 std::string build_stub_asm_x64(u64 rt_entry_rva, u64 resume_rva, u64 image_base,
-                               const StubCrypt* crypt) {
+                               const StubCrypt* crypt, const StubAntiDebug* adb) {
     std::string o;
     // MIT-458: 加密函数在序言之前织入 one-shot 解密块（nullptr = 无加密，
     // 本函数体其余部分逐字节不变）。
     if (crypt) o += build_crypt_asm_x64(*crypt);
+    // MIT-463: 反调试检查块（解密块之后、序言之前；nullptr = 无检查）。
+    if (adb) o += build_adb_asm_x64(adb->techniques);
     o += "push rbx\n push rbp\n push rdi\n push rsi\n";
     o += "push r12\n push r13\n push r14\n push r15\n";
     o += "sub rsp, " + hex(kCtxSize) + "\n";
@@ -288,10 +348,12 @@ std::string build_stub_asm_x64(u64 rt_entry_rva, u64 resume_rva, u64 image_base,
 // =============================================================================
 std::string build_stub_asm_x86(u64 rt_entry_rva, u64 blob_stream_rva,
                                u64 resume_rva, u64 image_base,
-                               const StubCrypt* crypt) {
+                               const StubCrypt* crypt, const StubAntiDebug* adb) {
     std::string o;
     // MIT-458: 同 x64 形——序言前解密块（esp 平衡，见 build_crypt_asm_x86 注）。
     if (crypt) o += build_crypt_asm_x86(*crypt);
+    // MIT-463: 反调试检查块（解密块之后、序言之前）。
+    if (adb) o += build_adb_asm_x86(adb->techniques);
     // —— 序言：guard 垫栈（X5b）+ 4 callee-saved push + ctx 区（kStubPushBytesX86
     //      + kCtxSize + kX86GuardBytes 参与出口槽换算，禁字面量第二份）。
     //      guard 最前垫（[ns-G..ns-4] 吸收 guest push），push 序固定 ebx→edi
@@ -400,7 +462,7 @@ std::string build_stub_asm_x86(u64 rt_entry_rva, u64 blob_stream_rva,
 
 std::vector<u8> generate_entry_stub(u64 stub_rva, u64 blob_stream_rva, u64 rt_entry_rva,
                                     u64 resume_rva, u64 image_base, StubArch arch,
-                                    const StubCrypt* crypt) {
+                                    const StubCrypt* crypt, const StubAntiDebug* adb) {
     ks_engine* ks = nullptr;
     if (ks_open(KS_ARCH_X86, arch == StubArch::X86 ? KS_MODE_32 : KS_MODE_64, &ks) !=
         KS_ERR_OK)
@@ -409,8 +471,8 @@ std::vector<u8> generate_entry_stub(u64 stub_rva, u64 blob_stream_rva, u64 rt_en
 
     const std::string src =
         arch == StubArch::X86
-            ? build_stub_asm_x86(rt_entry_rva, blob_stream_rva, resume_rva, image_base, crypt)
-            : build_stub_asm_x64(rt_entry_rva, resume_rva, image_base, crypt);
+            ? build_stub_asm_x86(rt_entry_rva, blob_stream_rva, resume_rva, image_base, crypt, adb)
+            : build_stub_asm_x64(rt_entry_rva, resume_rva, image_base, crypt, adb);
     // 调试钩子（排查用）：WVMP_STUB_DUMP=<win 路径> 时落盘汇编文本。
     {
         char* dp = nullptr;

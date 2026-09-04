@@ -10,6 +10,7 @@
 #include "wvmp/passes/pe_loader/pe_image.hpp"
 #include "wvmp/passes/virtualize/virtualize_pass.hpp"
 #include "wvmp/passes/crypt/crypt_plan.hpp"
+#include "wvmp/passes/anti_debug/anti_debug_plan.hpp"
 #include "wvmp/regvm/isa/blob.hpp"
 #include "wvmp/regvm/isa/encoding.hpp"
 #include "wvmp/regvm/runtime/runtime.hpp"
@@ -132,6 +133,11 @@ void StubLinkPass::run(ProtectionContext& ctx) {
                         "crypt plan algo '" + plan->algo + "' 不受支持，忽略加密计划");
         plan = nullptr;
     }
+
+    // MIT-463 (anti_debug-v1)：反调试计划（anti_debug pass 写入；槽缺席 =
+    // 无检查块，stub 逐字节 v1 前现形）。
+    const anti_debug::AntiDebugPlan* adb_plan =
+        ctx.find_slot<anti_debug::AntiDebugPlan>(kAntiDebugPlan);
     const auto plan_of = [&](size_t vfs_index) -> const crypt::CryptedFunction* {
         if (plan == nullptr) return nullptr;
         for (const auto& e : plan->functions)
@@ -191,6 +197,12 @@ void StubLinkPass::run(ProtectionContext& ctx) {
                     static_cast<u32>(crypted->stream_bytes / 4);
                 crypt_ptr = &crypt_param;
             }
+            StubAntiDebug adb_param{};
+            const StubAntiDebug* adb_ptr = nullptr;
+            if (adb_plan != nullptr && adb_plan->techniques != 0) {
+                adb_param.techniques = adb_plan->techniques;
+                adb_ptr = &adb_param;
+            }
             // image_base（PE optional header 的 ImageBase）写入 VmContext 的
             // scratch_mem 槽：运行时 Load/Store/Push/Pop 的访存汇编即
             // `[addr + image_base]`. 翻译期算的 RVA（rip-relative 转绝对）
@@ -198,7 +210,7 @@ void StubLinkPass::run(ProtectionContext& ctx) {
             stub = generate_entry_stub(stub_rva, blob_stream_rva, rt_entry, vf.end_rva,
                                        pe->image_base,
                                        is_x86 ? StubArch::X86 : StubArch::X64,
-                                       crypt_ptr);
+                                       crypt_ptr, adb_ptr);
         } catch (const std::exception& e) {
             ctx.diag.report(Severity::Error, name(),
                             "函数 " + vf.name + " stub 生成失败（保持原生）: " + e.what());

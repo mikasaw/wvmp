@@ -11,4 +11,7 @@ inline constexpr std::string_view kProtectRules="config.protect_rules";
 // MIT-458 crypt-v1：字节码加密计划（crypt pass 写入 → stub_link 消费）。
 // 契约模型见 passes/crypt/include/wvmp/passes/crypt/crypt_plan.hpp。
 inline constexpr std::string_view kCryptPlan="crypt.plan";
+// MIT-463 anti_debug-v1：反调试计划（anti_debug pass 写入 → stub_link 消费）。
+// 契约模型见 passes/anti_debug/include/wvmp/passes/anti_debug/anti_debug_plan.hpp。
+inline constexpr std::string_view kAntiDebugPlan="anti_debug.plan";
 }

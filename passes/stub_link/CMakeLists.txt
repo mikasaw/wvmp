@@ -15,6 +15,7 @@ target_link_libraries(wvmp_pass_stub_link PRIVATE
     wvmp::vm
     wvmp_pass_virtualize    # VirtualizedFunction 槽类型
     wvmp_pass_crypt_plan    # MIT-458: CryptPlan 契约头（INTERFACE，不吸 crypt 对象）
+    wvmp_pass_anti_debug_plan  # MIT-463: AntiDebugPlan 契约头（INTERFACE）
     wvmp_pass_pe_loader     # PeImage 模型
     wvmp_regvm_runtime
     wvmp_regvm_isa
