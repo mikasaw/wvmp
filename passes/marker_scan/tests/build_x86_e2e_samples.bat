@@ -143,6 +143,18 @@ cl /nologo /utf-8 /O1 /MD /c "%~dp0x86_div_main.c" || goto :fail
 link /nologo /SUBSYSTEM:CONSOLE /MACHINE:X86 x86_div_main.obj x86_div_sample.obj /OUT:"%~1\wvmp_x86_div_sample.exe" || goto :fail
 .\wvmp_x86_div_sample.exe || goto :fail
 
+rem ---- MIT-456 (push-mem): pool 16 -> 17 (push [mem] opening) ----
+
+rem (17) pushmem: in-region memory-sourced push faces (FF 35 abs global /
+rem FF 71 04 reg+disp8 IAT form / FF 74 24 04 esp stack-window idiom reading
+rem pre-push esp / call-arg push [mem] pair with callgate + cdecl cleanup),
+rem net depth 0 at Halt; address+load emitted before the esp decrement
+rem (native order), asmgen zero-diff via the Push/Reg branch.
+ml /nologo /c /Coff "%~dp0x86_pushmem_sample.asm" || goto :fail
+cl /nologo /utf-8 /O1 /MD /c "%~dp0x86_pushmem_main.c" || goto :fail
+link /nologo /SUBSYSTEM:CONSOLE /MACHINE:X86 x86_pushmem_main.obj x86_pushmem_sample.obj /OUT:"%~1\wvmp_x86_pushmem_sample.exe" || goto :fail
+.\wvmp_x86_pushmem_sample.exe || goto :fail
+
 popd
 exit /b 0
 :fail

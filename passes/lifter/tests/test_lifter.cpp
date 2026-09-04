@@ -469,6 +469,41 @@ TEST_F(LifterTranslate, PushImmLiftsDstImm) {
     EXPECT_EQ(b.insn.size, ir::Size::S32);
 }
 
+TEST_F(LifterTranslate, PushMemLiftsDstMem) {
+    // MIT-456 (push-mem) 钉：push [mem] 本就被 lifter lift 为 Op::Push
+    // dst=Mem（X7 批一"新数据行"记录的真卡点在 translator translate_push
+    // Mem skip, 本单翻正后此钉防 lifter 侧误改回流）。x86 双编码 + x64 同
+    // 字节面（FF 30 双 arch 同为 push [eax]/push [rax], 宽度按 arch 分叉）:
+    //   FF 30:          push [eax]      (x86, FF /6 mod=00 rm=000)
+    //   FF 77 08:       push [edi+8]    (x86, mod=01 disp8)
+    const wvmp::u8 b32[] = {0xFF, 0x30};
+    auto a = translate_bytes(x86, b32, ir::Arch::X86);
+    ASSERT_EQ(a.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(a.insn.op, ir::Op::Push);
+    ASSERT_EQ(a.insn.dst.kind, ir::Operand::Kind::Mem);
+    EXPECT_EQ(a.insn.dst.mem.base, ir::Reg::Rax);
+    EXPECT_EQ(a.insn.dst.mem.index, ir::Reg::Flags);
+    EXPECT_EQ(a.insn.dst.mem.disp, 0);
+    EXPECT_EQ(a.insn.size, ir::Size::S32);
+    EXPECT_FALSE(a.insn.updates_flags);
+
+    const wvmp::u8 bdisp[] = {0xFF, 0x77, 0x08};
+    auto c = translate_bytes(x86, bdisp, ir::Arch::X86);
+    ASSERT_EQ(c.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(c.insn.op, ir::Op::Push);
+    ASSERT_EQ(c.insn.dst.kind, ir::Operand::Kind::Mem);
+    EXPECT_EQ(c.insn.dst.mem.base, ir::Reg::Rdi);
+    EXPECT_EQ(c.insn.dst.mem.disp, 8);
+
+    const wvmp::u8 b64[] = {0xFF, 0x30};
+    auto d = translate_bytes(x64, b64, ir::Arch::X64);
+    ASSERT_EQ(d.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(d.insn.op, ir::Op::Push);
+    ASSERT_EQ(d.insn.dst.kind, ir::Operand::Kind::Mem);
+    EXPECT_EQ(d.insn.dst.mem.base, ir::Reg::Rax);
+    EXPECT_EQ(d.insn.size, ir::Size::S64);
+}
+
 TEST_F(LifterTranslate, CmpTest) {
     // 39 C8: cmp eax, ecx
     const wvmp::u8 cb[] = {0x39, 0xC8};

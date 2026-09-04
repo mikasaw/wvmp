@@ -2299,6 +2299,86 @@ TEST(Translate, X86PushImmS16Gated) {
     EXPECT_NE(r.notes[0].find("push 位宽未支持"), std::string::npos);
 }
 
+// ==================== MIT-456 (push-mem): x86 push [mem] 开面 ====================
+
+namespace {
+ir::Insn push_mem_insn(ir::Reg base, ir::Reg index, u8 scale, i64 disp, ir::Size sz) {
+    ir::Insn i = I(ir::Op::Push, sz);
+    i.dst = ir::Operand::mem_(m(base, index, scale, disp));
+    return i;
+}
+// 平衡栈形（push [mem] + pop），同 fn86_pushimm 纪律：孤立 push 会被栈深
+// walk "Halt 出口栈不平衡" 正确 gate（X5b 产品行为）。
+ir::FunctionRegion fn86_pushmem(ir::Reg base, ir::Reg index, u8 scale, i64 disp) {
+    ir::FunctionRegion fn = fn_of({blk(0x1000, {push_mem_insn(base, index, scale, disp, ir::Size::S32),
+                                                pop_insn(ir::Reg::Rbx, ir::Size::S32)})});
+    fn.arch = ir::Arch::X86;
+    return fn;
+}
+} // namespace
+
+TEST(Translate, X86PushMemAddressLoadPush) {
+    // MIT-456: x86 push [eax] → 地址槽(Mov acc, eax) + Load 值槽 + 单 op
+    // Push a_kind=Reg（handler 既有 Reg 分支, asmgen 零 diff）。3 VmOp +
+    // Jmp(+1) + Halt = 6。地址/读值在 Push 减 esp 之前发射 = native 序
+    // （push [esp+X] 读减前 esp）。
+    const auto r = wvmp::regvm::translator::translate_function(fn86_pushmem(ir::Reg::Rax, ir::Reg::Flags, 0, 0));
+    EXPECT_TRUE(r.notes.empty());
+    const Decoded d = decode_program(r.program);
+    ASSERT_EQ(d.insns.size(), static_cast<size_t>(6));
+    expect_is(d.insns[0], VmOp::Mov, OpKind::Reg, isa::kScratchFirst, OpKind::Reg, kRax, 0, kS32);
+    expect_is(d.insns[1], VmOp::Load, OpKind::Reg, isa::kScratchFirst + 1,
+              OpKind::Reg, isa::kScratchFirst, 0, kS32);
+    expect_is(d.insns[2], VmOp::Push, OpKind::Reg, isa::kScratchFirst + 1,
+              OpKind::None, 0, 0, kS32);
+    expect_is(d.insns[3], VmOp::Pop, OpKind::Reg, kRbx, OpKind::None, 0, 0, kS32);
+}
+
+TEST(Translate, X86PushMemDispIndexForm) {
+    // push [eax + ecx*4 + 0x10]：地址全展开（Mov acc / Mov ix / Shl 2 /
+    // Add acc,ix / Add acc,disp）+ Load + Push = 7 VmOp。
+    const auto r = wvmp::regvm::translator::translate_function(
+        fn86_pushmem(ir::Reg::Rax, ir::Reg::Rcx, 4, 0x10));
+    EXPECT_TRUE(r.notes.empty());
+    const Decoded d = decode_program(r.program);
+    ASSERT_EQ(d.insns.size(), static_cast<size_t>(10));  // 7 + Pop + Jmp(+1) + Halt
+    expect_is(d.insns[0], VmOp::Mov, OpKind::Reg, isa::kScratchFirst, OpKind::Reg, kRax, 0, kS32);
+    expect_is(d.insns[1], VmOp::Mov, OpKind::Reg, isa::kScratchFirst + 1, OpKind::Reg, kRcx, 0, kS32);
+    expect_is(d.insns[2], VmOp::Shl, OpKind::Reg, isa::kScratchFirst + 1, OpKind::Imm, 0, 2, kS32);
+    expect_is(d.insns[3], VmOp::Add, OpKind::Reg, isa::kScratchFirst,
+              OpKind::Reg, isa::kScratchFirst + 1, 0, kS32);
+    expect_is(d.insns[4], VmOp::Add, OpKind::Reg, isa::kScratchFirst, OpKind::Imm, 0, 0x10, kS32);
+    expect_is(d.insns[5], VmOp::Load, OpKind::Reg, isa::kScratchFirst + 2,
+              OpKind::Reg, isa::kScratchFirst, 0, kS32);
+    expect_is(d.insns[6], VmOp::Push, OpKind::Reg, isa::kScratchFirst + 2,
+              OpKind::None, 0, 0, kS32);
+    expect_is(d.insns[7], VmOp::Pop, OpKind::Reg, kRbx, OpKind::None, 0, 0, kS32);
+}
+
+TEST(Translate, X86PushMemNegativeDispReachGate) {
+    // push [esp-200]：负位移下探 reach = 4+200+4 = 208 > guard 预算 128 →
+    // 栈深 walk gate（X5b 规则 3 对 Push dst=Mem 的既有覆盖随本开面生效）。
+    ir::FunctionRegion fn = fn_of({blk(0x1000, {push_mem_insn(ir::Reg::Rsp, ir::Reg::Flags,
+                                                              0, -200, ir::Size::S32)})});
+    fn.arch = ir::Arch::X86;
+    const auto r = wvmp::regvm::translator::translate_function(fn);
+    ASSERT_FALSE(r.notes.empty());
+    EXPECT_NE(r.notes[0].find("栈写下探超 guard 预算"), std::string::npos);
+}
+
+TEST(Translate, X64PushMemStillGated) {
+    // D2 裁决钉：x64 push [mem] 维持 skip（x86-only 开面, x64 无 push_mem
+    // 数据行）。形 note 文本与 MIT-456 前逐字节一致。
+    ir::FunctionRegion fn = fn_of({blk(0x1000, {push_mem_insn(ir::Reg::Rax, ir::Reg::Flags,
+                                                              0, 0, ir::Size::S64)})});
+    const auto r = wvmp::regvm::translator::translate_function(fn);
+    ASSERT_FALSE(r.notes.empty());
+    bool has_shape_note = false;
+    for (const auto& n : r.notes)
+        if (n.find("push 操作数形态未支持") != std::string::npos) has_shape_note = true;
+    EXPECT_TRUE(has_shape_note);
+}
+
 // ==================== MIT-451 (X5b) B.2: 栈深 walk 正反例 ====================
 
 namespace {

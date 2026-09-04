@@ -931,7 +931,7 @@ struct Translator {
         case ir::Op::Lea: ok = translate_lea(em, sc, in, current_rva, next_ip); break;
         case ir::Op::Load: ok = translate_load(em, sc, in, current_rva, next_ip); break;
         case ir::Op::Store: ok = translate_store(em, sc, in, current_rva, next_ip); break;
-        case ir::Op::Push: ok = translate_push(em, in); break;
+        case ir::Op::Push: ok = translate_push(em, sc, in, current_rva, next_ip); break;
         case ir::Op::Pop: ok = translate_pop(em, in); break;
         case ir::Op::Ret:
             // MIT-438 (X1b): ret imm16 清栈语义——lifter 已把 imm 放进 in.src
@@ -1576,7 +1576,16 @@ struct Translator {
     // 0xFFFFFFFF → 0xFFFFFFFF 同值）；超 32 位值域（x64 sext 形混入）防御
     // skip。S16/S8 位宽 gate 前置（66 68 push imm16 同 gate 口径, 对齐 442
     // push 位宽面）。
-    bool translate_push(Emitter& em, const ir::Insn& in) {
+    // MIT-456 (push-mem): x86 push [mem] 开面 —— X7 批一实测 505,828 条 =
+    // 1.845%（92.9% 文件命中，core_os IAT/栈窗惯用面重）= x86 第一大非 x87
+    // shape gate，本单按 X7 收口节"新数据行"翻正。折条 = 既有通路零新 VmOp：
+    // emit_load（地址槽 acc + Load 值槽）→ 单 VmOp::Push a_kind=Reg（handler
+    // 既有 Reg 分支，asmgen 零 diff）。语义序 = native 序：地址计算/读值在
+    // Push 减 esp **之前**（push [esp+X]/push [esp] 读的是减前 esp —— IAT
+    // 栈窗形语义锚）。x64 维持 skip（D2 x86-only：x64 无 push_mem 数据行，
+    // 且 x64 push 现形 = Sub+Store 双 op，Mem 开面属独立数据裁决面）。
+    bool translate_push(Emitter& em, Scratch& sc, const ir::Insn& in,
+                        u64 current_rva, u64 next_ip) {
         if (in.size == ir::Size::S16 || in.size == ir::Size::S8)
             return skip(in, "push 位宽未支持 (S16/S8 栈推进不在 VM 栈模型内)", nullptr);
         if (in.dst.kind == ir::Operand::Kind::Reg) {
@@ -1607,7 +1616,24 @@ struct Translator {
                     static_cast<u32>(static_cast<u64>(v)), isa::size_field(in.size));
             return true;
         }
-        // x64 push imm（D2 维持 gate）+ 其余形态兜底。
+        // MIT-456 (push-mem): x86 push [mem] —— translate_load 同款折条：
+        // emit_address（地址槽）→ Load/LoadRva（值槽）→ 单 op Push a_kind=Reg
+        // （handler 既有 Reg 分支，asmgen 零 diff）。地址/读值在 Push 减 esp
+        // 之前发射 = native 序（push [esp+X] 读减前 esp —— IAT 栈窗形锚）。
+        if (in.dst.kind == ir::Operand::Kind::Mem && arch_ == ir::Arch::X86) {
+            u8 acc = 0;
+            if (!emit_address(em, sc, in.dst.mem, current_rva, next_ip, sz_step_, acc))
+                return skip(in, "push 地址形态未支持", &in.dst.mem);
+            const isa::VmOp load_op =
+                (in.dst.mem.base == ir::Reg::Rip) ? isa::VmOp::LoadRva : isa::VmOp::Load;
+            const u8 val = sc.take();
+            em.emit_rr(load_op, val, acc, isa::size_field(in.size));
+            em.emit(VmOp::Push, OpKind::Reg, val, OpKind::None, 0, 0,
+                    isa::size_field(in.size));
+            return true;
+        }
+        // x64 push imm（D2 维持 gate）+ x64 push [mem]（MIT-456 D2 维持
+        // gate，见上注）+ 其余形态兜底。
         return skip(in, "push 操作数形态未支持", nullptr);
     }
 

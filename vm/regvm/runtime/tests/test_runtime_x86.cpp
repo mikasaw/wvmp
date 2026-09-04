@@ -2122,6 +2122,81 @@ TEST(X86Battery, PushImmMultiValueStack) {
 }
 
 // ---------------------------------------------------------------------------
+// (26d) MIT-456 (push-mem): push [mem] 真执行 —— 内存源值经地址槽 + Load 值槽
+//       推入 guest 栈（translator 折条 Load+Push 的语义闭环；handler 既有
+//       Reg 分支零新码）。esp 步进 + 栈内存 LIFO 逐 dword 断言，镜像 26a/26b 形。
+//       覆盖三面: [reg] 直接形 / [reg+disp] IAT 栈窗惯用形 / push 顺序语义
+//       （地址读取发生在减 esp 之前 —— 数据预置在栈低址侧, 减序不影响读值）。
+// ---------------------------------------------------------------------------
+TEST(X86Battery, PushMemFromMemory) {
+    wvmp::Rng rng(12345);
+    const auto gen = rt::generate_runtime_x86(rng);
+    alignas(4) std::array<u8, 0x40> scratch{};
+    scratch.fill(0);
+    // 数据预置（读源）: [base+0x00]=0xAAAA1111、[base+0x04]=0xBBBB2222。
+    const u32 base_addr = static_cast<u32>(reinterpret_cast<uintptr_t>(scratch.data())) + 0x00;
+    const u32 val_a = 0xAAAA1111u, val_b = 0xBBBB2222u;
+    std::memcpy(scratch.data() + 0x00, &val_a, 4);
+    std::memcpy(scratch.data() + 0x04, &val_b, 4);
+    RwxImage rwx(gen.image.code);
+    const auto entry = rwx.entry();
+    const u32 stack_top = static_cast<u32>(reinterpret_cast<uintptr_t>(scratch.data())) + 0x20;
+    const u8 rsp_slot = isa::vm_reg_of(ir::Reg::Rsp);
+
+    rt::VmContext ctx;
+    ctx.bytecode = nullptr;  // 装配于下
+    std::vector<u8> s;
+    // ⚠️ 槽位纪律: VM 槽 0..7 = 客机 GPR 槽 1:1 (ir::Reg 序, 槽 4 = RSP
+    // 槽!)——数据槽只能用 2(Rdx)/5(Rsi)/6(Rdi)/8+(scratch 域), 误用槽 4
+    // 会把 Load 值写进 esp 槽, 下一次 Push 即以值地址访存 (cdb 实录
+    // mov [ebx],edx @ bbbb221e)。PushImmMultiValueStack 用 5/6 同纪律。
+    isa::append_insn(s, mov_imm(2, base_addr));                              // 0
+    isa::append_insn(s, isa::make_insn(isa::VmOp::Load, isa::OpKind::Reg, 5,
+                                       isa::OpKind::Reg, 2, 0,
+                                       isa::size_field(ir::Size::S32)));     // 1  v5 = [base]
+    isa::append_insn(s, isa::make_insn(isa::VmOp::Push, isa::OpKind::Reg, 5,
+                                       isa::OpKind::None, 0, 0,
+                                       isa::size_field(ir::Size::S32)));     // 2  push [base]
+    // [base+4] 形: 地址槽 +4 后再 Load（translator push [reg+disp] 展开的
+    // 等价 VmOp 序: Add acc,disp → Load val,[acc] → Push val）。
+    isa::append_insn(s, isa::make_insn(isa::VmOp::Add, isa::OpKind::Reg, 2,
+                                       isa::OpKind::Imm, 0, 0x04,
+                                       isa::size_field(ir::Size::S32)));     // 3
+    isa::append_insn(s, isa::make_insn(isa::VmOp::Load, isa::OpKind::Reg, 6,
+                                       isa::OpKind::Reg, 2, 0,
+                                       isa::size_field(ir::Size::S32)));     // 4  v6 = [base+4]
+    isa::append_insn(s, isa::make_insn(isa::VmOp::Push, isa::OpKind::Reg, 6,
+                                       isa::OpKind::None, 0, 0,
+                                       isa::size_field(ir::Size::S32)));     // 5  push [base+4]
+    isa::append_insn(s, isa::make_insn(isa::VmOp::Pop, isa::OpKind::Reg, 7,
+                                       isa::OpKind::None, 0, 0,
+                                       isa::size_field(ir::Size::S32)));     // 6
+    isa::append_insn(s, isa::make_insn(isa::VmOp::Pop, isa::OpKind::Reg, 8,
+                                       isa::OpKind::None, 0, 0,
+                                       isa::size_field(ir::Size::S32)));     // 7
+    isa::append_insn(s, halt());                                             // 8
+
+    ctx.bytecode = const_cast<u8*>(s.data());
+    ctx.pc = 0;
+    ctx.scratch_mem = 0;
+    ctx.regs[rsp_slot] = stack_top;
+    entry(&ctx);
+
+    // LIFO: 后推的 [base+4]=0xBBBB2222 先弹出。
+    expect_slot32(ctx, 7, val_b);
+    expect_slot32(ctx, 8, val_a);
+    // esp 步进: 两 push 两 pop → 回 stack_top。
+    EXPECT_EQ(ctx.regs[rsp_slot], static_cast<u64>(stack_top));
+    // 栈内存逐 dword（push 先减后写 = 首推在最高址）:
+    // [top-4]=val_a（首推）、[top-8]=val_b（次推）。
+    u32 m0, m1;
+    std::memcpy(&m0, scratch.data() + 0x1C, 4);
+    std::memcpy(&m1, scratch.data() + 0x18, 4);
+    EXPECT_EQ(m0, val_a);
+    EXPECT_EQ(m1, val_b);
+}
+
+// ---------------------------------------------------------------------------
 // (26c) MIT-454 (X6 A=X3d) 批次二：x86 SSE 面 —— 算术/传送/位运算/mem 原语/
 //       GP↔xmm 桥真执行语义（x64 SSE 电池的 32 位镜像；ctx.xmm 读回可观察
 //       —— 影子纪律：仅 stdout 不构成验收）。

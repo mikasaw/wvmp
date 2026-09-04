@@ -325,6 +325,14 @@ x86_samples=(
     # build_div_idiv_x86 handlers (x64 build_div_idiv mirror; 453 b59b
     # residual face closure, stubs 11 -> 12 on wvmpTest b59b).
     "build/x86_samples/wvmp_x86_div_sample.exe"
+    # MIT-456 (push-mem): pushmem (pool 16 -> 17, x86 85 runs, total 335).
+    # In-region memory-sourced push faces (FF 35 abs / FF 71 04 reg+disp8
+    # IAT form / FF 74 24 04 esp stack-window idiom reading pre-push esp /
+    # call-arg push [mem] pair with callgate + cdecl cleanup) virtualized
+    # through the address-slot + Load + Push/Reg fold (asmgen zero-diff);
+    # net depth 0 at Halt. X7 new-data-row residual face closure
+    # (push_mem 1.845%, 92.9% file hit).
+    "build/x86_samples/wvmp_x86_pushmem_sample.exe"
 )
 
 # Seeds: 1 (small), 12345 (default), 99999 (large), 0xDEADBEEF (magic), 0xCAFEBABE (magic).
