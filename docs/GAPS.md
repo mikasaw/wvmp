@@ -1123,7 +1123,7 @@ NotIntercepted 双锁）；Inc/Dec 唯一构造点 translate_unary 不写 src2
 | 项 | 现状 |
 |---|---|
 | crypt（blob 加密） | ✅ **MIT-458 (crypt-v1) 收口（2026-09-05）**：xor_chain blob 级加密 + stub 入口 one-shot 解密（密钥 seed 派生、每目标嵌入）。D1 边界：首入口并发双重解密未防护（单线程初始化威胁模型）；首次执行后明文驻留内存（对抗静态提取，不对抗运行时转储）；指令级加密（C 点取指织入）仍预留未接线 |
-| mutate | pass 占位 |
+| mutate | ✅ **MIT-459 (mutate-v1) 首版（2026-09-05）**：Nop 密度填充（P=0.10，确定性 seed 派生）；junk-Mov（死寄存器垃圾注入）**默认关闭挂账**——首通 E2E 实录见下节 |
 | anti_debug | pass 占位 |
 | integrity_crc / import_protect | pass 占位 |
 | W^X 分离 | 单 RWX 节，解释器/字节码/stub 同节共存（stub_link_pass.cpp:27 注释明示 v1 取舍） |
@@ -1529,3 +1529,28 @@ sha256 逐字节恒等**（x64 零扰动机器证明）。
 
 冻结契约零 diff（kVmOpMax=97 / 载体域 0..28 / kCtxSize / runtime.hpp /
 backend.hpp / 判定链 / ExitNative 协议 / 跳表 128 / asmgen.cpp）。
+
+
+## mutate junk-Mov 挂账（MIT-459 收口裁定 + 首通实录，2026-09-05）
+
+**结论**：死寄存器垃圾 Mov 注入（块内向后 liveness）实现保留于
+`passes/mutate/src/mutate_pass.cpp`，`kEnableJunkMov=false` 默认关闭；v1
+只发 Nop 填充（E2E byte-exact 已证）。翻案前置 = 系统性审计 VM 槽的
+隐式消费面（候选：callgate 参数/返回 marshal、ExitNative/Ret 出口坐标、
+stub xmm 同步、x86 参数窗），当前证据不足以定位残余消费点。
+
+**首通实录**（wvmpTest x64，mutate+crypt 全栈 8 passes，seed 12345）：
+1. 137 个 junk Mov 注入 → kern.md5 首测 `mov dword ptr [0],2Ah` 崩溃
+   （+0x47720 原生代码，野指针写）。
+2. 修正一（有效，入册）：**callgate 隐式读**——x64 `Op::Call` 经 callgate
+   把客户 rcx/rdx/r8/r9 槽作为 Win64 原生参数传被调方（rax 低 8 位 = 变参
+   浮标）；块内 liveness 修复为 Call 处强制 rcx/rdx/r8/r9/rax 活。
+3. 修正一后仍崩（同址发散）→ 剩余未定位消费点存在 → 挂账。
+4. 对照：nop-only（P=0.10，99-105 Nop 注入）双跑 byte-exact、14 stubs
+   （junk Mov 曾致 cf88 跳表匹配器失配 gate——Nop 同样会断模式链，gate
+   行为安全；本实录 nop-only 下 cf88 恢复真虚拟化，因 rng 序不同插入位置
+   不同，非普遍结论：跳表函数遇 mutate 可能 gate，属安全面）。
+
+**教训入册**：VM 槽的消费者不止 IR 读集——运行时把客户槽 Marshal 进
+原生 ABI 的每条通路（callgate/ExitNative/xmm 同步）都是隐式读；IR 级
+变换的 liveness 必须把"槽 → 原生 ABI"面纳入读集后才能安全写槽。

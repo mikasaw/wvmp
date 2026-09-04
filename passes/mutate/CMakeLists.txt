@@ -6,3 +6,7 @@ target_include_directories(wvmp_pass_mutate PUBLIC
 )
 target_link_libraries(wvmp_pass_mutate PRIVATE wvmp::framework wvmp::ir wvmp::common)
 wvmp_target_warnings(wvmp_pass_mutate)
+
+if(WVMP_BUILD_TESTS)
+    add_subdirectory(tests)
+endif()
