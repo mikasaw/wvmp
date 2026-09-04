@@ -10,6 +10,7 @@
 #include "wvmp/regvm/codecs/xor_chain.hpp"
 #include "wvmp/framework/context.hpp"
 #include "wvmp/framework/keys.hpp"
+#include "wvmp/framework/protect_levels.hpp"
 #include "wvmp/regvm/isa/blob.hpp"
 
 #include <gtest/gtest.h>
@@ -151,3 +152,65 @@ TEST(CryptPass, EmptyProgramSlotSkips) {
 }
 
 } // namespace
+
+TEST(CryptPass, NameRuleCryptFalseExemptsFunction) {
+    // MIT-461: name 选择器 crypt=false → 该函数不进 plan（豁免），
+    // 其他函数照常加密。
+    wvmp::ProtectionContext ctx;
+    ctx.seed = 99;
+    fill_vfs(ctx);
+    wvmp::ProtectRules rules;
+    wvmp::FunctionProtectRule rule;
+    rule.has_name = true;
+    rule.name = "fn0";
+    rule.has_crypt = true;
+    rule.crypt = false;
+    rules.functions.push_back(rule);
+    ctx.slot<wvmp::ProtectRules>(wvmp::kProtectRules) = rules;
+
+    wvmp::passes::CryptPass pass;
+    pass.run(ctx);
+    const auto* plan = ctx.find_slot<wvmp::passes::crypt::CryptPlan>(wvmp::kCryptPlan);
+    ASSERT_NE(plan, nullptr);
+    ASSERT_EQ(plan->functions.size(), size_t{1});
+    EXPECT_EQ(plan->functions[0].name, "fn1");
+}
+
+TEST(CryptPass, ExemptionDoesNotShiftKeyStream) {
+    // MIT-461 验收 REJECT 项修复钉：密钥流按 vfs 序无条件消费（豁免函数
+    // 也消费一次）——加一条豁免规则后，其余已加密函数的 key0 与无豁免
+    // 基线逐字节一致（"只加豁免不改密钥"性质）。
+    // 基线：无规则。
+    wvmp::ProtectionContext base;
+    base.seed = 99;
+    fill_vfs(base);
+    wvmp::passes::CryptPass p0;
+    p0.run(base);
+    const auto* base_plan =
+        base.find_slot<wvmp::passes::crypt::CryptPlan>(wvmp::kCryptPlan);
+    ASSERT_NE(base_plan, nullptr);
+    ASSERT_EQ(base_plan->functions.size(), size_t{2});
+    const u32 key_fn0 = base_plan->functions[0].key0;
+    const u32 key_fn1 = base_plan->functions[1].key0;
+
+    // 加豁免 fn0 → fn1 的 key0 必须不变（密钥流序未被豁免扰动）。
+    wvmp::ProtectionContext ctx;
+    ctx.seed = 99;
+    fill_vfs(ctx);
+    wvmp::ProtectRules rules;
+    wvmp::FunctionProtectRule rule;
+    rule.has_name = true;
+    rule.name = "fn0";
+    rule.has_crypt = true;
+    rule.crypt = false;
+    rules.functions.push_back(rule);
+    ctx.slot<wvmp::ProtectRules>(wvmp::kProtectRules) = rules;
+    wvmp::passes::CryptPass pass;
+    pass.run(ctx);
+    const auto* plan = ctx.find_slot<wvmp::passes::crypt::CryptPlan>(wvmp::kCryptPlan);
+    ASSERT_NE(plan, nullptr);
+    ASSERT_EQ(plan->functions.size(), size_t{1});
+    EXPECT_EQ(plan->functions[0].name, "fn1");
+    EXPECT_EQ(plan->functions[0].key0, key_fn1) << "豁免不应改变后续函数密钥";
+    EXPECT_NE(plan->functions[0].key0, key_fn0);
+}

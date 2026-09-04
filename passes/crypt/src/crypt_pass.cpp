@@ -5,6 +5,7 @@
 #include "wvmp/regvm/codecs/xor_chain.hpp"
 #include "wvmp/framework/context.hpp"
 #include "wvmp/framework/keys.hpp"
+#include "wvmp/framework/protect_levels.hpp"
 #include "wvmp/framework/registry.hpp"
 
 #include <stdexcept>
@@ -17,6 +18,8 @@ namespace wvmp::passes {
 // virtualize → crypt → stub_link）。本 pass 对 kVmProgram 里每个 VM 程序：
 //   1. 从独立 Rng（ctx.seed ^ kCryptSeedSalt，确定性——不消费 ctx.rng，
 //      下游随机序列与无 crypt 管道逐字节一致，回归基线零扰动）派生 key0；
+//      密钥流按 vfs 序无条件消费（豁免函数也消费一次——加豁免规则不改变
+//      任何已加密函数的 key0，MIT-461 验收 REJECT 项修复）；
 //   2. XorChainCodec::encrypt_with_key 原地加密（32B 头明文保留——
 //      stub_link x86 白名单 gate 与 read_blob 消费头）；
 //   3. 追加 8B 尾旗标（flag=1=已加密）；
@@ -55,17 +58,33 @@ void CryptPass::run(ProtectionContext& ctx) {
     // 独立确定性密钥流（盐见上注）。逐函数消费一个 next()（vfs 序）。
     Rng key_rng(ctx.seed ^ kCryptSeedSalt);
 
+    // MIT-461: 每函数 crypt 覆写（[[functions]] crypt=true/false；缺省 =
+    // 全加密）。密钥流按 vfs 序消费（含被豁免的函数）——豁免不改其他
+    // 函数的密钥，保证"只加一条豁免规则"时已加密函数密钥不变。
+    const ProtectRules* rules = ctx.find_slot<ProtectRules>(kProtectRules);
+
     crypt::CryptPlan plan;
     plan.algo = std::string(crypt::kAlgoXorChain);
     plan.functions.reserve(vfs->size());
 
+    size_t encrypted = 0, exempted = 0;
     for (size_t i = 0; i < vfs->size(); ++i) {
         const auto& vf = (*vfs)[i];
+        // 密钥流无条件按 vfs 序消费（含豁免函数）——保证"只加一条豁免
+        // 规则"时不改变任何已加密函数的 key0（MIT-461 验收 REJECT 项修复）。
+        const u32 key0 = static_cast<u32>(key_rng.next());
+        if (rules != nullptr) {
+            const auto override_crypt =
+                rules->crypt_for(vf.begin_rva, i, vf.name);
+            if (override_crypt.has_value() && !*override_crypt) {
+                ++exempted;
+                continue;
+            }
+        }
         crypt::CryptedFunction entry;
         entry.vfs_index = i;
         entry.name = vf.name;
-        entry.key0 = static_cast<u32>(key_rng.next());
-
+        entry.key0 = key0;
         entry.encrypted_blob = vf.program.bytecode;
         regvm::codecs::XorChainCodec::encrypt_with_key(entry.key0, entry.encrypted_blob);
         // 尾旗标：flag=1（已加密）；旗标 RVA = 流起点 + stream_bytes（stub
@@ -78,13 +97,16 @@ void CryptPass::run(ProtectionContext& ctx) {
         for (int b = 0; b < 4; ++b)
             entry.encrypted_blob.push_back(0);
         plan.functions.push_back(std::move(entry));
+        ++encrypted;
     }
 
     ctx.slot<crypt::CryptPlan>(kCryptPlan) = std::move(plan);
     ctx.diag.report(Severity::Note, name(),
-                    "已加密 " + std::to_string(vfs->size()) + "/" +
+                    "已加密 " + std::to_string(encrypted) + "/" +
                         std::to_string(vfs->size()) + " 个 VM 程序（xor_chain，"
-                        "seed 派生密钥，stub 入口 one-shot 解密）");
+                        "seed 派生密钥，stub 入口 one-shot 解密）" +
+                        (exempted > 0 ? "；豁免 " + std::to_string(exempted) + " 个（crypt=false）"
+                                      : ""));
 }
 
 WVMP_REGISTER_PASS(CryptPass)

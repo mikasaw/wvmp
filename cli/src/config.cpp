@@ -236,13 +236,22 @@ ConfigResult parse_config(const std::filesystem::path& file) {
             // 选择器 rva / index：恰一（TOML 整数字面量，rva 支持 0x 前缀）。
             const bool has_rva = entry->get("rva") != nullptr;
             const bool has_index = entry->get("index") != nullptr;
-            if (has_rva && has_index)
-                return fail(where + " 'rva' 与 'index' 只能二选一（消除选择器歧义）");
-            if (!has_rva && !has_index)
-                return fail(where + " 缺少选择器字段（'rva' 或 'index' 恰一）");
+            const bool has_name = entry->get("name") != nullptr;
+            const int selectors = static_cast<int>(has_rva) + static_cast<int>(has_index) +
+                                  static_cast<int>(has_name);
+            if (selectors > 1)
+                return fail(where + " 'rva'/'index'/'name' 只能选其一（消除选择器歧义）");
+            if (selectors == 0)
+                return fail(where + " 缺少选择器字段（'rva'/'index'/'name' 恰一）");
 
             FunctionProtectRule rule;
-            if (has_rva) {
+            if (has_name) {
+                auto name = (*entry)["name"].value<std::string>();
+                if (!name || name->empty())
+                    return fail(where + " 字段 'name' 必须是非空字符串（标记函数真名）");
+                rule.has_name = true;
+                rule.name = *name;
+            } else if (has_rva) {
                 auto rva = (*entry)["rva"].value<std::int64_t>();
                 if (!rva || *rva < 0)
                     return fail(where + " 字段 'rva' 必须是非负整数（begin 标记 "
@@ -255,6 +264,15 @@ ConfigResult parse_config(const std::filesystem::path& file) {
                     return fail(where + " 字段 'index' 必须是非负整数（扫描序 0-based）");
                 rule.has_index = true;
                 rule.index = static_cast<u64>(*index);
+            }
+
+            // crypt 覆写：可省略；MIT-461。
+            if (const toml::node* cr = entry->get("crypt")) {
+                auto c = cr->value<bool>();
+                if (!c)
+                    return fail(where + " 字段 'crypt' 必须是布尔值（true/false）");
+                rule.has_crypt = true;
+                rule.crypt = *c;
             }
 
             // level：可省略 = "virtualize"（与 default 独立显式化）。
@@ -272,15 +290,17 @@ ConfigResult parse_config(const std::filesystem::path& file) {
             }
             // 严格 schema：[[functions]] 条目只认 rva/index/level（静默吸键防线）。
             for (const auto& [key, value] : *entry) {
-                if (key.str() != "rva" && key.str() != "index" && key.str() != "level")
+                if (key.str() != "rva" && key.str() != "index" && key.str() != "name" &&
+                    key.str() != "level" && key.str() != "crypt")
                     return fail(where + " 未知字段 '" + std::string(key.str()) +
-                                "'（[[functions]] 条目只允许 rva/index/level）");
+                                "'（[[functions]] 条目只允许 rva/index/name/level/crypt）");
             }
 
             // 同选择器重复 = 配置矛盾（后写覆盖类语义在此最易埋雷），显式拒。
             for (const auto& existing : result.value.rules.functions) {
                 if ((rule.has_rva && existing.has_rva && existing.rva == rule.rva) ||
-                    (rule.has_index && existing.has_index && existing.index == rule.index))
+                    (rule.has_index && existing.has_index && existing.index == rule.index) ||
+                    (rule.has_name && existing.has_name && existing.name == rule.name))
                     return fail(where + " 选择器与前文规则重复（同一函数只允许一条规则）");
             }
             result.value.rules.functions.push_back(rule);

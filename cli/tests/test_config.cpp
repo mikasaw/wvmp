@@ -360,7 +360,7 @@ TEST(ConfigParse, ProtectRulesBothSelectorsFails) {
         "index = 2\n");
     const auto result = wvmp::cli::parse_config(toml.path());
     ASSERT_FALSE(result.ok);
-    EXPECT_TRUE(contains(result.error, "二选一"));
+    EXPECT_TRUE(contains(result.error, "只能选其一"));
 }
 
 TEST(ConfigParse, ProtectRulesNoSelectorFails) {
@@ -434,4 +434,63 @@ TEST(ConfigParse, UnknownFunctionsEntryKeyFails) {
     const auto result = wvmp::cli::parse_config(toml.path());
     ASSERT_FALSE(result.ok);
     EXPECT_TRUE(contains(result.error, "未知字段 'note'"));
+}
+
+// ==================== MIT-461 配置 v2：name 选择器 + crypt 覆写 ====================
+
+TEST(ConfigParse, NameSelectorAndCryptOverride) {
+    const TempToml toml(
+        "input  = \"target.exe\"\n"
+        "output = \"out.exe\"\n"
+        "[[functions]]\n"
+        "name = \"compute_alpha\"\n"
+        "crypt = false\n"
+        "[[functions]]\n"
+        "name = \"secret_box\"\n"
+        "level = \"none\"\n");
+    const auto result = wvmp::cli::parse_config(toml.path());
+    ASSERT_TRUE(result.ok) << result.error;
+    ASSERT_EQ(result.value.rules.functions.size(), size_t{2});
+    EXPECT_TRUE(result.value.rules.functions[0].has_name);
+    EXPECT_EQ(result.value.rules.functions[0].name, "compute_alpha");
+    EXPECT_TRUE(result.value.rules.functions[0].has_crypt);
+    EXPECT_FALSE(result.value.rules.functions[0].crypt);
+    EXPECT_TRUE(result.value.rules.functions[1].has_name);
+    EXPECT_EQ(result.value.rules.functions[1].level, wvmp::ProtectLevel::None);
+    EXPECT_FALSE(result.value.rules.functions[1].has_crypt);
+}
+
+TEST(ConfigParse, NameSelectorEmptyValueFails) {
+    const TempToml toml(
+        "input  = \"target.exe\"\n"
+        "output = \"out.exe\"\n"
+        "[[functions]]\n"
+        "name = \"\"\n");
+    const auto result = wvmp::cli::parse_config(toml.path());
+    ASSERT_FALSE(result.ok);
+    EXPECT_TRUE(contains(result.error, "name"));
+}
+
+TEST(ConfigParse, CryptNonBoolFails) {
+    const TempToml toml(
+        "input  = \"target.exe\"\n"
+        "output = \"out.exe\"\n"
+        "[[functions]]\n"
+        "rva = 1\n"
+        "crypt = \"yes\"\n");
+    const auto result = wvmp::cli::parse_config(toml.path());
+    ASSERT_FALSE(result.ok);
+    EXPECT_TRUE(contains(result.error, "crypt"));
+}
+
+TEST(ConfigParse, MixedSelectorPairStillRejected) {
+    const TempToml toml(
+        "input  = \"target.exe\"\n"
+        "output = \"out.exe\"\n"
+        "[[functions]]\n"
+        "name = \"x\"\n"
+        "rva = 2\n");
+    const auto result = wvmp::cli::parse_config(toml.path());
+    ASSERT_FALSE(result.ok);
+    EXPECT_TRUE(contains(result.error, "只能选其一"));
 }

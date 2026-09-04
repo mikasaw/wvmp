@@ -1,6 +1,8 @@
 #pragma once
 #include "wvmp/common/types.hpp"
 
+#include <optional>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -23,13 +25,21 @@ inline constexpr std::string_view to_string(ProtectLevel level) {
     return "?";
 }
 
-// 单条函数规则：选择器（rva / index 恰一，解析期保证）+ 档位。
+// 单条函数规则：选择器（rva / index / name 恰一，解析期保证，MIT-461 起
+// 增 name——依赖 MIT-460 P7-names 真名解析）+ 档位 + 可选 crypt 覆写。
 struct FunctionProtectRule {
     bool has_rva = false;
     u64  rva   = 0;  // begin 标记 RVA（= FunctionRegion.begin_rva；TOML 支持 0x 十六进制字面量）
     bool has_index = false;
     u64  index = 0;  // 扫描序 0-based（= ProtectionContext.functions 下标；跨重编译不稳，调试用）
+    bool has_name = false;
+    std::string name;  // 标记函数真名（MIT-460 解析；跨重编译稳定的选择器）
     ProtectLevel level = ProtectLevel::Virtualize;
+    // MIT-461：每函数 crypt 覆写（三态）。nullopt = 跟随管道全局行为
+    //（crypt pass 在 = 全加密）；false = 该函数豁免加密；true = 强制加密
+    //（仅当 crypt pass 在管道时有意义）。
+    bool has_crypt = false;
+    bool crypt = true;
 };
 
 // 保护规则集（CLI 解析 TOML 后整体写入 ctx 扩展槽，key = kProtectRules）。
@@ -54,6 +64,22 @@ struct ProtectRules {
             if (r.has_rva && r.rva == begin_rva) level = r.level;
         }
         return level;
+    }
+
+    // MIT-461：每函数 crypt 覆写解析。按规则声明序后评胜（任一选择器
+    // 命中即覆写；仅统计显式携带 crypt 覆写的规则）。
+    // 返回 nullopt = 无显式覆写（跟随全局行为）。
+    std::optional<bool> crypt_for(u64 begin_rva, u64 index,
+                                  std::string_view name) const {
+        std::optional<bool> result;
+        for (const auto& r : functions) {
+            if (r.has_crypt &&
+                ((r.has_index && r.index == index) ||
+                 (r.has_rva && r.rva == begin_rva) ||
+                 (r.has_name && r.name == name)))
+                result = r.crypt;
+        }
+        return result;
     }
 };
 
