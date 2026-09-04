@@ -115,6 +115,24 @@ ConfigResult parse_config(const std::filesystem::path& file) {
         return result;
     };
 
+    // MIT-457（验收反馈加固）：严格 schema——未知键显式拒绝。背景：TOML
+    // 的表作用域规则会把写在 [[表头]] 之后的顶层键静默吸进该表（如
+    // default_level 追加到文件尾 → 落进最后一个 [[passes]] 元素），v0 的
+    // "未知键忽略" 口径会让这类配置静默失效零告警——保护工具的配置打错
+    // 必须响，不能静默吞。
+    constexpr std::string_view kTopLevelKeys[] = {"input", "output", "seed", "arch",
+                                                  "default_level", "functions", "passes"};
+    for (const auto& [key, value] : tbl) {
+        bool known = false;
+        for (auto k : kTopLevelKeys)
+            if (key.str() == k) known = true;
+        if (!known)
+            return fail("config 未知顶层字段 '" + std::string(key.str()) +
+                        "'（允许: input/output/seed/arch/default_level/functions/"
+                        "passes——⚠️ 顶层键必须写在任何 [[表头]] 之前，否则会被 "
+                        "TOML 作用域规则吸进表内）");
+    }
+
     // input / output：必填非空字符串。
     if (auto input = tbl["input"].value<std::string>()) {
         if (input->empty()) return fail("config 缺少字段: 'input' 不能为空字符串");
@@ -175,6 +193,14 @@ ConfigResult parse_config(const std::filesystem::path& file) {
             if (!name || name->empty())
                 return fail("config 'passes[" + std::to_string(index) +
                             "]' 缺少必填字段 'name'（非空字符串）");
+            // 严格 schema：[[passes]] 条目只认 name（见上注——静默吸键防线）。
+            for (const auto& [key, value] : *entry) {
+                if (key.str() != "name")
+                    return fail("config 'passes[" + std::to_string(index) +
+                                "]' 未知字段 '" + std::string(key.str()) +
+                                "'（[[passes]] 条目只允许 'name'；若这是顶层键，"
+                                "必须写在任何 [[表头]] 之前）");
+            }
             result.value.passes.push_back(PassConfig{*name});
             ++index;
         }
@@ -243,6 +269,12 @@ ConfigResult parse_config(const std::filesystem::path& file) {
                 else
                     return fail(where + " 字段 'level' 非法值 '" + *level +
                                 "'（允许: none/virtualize）");
+            }
+            // 严格 schema：[[functions]] 条目只认 rva/index/level（静默吸键防线）。
+            for (const auto& [key, value] : *entry) {
+                if (key.str() != "rva" && key.str() != "index" && key.str() != "level")
+                    return fail(where + " 未知字段 '" + std::string(key.str()) +
+                                "'（[[functions]] 条目只允许 rva/index/level）");
             }
 
             // 同选择器重复 = 配置矛盾（后写覆盖类语义在此最易埋雷），显式拒。

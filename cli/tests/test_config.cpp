@@ -53,7 +53,6 @@ TEST(ConfigParse, FullConfigFields) {
         "name = \"pe_loader\"\n"
         "[[passes]]\n"
         "name = \"marker_scan\"\n"
-        "name_unused = \"被忽略的额外键\"\n"
         "[[passes]]\n"
         "name = \"pe_writer\"\n");
     const auto result = wvmp::cli::parse_config(toml.path());
@@ -398,4 +397,41 @@ TEST(ConfigParse, ProtectRulesDuplicateSelectorFails) {
     const auto result = wvmp::cli::parse_config(toml.path());
     ASSERT_FALSE(result.ok);
     EXPECT_TRUE(contains(result.error, "重复"));
+}
+
+TEST(ConfigParse, UnknownTopLevelKeyFails) {
+    // MIT-457 验收反馈加固：顶层未知键显式拒（TOML 表作用域吸键静默失效防线）。
+    const TempToml toml(
+        "input  = \"target.exe\"\n"
+        "output = \"out.exe\"\n"
+        "seedx = 1\n");
+    const auto result = wvmp::cli::parse_config(toml.path());
+    ASSERT_FALSE(result.ok);
+    EXPECT_TRUE(contains(result.error, "未知顶层字段 'seedx'"));
+}
+
+TEST(ConfigParse, MisplacedTopLevelKeyAfterTableHeaderFails) {
+    // 验收实录陷阱：default_level 追加在 [[passes]] 之后会被 TOML 吸进表内
+    // ——顶层查不到该键 = 缺字段口径报错（不再静默忽略）。
+    const TempToml toml(
+        "input  = \"target.exe\"\n"
+        "output = \"out.exe\"\n"
+        "[[passes]]\n"
+        "name = \"pe_loader\"\n"
+        "default_level = \"none\"\n");
+    const auto result = wvmp::cli::parse_config(toml.path());
+    ASSERT_FALSE(result.ok);
+    EXPECT_TRUE(contains(result.error, "passes[0]"));
+}
+
+TEST(ConfigParse, UnknownFunctionsEntryKeyFails) {
+    const TempToml toml(
+        "input  = \"target.exe\"\n"
+        "output = \"out.exe\"\n"
+        "[[functions]]\n"
+        "rva = 1\n"
+        "note = \"x\"\n");
+    const auto result = wvmp::cli::parse_config(toml.path());
+    ASSERT_FALSE(result.ok);
+    EXPECT_TRUE(contains(result.error, "未知字段 'note'"));
 }
