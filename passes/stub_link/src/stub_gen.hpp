@@ -26,9 +26,14 @@ struct StubAntiDebug {
 // 加密（x64 stub 逐字节与 v1 前一致，D2 恒等铁约束）。
 struct StubCrypt {
     u64 stream_va;    // 密文流 VA（image_base + blob_stream_rva）
-    u64 flag_va;      // 尾旗标 VA（stream_va + stream_bytes；one-shot：1→0）
+    u64 flag_va;      // 尾区 VA（stream_va + stream_bytes；one-shot：1→0）
     u32 key0;         // xor_chain 初态（立即数嵌入 = 密钥每目标嵌入）
     u32 dword_count;  // 解密字数（stream_bytes / 4）
+    // MIT-464: 密文 CRC32 完整性校验（integrity_crc pass 在管道时启用）。
+    // 校验在解密**之前**（bitwise CRC32 over 密文，mismatch → FailFast）。
+    bool verify_crc;
+    u32 crc32;        // 期望值（尾区 [flag][crc32] 的 crc32 槽）
+    u32 byte_count;   // 流字节数（= stream_bytes；CRC 逐字节计数）
 };
 
 // 生成单个被虚拟化函数的入口 stub（位置无关）。

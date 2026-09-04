@@ -97,6 +97,36 @@ std::string build_crypt_asm_x64(const StubCrypt& c) {
     o += "mov r10, " + hex(c.flag_va) + "\n";
     o += "cmp dword ptr [r10], 0\n";
     o += "je wvcrypt_done\n";
+    // MIT-464: 密文 CRC32 校验（解密之前；bitwise 无表，poly 0xEDB88320，
+    // 常数单一来源 = common/crc32.hpp）。mismatch = 密文被篡改 → FailFast。
+    if (c.verify_crc) {
+        o += "mov r11, " + hex(c.stream_va) + "\n";
+        o += "mov r8d, " + hex(c.byte_count) + "\n";
+        o += "mov eax, 0xFFFFFFFF\n";
+        o += "wvcrc_byte:\n";
+        o += "movzx edx, byte ptr [r11]\n";
+        o += "xor eax, edx\n";
+        o += "mov edx, eax\n and edx, 1\n neg edx\n and edx, " + hex(0xEDB88320u) + "\n";
+        o += "shr eax, 1\n xor eax, edx\n";
+        o += "mov edx, eax\n and edx, 1\n neg edx\n and edx, " + hex(0xEDB88320u) + "\n";
+        o += "shr eax, 1\n xor eax, edx\n";
+        o += "mov edx, eax\n and edx, 1\n neg edx\n and edx, " + hex(0xEDB88320u) + "\n";
+        o += "shr eax, 1\n xor eax, edx\n";
+        o += "mov edx, eax\n and edx, 1\n neg edx\n and edx, " + hex(0xEDB88320u) + "\n";
+        o += "shr eax, 1\n xor eax, edx\n";
+        o += "mov edx, eax\n and edx, 1\n neg edx\n and edx, " + hex(0xEDB88320u) + "\n";
+        o += "shr eax, 1\n xor eax, edx\n";
+        o += "mov edx, eax\n and edx, 1\n neg edx\n and edx, " + hex(0xEDB88320u) + "\n";
+        o += "shr eax, 1\n xor eax, edx\n";
+        o += "mov edx, eax\n and edx, 1\n neg edx\n and edx, " + hex(0xEDB88320u) + "\n";
+        o += "shr eax, 1\n xor eax, edx\n";
+        o += "mov edx, eax\n and edx, 1\n neg edx\n and edx, " + hex(0xEDB88320u) + "\n";
+        o += "shr eax, 1\n xor eax, edx\n";
+        o += "inc r11\n dec r8d\n jnz wvcrc_byte\n";
+        o += "xor eax, 0xFFFFFFFF\n";
+        o += "cmp eax, dword ptr [r10+4]\n";
+        o += "jne wvcrc_bad\n";
+    }
     o += "mov r11, " + hex(c.stream_va) + "\n";
     o += "mov eax, " + hex(c.key0) + "\n";
     o += "mov ecx, " + hex(c.dword_count) + "\n";
@@ -111,6 +141,12 @@ std::string build_crypt_asm_x64(const StubCrypt& c) {
     o += "dec ecx\n";
     o += "jnz wvcrypt_loop\n";
     o += "mov dword ptr [r10], 0\n";
+    if (c.verify_crc) {  // MIT-464 验收披露②修正：无 CRC 时不发空转 jmp（2B 差异）
+        o += "jmp wvcrypt_done\n";
+        o += "wvcrc_bad:\n";
+        o += "xor eax, eax\n";
+        o += "mov qword ptr [rax], 0\n";
+    }
     o += "wvcrypt_done:\n";
     o += "pop r11\n pop r10\n pop r8\n pop rdx\n pop rcx\n pop rax\n";
     return o;
@@ -124,6 +160,36 @@ std::string build_crypt_asm_x86(const StubCrypt& c) {
     o += "mov esi, " + hex(c.flag_va) + "\n";
     o += "cmp dword ptr [esi], 0\n";
     o += "je wvcrypt_done\n";
+    // MIT-464: 密文 CRC32 校验（同 x64 形；acc=eax, cursor=edi, count=ebx,
+    // tmp=edx——均在本块 push 集内，解密段自行重置）。
+    if (c.verify_crc) {
+        o += "mov edi, " + hex(c.stream_va) + "\n";
+        o += "mov ebx, " + hex(c.byte_count) + "\n";
+        o += "mov eax, 0xFFFFFFFF\n";
+        o += "wvcrc_byte:\n";
+        o += "movzx edx, byte ptr [edi]\n";
+        o += "xor eax, edx\n";
+        o += "mov edx, eax\n and edx, 1\n neg edx\n and edx, " + hex(0xEDB88320u) + "\n";
+        o += "shr eax, 1\n xor eax, edx\n";
+        o += "mov edx, eax\n and edx, 1\n neg edx\n and edx, " + hex(0xEDB88320u) + "\n";
+        o += "shr eax, 1\n xor eax, edx\n";
+        o += "mov edx, eax\n and edx, 1\n neg edx\n and edx, " + hex(0xEDB88320u) + "\n";
+        o += "shr eax, 1\n xor eax, edx\n";
+        o += "mov edx, eax\n and edx, 1\n neg edx\n and edx, " + hex(0xEDB88320u) + "\n";
+        o += "shr eax, 1\n xor eax, edx\n";
+        o += "mov edx, eax\n and edx, 1\n neg edx\n and edx, " + hex(0xEDB88320u) + "\n";
+        o += "shr eax, 1\n xor eax, edx\n";
+        o += "mov edx, eax\n and edx, 1\n neg edx\n and edx, " + hex(0xEDB88320u) + "\n";
+        o += "shr eax, 1\n xor eax, edx\n";
+        o += "mov edx, eax\n and edx, 1\n neg edx\n and edx, " + hex(0xEDB88320u) + "\n";
+        o += "shr eax, 1\n xor eax, edx\n";
+        o += "mov edx, eax\n and edx, 1\n neg edx\n and edx, " + hex(0xEDB88320u) + "\n";
+        o += "shr eax, 1\n xor eax, edx\n";
+        o += "inc edi\n dec ebx\n jnz wvcrc_byte\n";
+        o += "xor eax, 0xFFFFFFFF\n";
+        o += "cmp eax, dword ptr [esi+4]\n";
+        o += "jne wvcrc_bad\n";
+    }
     o += "mov edi, " + hex(c.stream_va) + "\n";
     o += "mov eax, " + hex(c.key0) + "\n";
     o += "mov ecx, " + hex(c.dword_count) + "\n";
@@ -138,6 +204,12 @@ std::string build_crypt_asm_x86(const StubCrypt& c) {
     o += "dec ecx\n";
     o += "jnz wvcrypt_loop\n";
     o += "mov dword ptr [esi], 0\n";
+    if (c.verify_crc) {  // MIT-464 验收披露②修正：同 x64 形
+        o += "jmp wvcrypt_done\n";
+        o += "wvcrc_bad:\n";
+        o += "xor eax, eax\n";
+        o += "mov dword ptr [eax], 0\n";
+    }
     o += "wvcrypt_done:\n";
     o += "pop edi\n pop esi\n pop ebx\n pop edx\n pop ecx\n pop eax\n";
     return o;

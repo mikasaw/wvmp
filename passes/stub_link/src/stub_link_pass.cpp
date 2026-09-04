@@ -195,6 +195,10 @@ void StubLinkPass::run(ProtectionContext& ctx) {
                 crypt_param.key0 = crypted->key0;
                 crypt_param.dword_count =
                     static_cast<u32>(crypted->stream_bytes / 4);
+                // MIT-464: integrity_crc pass 在管道时 → 解密前 CRC32 校验。
+                crypt_param.verify_crc = crypted->has_crc;
+                crypt_param.crc32 = crypted->crc32;
+                crypt_param.byte_count = static_cast<u32>(crypted->stream_bytes);
                 crypt_ptr = &crypt_param;
             }
             StubAntiDebug adb_param{};

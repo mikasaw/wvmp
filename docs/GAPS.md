@@ -1125,7 +1125,8 @@ NotIntercepted 双锁）；Inc/Dec 唯一构造点 translate_unary 不写 src2
 | crypt（blob 加密） | ✅ **MIT-458 (crypt-v1) 收口（2026-09-05）**：xor_chain blob 级加密 + stub 入口 one-shot 解密（密钥 seed 派生、每目标嵌入）。D1 边界：首入口并发双重解密未防护（单线程初始化威胁模型）；首次执行后明文驻留内存（对抗静态提取，不对抗运行时转储）；指令级加密（C 点取指织入）仍预留未接线 |
 | mutate | ✅ **MIT-459 (mutate-v1) 首版（2026-09-05）**：Nop 密度填充（P=0.10，确定性 seed 派生）；junk-Mov（死寄存器垃圾注入）**默认关闭挂账**——首通 E2E 实录见下节 |
 | anti_debug | ✅ **MIT-463 (anti_debug-v1) 首版（2026-09-05）**：PEB.BeingDebugged + NtGlobalFlag 检查（stub 入口前缀，FailFast）。D1 边界：检查面仅入口 stub（gate 函数原生无检查）；rdtsc/DRx/NtQuery 面留后续；响应 = FailFast（ExitProcess 需 import 解析）；⚠️ 验收补充边角：目标自装 SEH/VEH 理论上可吞 FailFast AV——命中路径栈不平衡（pop 未执行），执行被恢复即失衡（非干净终止）；v1 威胁模型影响极低，后续响应策略重构时处理 |
-| integrity_crc / import_protect | pass 占位 |
+| integrity_crc | ✅ **MIT-464 (integrity_crc-v1) 首版（2026-09-05）**：密文流 CRC32（尾区 reserved 槽兑现）+ stub 解密前校验（FailFast）——封死 xor 可延展盲翻面。D1：仅密文流面；bitwise 无表（表驱动优化后续）；.wvmp 其余部分属 init 钩子面（MIT-465） |
+| import_protect | pass 占位 |
 | W^X 分离 | 单 RWX 节，解释器/字节码/stub 同节共存（stub_link_pass.cpp:27 注释明示 v1 取舍） |
 | flags 活跃性消除 | 未做，跨指令污染靠全量更新兜底 |
 
