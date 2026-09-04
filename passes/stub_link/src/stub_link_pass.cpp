@@ -9,6 +9,7 @@
 #include "wvmp/framework/registry.hpp"
 #include "wvmp/passes/pe_loader/pe_image.hpp"
 #include "wvmp/passes/virtualize/virtualize_pass.hpp"
+#include "wvmp/passes/crypt/crypt_plan.hpp"
 #include "wvmp/regvm/isa/blob.hpp"
 #include "wvmp/regvm/isa/encoding.hpp"
 #include "wvmp/regvm/runtime/runtime.hpp"
@@ -122,7 +123,26 @@ void StubLinkPass::run(ProtectionContext& ctx) {
     };
     std::vector<Patch> patches;
 
-    for (const auto& vf : *vfs) {
+    // MIT-458 (crypt-v1)：加密计划（crypt pass 在 Transform 阶段写入；
+    // 槽缺席 = 无加密，全部走明文路径，v1 前行为逐字节不变）。algo 不认识
+    // 则整单拒绝加密（保守：宁可明文也不发一个解不开的镜像）。
+    const crypt::CryptPlan* plan = ctx.find_slot<crypt::CryptPlan>(kCryptPlan);
+    if (plan != nullptr && plan->algo != crypt::kAlgoXorChain) {
+        ctx.diag.report(Severity::Warning, name(),
+                        "crypt plan algo '" + plan->algo + "' 不受支持，忽略加密计划");
+        plan = nullptr;
+    }
+    const auto plan_of = [&](size_t vfs_index) -> const crypt::CryptedFunction* {
+        if (plan == nullptr) return nullptr;
+        for (const auto& e : plan->functions)
+            if (e.vfs_index == vfs_index) return &e;
+        return nullptr;
+    };
+
+    // ⚠️ 索引循环：x86 白名单 gate 的提前 continue 也占用一个 vfs 下标，
+    // plan 配对（crypted = plan_of(i)）必须与 kVmProgram 下标严格同步。
+    for (size_t vfs_index = 0; vfs_index < vfs->size(); ++vfs_index) {
+        const auto& vf = (*vfs)[vfs_index];
         // MIT-446 (X4)：x86 白名单 gate——字节码含 x86 运行时跳表缺项
         // VmOp（SSE 族 32 / Div / Idiv 等"仍纸面"面）的函数整函数保持原生，
         // 阻断 C2 类静默错（翻译成功、区域覆写后运行即 Halt）。x64 路径
@@ -140,9 +160,16 @@ void StubLinkPass::run(ProtectionContext& ctx) {
             }
         }
         // blob：VmProgram.bytecode 已是 32B 头 + 8xN 流的完整序列化。
+        // MIT-458: 有加密计划时发射密文 blob（32B 明文头 + 密文流 + 8B 尾
+        // 旗标），stub 携带 one-shot 解密块；x86 白名单 gate 仍读明文
+        // （vf.program.bytecode，加密定长且 gate 在本 pass 内先于发射执行，
+        // 密文不进 gate）。
+        const crypt::CryptedFunction* crypted = plan_of(vfs_index);
         const u64 blob_off = align_up(payload.size(), 8);
         payload.resize(static_cast<size_t>(blob_off), 0);
-        payload.insert(payload.end(), vf.program.bytecode.begin(), vf.program.bytecode.end());
+        const std::vector<u8>& blob_bytes =
+            crypted ? crypted->encrypted_blob : vf.program.bytecode;
+        payload.insert(payload.end(), blob_bytes.begin(), blob_bytes.end());
         const u64 blob_stream_rva = section_rva + blob_off + 32;  // 跳过 blob 头
 
         const u64 stub_off = align_up(payload.size(), 16);
@@ -150,13 +177,28 @@ void StubLinkPass::run(ProtectionContext& ctx) {
         const u64 stub_rva = section_rva + stub_off;
         std::vector<u8> stub;
         try {
+            // MIT-458: 加密函数的 stub 携带 one-shot 解密块参数（流/旗标 VA
+            // = image_base + RVA，PE32+ imm64 经寄存器中转由 asm 模板处理；
+            // key0 立即数嵌入 = 密钥每目标嵌入）。无加密 = nullptr（逐字节
+            // v1 前现形）。
+            StubCrypt crypt_param{};
+            const StubCrypt* crypt_ptr = nullptr;
+            if (crypted != nullptr) {
+                crypt_param.stream_va = pe->image_base + blob_stream_rva;
+                crypt_param.flag_va = crypt_param.stream_va + crypted->stream_bytes;
+                crypt_param.key0 = crypted->key0;
+                crypt_param.dword_count =
+                    static_cast<u32>(crypted->stream_bytes / 4);
+                crypt_ptr = &crypt_param;
+            }
             // image_base（PE optional header 的 ImageBase）写入 VmContext 的
             // scratch_mem 槽：运行时 Load/Store/Push/Pop 的访存汇编即
             // `[addr + image_base]`. 翻译期算的 RVA（rip-relative 转绝对）
             // + 此基址 = 实际 VA. ASLR 下基址变化不影响 RVA, 槽值不变.
             stub = generate_entry_stub(stub_rva, blob_stream_rva, rt_entry, vf.end_rva,
                                        pe->image_base,
-                                       is_x86 ? StubArch::X86 : StubArch::X64);
+                                       is_x86 ? StubArch::X86 : StubArch::X64,
+                                       crypt_ptr);
         } catch (const std::exception& e) {
             ctx.diag.report(Severity::Error, name(),
                             "函数 " + vf.name + " stub 生成失败（保持原生）: " + e.what());

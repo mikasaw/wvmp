@@ -14,9 +14,11 @@ target_link_libraries(wvmp_pass_stub_link PRIVATE
     wvmp::common
     wvmp::vm
     wvmp_pass_virtualize    # VirtualizedFunction 槽类型
+    wvmp_pass_crypt_plan    # MIT-458: CryptPlan 契约头（INTERFACE，不吸 crypt 对象）
     wvmp_pass_pe_loader     # PeImage 模型
     wvmp_regvm_runtime
     wvmp_regvm_isa
+    wvmp_regvm_codecs       # MIT-458: kXorChainMult（解密块常数单一来源）
 )
 wvmp_target_warnings(wvmp_pass_stub_link)
 

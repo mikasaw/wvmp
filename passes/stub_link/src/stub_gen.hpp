@@ -12,6 +12,17 @@ namespace wvmp::passes {
 // stub_link pass 按 PeImage.machine 派发（machine=0x014C → X86）。
 enum class StubArch { X64, X86 };
 
+// MIT-458 (crypt-v1)：stub 入口 one-shot 解密块参数（xor_chain）。
+// 非空时 generate_entry_stub 在序言**之前**织入解密块（保存/恢复全部被蹭
+// GP 寄存器与 esp 平衡；flags 不保全——序言 sub 既有先例）。nullptr = 无
+// 加密（x64 stub 逐字节与 v1 前一致，D2 恒等铁约束）。
+struct StubCrypt {
+    u64 stream_va;    // 密文流 VA（image_base + blob_stream_rva）
+    u64 flag_va;      // 尾旗标 VA（stream_va + stream_bytes；one-shot：1→0）
+    u32 key0;         // xor_chain 初态（立即数嵌入 = 密钥每目标嵌入）
+    u32 dword_count;  // 解密字数（stream_bytes / 4）
+};
+
 // 生成单个被虚拟化函数的入口 stub（位置无关）。
 //
 // stub 运行时职责：
@@ -42,6 +53,7 @@ enum class StubArch { X64, X86 };
 [[nodiscard]] std::vector<u8> generate_entry_stub(u64 stub_rva, u64 blob_stream_rva,
                                                   u64 rt_entry_rva, u64 resume_rva,
                                                   u64 image_base,
-                                                  StubArch arch = StubArch::X64);
+                                                  StubArch arch = StubArch::X64,
+                                                  const StubCrypt* crypt = nullptr);
 
 } // namespace wvmp::passes

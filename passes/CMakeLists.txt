@@ -52,7 +52,10 @@ if(TARGET wvmp_regvm_backend)
         $<BUILD_INTERFACE:$<TARGET_OBJECTS:wvmp_regvm_isa>>
         $<BUILD_INTERFACE:$<TARGET_OBJECTS:wvmp_regvm_translator>>
         $<BUILD_INTERFACE:$<TARGET_OBJECTS:wvmp_regvm_runtime>>
-        $<BUILD_INTERFACE:$<TARGET_OBJECTS:wvmp_regvm_backend>>)
+        $<BUILD_INTERFACE:$<TARGET_OBJECTS:wvmp_regvm_backend>>
+        # MIT-458: crypt pass 引用 xor_chain codec（encrypt_with_key /
+        # create_codec），同上 OBJECT 不传播，显式挂聚合库接口。
+        $<BUILD_INTERFACE:$<TARGET_OBJECTS:wvmp_regvm_codecs>>)
     # runtime 对象引用 ks_*：OBJECT 依赖的 keystone 链接同样不自动传播。
     if(TARGET wvmp::keystone)
         target_link_libraries(wvmp_passes_all INTERFACE wvmp::keystone)

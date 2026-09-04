@@ -1,5 +1,6 @@
 #include "stub_gen.hpp"
 
+#include "wvmp/regvm/codecs/xor_chain.hpp"
 #include "wvmp/regvm/runtime/runtime.hpp"
 #include "wvmp/regvm/runtime/runtime_x86.hpp"
 
@@ -79,10 +80,76 @@ constexpr u64 kX86ExitSlotFromStubEntry =
 static_assert(kX86ExitSlotFromStubEntry == 0x80,
               "x86 exit slot entry prewrite must stay disp8-encodable");
 
+// =============================================================================
+// MIT-458 (crypt-v1)：xor_chain one-shot 解密块（stub 序言之前执行）。
+//
+// 递推（与 vm/regvm/codecs/xor_chain.hpp 加密侧同递推，常数同步纪律见彼处）：
+//   k = state; c = [mem]; state = state*G + c; [mem] = c ^ k   （state 吃密文）
+// one-shot：尾旗标 [flag]==1 才解密、解完写 0（xor_chain 同段内存重复执行 =
+// 再加密）。被蹭 GP 寄存器全部 push/pop 保存恢复——本块在 stub 序言之前
+// 运行，x64 预载面 / x86 ctx 预载读的都是"进入时刻"的寄存器值，解密块
+// 不得留痕（flags 不保全：序言 sub 既有先例）。esp 平衡（x86 形 6 push/6 pop）。
+// =============================================================================
+std::string build_crypt_asm_x64(const StubCrypt& c) {
+    std::string o;
+    o += "push rax\n push rcx\n push rdx\n push r8\n push r10\n push r11\n";
+    o += "mov r10, " + hex(c.flag_va) + "\n";
+    o += "cmp dword ptr [r10], 0\n";
+    o += "je wvcrypt_done\n";
+    o += "mov r11, " + hex(c.stream_va) + "\n";
+    o += "mov eax, " + hex(c.key0) + "\n";
+    o += "mov ecx, " + hex(c.dword_count) + "\n";
+    o += "wvcrypt_loop:\n";
+    o += "mov edx, dword ptr [r11]\n";
+    o += "mov r8d, eax\n";
+    o += "imul eax, eax, " + hex(wvmp::regvm::codecs::kXorChainMult) + "\n";
+    o += "add eax, edx\n";
+    o += "xor edx, r8d\n";
+    o += "mov dword ptr [r11], edx\n";
+    o += "add r11, 4\n";
+    o += "dec ecx\n";
+    o += "jnz wvcrypt_loop\n";
+    o += "mov dword ptr [r10], 0\n";
+    o += "wvcrypt_done:\n";
+    o += "pop r11\n pop r10\n pop r8\n pop rdx\n pop rcx\n pop rax\n";
+    return o;
+}
+
+std::string build_crypt_asm_x86(const StubCrypt& c) {
+    std::string o;
+    // esp 平衡 6 push/6 pop（ebx/esi/edi 为 callee-saved 必还；eax/ecx/edx
+    // 为预载面必还原原值）。PE32 VA 恒 imm32 可编码（407 v2 铁律同源）。
+    o += "push eax\n push ecx\n push edx\n push ebx\n push esi\n push edi\n";
+    o += "mov esi, " + hex(c.flag_va) + "\n";
+    o += "cmp dword ptr [esi], 0\n";
+    o += "je wvcrypt_done\n";
+    o += "mov edi, " + hex(c.stream_va) + "\n";
+    o += "mov eax, " + hex(c.key0) + "\n";
+    o += "mov ecx, " + hex(c.dword_count) + "\n";
+    o += "wvcrypt_loop:\n";
+    o += "mov edx, dword ptr [edi]\n";
+    o += "mov ebx, eax\n";
+    o += "imul eax, eax, " + hex(wvmp::regvm::codecs::kXorChainMult) + "\n";
+    o += "add eax, edx\n";
+    o += "xor edx, ebx\n";
+    o += "mov dword ptr [edi], edx\n";
+    o += "add edi, 4\n";
+    o += "dec ecx\n";
+    o += "jnz wvcrypt_loop\n";
+    o += "mov dword ptr [esi], 0\n";
+    o += "wvcrypt_done:\n";
+    o += "pop edi\n pop esi\n pop ebx\n pop edx\n pop ecx\n pop eax\n";
+    return o;
+}
+
 // x64 stub 汇编（MIT-446 (X4) B.1 起更名 x64 专形；D2 恒等铁约束：函数体
 // 逐字保留，x64 asm_dump sha ffd47289… 恒等是机器证明项）。
-std::string build_stub_asm_x64(u64 rt_entry_rva, u64 resume_rva, u64 image_base) {
+std::string build_stub_asm_x64(u64 rt_entry_rva, u64 resume_rva, u64 image_base,
+                               const StubCrypt* crypt) {
     std::string o;
+    // MIT-458: 加密函数在序言之前织入 one-shot 解密块（nullptr = 无加密，
+    // 本函数体其余部分逐字节不变）。
+    if (crypt) o += build_crypt_asm_x64(*crypt);
     o += "push rbx\n push rbp\n push rdi\n push rsi\n";
     o += "push r12\n push r13\n push r14\n push r15\n";
     o += "sub rsp, " + hex(kCtxSize) + "\n";
@@ -220,8 +287,11 @@ std::string build_stub_asm_x64(u64 rt_entry_rva, u64 resume_rva, u64 image_base)
 // 整函数 C1 gate 保原生（translator.cpp stack-walk）。
 // =============================================================================
 std::string build_stub_asm_x86(u64 rt_entry_rva, u64 blob_stream_rva,
-                               u64 resume_rva, u64 image_base) {
+                               u64 resume_rva, u64 image_base,
+                               const StubCrypt* crypt) {
     std::string o;
+    // MIT-458: 同 x64 形——序言前解密块（esp 平衡，见 build_crypt_asm_x86 注）。
+    if (crypt) o += build_crypt_asm_x86(*crypt);
     // —— 序言：guard 垫栈（X5b）+ 4 callee-saved push + ctx 区（kStubPushBytesX86
     //      + kCtxSize + kX86GuardBytes 参与出口槽换算，禁字面量第二份）。
     //      guard 最前垫（[ns-G..ns-4] 吸收 guest push），push 序固定 ebx→edi
@@ -329,7 +399,8 @@ std::string build_stub_asm_x86(u64 rt_entry_rva, u64 blob_stream_rva,
 } // namespace
 
 std::vector<u8> generate_entry_stub(u64 stub_rva, u64 blob_stream_rva, u64 rt_entry_rva,
-                                    u64 resume_rva, u64 image_base, StubArch arch) {
+                                    u64 resume_rva, u64 image_base, StubArch arch,
+                                    const StubCrypt* crypt) {
     ks_engine* ks = nullptr;
     if (ks_open(KS_ARCH_X86, arch == StubArch::X86 ? KS_MODE_32 : KS_MODE_64, &ks) !=
         KS_ERR_OK)
@@ -338,8 +409,8 @@ std::vector<u8> generate_entry_stub(u64 stub_rva, u64 blob_stream_rva, u64 rt_en
 
     const std::string src =
         arch == StubArch::X86
-            ? build_stub_asm_x86(rt_entry_rva, blob_stream_rva, resume_rva, image_base)
-            : build_stub_asm_x64(rt_entry_rva, resume_rva, image_base);
+            ? build_stub_asm_x86(rt_entry_rva, blob_stream_rva, resume_rva, image_base, crypt)
+            : build_stub_asm_x64(rt_entry_rva, resume_rva, image_base, crypt);
     // 调试钩子（排查用）：WVMP_STUB_DUMP=<win 路径> 时落盘汇编文本。
     {
         char* dp = nullptr;

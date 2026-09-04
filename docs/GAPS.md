@@ -1122,7 +1122,7 @@ NotIntercepted 双锁）；Inc/Dec 唯一构造点 translate_unary 不写 src2
 
 | 项 | 现状 |
 |---|---|
-| crypt（blob 加密） | pass 占位；codec 织入点已预留未接线（regvm_backend.cpp:14-18） |
+| crypt（blob 加密） | ✅ **MIT-458 (crypt-v1) 收口（2026-09-05）**：xor_chain blob 级加密 + stub 入口 one-shot 解密（密钥 seed 派生、每目标嵌入）。D1 边界：首入口并发双重解密未防护（单线程初始化威胁模型）；首次执行后明文驻留内存（对抗静态提取，不对抗运行时转储）；指令级加密（C 点取指织入）仍预留未接线 |
 | mutate | pass 占位 |
 | anti_debug | pass 占位 |
 | integrity_crc / import_protect | pass 占位 |
