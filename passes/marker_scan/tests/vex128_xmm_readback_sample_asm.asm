@@ -17,8 +17,8 @@
 ; ⚠️ rax 跨 marker_end/marker_begin 调用会被 clobber (SDK `mov rax, imm64`
 ; 加载 magic 立即数), out 指针必须放 callee-saved 寄存器 rbx (pitfall #36)。
 
-; MSVC C++ 名称修饰 (x64): ?marker_begin@sdk@wvmp@@YAXXZ (void marker_begin())
-EXTERNDEF ?marker_begin@sdk@wvmp@@YAXXZ : PROC
+; MSVC C++ 名称修饰 (x64): ?marker_begin@sdk@wvmp@@YAXPEBD@Z (void marker_begin())
+EXTERNDEF ?marker_begin@sdk@wvmp@@YAXPEBD@Z : PROC
 EXTERNDEF ?marker_end@sdk@wvmp@@YAXXZ   : PROC
 
 ; C 链接全局 (vex128_xmm_readback_sample_main.cpp extern "C")
@@ -58,7 +58,7 @@ vex_sh_addss PROC
     load_all
 
     ; ===== marker region begin =====
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     vaddss xmm0, xmm0, xmm1          ; 三态① (低 32 = lane 位加, 高位不动)
     nop
     nop
@@ -81,7 +81,7 @@ vex_sh_addps_swap PROC
     load_all
 
     ; ===== marker region begin =====
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     vaddps xmm2, xmm3, xmm2          ; d==s2 (s2=xmm2, s1=xmm3) → 交换折
     nop
     nop
@@ -103,7 +103,7 @@ vex_sh_addps_dindep PROC
     load_all
 
     ; ===== marker region begin =====
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     vaddps xmm2, xmm0, xmm1          ; 三态③ → 前置 Movaps + 2-op
     nop
     nop
@@ -125,7 +125,7 @@ vex_sh_vmulss_dindep PROC
     load_all
 
     ; ===== marker region begin =====
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     vmulss xmm2, xmm0, xmm1          ; 三态③ 标量 → 高位语义断言面
     nop
     nop
@@ -146,7 +146,7 @@ vex_sh_subps_dindep PROC
     load_all
 
     ; ===== marker region begin =====
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     vsubps xmm2, xmm0, xmm1
     nop
     nop
@@ -167,7 +167,7 @@ vex_sh_andnps_dindep PROC
     load_all
 
     ; ===== marker region begin =====
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     vandnps xmm2, xmm0, xmm1
     nop
     nop
@@ -188,7 +188,7 @@ vex_sh_movaps PROC
     load_all
 
     ; ===== marker region begin =====
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     vmovaps xmm3, xmm0
     nop
     nop
@@ -209,7 +209,7 @@ vex_sh_vpxor PROC
     load_all
 
     ; ===== marker region begin =====
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     vpxor  xmm2, xmm0, xmm0          ; dst=2, s1=s2=0 (d==s1 直走)
     nop
     nop
@@ -230,7 +230,7 @@ vex_sh_vmovups_load PROC
     load_all
 
     ; ===== marker region begin =====
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     vmovups xmm2, xmmword ptr [g_sh_vex_ps]
     nop
     nop

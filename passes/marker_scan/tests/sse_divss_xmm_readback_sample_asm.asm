@@ -23,8 +23,8 @@
 ; 加载 magic 立即数), 必须在 call 前存到 callee-saved 寄存器 (pitfall #36)。
 ; out 指针放 rbx/rdi (callee-saved), 不依赖 marker stub 的寄存器行为。
 
-; MSVC C++ 名称修饰 (x64): ?marker_begin@sdk@wvmp@@YAXXZ (void marker_begin())
-EXTERNDEF ?marker_begin@sdk@wvmp@@YAXXZ : PROC
+; MSVC C++ 名称修饰 (x64): ?marker_begin@sdk@wvmp@@YAXPEBD@Z (void marker_begin())
+EXTERNDEF ?marker_begin@sdk@wvmp@@YAXPEBD@Z : PROC
 EXTERNDEF ?marker_end@sdk@wvmp@@YAXXZ   : PROC
 
 _TEXT SEGMENT
@@ -39,7 +39,7 @@ xr_divss_s01 PROC
     sub  rsp, 32
 
     ; ===== marker region begin =====
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     divss xmm0, xmm1                 ; 真 divss REG-REG (F3 0F 5E C1, mod=11)
     nop
     nop
@@ -69,7 +69,7 @@ xr_divss_s23 PROC
     movaps xmm3, xmm1
 
     ; ===== marker region begin =====
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     divss xmm2, xmm3                 ; 真 divss REG-REG (F3 0F 5E D3, mod=11)
     nop
     nop
@@ -101,7 +101,7 @@ xr_divss_keep PROC
     mov  rbx, r8                     ; slots = 位置 3 → r8 (callee-saved, pitfall #36)
 
     ; ===== marker region begin =====
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     divss xmm0, xmm1                 ; 真 divss REG-REG (F3 0F 5E C1, mod=11)
     nop
     nop

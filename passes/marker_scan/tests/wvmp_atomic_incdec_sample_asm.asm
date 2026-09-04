@@ -28,7 +28,7 @@
 ; spill 到 [rsp+24] (marker_end clobber rax, pitfall #36); 无 rsp 调整
 ; (entry rsp 恒等, Halt 恢复契约)。
 
-EXTERNDEF ?marker_begin@sdk@wvmp@@YAXXZ : PROC
+EXTERNDEF ?marker_begin@sdk@wvmp@@YAXPEBD@Z : PROC
 EXTERNDEF ?marker_end@sdk@wvmp@@YAXXZ   : PROC
 EXTERNDEF g_id_rip : QWORD
 
@@ -38,7 +38,7 @@ _TEXT SEGMENT
 ; void wv_id_inc32(long* p)
 wv_id_inc32 PROC
     sub  rsp, 56
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     lock inc dword ptr [rcx]
     mov  eax, [rcx]             ; 结果 spill (区域 ≥5B 供 stub_link 写 E9,
                                 ; 419 同款; marker_end clobber rax)
@@ -51,7 +51,7 @@ wv_id_inc32 ENDP
 ; void wv_id_inc64(long long* p)
 wv_id_inc64 PROC
     sub  rsp, 56
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     lock inc qword ptr [rcx]
     mov  rax, [rcx]             ; 结果 spill (同上)
     call ?marker_end@sdk@wvmp@@YAXXZ
@@ -63,7 +63,7 @@ wv_id_inc64 ENDP
 ; void wv_id_dec32(long* p)
 wv_id_dec32 PROC
     sub  rsp, 56
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     lock dec dword ptr [rcx]
     mov  eax, [rcx]             ; 结果 spill (同上)
     call ?marker_end@sdk@wvmp@@YAXXZ
@@ -75,7 +75,7 @@ wv_id_dec32 ENDP
 ; void wv_id_dec64(long long* p)
 wv_id_dec64 PROC
     sub  rsp, 56
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     lock dec qword ptr [rcx]
     mov  rax, [rcx]             ; 结果 spill (同上)
     call ?marker_end@sdk@wvmp@@YAXXZ
@@ -89,7 +89,7 @@ wv_id_dec64 ENDP
 ; (x64 无绝对寻址, 419 cmpxchg_rip 同款先例)。
 wv_id_inc_rip PROC
     sub  rsp, 56
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     lock inc qword ptr [g_id_rip]
     mov  rax, [g_id_rip]
     mov  [rsp+24], rax
@@ -103,7 +103,7 @@ wv_id_inc_rip ENDP
 ; u64 wv_id_loop_inc(long* p) → 轮数 (7)
 wv_id_loop_inc PROC
     sub  rsp, 56
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     mov  r8d, 7
 loop_6:
     lock inc dword ptr [rcx]
@@ -122,7 +122,7 @@ wv_id_loop_inc ENDP
 ;                              bit1 = CF=0 探针过 (jc 未命中), [p] 增 2
 wv_id_inc_cf PROC
     sub  rsp, 56
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     ; — 探针 1: add 0xFFFFFFFF+1 → CF=1 → lock inc 不得清 CF → jc 命中
     mov  eax, 0FFFFFFFFh
     add  eax, 1                 ; eax=0, CF=1, ZF=1 (Add handler 全量装配)
@@ -155,7 +155,7 @@ wv_id_inc_cf ENDP
 ; 退出), 行为保真由双跑兜底。
 wv_id_neg_lock_not PROC
     sub  rsp, 56
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     mov  rax, [rcx]
     mov  [rsp+24], rax          ; 旧值 spill (lock not 不动 rax)
     db   0F0h, 048h, 0F7h, 011h ; lock not qword ptr [rcx] — capstone 可解
@@ -172,7 +172,7 @@ wv_id_neg_lock_not ENDP
 ; capstone 拒解码 → skipped_ranges → gate; main 只取地址不调用 (419 同款)。
 wv_id_neg_lock_inc_reg PROC
     sub  rsp, 56
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     db   0F0h, 0FFh, 0C1h       ; lock inc ecx — 原生 #UD, 禁入可执行路径
     call ?marker_end@sdk@wvmp@@YAXXZ
     add  rsp, 56

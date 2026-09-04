@@ -28,8 +28,8 @@
 ; ⚠️ rax 跨 marker_end/marker_begin 调用会被 clobber (SDK `mov rax, imm64`
 ; 加载 magic 立即数), 位图案结果一律 region 后 movq rax, xmm0 提取。
 
-; MSVC C++ 名称修饰 (x64): ?marker_begin@sdk@wvmp@@YAXXZ (void marker_begin())
-EXTERNDEF ?marker_begin@sdk@wvmp@@YAXXZ : PROC
+; MSVC C++ 名称修饰 (x64): ?marker_begin@sdk@wvmp@@YAXPEBD@Z (void marker_begin())
+EXTERNDEF ?marker_begin@sdk@wvmp@@YAXPEBD@Z : PROC
 EXTERNDEF ?marker_end@sdk@wvmp@@YAXXZ   : PROC
 
 ; C 链接全局 (vex128_sample_main.cpp extern "C"): MASM 直引 → rip-relative
@@ -45,7 +45,7 @@ vex_addss_d_s1 PROC
     movd xmm1, edx                   ; 区外: b
 
     ; ===== marker region begin =====
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     vaddss xmm0, xmm0, xmm1          ; C5 FA 58 C1 (d==s1)
     nop
     nop
@@ -65,7 +65,7 @@ vex_vmulps_d_s2 PROC
     movq xmm2, rdx                   ; 区外: dst (s2)
 
     ; ===== marker region begin =====
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     vmulps xmm2, xmm0, xmm2          ; d==s2 (packed) → 交换折 (xmm2,xmm0)
     nop
     nop
@@ -86,7 +86,7 @@ vex_addps_dindep PROC
     movq xmm2, rcx                   ; 区外: dst 预置 0 (断言 pre-Mov 覆盖)
 
     ; ===== marker region begin =====
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     vaddps xmm2, xmm0, xmm1          ; d 独立 → 前置 Movaps(xmm2←xmm0)
     nop
     nop
@@ -107,7 +107,7 @@ vex_subps_dindep PROC
     movq xmm2, rcx
 
     ; ===== marker region begin =====
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     vsubps xmm2, xmm0, xmm1          ; 非交换 d 独立 → pre-Mov + 2-op
     nop
     nop
@@ -128,7 +128,7 @@ vex_vmulss_dindep PROC
     movq xmm2, rcx
 
     ; ===== marker region begin =====
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     vmulss xmm2, xmm0, xmm1          ; d 独立 → pre-Mov(xmm2←xmm0) + mulss
     nop
     nop
@@ -148,7 +148,7 @@ vex_vandnps_dindep PROC
     movq xmm2, rcx
 
     ; ===== marker region begin =====
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     vandnps xmm2, xmm0, xmm1         ; dst = ~s1 & s2 → pre-Mov + 2-op
     nop
     nop
@@ -166,7 +166,7 @@ vex_vmovaps_copy PROC
     movq xmm1, rdx                   ; 区外: b
 
     ; ===== marker region begin =====
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     vmovaps xmm0, xmm1               ; 2-op 纯拷贝 (op_count=2, 单条)
     nop
     nop
@@ -182,7 +182,7 @@ vex_vmovaps_copy ENDP
 vex_vmovups_load PROC
 
     ; ===== marker region begin =====
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     vmovups xmm0, xmmword ptr [g_vex_ps]  ; 2-op mem load (rip)
     nop
     nop
@@ -199,7 +199,7 @@ vex_vaddsd_mem PROC
     movq xmm0, rcx
 
     ; ===== marker region begin =====
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     vaddsd xmm0, xmm0, qword ptr [g_vex_d]  ; d==s1 直走 + mem 源折条
     nop
     nop
@@ -215,7 +215,7 @@ vex_vpxor_zero PROC
     movq xmm2, rcx                   ; 区外: dst 预置非零
 
     ; ===== marker region begin =====
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     vpxor  xmm2, xmm2, xmm2          ; d==s1==s2 → 直走 2-op (xmm2, xmm2)
     nop
     nop
@@ -233,7 +233,7 @@ vex_vucomiss_seta PROC
     movd xmm1, edx
 
     ; ===== marker region begin =====
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     vucomiss xmm0, xmm1              ; 2-op 比较直通 (flags 真写)
     seta  al                         ; CF=0 且 ZF=0 (above) → 1
     movzx eax, al
@@ -253,7 +253,7 @@ vex_c4_enc_addsd PROC
     movq xmm1, rdx
 
     ; ===== marker region begin =====
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     db 0C4h, 0E1h, 07Bh, 058h, 0C1h  ; vaddsd xmm0, xmm0, xmm1 (C4 全前缀)
     nop
     nop
@@ -274,7 +274,7 @@ vex_ymm_neg PROC
     movq xmm1, rdx
 
     ; ===== marker region begin =====
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     vaddps ymm0, ymm0, ymm1          ; ymm 形态 → 位宽闸 gate (原生执行)
     nop
     nop
@@ -293,7 +293,7 @@ vex_fma_neg PROC
     movq xmm2, r8
 
     ; ===== marker region begin =====
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     vfmadd213sd xmm1, xmm2, xmm0     ; FMA → gate (永不拆 mul+add)
     nop
     nop
@@ -309,7 +309,7 @@ vex_fma_neg ENDP
 vex_rorx_neg PROC
 
     ; ===== marker region begin =====
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     rorx  eax, ecx, 3                ; VEX-GP → gate (原生执行)
     nop
     nop
@@ -323,7 +323,7 @@ vex_rorx_neg ENDP
 vex_vzeroupper_neg PROC
 
     ; ===== marker region begin =====
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     vzeroupper                       ; gate (原生执行, 行为等价 no-op)
     nop
     nop
@@ -341,7 +341,7 @@ vex_vpaddd_neg PROC
     movq xmm1, rdx
 
     ; ===== marker region begin =====
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     vpaddd xmm0, xmm0, xmm1          ; V-对随本体 paddq gate (原生执行)
     nop
     nop
@@ -360,7 +360,7 @@ vex_noncomm_ds2_neg PROC
     movq xmm2, r8                    ; dst = 2.0
 
     ; ===== marker region begin =====
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     vsubsd xmm2, xmm0, xmm2          ; 非交换 d==s2 → D2 gate (原生执行)
     nop
     nop
@@ -379,7 +379,7 @@ vex_movsd_insert_neg PROC
     movq xmm1, rdx                   ; s2
 
     ; ===== marker region begin =====
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     vmovsd xmm2, xmm0, xmm1          ; 插入 d≠s1 → gate (原生执行)
     nop
     nop
@@ -399,7 +399,7 @@ vex_mulsd_ds2_neg PROC
     movq xmm1, rdx                   ; dst = 2.5
 
     ; ===== marker region begin =====
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     vmulsd xmm1, xmm0, xmm1          ; 标量 d==s2 → D2 gate (原生执行)
     nop
     nop

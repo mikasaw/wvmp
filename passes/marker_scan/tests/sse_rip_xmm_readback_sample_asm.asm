@@ -26,8 +26,8 @@
 ; ⚠️ rax 跨 marker_end/marker_begin 调用会被 clobber (SDK `mov rax, imm64`
 ; 加载 magic 立即数), 指针必须放 callee-saved 寄存器 (pitfall #36)。
 
-; MSVC C++ 名称修饰 (x64): ?marker_begin@sdk@wvmp@@YAXXZ (void marker_begin())
-EXTERNDEF ?marker_begin@sdk@wvmp@@YAXXZ : PROC
+; MSVC C++ 名称修饰 (x64): ?marker_begin@sdk@wvmp@@YAXPEBD@Z (void marker_begin())
+EXTERNDEF ?marker_begin@sdk@wvmp@@YAXPEBD@Z : PROC
 EXTERNDEF ?marker_end@sdk@wvmp@@YAXXZ   : PROC
 
 _DATA SEGMENT
@@ -51,7 +51,7 @@ xr_memld PROC
     mov  rbx, rcx                     ; out (callee-saved, pitfall #36)
 
     ; ===== marker region begin =====
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     movups xmm0, xmmword ptr [g16_src]   ; 真 movups mem 读 (0F 10 05 disp32)
     nop
     nop
@@ -83,7 +83,7 @@ xr_memalu PROC
     movlhps  xmm0, xmm2               ; {a0, a1, a2, a3}
 
     ; ===== marker region begin =====
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     addps xmm0, xmmword ptr [g16_src]    ; 真 addps mem 读 (0F 58 05 disp32)
     nop
     nop
@@ -109,7 +109,7 @@ xr_memst PROC
     movlhps  xmm0, xmm2
 
     ; ===== marker region begin =====
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     movups xmmword ptr [g16_dst], xmm0   ; 真 movups mem 写 (0F 11 05 disp32)
     nop
     nop
@@ -132,7 +132,7 @@ xr_sd_ld PROC
     mov  rbx, rcx                     ; out128
 
     ; ===== marker region begin =====
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     movsd xmm0, qword ptr [g_sd_in]      ; 真 movsd mem 读 (F2 0F 10 05 disp32)
     nop
     nop
@@ -154,7 +154,7 @@ xr_sd_st PROC
     sub  rsp, 32
 
     ; ===== marker region begin =====
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     movsd qword ptr [g_sd_out], xmm0     ; 真 movsd mem 写 (F2 0F 11 05 disp32)
     nop
     nop

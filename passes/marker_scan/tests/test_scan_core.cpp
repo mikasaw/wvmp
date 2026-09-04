@@ -248,3 +248,60 @@ TEST(FindAllX86, ContinuousEightByteIsDegenerateDualAndX64NeedleStillWorks) {
 }
 
 } // namespace
+
+// ==================== MIT-460 (P7-names)：名字物化定位 ====================
+
+namespace {
+std::vector<u8> with(const std::vector<u8>& prefix, size_t total) {
+    std::vector<u8> v = prefix;
+    v.resize(total, 0xCC);
+    return v;
+}
+} // namespace
+
+TEST(ScanCoreNameOperand, X64LeaRipRelLocated) {
+    // 48 8D 0D <disp32> 紧邻 E8：lea 在 [call_next-12, call_next-5)、
+    // E8 占 [call_next-5, call_next)。disp 有符号读出。
+    std::vector<u8> img = with({0x48, 0x8D, 0x0D, 0x34, 0x12, 0x00, 0x00,
+                                0xE8, 0x00, 0x00, 0x00, 0x00},
+                               32);
+    const auto r = ms::locate_name_operand(img, 12, false);
+    ASSERT_TRUE(r.has_value());
+    EXPECT_TRUE(r->is_rip_rel);
+    EXPECT_EQ(r->value, 0x1234);
+}
+
+TEST(ScanCoreNameOperand, X86PushAbsLocated) {
+    // 68 <abs32> 紧邻 E8：push 在 [call_next-10, call_next-5)。
+    std::vector<u8> img = with({0x68, 0x78, 0x56, 0x00, 0x01,
+                                0xE8, 0x00, 0x00, 0x00, 0x00},
+                               32);
+    const auto r = ms::locate_name_operand(img, 10, true);
+    ASSERT_TRUE(r.has_value());
+    EXPECT_FALSE(r->is_rip_rel);
+    EXPECT_EQ(r->value, 0x01005678);
+}
+
+TEST(ScanCoreNameOperand, X64NegativeDispSignExtended) {
+    // MIT-460 验收反馈：负 disp（.rdata 在 lea 之前）必须符号扩展
+    // （0xFFFFF000 → -4096，而非 +4294952960）。
+    std::vector<u8> img = with({0x48, 0x8D, 0x0D, 0x00, 0xF0, 0xFF, 0xFF,
+                                0xE8, 0x00, 0x00, 0x00, 0x00},
+                               32);
+    const auto r = ms::locate_name_operand(img, 12, false);
+    ASSERT_TRUE(r.has_value());
+    EXPECT_TRUE(r->is_rip_rel);
+    EXPECT_EQ(r->value, -4096);
+}
+
+TEST(ScanCoreNameOperand, NoPatternFallsBack) {
+    // 无物化（旧产物）→ nullopt（调用方回退地址名）。
+    std::vector<u8> img = with({0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90,
+                                0xE8, 0x00, 0x00, 0x00, 0x00},
+                               32);
+    EXPECT_FALSE(ms::locate_name_operand(img, 12, false).has_value());
+    EXPECT_FALSE(ms::locate_name_operand(img, 12, true).has_value());
+    // 太短防越界。
+    std::vector<u8> tiny = {0x48, 0x8D};
+    EXPECT_FALSE(ms::locate_name_operand(tiny, 2, false).has_value());
+}

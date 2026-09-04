@@ -43,7 +43,7 @@
 ; (ADDR64 重定位, 链接期 VA — 翻译期减 optional header ImageBase 得 RVA,
 ; ASLR 无关: 文件内值与 header 同为链接期常量)。
 
-EXTERNDEF ?marker_begin@sdk@wvmp@@YAXXZ : PROC
+EXTERNDEF ?marker_begin@sdk@wvmp@@YAXPEBD@Z : PROC
 EXTERNDEF ?marker_end@sdk@wvmp@@YAXXZ   : PROC
 EXTERNDEF g_sel : QWORD
 EXTERNDEF g_data_var : QWORD
@@ -56,7 +56,7 @@ wv_jt8_abs PROC
     push rbx
     sub  rsp, 56
     ; ===== marker region begin =====
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     mov  rax, QWORD PTR [g_sel]      ; idx 载入 (block A 首条)
     cmp  rax, 7
     ja   jt8a_default                ; 防御常数 (cmp idx,7; ja → K=8)
@@ -95,7 +95,7 @@ wv_jt8_delta PROC
     push rbx
     sub  rsp, 56
     ; ===== marker region begin =====
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     mov  rax, QWORD PTR [g_sel]
     cmp  rax, 7
     ja   jt8d_default
@@ -137,7 +137,7 @@ wv_jt8_djmp PROC
     push rbx
     sub  rsp, 56
     ; ===== marker region begin =====
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     mov  rax, QWORD PTR [g_sel]
     cmp  rax, 7
     ja   jt8j_default
@@ -181,7 +181,7 @@ wv_jtm_abs PROC
     push rbx
     sub  rsp, 56
     ; ===== marker region begin =====
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     mov  rax, QWORD PTR [g_sel]
     cmp  rax, 7
     ja   jtma_default
@@ -219,7 +219,7 @@ wv_jtm_movabs PROC
     push rbx
     sub  rsp, 56
     ; ===== marker region begin =====
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     mov  rax, QWORD PTR [g_sel]
     cmp  rax, 7
     ja   jtmm_default
@@ -260,7 +260,7 @@ wv_jt_undef PROC
     push rbx
     sub  rsp, 56
     ; ===== marker region begin =====
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     mov  rax, QWORD PTR [g_sel]      ; idx 载入 (block A)
     test rax, rax                    ; 块边界 (非防御 — cond=E)
     jz   jtun_case0
@@ -302,7 +302,7 @@ wv_jt_oob PROC
     push rbx
     sub  rsp, 56
     ; ===== marker region begin =====
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     mov  rax, QWORD PTR [g_sel]
     cmp  rax, 7
     ja   jtoo_default
@@ -342,7 +342,7 @@ wv_jt_data PROC
     push rbx
     sub  rsp, 56
     ; ===== marker region begin =====
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     mov  rax, QWORD PTR [g_sel]
     cmp  rax, 7
     ja   jtda_default

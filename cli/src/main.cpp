@@ -172,8 +172,9 @@ int cmd_protect(const wvmp::cli::ArgsResult& args) {
     if (!ctx.functions.empty()) {
         std::string list = "[wvmp] 区域清单:";
         for (size_t i = 0; i < ctx.functions.size(); ++i) {
-            char buf[64];
-            std::snprintf(buf, sizeof(buf), " [%zu] rva=0x%llX", i,
+            char buf[160];
+            std::snprintf(buf, sizeof(buf), " [%zu] %s rva=0x%llX", i,
+                          ctx.functions[i].name.c_str(),
                           static_cast<unsigned long long>(ctx.functions[i].begin_rva));
             list += buf;
         }

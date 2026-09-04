@@ -27,7 +27,9 @@
 
 namespace wvmp::sdk {
 
-WVMP_SDK_NOINLINE void marker_begin() {
+WVMP_SDK_NOINLINE void marker_begin(const char*) {
+    // MIT-460: 名字参数不落任何指令——仅为让编译器在调用点前物化字符串
+    // 地址（lea/push），marker_scan 据此解析区域名。函数体保持 magic 锚。
     volatile unsigned long long m = kBeginMagic;
     (void)m;
 }

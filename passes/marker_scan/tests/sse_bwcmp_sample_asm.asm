@@ -28,8 +28,8 @@
 ; 加载 magic 立即数), seta 结果必须在 marker_end 之前存 stack、之后还原
 ; (pitfall #36, 沿用 setcc_sample_asm.asm 的 [rsp+24] 模式)。
 
-; MSVC C++ 名称修饰 (x64): ?marker_begin@sdk@wvmp@@YAXXZ (void marker_begin())
-EXTERNDEF ?marker_begin@sdk@wvmp@@YAXXZ : PROC
+; MSVC C++ 名称修饰 (x64): ?marker_begin@sdk@wvmp@@YAXPEBD@Z (void marker_begin())
+EXTERNDEF ?marker_begin@sdk@wvmp@@YAXPEBD@Z : PROC
 EXTERNDEF ?marker_end@sdk@wvmp@@YAXXZ   : PROC
 
 _TEXT SEGMENT
@@ -46,7 +46,7 @@ bw_xorps PROC
     movd xmm1, edx                    ; xmm1 = b (位图案)
 
     ; ===== marker region begin =====
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     xorps xmm0, xmm1                  ; 真 xorps REG-REG (0F 57 C1, mod=11)
     nop
     nop
@@ -70,7 +70,7 @@ bw_orps PROC
     movd xmm1, edx
 
     ; ===== marker region begin =====
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     orps  xmm0, xmm1                  ; 真 orps REG-REG (0F 56 C1, mod=11)
     nop
     nop
@@ -94,7 +94,7 @@ bw_andps PROC
     movd xmm1, edx
 
     ; ===== marker region begin =====
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     andps xmm0, xmm1                  ; 真 andps REG-REG (0F 54 C1, mod=11)
     nop
     nop
@@ -117,7 +117,7 @@ ucmp_ss_gt PROC
     sub  rsp, 56
 
     ; ===== marker region begin =====
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     ucomiss xmm0, xmm1                ; 真 ucomiss REG-REG (0F 2E C1, mod=11)
     seta   al                         ; a > b (CF=0 且 ZF=0) → 1, 否则 0
     movzx rax, al
@@ -137,7 +137,7 @@ ucmp_ss_lt PROC
     sub  rsp, 56
 
     ; ===== marker region begin =====
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     ucomiss xmm0, xmm1                ; 真 ucomiss REG-REG (0F 2E C1, mod=11)
     seta   al                         ; less → CF=1 → seta=0
     movzx rax, al
@@ -157,7 +157,7 @@ ucmp_ss_eq PROC
     sub  rsp, 56
 
     ; ===== marker region begin =====
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     ucomiss xmm0, xmm1                ; 真 ucomiss REG-REG (0F 2E C1, mod=11)
     seta   al                         ; equal → ZF=1 → seta=0
     movzx rax, al
@@ -178,7 +178,7 @@ ucmp_ss_nan PROC
     sub  rsp, 56
 
     ; ===== marker region begin =====
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     ucomiss xmm0, xmm1                ; 真 ucomiss REG-REG (0F 2E C1, mod=11)
     seta   al                         ; unordered → CF=1 → seta=0
     movzx rax, al
@@ -198,7 +198,7 @@ ucmp_sd_gt PROC
     sub  rsp, 56
 
     ; ===== marker region begin =====
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     ucomisd xmm0, xmm1                ; 真 ucomisd REG-REG (66 0F 2E C1, mod=11)
     seta   al                         ; a > b (CF=0 且 ZF=0) → 1
     movzx rax, al
@@ -218,7 +218,7 @@ ucmp_sd_lt PROC
     sub  rsp, 56
 
     ; ===== marker region begin =====
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     ucomisd xmm0, xmm1                ; 真 ucomisd REG-REG (66 0F 2E C1, mod=11)
     seta   al                         ; less → CF=1 → seta=0
     movzx rax, al

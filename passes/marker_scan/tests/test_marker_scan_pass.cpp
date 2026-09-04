@@ -220,11 +220,14 @@ TEST(MarkerScanPass, ScansSampleExecutable) {
 
     ASSERT_EQ(ctx.functions.size(), static_cast<size_t>(2));
     EXPECT_FALSE(ctx.diag.has_errors());
+    // MIT-460 (P7-names)：SDK 传名 → 两个区域都解析到真名，零 Note。
     EXPECT_TRUE(ctx.diag.items().empty()); // 恰好配对：无告警
 
     for (const auto& f : ctx.functions) {
         EXPECT_EQ(f.arch, wvmp::ir::Arch::X64);
-        EXPECT_NE(f.name.find("marker@"), std::string::npos);
+        // MIT-460 (P7-names)：SDK WVMP_BEGIN(fn) 传名 → 区域名 = 真名。
+        EXPECT_TRUE(f.name == "compute_alpha" || f.name == "compute_beta")
+            << "实际名: " << f.name;
         EXPECT_GT(f.end_rva, f.begin_rva);       // 长度 > 0
         EXPECT_TRUE(f.blocks.empty());           // Analyze 阶段不产出块
     }
@@ -276,9 +279,11 @@ TEST(MarkerScanPass, SyntheticPairProducesRegion) {
     EXPECT_EQ(f.begin_rva, static_cast<wvmp::u64>(0x85));
     EXPECT_EQ(f.end_rva, static_cast<wvmp::u64>(0xA0));
     EXPECT_FALSE(ctx.diag.has_errors());
-    // 无 PE 头：PeImage 槽缺失 → 恰好一条回退 Note（保持文件偏移）。
+    // 无 PE 头：PeImage 槽缺失 → 恰好一条 M1 回退 Note（保持文件偏移）；
+    // 名字解析 gated on pe（MIT-460），pe 缺席时不产 P7-names Note。
     ASSERT_EQ(ctx.diag.items().size(), static_cast<size_t>(1));
-    EXPECT_EQ(ctx.diag.items()[0].severity, wvmp::Severity::Note);
+    for (const auto& item : ctx.diag.items())
+        EXPECT_EQ(item.severity, wvmp::Severity::Note);
 }
 
 TEST(MarkerScanPass, SyntheticUnpairedBeginWarns) {
@@ -319,7 +324,10 @@ TEST(MarkerScanPassX86, SyntheticX86ImageProducesRegionWithArchX86) {
     EXPECT_EQ(f.begin_rva, static_cast<wvmp::u64>(0x1045)); // 0x245 → RVA
     EXPECT_EQ(f.end_rva, static_cast<wvmp::u64>(0x1080));   // 0x280 → RVA
     EXPECT_FALSE(ctx.diag.has_errors());
-    EXPECT_TRUE(ctx.diag.items().empty()); // PeImage 在槽：无告警无 Note
+    // 合成镜像无名字物化 → 恰好一条 P7-names 回退 Note（MIT-460）。
+    ASSERT_EQ(ctx.diag.items().size(), static_cast<size_t>(1));
+    EXPECT_EQ(ctx.diag.items()[0].severity, wvmp::Severity::Note);
+    EXPECT_NE(ctx.diag.items()[0].message.find("回退地址名"), std::string::npos);
 }
 
 #ifdef WVMP_X86_MARKER_SAMPLE_EXE
@@ -356,9 +364,15 @@ TEST(MarkerScanPassX86, ScansRealMlExeDualSegmentAnchors) {
     for (const auto& item : ctx.diag.items())
         diag_dump += "[" + std::to_string(static_cast<int>(item.severity)) + "] " +
                      item.message + "\n";
-    ASSERT_EQ(ctx.diag.items().size(), static_cast<size_t>(2)) << diag_dump;
-    for (const auto& item : ctx.diag.items())
-        EXPECT_EQ(item.severity, wvmp::Severity::Warning) << item.message;
+    // MIT-460: ml 手编产物无名字物化 → 每区域一条 P7-names 回退 Note（2 条）。
+    ASSERT_EQ(ctx.diag.items().size(), static_cast<size_t>(4)) << diag_dump;
+    size_t warnings = 0, fallback_notes = 0;
+    for (const auto& item : ctx.diag.items()) {
+        if (item.severity == wvmp::Severity::Warning) ++warnings;
+        if (item.message.find("回退地址名") != std::string::npos) ++fallback_notes;
+    }
+    EXPECT_EQ(warnings, static_cast<size_t>(2));
+    EXPECT_EQ(fallback_notes, static_cast<size_t>(2));
 
     u32 text_va = 0, text_raw = 0;
     ASSERT_TRUE(text_section_location(image, text_va, text_raw));

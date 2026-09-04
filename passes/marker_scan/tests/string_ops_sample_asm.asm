@@ -25,7 +25,7 @@
 ; 恢复契约 — prologue 的 push/sub 均在 marker_begin 之前区外)。
 ; rsi/rdi 是 Win64 callee-saved: prologue/epilogue (区外) push/pop。
 
-EXTERNDEF ?marker_begin@sdk@wvmp@@YAXXZ : PROC
+EXTERNDEF ?marker_begin@sdk@wvmp@@YAXPEBD@Z : PROC
 EXTERNDEF ?marker_end@sdk@wvmp@@YAXXZ   : PROC
 
 _TEXT SEGMENT
@@ -36,7 +36,7 @@ wv_str_movsb PROC
     push rsi
     push rdi
     sub  rsp, 56
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     mov  rsi, rdx                ; src
     mov  rdi, rcx                ; dst
     mov  rcx, r8                 ; n
@@ -58,7 +58,7 @@ wv_str_movsq_unaligned PROC
     push rsi
     push rdi
     sub  rsp, 56
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     mov  rsi, rdx
     mov  rdi, rcx
     mov  rcx, r8
@@ -77,7 +77,7 @@ wv_str_movsq_unaligned ENDP
 wv_str_stosb PROC
     push rdi
     sub  rsp, 56
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     mov  rdi, rcx                ; dst
     mov  eax, edx                ; v (低 8 位 = al)
     mov  rcx, r8                 ; n
@@ -97,7 +97,7 @@ wv_str_stosb ENDP
 wv_str_scasb PROC
     push rdi
     sub  rsp, 56
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     mov  [rsp+40], rcx           ; spill buf (rcx 将被 n 覆盖)
     mov  rdi, rcx                ; buf
     mov  eax, edx                ; needle (al)
@@ -122,7 +122,7 @@ wv_str_cmpsb PROC
     push rsi
     push rdi
     sub  rsp, 56
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     mov  [rsp+40], rcx           ; spill a (rcx 将被 n 覆盖)
     mov  rsi, rcx                ; a
     mov  rdi, rdx                ; b
@@ -148,7 +148,7 @@ wv_str_lodsb PROC
     push rsi
     push rdi
     sub  rsp, 56
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     mov  eax, 5A5A5A5Ah          ; 预置 acc (n=0 空转路径可观测)
     mov  rsi, rdx                ; src
     mov  rdi, rcx                ; dst
@@ -173,7 +173,7 @@ wv_str_movsb_flags PROC
     push rsi
     push rdi
     sub  rsp, 56
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     cmp  rcx, 1                  ; ZF = (zf_in == 1) — 区域内 flags 来源
     mov  rsi, r8                 ; src (mov 不写 flags)
     mov  rdi, rdx                ; dst
@@ -196,7 +196,7 @@ wv_str_movsb_flags ENDP
 ; 保持原生, 行为 byte-exact。
 wv_str_neg_pause PROC
     sub  rsp, 40
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     pause                        ; F3 90
     mov  [rsp+24], rcx
     call ?marker_end@sdk@wvmp@@YAXXZ

@@ -2,6 +2,7 @@
 #include "wvmp/common/types.hpp"
 #include <array>
 #include <cstddef>
+#include <optional>
 #include <span>
 #include <vector>
 
@@ -105,5 +106,21 @@ struct MarkerCalls {
 // 串扰（把 end 调用也算成 begin），"紧随其后"规则天然排他。
 MarkerCalls attribute_marker_calls(std::span<const CallRef> calls, std::span<const Anchor> anchors,
                                    size_t max_back);
+
+// MIT-460 (P7-names)：begin 调用点前的名字物化定位。
+// 约定调用点形态（MSVC /Od /O1 实测）：begin_next_off = E8 调用的下一条
+// 指令偏移（= 区域起点）。
+//   x64: [call_next-12, call_next-5) = 48 8D 0D <disp32>   lea rcx,[rip+disp]
+//        名字 VA-基 = call_next（rip 相对基 = lea 下一条 = E8 起点前一字节
+//        恰为 call_next-5，其"下一条"= call_next）；返回 disp（i64，有符号）。
+//   x86: [call_next-10, call_next-5) = 68 <abs32>           push imm32
+//        返回绝对 VA（u64 零扩展）。
+// 无匹配 = nullopt（旧产物/非常规代码序 → 调用方回退地址名）。
+struct NameOperand {
+    bool is_rip_rel;  // true = x64 rip 相对（value 为 disp）；false = x86 绝对 VA
+    i64 value;
+};
+std::optional<NameOperand> locate_name_operand(std::span<const u8> image,
+                                               size_t call_next_off, bool is_x86);
 
 } // namespace wvmp::passes::marker_scan

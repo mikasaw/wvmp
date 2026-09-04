@@ -18,8 +18,8 @@
 ; ⚠️ rax 跨 marker_end/marker_begin 调用会被 clobber (SDK `mov rax, imm64`
 ; 加载 magic 立即数), 必须在 call 前存到 stack, call 后还原 ( pitfall #36)。
 
-; MSVC C++ 名称修饰 (x64): ?marker_begin@sdk@wvmp@@YAXXZ (void marker_begin())
-EXTERNDEF ?marker_begin@sdk@wvmp@@YAXXZ : PROC
+; MSVC C++ 名称修饰 (x64): ?marker_begin@sdk@wvmp@@YAXPEBD@Z (void marker_begin())
+EXTERNDEF ?marker_begin@sdk@wvmp@@YAXPEBD@Z : PROC
 EXTERNDEF ?marker_end@sdk@wvmp@@YAXXZ   : PROC
 
 _TEXT SEGMENT
@@ -33,7 +33,7 @@ sse_divss PROC
     sub  rsp, 32
 
     ; ===== marker region begin =====
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     divss xmm0, xmm1                 ; 真 divss REG-REG (F3 0F 5E C1, mod=11)
     nop
     nop
@@ -61,7 +61,7 @@ sse_divps PROC
     movups xmm1, xmmword ptr [rdx]    ; xmm1 = packed b
 
     ; ===== marker region begin =====
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     divps  xmm0, xmm1                 ; 真 divps REG-REG (0F 5E C1, mod=11)
     nop
     nop
@@ -93,7 +93,7 @@ sse_divpd PROC
     movups xmm1, xmmword ptr [rdx]    ; xmm1 = packed b (2xf64)
 
     ; ===== marker region begin =====
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     divpd  xmm0, xmm1                 ; 真 divpd REG-REG (66 0F 5E C1, mod=11)
     nop
     nop

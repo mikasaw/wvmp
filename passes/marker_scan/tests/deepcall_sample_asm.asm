@@ -39,7 +39,7 @@
 ; rax 跨 marker_end/marker_begin 调用会被 clobber (SDK magic imm64,
 ; pitfall #36) — 结果经 [rsp+20h] 落栈中转。
 
-EXTERNDEF ?marker_begin@sdk@wvmp@@YAXXZ : PROC
+EXTERNDEF ?marker_begin@sdk@wvmp@@YAXPEBD@Z : PROC
 EXTERNDEF ?marker_end@sdk@wvmp@@YAXXZ   : PROC
 
 _TEXT SEGMENT
@@ -86,7 +86,7 @@ deep_recurse ENDP
 ; 区域 = marker_begin 返回点 .. marker_end 调用点之间 (marker_scan E8 回溯)。
 deepcall_entry PROC
     sub  rsp, 28h                   ; 0x28 % 16 == 8 → 区域入口 rsp ≡ 8 (mod 16)
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     ; ===== marker region begin =====
     mov  rdx, 1234h                 ; acc 种子 (7 字节, 区域首条 ≥5B 供 stub 织入)
     mov  ecx, 20h                   ; levels = 32 (MIT-407 加深, 树深 0xC00)

@@ -18,8 +18,8 @@
 ; ⚠️ rax 跨 marker_end/marker_begin 调用会被 clobber (SDK `mov rax, imm64`
 ; 加载 magic 立即数), out 指针必须放 callee-saved 寄存器 rbx (pitfall #36)。
 
-; MSVC C++ 名称修饰 (x64): ?marker_begin@sdk@wvmp@@YAXXZ (void marker_begin())
-EXTERNDEF ?marker_begin@sdk@wvmp@@YAXXZ : PROC
+; MSVC C++ 名称修饰 (x64): ?marker_begin@sdk@wvmp@@YAXPEBD@Z (void marker_begin())
+EXTERNDEF ?marker_begin@sdk@wvmp@@YAXPEBD@Z : PROC
 EXTERNDEF ?marker_end@sdk@wvmp@@YAXXZ   : PROC
 
 ; C 链接全局 (sse_bridge_xmm_readback_sample_main.cpp extern "C")
@@ -64,7 +64,7 @@ ENDM
 bsh_movd_in PROC
     mov rbx, rdx
     load_all
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     mov  eax, 0A5A5A5A5h
     movd xmm0, eax                  ; 66 0F 6E C0 (桥 load w4)
     nop
@@ -81,7 +81,7 @@ bsh_movd_in ENDP
 bsh_movq_in PROC
     mov rbx, rdx
     load_all
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     mov  rax, 1122334455667788h
     movq xmm0, rax                  ; 66 48 0F 6E C0 (桥 load w8)
     nop
@@ -101,7 +101,7 @@ bsh_movq_in ENDP
 bsh_movd_out PROC
     mov rbx, rdx
     load_all
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     movd eax, xmm0                  ; 66 0F 7E C0 (桥 store w4)
     mov [rbx + 16*8], rax           ; 区内 Store: Rax 槽 64 位全量落盘
     nop
@@ -115,7 +115,7 @@ bsh_movd_out ENDP
 bsh_movq_out PROC
     mov rbx, rdx
     load_all
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     movq rax, xmm0                  ; 66 48 0F 7E C0 (桥 store w8)
     mov [rbx + 16*8], rax           ; 区内 Store 落盘
     nop
@@ -130,7 +130,7 @@ bsh_movq_out ENDP
 bsh_movq_xmm_zero PROC
     mov rbx, rdx
     load_all
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     db 0F3h, 0Fh, 7Eh, 0C1h         ; movq xmm0, xmm1 (F3, 高 64 清零)
     nop
     nop
@@ -147,7 +147,7 @@ bsh_movq_xmm_zero ENDP
 bsh_movq_xmm_d6 PROC
     mov rbx, rdx
     load_all
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     db 066h, 0Fh, 0D6h, 0C8h        ; movq xmm0, xmm1 (66 0F D6 reg-reg; C8 = dst r/m 位)
     nop
     nop
@@ -163,7 +163,7 @@ bsh_movq_xmm_d6 ENDP
 bsh_movd_mem_in PROC
     mov rbx, rdx
     load_all
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     movd xmm0, dword ptr [g_bsh32]   ; 66 0F 6E 05 (mem load w4)
     nop
     nop
@@ -179,7 +179,7 @@ bsh_movd_mem_in ENDP
 bsh_movq_mem_in PROC
     mov rbx, rdx
     load_all
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     movq xmm0, qword ptr [g_bsh64]   ; 66 REX.W 0F 6E / F3 0F 7E (mem load w8)
     nop
     nop
@@ -195,7 +195,7 @@ bsh_movq_mem_in ENDP
 bsh_movq_mem_out PROC
     mov rbx, rdx
     load_all
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     movq qword ptr [g_bshout64], xmm0   ; 66 REX.W 0F 7E / 66 0F D6 (mem store w8)
     nop
     nop

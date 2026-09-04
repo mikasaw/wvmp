@@ -37,7 +37,7 @@
 ; magic 立即数), seta 结果先存 [rsp+24]、marker_end 后还原 (pitfall #36)。
 
 ; MSVC C++ 名称修饰 (x64): void marker_begin() / void marker_end()
-EXTERNDEF ?marker_begin@sdk@wvmp@@YAXXZ : PROC
+EXTERNDEF ?marker_begin@sdk@wvmp@@YAXPEBD@Z : PROC
 EXTERNDEF ?marker_end@sdk@wvmp@@YAXXZ   : PROC
 
 _TEXT SEGMENT
@@ -59,7 +59,7 @@ ufr_gt PROC
     movups xmm7, xmmword ptr [r8 + 7*16]
 
     ; ===== marker region begin =====
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     ucomiss xmm0, xmm1                 ; 真 ucomiss REG-REG (0F 2E C1, mod=11)
     seta   al                          ; a > b (CF=0 且 ZF=0) → 1
     movzx rax, al
@@ -99,7 +99,7 @@ ufr_lt PROC
     movups xmm7, xmmword ptr [r8 + 7*16]
 
     ; ===== marker region begin =====
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     ucomiss xmm0, xmm1                 ; 真 ucomiss REG-REG (0F 2E C1, mod=11)
     seta   al                          ; less → CF=1 → seta=0
     movzx rax, al
@@ -138,7 +138,7 @@ ufr_eq PROC
     movups xmm7, xmmword ptr [r8 + 7*16]
 
     ; ===== marker region begin =====
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     ucomiss xmm0, xmm1                 ; 真 ucomiss REG-REG (0F 2E C1, mod=11)
     seta   al                          ; equal → ZF=1 → seta=0
     movzx rax, al
@@ -177,7 +177,7 @@ ufr_nan PROC
     movups xmm7, xmmword ptr [r8 + 7*16]
 
     ; ===== marker region begin =====
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     ucomiss xmm0, xmm1                 ; 真 ucomiss REG-REG (0F 2E C1, mod=11)
     seta   al                          ; unordered → CF=1 → seta=0
     movzx rax, al

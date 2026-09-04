@@ -14,7 +14,7 @@
 ; Win64 ABI: rcx = n；jmp 时 rsp = entry rsp - 28h（prologue sub），与原生
 ; 执行路径完全一致（gate = 不虚拟化，行为逐位保持）。
 
-EXTERNDEF ?marker_begin@sdk@wvmp@@YAXXZ : PROC
+EXTERNDEF ?marker_begin@sdk@wvmp@@YAXPEBD@Z : PROC
 EXTERNDEF ?marker_end@sdk@wvmp@@YAXXZ   : PROC
 EXTERNDEF wv_exit_far_helper : PROC
 
@@ -22,7 +22,7 @@ _TEXT SEGMENT
 
 wv_exit_oob_masm PROC
     sub  rsp, 28h                   ; shadow (marker stubs 写 [rsp+X])
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     ; ===== marker region begin =====
     mov  rax, rcx               ; r = n
     shl  rax, 1                 ; r = n * 2

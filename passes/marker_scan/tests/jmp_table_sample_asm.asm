@@ -15,7 +15,7 @@
 ; rsp = entry rsp (目标函数 ret 直接弹本函数调用方的返回址, 尾调用语义)。
 ; ⚠️ 禁止在尾跳前 sub 28h 之类栈调整——目标 ret 会弹错返回址 (首版事故)。
 
-EXTERNDEF ?marker_begin@sdk@wvmp@@YAXXZ : PROC
+EXTERNDEF ?marker_begin@sdk@wvmp@@YAXPEBD@Z : PROC
 EXTERNDEF ?marker_end@sdk@wvmp@@YAXXZ   : PROC
 EXTERNDEF g_fp : QWORD
 
@@ -23,7 +23,7 @@ _TEXT SEGMENT
 
 wv_opaque_jmp_masm PROC
     sub  rsp, 8                      ; 对齐: entry ≡ 8 → call 前 ≡ 0
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     add  rsp, 8                      ; 恢复 entry rsp, 尾跳目标 ret 直通
     ; ===== marker region begin =====
     mov  rax, QWORD PTR [g_fp]      ; 全局函数指针 (rip-relative, 白名单)

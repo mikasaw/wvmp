@@ -32,7 +32,7 @@
 ; Win64 ABI: wv_x87_gate_fn 无参无返回值 (结果写全局); wv_gp_helper 参 = ecx,
 ; 返回值 = eax (区域外恢复)。
 
-EXTERNDEF ?marker_begin@sdk@wvmp@@YAXXZ : PROC
+EXTERNDEF ?marker_begin@sdk@wvmp@@YAXPEBD@Z : PROC
 EXTERNDEF ?marker_end@sdk@wvmp@@YAXXZ   : PROC
 EXTERNDEF g_a : QWORD
 EXTERNDEF g_b : QWORD
@@ -50,7 +50,7 @@ wv_x87_gate_fn PROC
     push rbx
     sub  rsp, 56
     ; ===== marker region begin =====
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     ; -- 数据传输族: fld / fstp (qword 宽) --
     fld  QWORD PTR [g_a]
     fld  QWORD PTR [g_b]
@@ -80,7 +80,7 @@ wv_gp_helper PROC
     push rbx
     sub  rsp, 56
     ; ===== marker region begin =====
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     mov  eax, ecx                    ; 参数 (Win64: rcx)
     add  eax, 100
     mov  [rsp+24], eax               ; 结果 spill (marker_end clobber rax)

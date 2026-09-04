@@ -22,8 +22,8 @@
 ; 加载 magic 立即数), seta/movzx 结果必须 marker_end 前存栈、之后还原
 ; (pitfall #36, 沿用 setcc_sample_asm.asm 的 [rsp+24] 模式)。
 
-; MSVC C++ 名称修饰 (x64): ?marker_begin@sdk@wvmp@@YAXXZ (void marker_begin())
-EXTERNDEF ?marker_begin@sdk@wvmp@@YAXXZ : PROC
+; MSVC C++ 名称修饰 (x64): ?marker_begin@sdk@wvmp@@YAXPEBD@Z (void marker_begin())
+EXTERNDEF ?marker_begin@sdk@wvmp@@YAXPEBD@Z : PROC
 EXTERNDEF ?marker_end@sdk@wvmp@@YAXXZ   : PROC
 
 ; C 链接全局 (sse_memop_sample_main.cpp extern "C"): MASM 直引 → rip-relative
@@ -42,7 +42,7 @@ memop_triple_add PROC
     sub  rsp, 32
 
     ; ===== marker region begin =====
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     movsd xmm1, qword ptr [g_d]      ; 读 (rip mem 源)
     addsd xmm1, xmm0                 ; 算 (v + g_d)
     movsd qword ptr [g_d], xmm1      ; 写回 (rip mem 目标)
@@ -64,7 +64,7 @@ memop_addsd_stack PROC
     movsd qword ptr [rsp+40], xmm0   ; 存参 (区外)
 
     ; ===== marker region begin =====
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     addsd xmm0, qword ptr [rsp+40]   ; F2 0F 58 44 24 28 (栈基址 mem 源)
     call ?marker_end@sdk@wvmp@@YAXXZ
     ; ===== marker region end =====
@@ -83,7 +83,7 @@ memop_comiss_mem PROC
     sub  rsp, 56
 
     ; ===== marker region begin =====
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     comiss xmm0, dword ptr [g_f]     ; 0F 2F 05 rel32 (rip mem 源)
     seta   al                        ; v > g_f (CF=0 且 ZF=0) → 1
     movzx rax, al
@@ -104,7 +104,7 @@ memop_comisd_mem PROC
     sub  rsp, 56
 
     ; ===== marker region begin =====
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     comisd xmm0, qword ptr [g_d]     ; 66 0F 2F 05 rel32 (rip mem 源)
     seta   al                        ; v > g_d → 1
     movzx rax, al
@@ -127,7 +127,7 @@ memop_andpd_reg PROC
     movq xmm1, rdx                   ; b (区外)
 
     ; ===== marker region begin =====
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     andpd xmm0, xmm1                 ; 66 0F 54 C1
     nop
     nop
@@ -148,7 +148,7 @@ memop_orpd_reg PROC
     movq xmm1, rdx
 
     ; ===== marker region begin =====
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     orpd  xmm0, xmm1                 ; 66 0F 56 C1
     nop
     nop
@@ -169,7 +169,7 @@ memop_xorpd_reg PROC
     movq xmm1, rdx
 
     ; ===== marker region begin =====
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     xorpd xmm0, xmm1                 ; 66 0F 57 C1
     nop
     nop
@@ -190,7 +190,7 @@ memop_andpd_mem PROC
     movq xmm0, rcx
 
     ; ===== marker region begin =====
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     andpd xmm0, xmmword ptr [g_pd]   ; 66 0F 54 05 rel32 (rip mem 源)
     call ?marker_end@sdk@wvmp@@YAXXZ
     ; ===== marker region end =====
@@ -208,7 +208,7 @@ memop_orpd_mem PROC
     movq xmm0, rcx
 
     ; ===== marker region begin =====
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     orpd  xmm0, xmmword ptr [g_pd]   ; 66 0F 56 05 rel32
     call ?marker_end@sdk@wvmp@@YAXXZ
     ; ===== marker region end =====
@@ -226,7 +226,7 @@ memop_xorpd_mem PROC
     movq xmm0, rcx
 
     ; ===== marker region begin =====
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     xorpd xmm0, xmmword ptr [g_pd]   ; 66 0F 57 05 rel32
     call ?marker_end@sdk@wvmp@@YAXXZ
     ; ===== marker region end =====
@@ -250,7 +250,7 @@ memop_andnps_neg PROC
     movd xmm1, edx
 
     ; ===== marker region begin =====
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     andnps xmm0, xmm1                ; 0F 55 C1 (MIT-425 起正例)
     nop
     nop

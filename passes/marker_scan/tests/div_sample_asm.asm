@@ -20,7 +20,7 @@
 ;
 ; 栈布局 (0 push + sub 28h): [rsp+0..20h) = shadow, [rsp+20h] = 局部 qword。
 
-EXTERNDEF ?marker_begin@sdk@wvmp@@YAXXZ : PROC
+EXTERNDEF ?marker_begin@sdk@wvmp@@YAXPEBD@Z : PROC
 EXTERNDEF ?marker_end@sdk@wvmp@@YAXXZ   : PROC
 EXTERNDEF g_rip_divisor : DWORD
 
@@ -35,7 +35,7 @@ div32_reg PROC
     sub  rsp, 28h
     mov  dword ptr [rsp+20h], ecx       ; a
     mov  dword ptr [rsp+24h], edx       ; b (与 a 共居一个 qword 局部)
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     ; ===== marker region begin =====
     mov  eax, dword ptr [rsp+20h]       ; eax = a
     mov  ecx, dword ptr [rsp+24h]       ; ecx = b
@@ -62,7 +62,7 @@ div64_reg PROC
     mov  [rsp+20h], rcx                 ; a
     mov  [rsp+28h], rdx                 ; b
     mov  rbx, r8                        ; out (callee-saved 跨 marker 调用)
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     ; ===== marker region begin =====
     mov  rax, [rsp+20h]                 ; rax = a
     mov  rdi, [rsp+28h]                 ; rdi = b (除数 REG)
@@ -84,7 +84,7 @@ div32_mem PROC
     sub  rsp, 28h
     mov  dword ptr [rsp+20h], ecx       ; a
     mov  dword ptr [rsp+24h], edx       ; b — 除数留栈上 (MEM 形式)
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     ; ===== marker region begin =====
     mov  eax, dword ptr [rsp+20h]       ; eax = a
     cdq                                 ; edx:eax = sext(eax)
@@ -111,7 +111,7 @@ idiv64_reg PROC
     mov  [rsp+20h], rcx                 ; a
     mov  [rsp+28h], rdx                 ; b
     mov  rbx, r8
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     ; ===== marker region begin =====
     mov  rax, [rsp+20h]                 ; rax = a
     mov  rdi, [rsp+28h]                 ; rdi = b
@@ -133,7 +133,7 @@ idiv32_mem PROC
     sub  rsp, 28h
     mov  dword ptr [rsp+20h], ecx       ; a
     mov  dword ptr [rsp+24h], edx       ; b
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     ; ===== marker region begin =====
     mov  eax, dword ptr [rsp+20h]       ; eax = a
     cdq                                 ; edx:eax = sext(eax)
@@ -156,7 +156,7 @@ idiv32_mem ENDP
 cdqe_probe PROC
     sub  rsp, 28h
     mov  dword ptr [rsp+20h], ecx       ; v
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     ; ===== marker region begin =====
     mov  eax, dword ptr [rsp+20h]       ; eax = v
     cdqe                                ; 48 98: rax = sext(eax)
@@ -176,7 +176,7 @@ cdqe_probe ENDP
 div32_rip PROC
     sub  rsp, 28h
     mov  dword ptr [rsp+20h], ecx       ; a
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     ; ===== marker region begin =====
     mov  eax, dword ptr [rsp+20h]       ; eax = a
     cdq                                 ; edx:eax (正数 → edx=0)

@@ -181,8 +181,53 @@ void MarkerScanPass::run(ProtectionContext& ctx) {
     ctx.functions.reserve(regions.size());
     for (const auto& r : regions) {
         ir::FunctionRegion fr;
-        // TODO(P7-names): 从 begin 调用点的 lea/rcx 引用解析字符串名；v1 用地址。
-        fr.name = "(marker@0x" + hex_off(r.begin_off) + ")";
+        // MIT-460 (P7-names)：begin 调用点前的名字物化（x64 lea rcx,[rip+str]
+        // / x86 push offset str，locate_name_operand 判定）解析区域真名；
+        // 无物化回退地址名（旧产物/非常规代码序，行为与 MIT-460 前一致）。
+        // 名字物化在区域之外（begin 调用之前），不进虚拟化管道；解析失败
+        // 零危害（记 Note 披露回退路径）。
+        std::string region_name = "(marker@0x" + hex_off(r.begin_off) + ")";
+        if (pe != nullptr) {
+            const auto name_op = ms::locate_name_operand(ctx.image, r.begin_off, is_x86);
+            bool named = false;
+            if (name_op.has_value()) {
+                u64 str_rva = 0;
+                if (name_op->is_rip_rel) {
+                    // rip 基 = lea 的下一条 = E8 起点 = call_next - 5（call
+                    // 恒 5B：E8+rel32）。区域起点 RVA = call_next，减回。
+                    const u64 call_next_rva = to_rva(r.begin_off, "begin", region_name);
+                    str_rva = static_cast<u64>(static_cast<i64>(call_next_rva - 5) +
+                                               name_op->value);
+                } else {
+                    str_rva = static_cast<u64>(name_op->value) -
+                              static_cast<u64>(pe->image_base);
+                }
+                const auto str_off = pe->rva_to_offset(str_rva);
+                if (str_off.has_value() && *str_off < ctx.image.size()) {
+                    std::string resolved;
+                    const size_t max_len = 64;
+                    for (size_t i = *str_off;
+                         i < ctx.image.size() && resolved.size() < max_len; ++i) {
+                        const char c = static_cast<char>(ctx.image[i]);
+                        if (c == '\0') break;
+                        if (c < 0x21 || c > 0x7E) {  // 非可打印 = 不是名字字面量
+                            resolved.clear();
+                            break;
+                        }
+                        resolved.push_back(c);
+                    }
+                    if (!resolved.empty()) {
+                        region_name = resolved;
+                        named = true;
+                    }
+                }
+            }
+            if (!named)
+                ctx.diag.report(Severity::Note, name(),
+                                "begin@0x" + hex_off(r.begin_off) +
+                                    " 未解析到名字物化，回退地址名（P7-names 回退路径）");
+        }
+        fr.name = region_name;
         // X1a：x86 双段锚点已由步骤 1 的 is_x86 分支消费；区域 E8 回溯链
         // 双架构同形（x86 call rel32 与 x64 编码一致，实测）。arch 推导自
         // PeImage.machine（MIT-414 引入）；PeImage 缺失（泳道单测）沿用 X64。

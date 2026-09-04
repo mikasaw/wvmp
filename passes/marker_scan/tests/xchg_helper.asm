@@ -12,8 +12,8 @@
 ; Win64 ABI: rcx/rdx/r8 = 前 3 个整型/指针参数, rax = 返回值. callee-saved:
 ; rbx, rbp, rdi, rsi, r12-r15. 此函数用 rbx/rsi 作临时寄存器, push/pop 守恒.
 
-; MSVC C++ 名称修饰 (x64): ?marker_begin@sdk@wvmp@@YAXXZ (void marker_begin())
-EXTERNDEF ?marker_begin@sdk@wvmp@@YAXXZ : PROC
+; MSVC C++ 名称修饰 (x64): ?marker_begin@sdk@wvmp@@YAXPEBD@Z (void marker_begin())
+EXTERNDEF ?marker_begin@sdk@wvmp@@YAXPEBD@Z : PROC
 EXTERNDEF ?marker_end@sdk@wvmp@@YAXXZ   : PROC
 
 _TEXT SEGMENT
@@ -28,7 +28,7 @@ xchg64_fn PROC
     mov  [rsp+40], rdx
 
     ; ===== marker region begin =====
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
 
     mov  rax, [rsp+32]            ; a := x
     mov  rbx, [rsp+40]            ; b := y
@@ -54,7 +54,7 @@ xchg32_fn PROC
     mov  [rsp+32], ecx            ; low 32 of rcx = x
     mov  [rsp+36], edx            ; low 32 of rdx = y
 
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
 
     mov  eax, [rsp+32]            ; a := x (低 32)
     mov  ebx, [rsp+36]            ; b := y (低 32)
@@ -83,7 +83,7 @@ xchg_chain_fn PROC
     mov  [rsp+40], rdx            ; save &b
     mov  [rsp+48], r8             ; save &c
 
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
 
     ; load *a / *b / *c into 3 scratch registers
     mov  rsi, [rsp+32]

@@ -16,8 +16,8 @@
 ; ⚠️ rax 跨 marker_end/marker_begin 调用会被 clobber (SDK `mov rax, imm64`
 ; 加载 magic 立即数), out 指针必须放 callee-saved 寄存器 rbx (pitfall #36)。
 
-; MSVC C++ 名称修饰 (x64): ?marker_begin@sdk@wvmp@@YAXXZ (void marker_begin())
-EXTERNDEF ?marker_begin@sdk@wvmp@@YAXXZ : PROC
+; MSVC C++ 名称修饰 (x64): ?marker_begin@sdk@wvmp@@YAXPEBD@Z (void marker_begin())
+EXTERNDEF ?marker_begin@sdk@wvmp@@YAXPEBD@Z : PROC
 EXTERNDEF ?marker_end@sdk@wvmp@@YAXXZ   : PROC
 
 ; C 链接全局 (sse_fin_xmm_readback_sample_main.cpp extern "C")
@@ -66,7 +66,7 @@ fin_mulss_rr PROC
     load_slots
 
     ; ===== marker region begin =====
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     mulss xmm0, xmm1                 ; F3 0F 59 C1
     nop
     nop
@@ -88,7 +88,7 @@ fin_mulsd_rr PROC
     load_slots
 
     ; ===== marker region begin =====
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     mulsd xmm0, xmm1                 ; F2 0F 59 C1
     nop
     nop
@@ -110,7 +110,7 @@ fin_mulsd_mem PROC
     load_slots
 
     ; ===== marker region begin =====
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     mulsd xmm0, qword ptr [g_sh_d]   ; F2 0F 59 05 rel32
     nop
     nop
@@ -132,7 +132,7 @@ fin_mulps_rr PROC
     load_all
 
     ; ===== marker region begin =====
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     mulps xmm0, xmm1                 ; 0F 59 C1
     nop
     nop
@@ -154,7 +154,7 @@ fin_mulpd_rr PROC
     load_all
 
     ; ===== marker region begin =====
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     mulpd xmm0, xmm1                 ; 66 0F 59 C1
     nop
     nop
@@ -176,7 +176,7 @@ fin_mulps_mem PROC
     load_slots
 
     ; ===== marker region begin =====
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     mulps xmm0, xmmword ptr [g_sh_ps]  ; 0F 59 05 rel32
     nop
     nop
@@ -199,7 +199,7 @@ fin_andnps_rr PROC
     load_all
 
     ; ===== marker region begin =====
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     andnps xmm0, xmm1                ; 0F 55 C1
     nop
     nop
@@ -220,7 +220,7 @@ fin_andnpd_rr PROC
     load_all
 
     ; ===== marker region begin =====
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     andnpd xmm0, xmm1                ; 66 0F 55 C1
     nop
     nop
@@ -241,7 +241,7 @@ fin_pandn_rr PROC
     load_all
 
     ; ===== marker region begin =====
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     pandn  xmm0, xmm1                ; 66 0F DF C1
     nop
     nop
@@ -264,7 +264,7 @@ fin_pand_rr PROC
     load_all
 
     ; ===== marker region begin =====
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     pand   xmm2, xmm3                ; 66 0F DB D3 (dst=xmm2 槽变体)
     nop
     nop
@@ -285,7 +285,7 @@ fin_por_rr PROC
     load_all
 
     ; ===== marker region begin =====
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     por    xmm0, xmm1                ; 66 0F EB C1
     nop
     nop
@@ -307,7 +307,7 @@ fin_pxor_rr PROC
     load_all
 
     ; ===== marker region begin =====
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     pxor   xmm2, xmm3                ; 66 0F EF D3 (dst=xmm2 槽变体)
     nop
     nop
@@ -329,7 +329,7 @@ fin_pand_mem PROC
     load_all
 
     ; ===== marker region begin =====
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     pand   xmm0, xmmword ptr [g_sh_pi]  ; 66 0F DB 05 rel32
     nop
     nop

@@ -1,3 +1,5 @@
+#include <cstring>
+#include <optional>
 #include "wvmp/passes/marker_scan/scan_core.hpp"
 
 #include <algorithm>
@@ -107,6 +109,38 @@ PairResult pair_regions(std::vector<size_t> begin_nexts, std::vector<size_t> end
     }
     res.unmatched_begins = std::move(open);
     return res;
+}
+
+
+
+std::optional<NameOperand> locate_name_operand(std::span<const u8> image,
+                                               size_t call_next_off, bool is_x86) {
+    const auto le32 = [&](size_t off) {
+        return static_cast<i64>(static_cast<u32>(image[off])) |
+               (static_cast<i64>(static_cast<u32>(image[off + 1])) << 8) |
+               (static_cast<i64>(static_cast<u32>(image[off + 2])) << 16) |
+               (static_cast<i64>(static_cast<u32>(image[off + 3])) << 24);
+    };
+    if (is_x86) {
+        // push imm32（68 <abs32>）紧邻 E8。
+        if (call_next_off < 10) return std::nullopt;
+        const size_t base = call_next_off - 10;
+        if (base + 10 > image.size()) return std::nullopt;
+        if (image[base] != 0x68) return std::nullopt;
+        return NameOperand{false, le32(base + 1)};
+    }
+    // x64: lea rcx,[rip+disp32]（48 8D 0D <disp32>）紧邻 E8。
+    if (call_next_off < 12) return std::nullopt;
+    const size_t base = call_next_off - 12;
+    if (base + 12 > image.size()) return std::nullopt;
+    if (image[base] != 0x48 || image[base + 1] != 0x8D || image[base + 2] != 0x0D)
+        return std::nullopt;
+    // disp 有符号（MIT-460 验收反馈：.rdata 在 lea 之前布局时 disp 为负，
+    // 零扩展会算出偏大 2^32 的地址——经 i32 符号扩展修正）。
+    const u32 raw = static_cast<u32>(le32(base + 3));
+    i32 disp_signed = 0;
+    std::memcpy(&disp_signed, &raw, sizeof(disp_signed));
+    return NameOperand{true, static_cast<i64>(disp_signed)};
 }
 
 } // namespace wvmp::passes::marker_scan

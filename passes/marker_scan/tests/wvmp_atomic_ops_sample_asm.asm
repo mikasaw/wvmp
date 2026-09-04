@@ -30,7 +30,7 @@
 ; spill 到 [rsp+24] (marker_end clobber rax, pitfall #36); 无 rsp 调整
 ; (entry rsp 恒等, Halt 恢复契约)。
 
-EXTERNDEF ?marker_begin@sdk@wvmp@@YAXXZ : PROC
+EXTERNDEF ?marker_begin@sdk@wvmp@@YAXPEBD@Z : PROC
 EXTERNDEF ?marker_end@sdk@wvmp@@YAXXZ   : PROC
 EXTERNDEF g_at_cmpx : QWORD
 
@@ -40,7 +40,7 @@ _TEXT SEGMENT
 ; u32 wv_at_xadd32(long* p, long v) → rax = 旧 [p]
 wv_at_xadd32 PROC
     sub  rsp, 56
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     mov  eax, edx                ; v
     lock xadd dword ptr [rcx], eax
     mov  [rsp+24], eax           ; spill 旧值 (marker_end clobber rax)
@@ -54,7 +54,7 @@ wv_at_xadd32 ENDP
 ; u64 wv_at_xadd64(long long* p, long long v) → rax = 旧 [p]
 wv_at_xadd64 PROC
     sub  rsp, 56
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     mov  rax, rdx
     lock xadd qword ptr [rcx], rax
     mov  [rsp+24], rax
@@ -68,7 +68,7 @@ wv_at_xadd64 ENDP
 ; u32 wv_at_bts_imm(long* p) → rax = 旧位 (CF 读回)
 wv_at_bts_imm PROC
     sub  rsp, 56
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     lock bts dword ptr [rcx], 3
     setc al
     movzx eax, al
@@ -83,7 +83,7 @@ wv_at_bts_imm ENDP
 ; u32 wv_at_btr_imm(long* p) → rax = 旧位
 wv_at_btr_imm PROC
     sub  rsp, 56
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     lock btr dword ptr [rcx], 3
     setc al
     movzx eax, al
@@ -98,7 +98,7 @@ wv_at_btr_imm ENDP
 ; u32 wv_at_btc_reg(long* p, long bit) → rax = 旧位
 wv_at_btc_reg PROC
     sub  rsp, 56
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     lock btc dword ptr [rcx], edx
     setc al
     movzx eax, al
@@ -113,7 +113,7 @@ wv_at_btc_reg ENDP
 ; u32 wv_at_xchg_mem(long* p, long v) → rax = 旧 [p]
 wv_at_xchg_mem PROC
     sub  rsp, 56
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     mov  eax, edx
     xchg dword ptr [rcx], eax
     mov  [rsp+24], eax
@@ -132,7 +132,7 @@ wv_at_xchg_mem ENDP
 ; 实证: lock cmpxchg qword ptr [rip+disp], rcx)。
 wv_at_cmpxchg_rip PROC
     sub  rsp, 56
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     mov  rax, rcx                ; old → accumulator (cmpxchg 隐式 RAX)
     mov  rcx, rdx                ; new
     lock cmpxchg qword ptr [g_at_cmpx], rcx
@@ -153,7 +153,7 @@ wv_at_cmpxchg_rip ENDP
 ; 禁入可执行路径 (原生 #UD): main 只取地址不调用; 断言 protect 日志 gate。
 wv_at_neg_lock_mov PROC
     sub  rsp, 56
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     db   0F0h, 089h, 001h        ; lock mov [rcx], eax — ml64 A2068 拒汇编,
                                  ; db 直发 (416 同族先例); capstone 拒解码
     call ?marker_end@sdk@wvmp@@YAXXZ
@@ -165,7 +165,7 @@ wv_at_neg_lock_mov ENDP
 ; 同上: 禁入可执行路径 (原生 #UD); 断言 protect 日志 gate。
 wv_at_neg_lock_nop PROC
     sub  rsp, 56
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     db   0F0h, 090h              ; lock nop — db 直发; capstone 拒解码
     call ?marker_end@sdk@wvmp@@YAXXZ
     add  rsp, 56

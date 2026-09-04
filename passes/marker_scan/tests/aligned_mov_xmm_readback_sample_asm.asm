@@ -17,8 +17,8 @@
 ; ⚠️ rax 跨 marker_end/marker_begin 调用会被 clobber (SDK `mov rax, imm64`
 ; 加载 magic 立即数), out 指针必须放 callee-saved 寄存器 rbx (pitfall #36)。
 
-; MSVC C++ 名称修饰 (x64): ?marker_begin@sdk@wvmp@@YAXXZ (void marker_begin())
-EXTERNDEF ?marker_begin@sdk@wvmp@@YAXXZ : PROC
+; MSVC C++ 名称修饰 (x64): ?marker_begin@sdk@wvmp@@YAXPEBD@Z (void marker_begin())
+EXTERNDEF ?marker_begin@sdk@wvmp@@YAXPEBD@Z : PROC
 EXTERNDEF ?marker_end@sdk@wvmp@@YAXXZ   : PROC
 
 ; C 链接全局 (aligned_mov_xmm_readback_sample_main.cpp extern "C")
@@ -62,7 +62,7 @@ ENDM
 ash_dqa_rr PROC
     mov rbx, rdx
     load_all
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     movdqa xmm0, xmm1               ; 66 0F 6F C1 (全宽拷贝)
     nop
     nop
@@ -76,7 +76,7 @@ ash_dqa_rr ENDP
 ash_dqa_rr7 PROC
     mov rbx, rdx
     load_all
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     db 066h, 0Fh, 07Fh, 0C8h        ; movdqa xmm0, xmm1 (7F 形)
     nop
     nop
@@ -90,7 +90,7 @@ ash_dqa_rr7 ENDP
 ash_dqu_rr PROC
     mov rbx, rdx
     load_all
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     movdqu xmm0, xmm1               ; F3 0F 6F C1
     nop
     nop
@@ -108,7 +108,7 @@ ash_dqa_stack PROC
     mov  rbx, rdx
     load_all
     movups xmmword ptr [rsp+20h], xmm4   ; 栈槽预填 = xmm4 预载图案 (区外)
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     movdqa xmm0, xmmword ptr [rsp+20h]   ; 66 0F 6F 44 24 20
     nop
     nop
@@ -128,7 +128,7 @@ ash_dqu_stack_unal PROC
     mov  rbx, rdx
     load_all
     movups xmmword ptr [rsp+8h], xmm5    ; 非对齐栈槽预填 = xmm5 图案
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     movdqu xmm0, xmmword ptr [rsp+8h]    ; F3 0F 6F 44 24 08
     nop
     nop
@@ -145,7 +145,7 @@ ash_dqu_stack_unal ENDP
 ash_dqa_rip_load PROC
     mov rbx, rdx
     load_all
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     movdqa xmm0, xmmword ptr [g_ash_src]   ; 66 0F 6F 05 (rip load)
     nop
     nop
@@ -160,7 +160,7 @@ ash_dqa_rip_load ENDP
 ash_dqa_rip_store PROC
     mov rbx, rdx
     load_all
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     movdqa xmmword ptr [g_ash_out], xmm0   ; 66 0F 7F 05 (rip store)
     nop
     nop
@@ -174,7 +174,7 @@ ash_dqa_rip_store ENDP
 ash_vdqa_rr PROC
     mov rbx, rdx
     load_all
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     vmovdqa xmm0, xmm1              ; C5 F9 6F C1 (VEX 镜像)
     nop
     nop
@@ -188,7 +188,7 @@ ash_vdqa_rr ENDP
 ash_vdqu_rr PROC
     mov rbx, rdx
     load_all
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     vmovdqu xmm0, xmm1              ; C5 FA 6F C1
     nop
     nop

@@ -25,7 +25,7 @@
 ; 立即数), out 指针必须先存 callee-saved 寄存器 (pitfall #36)。
 
 ; MSVC C++ 名字修饰 (x64): void marker_begin() / void marker_end()
-EXTERNDEF ?marker_begin@sdk@wvmp@@YAXXZ : PROC
+EXTERNDEF ?marker_begin@sdk@wvmp@@YAXPEBD@Z : PROC
 EXTERNDEF ?marker_end@sdk@wvmp@@YAXXZ   : PROC
 
 _TEXT SEGMENT
@@ -45,7 +45,7 @@ sse_mov_ss PROC
     movups xmm1, xmmword ptr [rdx]
 
     ; ===== marker region begin =====
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     movss  xmm0, xmm1                  ; 真 movss REG-REG (F3 0F 10 C1, mod=11)
     nop
     nop
@@ -74,7 +74,7 @@ sse_mov_aps PROC
     movups xmm3, xmmword ptr [rdx]
 
     ; ===== marker region begin =====
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     movaps xmm2, xmm3                  ; 真 movaps REG-REG (0F 28 D3, mod=11)
     nop
     nop
@@ -103,7 +103,7 @@ sse_mov_apd PROC
     movups xmm5, xmmword ptr [rdx]
 
     ; ===== marker region begin =====
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     movapd xmm4, xmm5                  ; 真 movapd REG-REG (45 0F 28 E4, mod=11)
     nop
     nop
@@ -132,7 +132,7 @@ sse_mov_ups PROC
     movups xmm7, xmmword ptr [rdx]
 
     ; ===== marker region begin =====
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     movups xmm6, xmm7                  ; 真 movups REG-REG (41 0F 10 F7, mod=11)
     nop
     nop
@@ -161,7 +161,7 @@ sse_mov_upd PROC
     movups xmm3, xmmword ptr [rdx]
 
     ; ===== marker region begin =====
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     movupd xmm1, xmm3                  ; 真 movupd REG-REG (66 0F 10 CB, mod=11)
     nop
     nop

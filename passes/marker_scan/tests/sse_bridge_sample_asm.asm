@@ -27,8 +27,8 @@
 ; ⚠️ rax 跨 marker_end/marker_begin 调用会被 clobber (SDK `mov rax, imm64`
 ; 加载 magic 立即数), out 指针必须放 callee-saved 寄存器 rbx (pitfall #36)。
 
-; MSVC C++ 名称修饰 (x64): ?marker_begin@sdk@wvmp@@YAXXZ (void marker_begin())
-EXTERNDEF ?marker_begin@sdk@wvmp@@YAXXZ : PROC
+; MSVC C++ 名称修饰 (x64): ?marker_begin@sdk@wvmp@@YAXPEBD@Z (void marker_begin())
+EXTERNDEF ?marker_begin@sdk@wvmp@@YAXPEBD@Z : PROC
 EXTERNDEF ?marker_end@sdk@wvmp@@YAXXZ   : PROC
 
 ; C 链接全局 (sse_bridge_sample_main.cpp extern "C"): MASM 直引 → rip-relative
@@ -45,7 +45,7 @@ _TEXT SEGMENT
 ; 区域内重建; mov imm32 为白名单指令)。
 brg_movd_in PROC
     mov rbx, rcx                     ; out (callee-saved, pitfall #36)
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     mov eax, 0A5A5A5A5h              ; GP 源 (白名单 mov imm32)
     movd  xmm0, eax                  ; 66 0F 6E C0 (G1c 桥 load w4, 高 96 清零)
     nop
@@ -59,7 +59,7 @@ brg_movd_in ENDP
 ;      movq xmm0, rax } → out[0]=imm64, out[1]=0 (高 64 清零位级证据) ----
 brg_movq_in PROC
     mov rbx, rcx
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     mov  rax, 1122334455667788h      ; GP 源 (movabs imm64, 白名单)
     movq xmm0, rax                   ; 66 48 0F 6E C0 (G1c 桥 load w8)
     nop
@@ -78,7 +78,7 @@ brg_movq_in ENDP
 brg_movd_out PROC
     mov rbx, rdx                     ; out (callee-saved, pitfall #36)
     movq xmm0, rcx                   ; 区外装载 (位图案)
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     movd eax, xmm0                   ; 66 0F 7E C0 (G1c 桥 store w4)
     mov [rbx], rax                   ; 区内 Store: Rax 槽 64 位全量落盘 (零扩展可观察)
     nop
@@ -92,7 +92,7 @@ brg_movd_out ENDP
 brg_movq_out PROC
     mov rbx, rdx
     movq xmm0, rcx
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     movq rax, xmm0                   ; 66 48 0F 7E C0 (G1c 桥 store w8)
     mov [rbx], rax                   ; 区内 Store 落盘
     nop
@@ -109,7 +109,7 @@ brg_movq_xmm_zero PROC
     mov rbx, r8
     movups xmm0, xmmword ptr [rcx]   ; dst 16B 预载 (高位 = dst_bits[1])
     movups xmm1, xmmword ptr [rdx]   ; src
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     db 0F3h, 0Fh, 7Eh, 0C1h          ; movq xmm0, xmm1 (F3 形态, 高 64 清零)
     nop
     nop
@@ -126,7 +126,7 @@ brg_movq_d6 PROC
     mov rbx, r8
     movups xmm0, xmmword ptr [rcx]   ; dst 16B 预载
     movups xmm1, xmmword ptr [rdx]   ; src
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     db 066h, 0Fh, 0D6h, 0C8h         ; movq xmm0, xmm1 (66 0F D6 reg-reg)
     nop
     nop
@@ -140,7 +140,7 @@ brg_movq_d6 ENDP
 ;      (mem 形式 → 既有 XmmLoad w4 通路, movsd/movd mem 清零语义) ----
 brg_movd_mem_in PROC
     mov rbx, rcx
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     movd xmm0, dword ptr [g_brg32]   ; 66 0F 6E 05 (mem load w4)
     nop
     nop
@@ -153,7 +153,7 @@ brg_movd_mem_in ENDP
 ;      qword ptr [rip+g_brg64] } → out = {g_brg64, 0} ----
 brg_movq_mem_in PROC
     mov rbx, rcx
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     movq xmm0, qword ptr [g_brg64]   ; 66 REX.W 0F 6E / F3 0F 7E (mem load w8)
     nop
     nop
@@ -166,7 +166,7 @@ brg_movq_mem_in ENDP
 ;      ptr [rip+g_bout32], xmm0 } — mem store w4 截取 (main 落盘后读回) ----
 brg_movd_mem_out PROC
     movq xmm0, rcx
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     movd dword ptr [g_bout32], xmm0   ; 66 0F 7E 05 (mem store w4)
     nop
     nop
@@ -178,7 +178,7 @@ brg_movd_mem_out ENDP
 ;      ptr [rip+g_bout64], xmm0 } — mem store w8 ----
 brg_movq_mem_out PROC
     movq xmm0, rcx
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     movq qword ptr [g_bout64], xmm0   ; 66 REX.W 0F 7E / 66 0F D6 (mem store w8)
     nop
     nop
@@ -191,7 +191,7 @@ brg_movq_mem_out ENDP
 brg_paddq_neg PROC
     movq  xmm0, rcx
     movq  xmm1, rdx
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     paddq xmm0, xmm1                ; 66 0F D4 C1 (gate 负例)
     nop
     nop
@@ -204,7 +204,7 @@ brg_paddq_neg ENDP
 brg_psubq_neg PROC
     movq  xmm0, rcx
     movq  xmm1, rdx
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     psubq xmm0, xmm1                ; 66 0F FB C1 (gate 负例)
     nop
     nop
@@ -217,7 +217,7 @@ brg_psubq_neg ENDP
 brg_pmovmskb_neg PROC
     mov   rbx, rdx                  ; out (gate 负例整函数 native, rbx 直存)
     movq  xmm0, rcx
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     pmovmskb eax, xmm0              ; 66 0F D7 C0 (gate 负例)
     mov   [rbx], rax                ; 区内直存 (gate 函数 native 执行, 两跑一致)
     nop
@@ -230,7 +230,7 @@ brg_pmovmskb_neg ENDP
 brg_pcmpeqd_neg PROC
     movq  xmm0, rcx
     movq  xmm1, rdx
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     pcmpeqd xmm0, xmm1              ; 66 0F 76 C1 (gate 负例)
     nop
     nop
@@ -249,7 +249,7 @@ brg_pcmpeqd_neg ENDP
 brg_mmx_neg PROC
     mov  rbx, r8
     ; ===== marker region begin (gate 负例区 — mm 操作数判据面) =====
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     movq mm0, rcx                   ; NP 0F 6F C1 (MMX movq mm0, r64, gate)
     movq mm1, rdx                   ; NP 0F 6F CA (gate)
     movq mm0, mm1                   ; NP 0F 6F C1 (MMX movq mm, mm — 判据面, gate)

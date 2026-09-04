@@ -24,8 +24,8 @@
 ; ⚠️ rax 跨 marker_end/marker_begin 调用会被 clobber (SDK `mov rax, imm64`
 ; 加载 magic 立即数), out 指针必须放 callee-saved 寄存器 rbx (pitfall #36)。
 
-; MSVC C++ 名称修饰 (x64): ?marker_begin@sdk@wvmp@@YAXXZ (void marker_begin())
-EXTERNDEF ?marker_begin@sdk@wvmp@@YAXXZ : PROC
+; MSVC C++ 名称修饰 (x64): ?marker_begin@sdk@wvmp@@YAXPEBD@Z (void marker_begin())
+EXTERNDEF ?marker_begin@sdk@wvmp@@YAXPEBD@Z : PROC
 EXTERNDEF ?marker_end@sdk@wvmp@@YAXXZ   : PROC
 
 ; C 链接全局 (aligned_mov_sample_main.cpp extern "C"): MASM 直引 → rip-relative
@@ -41,7 +41,7 @@ amv_dqa_rr6 PROC
     mov  rbx, rcx                    ; out (callee-saved, pitfall #36)
     movups xmm0, xmmword ptr [rdx]   ; dst 预载哨兵脏值 (16B)
     movups xmm1, xmmword ptr [rdx+16]; src 位图案
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     movdqa xmm0, xmm1                ; 66 0F 6F C1 (G1d 对齐传送, 全宽)
     nop
     nop
@@ -56,7 +56,7 @@ amv_dqa_rr7 PROC
     mov  rbx, rcx
     movups xmm0, xmmword ptr [rdx]   ; dst 预载哨兵
     movups xmm1, xmmword ptr [rdx+16]; src
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     db 066h, 0Fh, 07Fh, 0C8h         ; movdqa xmm0, xmm1 (7F 形, dst=r/m 位)
     nop
     nop
@@ -70,7 +70,7 @@ amv_dqu_rr6 PROC
     mov  rbx, rcx
     movups xmm0, xmmword ptr [rdx]
     movups xmm1, xmmword ptr [rdx+16]
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     movdqu xmm0, xmm1                ; F3 0F 6F C1
     nop
     nop
@@ -84,7 +84,7 @@ amv_dqu_rr7 PROC
     mov  rbx, rcx
     movups xmm0, xmmword ptr [rdx]
     movups xmm1, xmmword ptr [rdx+16]
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     db 0F3h, 0Fh, 07Fh, 0C8h         ; movdqu xmm0, xmm1 (7F 形)
     nop
     nop
@@ -104,7 +104,7 @@ amv_dqa_stack PROC
     movups xmm0, xmmword ptr [rdx]   ; dst 预载哨兵脏值
     movups xmm1, xmmword ptr [rdx+16]; src 位图案
     movups xmmword ptr [rsp+20h], xmm1   ; 栈槽预填 (区域外 native, 两跑同内存)
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     movdqa xmm0, xmmword ptr [rsp+20h]   ; 66 0F 6F 44 24 20 (对齐栈槽 load)
     nop
     nop
@@ -126,7 +126,7 @@ amv_dqu_stack_unal PROC
     movups xmm0, xmmword ptr [rdx]
     movups xmm1, xmmword ptr [rdx+16]
     movups xmmword ptr [rsp+8h], xmm1    ; 非对齐栈槽预填
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     movdqu xmm0, xmmword ptr [rsp+8h]    ; F3 0F 6F 44 24 08 (非对齐栈槽)
     nop
     nop
@@ -142,7 +142,7 @@ amv_dqu_stack_unal ENDP
 amv_dqa_rip_load PROC
     mov  rbx, rcx
     movups xmm0, xmmword ptr [rdx]   ; 哨兵
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     movdqa xmm0, xmmword ptr [g_amv_src]   ; 66 0F 6F 05 (rip load)
     nop
     nop
@@ -155,7 +155,7 @@ amv_dqa_rip_load ENDP
 ;      → g_amv_out = src (16B 对齐 store; main 读回) ----
 amv_dqa_rip_store PROC
     movups xmm0, xmmword ptr [rcx]
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     movdqa xmmword ptr [g_amv_out], xmm0   ; 66 0F 7F 05 (rip store)
     nop
     nop
@@ -168,7 +168,7 @@ amv_dqa_rip_store ENDP
 ;      408 D2 配对 — movdqu 宽松语义) ----
 amv_dqu_rip_store PROC
     movups xmm0, xmmword ptr [rcx]
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     movdqu xmmword ptr [g_amv_out_u], xmm0   ; F3 0F 7F 05 (rip store, 非对齐)
     nop
     nop
@@ -182,7 +182,7 @@ amv_vdqa_rr PROC
     mov  rbx, rcx
     movups xmm0, xmmword ptr [rdx]
     movups xmm1, xmmword ptr [rdx+16]
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     vmovdqa xmm0, xmm1               ; C5 F9 6F C1 (VEX 镜像)
     nop
     nop
@@ -196,7 +196,7 @@ amv_vdqu_rr PROC
     mov  rbx, rcx
     movups xmm0, xmmword ptr [rdx]
     movups xmm1, xmmword ptr [rdx+16]
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     vmovdqu xmm0, xmm1               ; C5 FA 6F C1
     nop
     nop
@@ -209,7 +209,7 @@ amv_vdqu_rr ENDP
 ;      (C5 F9 7F 05 — VEX store 方向; main 读回) ----
 amv_vdqa_rip_store PROC
     movups xmm0, xmmword ptr [rcx]
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     vmovdqa xmmword ptr [g_amv_out], xmm0  ; C5 F9 7F 05 (VEX rip store)
     nop
     nop
@@ -224,7 +224,7 @@ amv_vmovdqa32_neg PROC
     mov  rbx, rdx
     movups xmm0, xmmword ptr [rcx]
     movups xmm1, xmmword ptr [rcx+16]
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     db 062h, 0F1h, 07Dh, 008h, 06Fh, 0C1h  ; vmovdqa32 xmm0, xmm1 (EVEX, gate)
     nop
     nop
@@ -240,7 +240,7 @@ amv_vpaddd_ymm_neg PROC
     mov  rbx, rdx
     vmovdqu ymm0, ymmword ptr [rcx]
     vmovdqu ymm1, ymmword ptr [rcx+32]
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     vpaddd ymm0, ymm0, ymm1          ; C5 FD FE C1 (ymm 位宽闸, gate)
     nop
     nop
@@ -255,7 +255,7 @@ amv_punpcklqdq_neg PROC
     mov  rbx, r8
     movups xmm0, xmmword ptr [rcx]
     movups xmm1, xmmword ptr [rdx]
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     punpcklqdq xmm0, xmm1            ; 66 0F 6C C1 (交织, gate)
     nop
     nop
@@ -269,7 +269,7 @@ amv_punpcklqdq_neg ENDP
 amv_pmovmskb_neg PROC
     mov   rbx, rdx
     movq  xmm0, rcx
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     pmovmskb eax, xmm0               ; 66 0F D7 C0 (gate)
     mov   [rbx], rax
     nop

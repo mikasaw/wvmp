@@ -25,8 +25,8 @@
 ;   [rsp+56] = local 4: d (r9)
 ;   [rsp+72] = original - 8 = saved rbx
 
-; MSVC C++ 名称修饰 (x64): ?marker_begin@sdk@wvmp@@YAXXZ (void marker_begin())
-EXTERNDEF ?marker_begin@sdk@wvmp@@YAXXZ : PROC
+; MSVC C++ 名称修饰 (x64): ?marker_begin@sdk@wvmp@@YAXPEBD@Z (void marker_begin())
+EXTERNDEF ?marker_begin@sdk@wvmp@@YAXPEBD@Z : PROC
 EXTERNDEF ?marker_end@sdk@wvmp@@YAXXZ   : PROC
 
 _TEXT SEGMENT
@@ -49,7 +49,7 @@ cmove_fn PROC
     mov  dword ptr [rsp+56], r9d   ; save d
 
     ; ===== marker region begin =====
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
 
     mov  ecx, dword ptr [rsp+32]
     mov  edx, dword ptr [rsp+40]
@@ -82,7 +82,7 @@ cmovne_fn PROC
     mov  dword ptr [rsp+56], r9d
 
     ; ===== marker region begin =====
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
 
     mov  ecx, dword ptr [rsp+32]
     mov  edx, dword ptr [rsp+40]
@@ -115,7 +115,7 @@ cmovb_fn PROC
     mov  dword ptr [rsp+56], r9d
 
     ; ===== marker region begin =====
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
 
     mov  ecx, dword ptr [rsp+32]
     mov  edx, dword ptr [rsp+40]
@@ -148,7 +148,7 @@ cmovg_fn PROC
     mov  dword ptr [rsp+56], r9d
 
     ; ===== marker region begin =====
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
 
     mov  ecx, dword ptr [rsp+32]
     mov  edx, dword ptr [rsp+40]
@@ -181,7 +181,7 @@ cmovl_fn PROC
     mov  dword ptr [rsp+56], r9d
 
     ; ===== marker region begin =====
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
 
     mov  ecx, dword ptr [rsp+32]
     mov  edx, dword ptr [rsp+40]
@@ -214,7 +214,7 @@ cmovge_fn PROC
     mov  dword ptr [rsp+56], r9d
 
     ; ===== marker region begin =====
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
 
     mov  ecx, dword ptr [rsp+32]
     mov  edx, dword ptr [rsp+40]

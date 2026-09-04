@@ -14,7 +14,7 @@
 ;
 ; Win64 ABI / 栈对齐 / rax clobber 约定同 div_sample_asm.asm。
 
-EXTERNDEF ?marker_begin@sdk@wvmp@@YAXXZ : PROC
+EXTERNDEF ?marker_begin@sdk@wvmp@@YAXPEBD@Z : PROC
 EXTERNDEF ?marker_end@sdk@wvmp@@YAXXZ   : PROC
 
 _TEXT SEGMENT
@@ -28,7 +28,7 @@ dfr_idiv64 PROC
     mov  [rsp+20h], rcx                 ; a
     mov  [rsp+28h], rdx                 ; b
     mov  rbx, r8                        ; out (callee-saved 跨 marker 调用)
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     ; ===== marker region begin =====
     mov  rax, [rsp+20h]                 ; rax = a
     mov  rdi, [rsp+28h]                 ; rdi = b
@@ -67,7 +67,7 @@ dfr_div32 PROC
     mov  dword ptr [rsp+20h], ecx       ; a
     mov  dword ptr [rsp+24h], edx       ; b
     mov  rbx, r8                        ; out
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     ; ===== marker region begin =====
     mov  eax, dword ptr [rsp+20h]       ; eax = a
     mov  ecx, dword ptr [rsp+24h]       ; ecx = b
@@ -105,7 +105,7 @@ dfr_idiv32 PROC
     mov  dword ptr [rsp+20h], ecx       ; a
     mov  dword ptr [rsp+24h], edx       ; b (MEM 除数)
     mov  rbx, r8
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     ; ===== marker region begin =====
     mov  eax, dword ptr [rsp+20h]       ; eax = a
     cdq                                 ; 99

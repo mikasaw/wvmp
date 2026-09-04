@@ -20,8 +20,8 @@
 ; ⚠️ rax 跨 marker_end/marker_begin 调用会被 clobber (SDK `mov rax, imm64`
 ; 加载 magic 立即数), 位图案结果一律 region 后 movq rax, xmm0 提取。
 
-; MSVC C++ 名称修饰 (x64): ?marker_begin@sdk@wvmp@@YAXXZ (void marker_begin())
-EXTERNDEF ?marker_begin@sdk@wvmp@@YAXXZ : PROC
+; MSVC C++ 名称修饰 (x64): ?marker_begin@sdk@wvmp@@YAXPEBD@Z (void marker_begin())
+EXTERNDEF ?marker_begin@sdk@wvmp@@YAXPEBD@Z : PROC
 EXTERNDEF ?marker_end@sdk@wvmp@@YAXXZ   : PROC
 
 ; C 链接全局 (sse_fin_sample_main.cpp extern "C"): MASM 直引 → rip-relative
@@ -38,7 +38,7 @@ fin_mulss_rr PROC
     movd xmm1, edx                   ; 区外: b
 
     ; ===== marker region begin =====
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     mulss xmm0, xmm1                 ; F3 0F 59 C1 (scalar single)
     nop
     nop
@@ -55,7 +55,7 @@ fin_mulsd_rr PROC
     movq xmm1, rdx
 
     ; ===== marker region begin =====
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     mulsd xmm0, xmm1                 ; F2 0F 59 C1 (scalar double)
     nop
     nop
@@ -72,7 +72,7 @@ fin_mulsd_mem PROC
     movq xmm0, rcx
 
     ; ===== marker region begin =====
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     mulsd xmm0, qword ptr [g_fin_d]  ; F2 0F 59 05 rel32 (rip mem 源)
     nop
     nop
@@ -90,7 +90,7 @@ fin_mulps_rr PROC
     movq xmm1, rdx
 
     ; ===== marker region begin =====
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     mulps xmm0, xmm1                 ; 0F 59 C1 (packed single)
     nop
     nop
@@ -107,7 +107,7 @@ fin_mulpd_rr PROC
     movq xmm1, rdx
 
     ; ===== marker region begin =====
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     mulpd xmm0, xmm1                 ; 66 0F 59 C1 (packed double)
     nop
     nop
@@ -123,7 +123,7 @@ fin_mulps_mem PROC
     movq xmm0, rcx
 
     ; ===== marker region begin =====
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     mulps xmm0, xmmword ptr [g_fin_ps]  ; 0F 59 05 rel32 (rip mem 源)
     nop
     nop
@@ -143,7 +143,7 @@ fin_andnps_rr PROC
     movq xmm1, rdx
 
     ; ===== marker region begin =====
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     andnps xmm0, xmm1                ; 0F 55 C1
     nop
     nop
@@ -161,7 +161,7 @@ fin_andnpd_rr PROC
     movq xmm1, rdx
 
     ; ===== marker region begin =====
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     andnpd xmm0, xmm1                ; 66 0F 55 C1
     nop
     nop
@@ -179,7 +179,7 @@ fin_pandn_rr PROC
     movq xmm1, rdx
 
     ; ===== marker region begin =====
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     pandn  xmm0, xmm1                ; 66 0F DF C1
     nop
     nop
@@ -197,7 +197,7 @@ fin_pand_rr PROC
     movq xmm1, rdx
 
     ; ===== marker region begin =====
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     pand   xmm0, xmm1                ; 66 0F DB C1
     nop
     nop
@@ -214,7 +214,7 @@ fin_por_rr PROC
     movq xmm1, rdx
 
     ; ===== marker region begin =====
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     por    xmm0, xmm1                ; 66 0F EB C1
     nop
     nop
@@ -231,7 +231,7 @@ fin_pxor_rr PROC
     movq xmm1, rdx
 
     ; ===== marker region begin =====
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     pxor   xmm0, xmm1                ; 66 0F EF C1
     nop
     nop
@@ -248,7 +248,7 @@ fin_pand_mem PROC
     movq xmm0, rcx
 
     ; ===== marker region begin =====
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     pand   xmm0, xmmword ptr [g_fin_pi]  ; 66 0F DB 05 rel32
     nop
     nop
@@ -267,7 +267,7 @@ fin_paddq_neg PROC
     movq xmm1, rdx
 
     ; ===== marker region begin =====
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     paddq  xmm0, xmm1                ; 66 0F D4 C1 (gate 负例)
     nop
     nop

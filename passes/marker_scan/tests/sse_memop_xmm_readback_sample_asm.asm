@@ -26,8 +26,8 @@
 ; 加载 magic 立即数), out 指针必须放 callee-saved 寄存器 rbx (pitfall #36);
 ; seta 结果 marker_end 前存 [rsp+24]、之后还原。
 
-; MSVC C++ 名称修饰 (x64): ?marker_begin@sdk@wvmp@@YAXXZ (void marker_begin())
-EXTERNDEF ?marker_begin@sdk@wvmp@@YAXXZ : PROC
+; MSVC C++ 名称修饰 (x64): ?marker_begin@sdk@wvmp@@YAXPEBD@Z (void marker_begin())
+EXTERNDEF ?marker_begin@sdk@wvmp@@YAXPEBD@Z : PROC
 EXTERNDEF ?marker_end@sdk@wvmp@@YAXXZ   : PROC
 
 _DATA SEGMENT
@@ -76,7 +76,7 @@ mop_comiss_gt PROC
     load_slots
 
     ; ===== marker region begin =====
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     comiss xmm0, dword ptr [g_sh_f]   ; 0F 2F 05 rel32 (rip mem 源)
     seta   al                         ; a > g_sh_f → 1
     movzx rax, al
@@ -102,7 +102,7 @@ mop_comisd_gt PROC
     load_slots
 
     ; ===== marker region begin =====
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     comisd xmm0, qword ptr [g_sh_d]   ; 66 0F 2F 05 rel32 (rip mem 源)
     seta   al                         ; a > g_sh_d → 1
     movzx rax, al
@@ -128,7 +128,7 @@ mop_andpd_reg PROC
     load_slots
 
     ; ===== marker region begin =====
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     andpd xmm0, xmm1                  ; 66 0F 54 C1
     nop
     nop
@@ -151,7 +151,7 @@ mop_orpd_mem PROC
     load_slots
 
     ; ===== marker region begin =====
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     orpd  xmm0, xmmword ptr [g_sh_pd] ; 66 0F 56 05 rel32
     call ?marker_end@sdk@wvmp@@YAXXZ
     ; ===== marker region end =====
@@ -172,7 +172,7 @@ mop_xorpd_reg PROC
     load_slots
 
     ; ===== marker region begin =====
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     xorpd xmm0, xmm1                  ; 66 0F 57 C1
     nop
     nop
@@ -196,7 +196,7 @@ mop_addsd_stack PROC
     load_slots
 
     ; ===== marker region begin =====
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     addsd xmm0, qword ptr [rsp+40]    ; F2 0F 58 44 24 28
     call ?marker_end@sdk@wvmp@@YAXXZ
     ; ===== marker region end =====
@@ -218,7 +218,7 @@ mop_triple PROC
     load_slots
 
     ; ===== marker region begin =====
-    call ?marker_begin@sdk@wvmp@@YAXXZ
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     movsd xmm1, qword ptr [g_sh_g]    ; 读 (F2 0F 10 0D rel32)
     addsd xmm1, xmm0                  ; 算 (F2 0F 58 C8)
     movsd qword ptr [g_sh_g], xmm1    ; 写回 (F2 0F 11 0D rel32)
