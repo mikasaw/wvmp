@@ -14,6 +14,7 @@
 
 #include "wvmp/framework/context.hpp"
 #include "wvmp/framework/diagnostics.hpp"
+#include "wvmp/framework/keys.hpp"
 #include "wvmp/framework/pass.hpp"
 #include "wvmp/framework/phase.hpp"
 #include "wvmp/framework/pipeline.hpp"
@@ -112,6 +113,13 @@ int cmd_protect(const wvmp::cli::ArgsResult& args) {
     std::printf("[wvmp] output: %s%s\n", output.c_str(),
                 output != config.output ? "（-o 覆盖）" : "");
     std::printf("[wvmp] seed  : %llu\n", static_cast<unsigned long long>(config.seed));
+    if (!config.rules.functions.empty() ||
+        config.rules.default_level != wvmp::ProtectLevel::Virtualize) {
+        std::printf("[wvmp] 档位  : default=%.*s, %zu 条函数规则\n",
+                    static_cast<int>(wvmp::to_string(config.rules.default_level).size()),
+                    wvmp::to_string(config.rules.default_level).data(),
+                    config.rules.functions.size());
+    }
     std::printf("[wvmp] %s\n", describe_pipeline(pipeline).c_str());
 
     if (args.dry_run) {
@@ -136,6 +144,9 @@ int cmd_protect(const wvmp::cli::ArgsResult& args) {
         }
         return wvmp::passes::kTargetArchAuto;
     }(config.arch);
+    // MIT-457 配置系统 v1：保护规则集入槽（kProtectRules）。空规则集也写入
+    // ——对 pass 而言"缺省档位"语义与槽缺席等价，写入统一两条取值路径。
+    ctx.slot<wvmp::ProtectRules>(wvmp::kProtectRules) = config.rules;
 
     try {
         pipeline.run(ctx);
@@ -155,6 +166,19 @@ int cmd_protect(const wvmp::cli::ArgsResult& args) {
     }
 
     print_diag_notes(ctx.diag);
+    // MIT-457 配置系统 v1：区域清单单行披露（[[functions]] 规则的 rva/index
+    // 选择器取此口径）。放 CLI 而非 marker_scan Note——pass 层保持"正常路径
+    // 零诊断"的既有测试契约。
+    if (!ctx.functions.empty()) {
+        std::string list = "[wvmp] 区域清单:";
+        for (size_t i = 0; i < ctx.functions.size(); ++i) {
+            char buf[64];
+            std::snprintf(buf, sizeof(buf), " [%zu] rva=0x%llX", i,
+                          static_cast<unsigned long long>(ctx.functions[i].begin_rva));
+            list += buf;
+        }
+        std::printf("%s\n", list.c_str());
+    }
     std::printf("[wvmp] 完成: %s -> %s\n", config.input.c_str(), output.c_str());
     return 0;
 }

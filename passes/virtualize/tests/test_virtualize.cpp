@@ -2,6 +2,7 @@
 
 #include "wvmp/framework/context.hpp"
 #include "wvmp/framework/keys.hpp"
+#include "wvmp/framework/protect_levels.hpp"
 #include "wvmp/framework/phase.hpp"
 #include "wvmp/ir/insn.hpp"
 #include "wvmp/ir/operand.hpp"
@@ -251,3 +252,97 @@ TEST(VirtualizePass, GateSkipsFunctionWithLifterSkip) {
 }
 
 } // namespace
+
+// ==================== MIT-457 配置系统 v1：档位选择 ====================
+
+TEST(VirtualizePass, LevelNoneRuleSkipsFunctionWithNote) {
+    // rva 选择器命中 → 该函数不进 kVmProgram 且记 Note；另一函数照常虚拟化。
+    wvmp::ProtectionContext ctx;
+    ctx.functions.push_back(make_sample_function("kept"));    // begin_rva=0x1000
+    ctx.functions.push_back(make_sample_function("skipped")); // begin_rva=0x1000
+    ctx.functions[1].begin_rva = 0x2000;                      // 区分 rva 选择器
+    wvmp::ProtectRules rules;
+    wvmp::FunctionProtectRule rule;
+    rule.has_rva = true;
+    rule.rva = 0x2000;
+    rule.level = wvmp::ProtectLevel::None;
+    rules.functions.push_back(rule);
+    ctx.slot<wvmp::ProtectRules>(wvmp::kProtectRules) = rules;
+
+    wvmp::passes::VirtualizePass pass;
+    pass.run(ctx);
+
+    const auto* vfs = ctx.find_slot<std::vector<wvmp::passes::VirtualizedFunction>>(wvmp::kVmProgram);
+    ASSERT_NE(vfs, nullptr);
+    ASSERT_EQ(vfs->size(), static_cast<size_t>(1));
+    EXPECT_EQ(vfs->at(0).name, "kept");
+    bool has_config_note = false;
+    for (const auto& d : ctx.diag.items())
+        if (d.message.find("level=none") != std::string::npos &&
+            d.message.find("skipped") != std::string::npos)
+            has_config_note = true;
+    EXPECT_TRUE(has_config_note);
+    EXPECT_FALSE(ctx.diag.has_errors());
+}
+
+TEST(VirtualizePass, DefaultNoneOnlySelectedVirtualized) {
+    // default_level=none + index 规则放行 → 只有被点名的函数虚拟化。
+    wvmp::ProtectionContext ctx;
+    ctx.functions.push_back(make_sample_function("off0"));
+    ctx.functions.push_back(make_sample_function("on1"));
+    wvmp::ProtectRules rules;
+    rules.default_level = wvmp::ProtectLevel::None;
+    wvmp::FunctionProtectRule rule;
+    rule.has_index = true;
+    rule.index = 1;
+    rule.level = wvmp::ProtectLevel::Virtualize;
+    rules.functions.push_back(rule);
+    ctx.slot<wvmp::ProtectRules>(wvmp::kProtectRules) = rules;
+
+    wvmp::passes::VirtualizePass pass;
+    pass.run(ctx);
+
+    const auto* vfs = ctx.find_slot<std::vector<wvmp::passes::VirtualizedFunction>>(wvmp::kVmProgram);
+    ASSERT_NE(vfs, nullptr);
+    ASSERT_EQ(vfs->size(), static_cast<size_t>(1));
+    EXPECT_EQ(vfs->at(0).name, "on1");
+}
+
+TEST(VirtualizePass, AbsentSlotKeepsLegacyBehavior) {
+    // 槽缺席（直连 API 不装配配置）= 全部 Virtualize，v1 之前行为不变。
+    wvmp::ProtectionContext ctx;
+    ctx.functions.push_back(make_sample_function("legacy"));
+    EXPECT_FALSE(ctx.has_slot(wvmp::kProtectRules));
+
+    wvmp::passes::VirtualizePass pass;
+    pass.run(ctx);
+
+    const auto* vfs = ctx.find_slot<std::vector<wvmp::passes::VirtualizedFunction>>(wvmp::kVmProgram);
+    ASSERT_NE(vfs, nullptr);
+    ASSERT_EQ(vfs->size(), static_cast<size_t>(1));
+    EXPECT_EQ(vfs->at(0).name, "legacy");
+}
+
+TEST(ProtectRulesLevelFor, SelectorPriorityAndDefault) {
+    // level_for 仲裁序：缺省 → index 规则覆盖 → rva 规则再覆盖（后评胜）。
+    wvmp::ProtectRules rules;
+    EXPECT_EQ(rules.level_for(0x1000, 0), wvmp::ProtectLevel::Virtualize);
+
+    rules.default_level = wvmp::ProtectLevel::None;
+    EXPECT_EQ(rules.level_for(0x1000, 0), wvmp::ProtectLevel::None);
+
+    wvmp::FunctionProtectRule by_index;
+    by_index.has_index = true;
+    by_index.index = 0;
+    by_index.level = wvmp::ProtectLevel::Virtualize;
+    rules.functions.push_back(by_index);
+    EXPECT_EQ(rules.level_for(0x1000, 0), wvmp::ProtectLevel::Virtualize);
+    EXPECT_EQ(rules.level_for(0x1000, 1), wvmp::ProtectLevel::None);  // index 不命中
+
+    wvmp::FunctionProtectRule by_rva;
+    by_rva.has_rva = true;
+    by_rva.rva = 0x1000;
+    by_rva.level = wvmp::ProtectLevel::None;
+    rules.functions.push_back(by_rva);
+    EXPECT_EQ(rules.level_for(0x1000, 0), wvmp::ProtectLevel::None);  // rva 后评胜
+}

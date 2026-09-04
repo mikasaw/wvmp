@@ -290,3 +290,112 @@ TEST(ConfigParse, ArchWrongTypeRejected) {
 }
 
 } // namespace
+
+// ==================== MIT-457 配置系统 v1：保护档位规则 ====================
+
+TEST(ConfigParse, ProtectRulesFullForm) {
+    const TempToml toml(
+        "input  = \"target.exe\"\n"
+        "output = \"out.exe\"\n"
+        "default_level = \"none\"\n"
+        "\n"
+        "[[functions]]\n"
+        "rva = 0xAEBB\n"
+        "level = \"virtualize\"\n"
+        "[[functions]]\n"
+        "index = 3\n"
+        "[[passes]]\n"
+        "name = \"pe_loader\"\n");
+    const auto result = wvmp::cli::parse_config(toml.path());
+    ASSERT_TRUE(result.ok) << result.error;
+    EXPECT_EQ(result.value.rules.default_level, wvmp::ProtectLevel::None);
+    ASSERT_EQ(result.value.rules.functions.size(), size_t{2});
+    EXPECT_TRUE(result.value.rules.functions[0].has_rva);
+    EXPECT_FALSE(result.value.rules.functions[0].has_index);
+    EXPECT_EQ(result.value.rules.functions[0].rva, uint64_t{0xAEBB});
+    EXPECT_EQ(result.value.rules.functions[0].level, wvmp::ProtectLevel::Virtualize);
+    EXPECT_TRUE(result.value.rules.functions[1].has_index);
+    EXPECT_EQ(result.value.rules.functions[1].index, uint64_t{3});
+    // level 可省略 = virtualize。
+    EXPECT_EQ(result.value.rules.functions[1].level, wvmp::ProtectLevel::Virtualize);
+}
+
+TEST(ConfigParse, ProtectRulesAbsentDefaultsEmpty) {
+    const TempToml toml(
+        "input  = \"target.exe\"\n"
+        "output = \"out.exe\"\n");
+    const auto result = wvmp::cli::parse_config(toml.path());
+    ASSERT_TRUE(result.ok) << result.error;
+    EXPECT_EQ(result.value.rules.default_level, wvmp::ProtectLevel::Virtualize);
+    EXPECT_TRUE(result.value.rules.functions.empty());
+}
+
+TEST(ConfigParse, ProtectRulesUnknownDefaultLevelFails) {
+    const TempToml toml(
+        "input  = \"target.exe\"\n"
+        "output = \"out.exe\"\n"
+        "default_level = \"ultra\"\n");
+    const auto result = wvmp::cli::parse_config(toml.path());
+    ASSERT_FALSE(result.ok);
+    EXPECT_TRUE(contains(result.error, "default_level"));
+}
+
+TEST(ConfigParse, ProtectRulesUnknownLevelFails) {
+    const TempToml toml(
+        "input  = \"target.exe\"\n"
+        "output = \"out.exe\"\n"
+        "[[functions]]\n"
+        "rva = 1\n"
+        "level = \"mutate\"\n");
+    const auto result = wvmp::cli::parse_config(toml.path());
+    ASSERT_FALSE(result.ok);
+    EXPECT_TRUE(contains(result.error, "level"));
+}
+
+TEST(ConfigParse, ProtectRulesBothSelectorsFails) {
+    const TempToml toml(
+        "input  = \"target.exe\"\n"
+        "output = \"out.exe\"\n"
+        "[[functions]]\n"
+        "rva = 1\n"
+        "index = 2\n");
+    const auto result = wvmp::cli::parse_config(toml.path());
+    ASSERT_FALSE(result.ok);
+    EXPECT_TRUE(contains(result.error, "二选一"));
+}
+
+TEST(ConfigParse, ProtectRulesNoSelectorFails) {
+    const TempToml toml(
+        "input  = \"target.exe\"\n"
+        "output = \"out.exe\"\n"
+        "[[functions]]\n"
+        "level = \"none\"\n");
+    const auto result = wvmp::cli::parse_config(toml.path());
+    ASSERT_FALSE(result.ok);
+    EXPECT_TRUE(contains(result.error, "选择器"));
+}
+
+TEST(ConfigParse, ProtectRulesNegativeSelectorFails) {
+    const TempToml toml(
+        "input  = \"target.exe\"\n"
+        "output = \"out.exe\"\n"
+        "[[functions]]\n"
+        "index = -1\n");
+    const auto result = wvmp::cli::parse_config(toml.path());
+    ASSERT_FALSE(result.ok);
+    EXPECT_TRUE(contains(result.error, "index"));
+}
+
+TEST(ConfigParse, ProtectRulesDuplicateSelectorFails) {
+    const TempToml toml(
+        "input  = \"target.exe\"\n"
+        "output = \"out.exe\"\n"
+        "[[functions]]\n"
+        "rva = 0x1000\n"
+        "level = \"none\"\n"
+        "[[functions]]\n"
+        "rva = 0x1000\n");
+    const auto result = wvmp::cli::parse_config(toml.path());
+    ASSERT_FALSE(result.ok);
+    EXPECT_TRUE(contains(result.error, "重复"));
+}

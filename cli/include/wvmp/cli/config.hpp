@@ -9,6 +9,8 @@
 
 #include "wvmp/common/types.hpp"
 
+#include "wvmp/framework/protect_levels.hpp"
+
 #include <filesystem>
 #include <string>
 #include <vector>
@@ -32,6 +34,10 @@ struct WvmpConfig {
     wvmp::u64 seed = 0;
     ArchOpt arch = ArchOpt::Auto;   // B.5: 缺省 auto = 现状行为不变
     std::vector<PassConfig> passes; // 配置顺序（Pipeline 会按 Phase 稳定排序）
+
+    // MIT-457 配置系统 v1：保护档位（default_level 可省略 = virtualize；
+    // [[functions]] 每函数规则，选择器 rva/index 恰一）。
+    ProtectRules rules;
 };
 
 // 轻量 Result<T>：ok=false 时 error 给出用户可读的失败描述（文件不存在 /

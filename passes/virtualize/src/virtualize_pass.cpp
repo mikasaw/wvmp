@@ -2,10 +2,12 @@
 
 #include "wvmp/framework/context.hpp"
 #include "wvmp/framework/keys.hpp"
+#include "wvmp/framework/protect_levels.hpp"
 #include "wvmp/framework/registry.hpp"
 #include "wvmp/regvm/backend/regvm_backend.hpp"
 #include "wvmp/vm/backend.hpp"
 
+#include <cstdio>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -16,6 +18,13 @@ namespace {
 // 引用 regvm 的具名工厂符号，确保其翻译单元（含静态注册）进入链接——
 // 否则 MSVC 会丢弃归档中无引用的自注册对象，create_backend 查不到后端。
 const auto kRegVmAnchor = &regvm::make_regvm;
+
+std::string hex64(u64 v) {
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "0x%llX",
+                  static_cast<unsigned long long>(v));
+    return buf;
+}
 
 } // namespace
 
@@ -39,7 +48,19 @@ void VirtualizePass::run(ProtectionContext& ctx) {
     auto& virtualized = ctx.slot<std::vector<VirtualizedFunction>>(kVmProgram);
     virtualized.clear();
 
-    for (const auto& fn : ctx.functions) {
+    // MIT-457 配置系统 v1：保护档位规则（CLI 写入 kProtectRules；槽缺席 =
+    // 直连 API 未装配配置 = 全部缺省档位，与 v1 之前行为一致）。
+    const ProtectRules* rules = ctx.find_slot<ProtectRules>(kProtectRules);
+
+    for (size_t fn_index = 0; fn_index < ctx.functions.size(); ++fn_index) {
+        const ir::FunctionRegion& fn = ctx.functions[fn_index];
+        if (rules != nullptr &&
+            rules->level_for(fn.begin_rva, fn_index) == ProtectLevel::None) {
+            ctx.diag.report(Severity::Note, name(),
+                            "函数 " + fn.name + " 按配置 level=none 保持原生（rva=" +
+                                hex64(fn.begin_rva) + "）");
+            continue;
+        }
         if (fn.blocks.empty()) {
             ctx.diag.report(Severity::Note, name(),
                             "函数 " + fn.name + " 无已 lift 的基本块，跳过虚拟化");
