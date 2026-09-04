@@ -46,3 +46,4 @@ scripts/__pycache__/
 /protected_*.txt
 /cl_shift_e2e.txt
 /popcnt_test.asm
+Testing/
