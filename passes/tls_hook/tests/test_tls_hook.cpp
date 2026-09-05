@@ -369,6 +369,152 @@ TEST(TlsHookAdbInit, DisabledLeavesPlaceholderBytes) {
     EXPECT_EQ(d[18], 0xC3u);
 }
 
+
+// MIT-470：DRx 位请求但目标无 GetThreadContext 导入 → 静默降级（无 CONTEXT
+// 暂存追加），其余面（PEB init 块）照常。
+TEST(TlsHookAdbInit, DrxWithoutGetThreadContextFallsBack) {
+    const u64 base = 0x140000000;
+    ProtectionContext ctx;
+    ctx.image = make_image(true, 0x8664, base);  // 夹具无导入表
+    ctx.slot<PeImage>(kPeImage) = make_meta(true, 0x8664, base);
+    NewSection sec;
+    sec.name = ".wvmp";
+    sec.data.assign(16, 0);
+    sec.requested_rva = 0x2000u;
+    ctx.slot<std::vector<NewSection>>(kNewSections).push_back(sec);
+    wvmp::passes::anti_debug::AntiDebugPlan adb;
+    adb.init_techniques = wvmp::passes::anti_debug::tech::kBeingDebugged |
+                          wvmp::passes::anti_debug::tech::kHardwareBreakpoints;
+    ctx.slot<wvmp::passes::anti_debug::AntiDebugPlan>(kAntiDebugPlan) = adb;
+
+    TlsHookPass pass;
+    pass.run(ctx);
+
+    const auto* plan = ctx.find_slot<tls_hook::TlsPlan>(kTlsPlan);
+    ASSERT_NE(plan, nullptr);
+    // 与 drx 关闭的等价用例对照：无 CONTEXT 暂存追加（尺寸差 = 0）。先跑
+    // 对照 ctx。
+    ProtectionContext ctx2;
+    ctx2.image = make_image(true, 0x8664, base);
+    ctx2.slot<PeImage>(kPeImage) = make_meta(true, 0x8664, base);
+    NewSection sec2;
+    sec2.name = ".wvmp";
+    sec2.data.assign(16, 0);
+    sec2.requested_rva = 0x2000u;
+    ctx2.slot<std::vector<NewSection>>(kNewSections).push_back(sec2);
+    wvmp::passes::anti_debug::AntiDebugPlan adb2;
+    adb2.init_techniques = wvmp::passes::anti_debug::tech::kBeingDebugged;
+    ctx2.slot<wvmp::passes::anti_debug::AntiDebugPlan>(kAntiDebugPlan) = adb2;
+    TlsHookPass pass2;
+    pass2.run(ctx2);
+
+    const auto& d1 = ctx.find_slot<std::vector<NewSection>>(kNewSections)->at(0).data;
+    const auto& d2 = ctx2.find_slot<std::vector<NewSection>>(kNewSections)->at(0).data;
+    EXPECT_EQ(d1.size(), d2.size());  // DRx 降级 = 无额外追加
+}
+
+
+
+// 带单条 GetThreadContext 导入的最小导入面（DRx 槽定位正例夹具）。
+// desc0 @RVA 0x1000：INT=0x1080、FT=0x10A0；INT 槽0 → 名字 @0x10C0。
+static std::vector<u8> make_image_with_gtc_import(u64 base) {
+    auto img = make_image(true, 0x8664, base);
+    auto wr32 = [&](size_t off, u32 v) {
+        for (int i = 0; i < 4; ++i) img[off + i] = u8((v >> (8 * i)) & 0xFF);
+    };
+    auto rva2off = [](u32 rva) { return size_t(rva) - 0x1000 + 0x400; };
+    wr32(rva2off(0x1000) + 0, 0x1080);   // INT
+    wr32(rva2off(0x1000) + 16, 0x10A0);  // FT
+    wr32(rva2off(0x1080), 0x10C0);       // 槽0 → IMAGE_IMPORT_BY_NAME
+    wr32(rva2off(0x1080) + 4, 0);        // 槽1 = NULL（x64 槽 8B：+4 也是 0）
+    img[rva2off(0x10C0)] = 0;
+    img[rva2off(0x10C0) + 1] = 0;
+    std::memcpy(&img[rva2off(0x10C0) + 2], "GetThreadContext", 16);
+    img[rva2off(0x10C0) + 18] = 0;
+    const size_t dd1 = kOpt + 112 + 1 * 8;
+    wr32(dd1, 0x1000);
+    wr32(dd1 + 4, 20);
+    return img;
+}
+
+// MIT-470 验收返工防回归：x64 DRx 块的 Dr0-Dr3 比较偏移必须是 0x48/0x50/
+// 0x58/0x60（winnt.h x64 CONTEXT；0x88/0x90/0x98/0xA0 是整型寄存器 home，
+// DEBUG_REGISTERS-only 调用恒零 → 永不命中的静默失效形态）。
+// cmp qword ptr [rdx+disp8], 0 = 48 83 BA <disp32> 00 00 00 00 —— keystone
+// 出 disp32 形（48 83 BA 只带 imm8 符号扩展……实为 48 83 BA imm8 或
+// 48 81 BA imm32），此处按助记符宽松断言四条 cmp 顺序 + 每条紧随的
+// jne drx_fail（75 xx）。
+TEST(TlsHookAdbInit, X64DrxOffsetsAreDebugRegisterSlots) {
+    const u64 base = 0x140000000;
+    ProtectionContext ctx;
+    ctx.image = make_image(true, 0x8664, base);
+    ctx.slot<PeImage>(kPeImage) = make_meta(true, 0x8664, base);
+    ctx.image = make_image_with_gtc_import(base);
+    ctx.slot<PeImage>(kPeImage) = make_meta(true, 0x8664, base);
+    NewSection sec;
+    sec.name = ".wvmp";
+    sec.data.assign(16, 0);
+    sec.requested_rva = 0x3000u;
+    ctx.slot<std::vector<NewSection>>(kNewSections).push_back(sec);
+    wvmp::passes::anti_debug::AntiDebugPlan adb;
+    adb.init_techniques = wvmp::passes::anti_debug::tech::kHardwareBreakpoints;
+    ctx.slot<wvmp::passes::anti_debug::AntiDebugPlan>(kAntiDebugPlan) = adb;
+
+    TlsHookPass pass;
+    pass.run(ctx);
+
+    const auto* plan = ctx.find_slot<tls_hook::TlsPlan>(kTlsPlan);
+    ASSERT_NE(plan, nullptr);
+    const auto& d = ctx.find_slot<std::vector<NewSection>>(kNewSections)->at(0).data;
+    const size_t cb = size_t(plan->callback_rva - 0x3000);
+    // cmp qword ptr [rdx+0x48], 0 的 disp8/disp32 两形都搜（keystone 选形）：
+    //   disp8: 48 83 BA 48 00 00 00 00
+    //   disp32: 48 8B BA 48 00 00 00 00 (mov rdi,[rdx+0x48]) 不适用——cmp 的
+    //   disp32 形 = 48 81 BA <imm32>。逐字节搜 0x48/0x50/0x58/0x60 依序出现。
+    bool ok48 = false, ok50 = false, ok58 = false, ok60 = false;
+    // cmp qword ptr [rdx+disp], 0 的两种编码：
+    //   disp8 形  48 83 7A <disp8> 00           （ModRM 7A = [rdx+disp8]）
+    //   disp32 形 48 81 BA <disp32 LE> 00 00 00 00（ModRM BA = [rdx+disp32]）
+    const auto scan = [&](size_t i, u8 disp) {
+        if (i + 8 > d.size()) return false;
+        if (d[i] == 0x48 && d[i+1] == 0x83 && d[i+2] == 0x7A &&
+            d[i+3] == disp && d[i+4] == 0x00) return true;
+        if (d[i] == 0x48 && d[i+1] == 0x81 && d[i+2] == 0xBA &&
+            d[i+3] == disp && d[i+4] == 0x00 && d[i+5] == 0x00 &&
+            d[i+6] == 0x00 && d[i+7] == 0x00) return true;
+        return false;
+    };
+    for (size_t i = cb; i + 8 <= d.size(); ++i) {
+        if (scan(i, 0x48)) ok48 = true;
+        if (scan(i, 0x50)) ok50 = true;
+        if (scan(i, 0x58)) ok58 = true;
+        if (scan(i, 0x60)) ok60 = true;
+    }
+    EXPECT_TRUE(ok48);
+    EXPECT_TRUE(ok50);
+    EXPECT_TRUE(ok58);
+    EXPECT_TRUE(ok60);
+    // ContextFlags 存储编码（x64：字段在 ctx+0x30，非 +0！）：
+    //   mov dword ptr [rdx+0x30], 0x00100010 = C7 82 30 00 00 00 10 00 10 00
+    // 此断言拦截"flags 写错偏移 → GTC 返回成功但零填充 → 永不命中"的
+    // 静默失效形态（T13 第二轮验收实证缺陷）。
+    bool ok_flags = false;
+    for (size_t i = cb; i + 10 <= d.size(); ++i) {
+        // disp8 形  C7 42 30 <imm32>（7B）
+        if (d[i] == 0xC7 && d[i+1] == 0x42 && d[i+2] == 0x30 &&
+            d[i+3] == 0x10 && d[i+4] == 0x00 && d[i+5] == 0x10 && d[i+6] == 0x00) {
+            ok_flags = true; break;
+        }
+        // disp32 形 C7 82 30 00 00 00 <imm32>（10B）
+        if (d[i] == 0xC7 && d[i+1] == 0x82 && d[i+2] == 0x30 && d[i+3] == 0x00 &&
+            d[i+4] == 0x00 && d[i+5] == 0x00 && d[i+6] == 0x10 && d[i+7] == 0x00 &&
+            d[i+8] == 0x10 && d[i+9] == 0x00) {
+            ok_flags = true; break;
+        }
+    }
+    EXPECT_TRUE(ok_flags);
+}
+
 TEST(TlsHookNoop, NoWvmpSectionLeavesNoPlan) {
     ProtectionContext ctx;
     ctx.image = make_image(true, 0x8664, 0x140000000);

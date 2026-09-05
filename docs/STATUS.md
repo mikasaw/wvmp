@@ -449,3 +449,29 @@ density 越界 + 未知子键；tls_hook_tests +1 配置关断；anti_debug note
 探针缺陷三连（int3 可被 init SEH 吞噬 / syscall 桩失准 / cdb 断点早于
 TLS）+ TEB 向量红鲱鱼。**TLS 依赖面（init 反调试 / IAT 回填）在全部已测
 目标上可用**；GAPS 原条目改判留档（探针方法论为长期资产）。
+
+## MIT-470 (T13 · anti_debug 扩面二：DRx 硬件断点检查) ✅ 2026-09-06
+
+**交付**：tech::kHardwareBreakpoints = 1<<2（append-only；仅 TLS init 面
+消费，stub 前缀面忽略）；tls_hook 消费 bit2——GetThreadContext 槽定位
+（INT 名字比对；描述符 FT 已反映迁移后状态 → 同一扫描两态皆准：迁移态 =
+镜像槽、原生态 = 原 IAT），CONTEXT 暂存追加 .wvmp（16 对齐，x64 0x4D0 /
+x86 0x2CC），回调内 GetThreadContext(伪句柄 -2, CONTEXT_DEBUG_REGISTERS)
+→ Dr0-Dr3 任一非零 FailFast；GTC 调用失败（al=0）静默跳过（保守不误杀）；
+目标未导入 GetThreadContext → 面降级（Note）。配置 [anti_debug] drx =
+true/false（opt-in，缺省 false）。x64 块内 sub/add 8 保调用对齐，drx_cleanup
+单一汇合点各路径栈平衡。
+
+**验收返工实录（首轮 REJECT，偏移缺陷）**：x64 CONTEXT Dr0-Dr3 实际位于
+**0x48/0x50/0x58/0x60**（winnt.h；首轮实现误用 0x88/0x90/0x98/0xA0——那是
+整型寄存器 home 槽，DEBUG_REGISTERS-only 调用恒零 → x64 面永不命中的
+静默失效形态）。验收代理以三重实证（winnt.h / MSVC offsetof / 挂起线程
+SetThreadContext(Dr0=0xdeadbeef) 回读）否决。返工：偏移修正 + 防回归单测
+（回调桩 cmp disp 双编码字节断言 0x48/0x50/0x58/0x60 依序在场）+ 本条
+基准值更正。x86 面（+4/8/0xC/0x10）首轮即正确。
+
+**验证**：ctest 23/23（tls_hook_tests 13 用例：DRx 降级对照 + x64 偏移
+防回归 + flags 存储编码断言）；tls_e2e.sh 2/2（11-pass + drx=true）；multiseed
+20/20。**第三轮复核实弹闭环**：调试器 CREATE_THREAD 后武装 Dr0=0xdeadbeef
+→ packed 产物 drx_fail 写 NULL → exit=0xC0000005（FailFast 实际发生）；
+无武装对照跑通零误触发。样本补 touch_get_thread_context。

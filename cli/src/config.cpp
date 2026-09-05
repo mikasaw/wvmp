@@ -339,15 +339,15 @@ ConfigResult parse_config(const std::filesystem::path& file) {
         u32 techniques = 0;
         for (const auto& [key, value] : *at)
             if (key.str() != "being_debugged" && key.str() != "nt_global_flag" &&
-                key.str() != "init")
+                key.str() != "init" && key.str() != "drx")
                 return fail("config [anti_debug] 未知子键 '" + std::string(key.str()) +
-                            "'（允许: being_debugged/nt_global_flag/init）");
+                            "'（允许: being_debugged/nt_global_flag/init/drx）");
         result.value.rules.has_anti_debug_techniques = true;
         result.value.rules.has_anti_debug_init = true;
         // 类型严格校验：布尔子键允许 bool 与 0/1 整数（toml++ permissive
         // 语义，直觉一致），字符串/浮点等一律可读报错（验收 issue：静默
         // 回落缺省 = 配置写错零告警，不可接受）。
-        for (const char* k : {"being_debugged", "nt_global_flag", "init"}) {
+        for (const char* k : {"being_debugged", "nt_global_flag", "init", "drx"}) {
             const toml::node* n = at->get(k);
             if (n != nullptr && !n->is_boolean() && !n->is_integer())
                 return fail("config [anti_debug] '" + std::string(k) +
@@ -361,6 +361,7 @@ ConfigResult parse_config(const std::filesystem::path& file) {
         };
         if (get_bool("being_debugged", true)) techniques |= 0x1;
         if (get_bool("nt_global_flag", true)) techniques |= 0x2;
+        if (get_bool("drx", false)) techniques |= 0x4;  // MIT-470: DRx 面（opt-in）
         result.value.rules.anti_debug_techniques = techniques;
         result.value.rules.anti_debug_init = get_bool("init", true);
     }

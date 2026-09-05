@@ -31,6 +31,15 @@ constexpr size_t kTlsDirIndex = 9;
 // 原回调数组并入条数上限：防御原目录字段损坏时的无界扫描（真实镜像的
 // CRT/用户回调个位数）。触顶视为损坏，按已读到的条数保守并入。
 constexpr size_t kMaxOriginalCallbacks = 256;
+constexpr size_t kMaxDescriptors = 1024;   // MIT-470: 描述符链上限（同 import_protect 口径）
+constexpr size_t kMaxSlotsPerDesc = 4096;  // MIT-470: 单描述符槽上限
+
+// MIT-470：DRx 检查面装配参数（GetThreadContext IAT 槽 + CONTEXT 暂存）。
+struct DrxInfo {
+    u64 gtc_slot_va = 0;   // GetThreadContext 的 IAT 槽 VA（迁移态 = 镜像槽）
+    u64 ctx_va = 0;        // CONTEXT 暂存 VA（.wvmp 内，16 对齐）
+    u32 ctx_flags = 0;     // CONTEXT_DEBUG_REGISTERS（按位宽）
+};
 
 // OptionalHeader 内数据目录区的布局偏移（PE32/PE32+ 可选头定长区不同）。
 size_t opt_num_rva_sizes_off(bool plus) { return plus ? 108u : 92u; }
@@ -174,13 +183,110 @@ std::string build_adb_init_asm(bool is_x86, u32 techniques) {
 std::vector<u8> assemble_callback_stub(bool is_x86,
                                        const import_protect::ImportPlan* imp,
                                        u64 image_base,
-                                       u32 adb_init) {
+                                       u32 adb_init,
+                                       const DrxInfo* drx) {
     ks_engine* ks = nullptr;
     if (ks_open(KS_ARCH_X86, is_x86 ? KS_MODE_32 : KS_MODE_64, &ks) != KS_ERR_OK)
         throw std::runtime_error("tls_hook: ks_open failed");
     ks_option(ks, KS_OPT_SYNTAX, KS_OPT_SYNTAX_INTEL);
     std::string body;
     if (adb_init != 0) body += build_adb_init_asm(is_x86, adb_init);
+    if (drx != nullptr && drx->gtc_slot_va != 0) {
+        // MIT-470：DRx 硬件断点检查——GetThreadContext(伪句柄 -2, CONTEXT)
+        // 取 CONTEXT_DEBUG_REGISTERS，Dr0-Dr3 任一非零 → FailFast。GTC 调用
+        // 失败（al=0）静默跳过（保守：不误杀）。x64 块内 sub/add 8 保 16 对齐；
+        // FailFast 路径栈不再复用（进程即死）。drx_cleanup 为唯一汇合点，
+        // 各路径栈平衡。
+        char db[700];
+        if (is_x86) {
+            std::snprintf(db, sizeof(db),
+                          "mov eax, 0x%llX%c"
+                          "push eax%c"
+                          "mov dword ptr [eax], 0x%08X%c"
+                          "push 0xFFFFFFFE%c"
+                          "mov eax, 0x%llX%c"
+                          "call dword ptr [eax]%c"
+                          "test al, al%c"
+                          "je drx_cleanup%c"
+                          "mov eax, 0x%llX%c"
+                          "cmp dword ptr [eax+4], 0%c"
+                          "jne drx_fail%c"
+                          "cmp dword ptr [eax+8], 0%c"
+                          "jne drx_fail%c"
+                          "cmp dword ptr [eax+0xC], 0%c"
+                          "jne drx_fail%c"
+                          "cmp dword ptr [eax+0x10], 0%c"
+                          "jne drx_fail%c"
+                          "jmp drx_cleanup%c"
+                          "drx_fail:%c"
+                          "xor eax, eax%c"
+                          "mov dword ptr [eax], 0%c"
+                          "drx_cleanup:%c",
+                          drx->ctx_va, char(10),
+                          char(10),
+                          drx->ctx_flags, char(10),
+                          char(10),
+                          drx->gtc_slot_va, char(10),
+                          char(10),
+                          char(10),
+                          char(10),
+                          drx->ctx_va, char(10),
+                          char(10), char(10),
+                          char(10), char(10),
+                          char(10), char(10),
+                          char(10), char(10),
+                          char(10),
+                          char(10),
+                          char(10),
+                          char(10),
+                          char(10));
+        } else {
+            std::snprintf(db, sizeof(db),
+                          "sub rsp, 8%c"
+                          "mov rcx, -2%c"
+                          "mov rdx, 0x%llX%c"
+                          "mov dword ptr [rdx+0x30], 0x%08X%c"
+                          "mov rax, 0x%llX%c"
+                          "call qword ptr [rax]%c"
+                          "test al, al%c"
+                          "je drx_cleanup%c"
+                          "mov rdx, 0x%llX%c"
+                          "cmp qword ptr [rdx+0x48], 0%c"
+                          "jne drx_fail%c"
+                          "cmp qword ptr [rdx+0x50], 0%c"
+                          "jne drx_fail%c"
+                          "cmp qword ptr [rdx+0x58], 0%c"
+                          "jne drx_fail%c"
+                          "cmp qword ptr [rdx+0x60], 0%c"
+                          "jne drx_fail%c"
+                          "jmp drx_cleanup%c"
+                          "drx_fail:%c"
+                          "xor eax, eax%c"
+                          "mov qword ptr [rax], 0%c"
+                          "drx_cleanup:%c"
+                          "add rsp, 8%c",
+                          char(10),
+                          char(10),
+                          drx->ctx_va, char(10),
+                          drx->ctx_flags, char(10),
+                          drx->gtc_slot_va, char(10),
+                          char(10),
+                          char(10),
+                          char(10),
+                          drx->ctx_va, char(10),
+                          char(10), char(10),
+                          char(10), char(10),
+                          char(10), char(10),
+                          char(10), char(10),
+                          char(10),
+                          char(10),
+                          char(10),
+                          char(10),
+                          char(10),
+                          char(10));
+        }
+        body += db;
+    }
     if (imp == nullptr) {
         body += is_x86 ? "xor eax, eax\nret 0Ch" : "xor eax, eax\nret";
     } else {
@@ -319,9 +425,66 @@ void TlsHookPass::run(ProtectionContext& ctx) {
     u32 adb_init = 0;
     if (const auto* adb = ctx.find_slot<wvmp::passes::anti_debug::AntiDebugPlan>(kAntiDebugPlan))
         adb_init = adb->init_techniques;
+    // MIT-470：DRx 检查面（bit2）。经 IAT 调 GetThreadContext（伪句柄 -2
+    // 免导入）。GetThreadContext 槽定位：描述符 FT 已反映迁移后状态（迁移
+    // 时被重指镜像切片；未迁移 = 原 IAT，loader 解析）→ 同一扫描两态皆准。
+    // 目标未导入 GetThreadContext → 该面静默跳过（Note 留痕）。
+    DrxInfo drx{};
+    const bool drx_requested = (adb_init & wvmp::passes::anti_debug::tech::kHardwareBreakpoints) != 0;
+    if (drx_requested) {
+        const size_t dd1 = size_t(pe->nt_headers_offset) + 24 +
+                           (plus ? 112u : 96u) + 1u * 8u;
+        bool gtc_found = false;
+        if (dd1 + 8 <= ctx.image.size()) {
+            const u32 desc_rva = u32(rd_le(ctx.image.data() + dd1, 4));
+            if (desc_rva != 0) {
+                const auto desc_off = pe->rva_to_offset(desc_rva);
+                if (desc_off.has_value()) {
+                    for (size_t i = 0; i < kMaxDescriptors && !gtc_found; ++i) {
+                        const size_t e = *desc_off + i * 20;
+                        if (e + 20 > ctx.image.size()) break;
+                        const u64 int_rva = rd_le(&ctx.image[e], 4);
+                        const u64 ft_rva = rd_le(&ctx.image[e] + 16, 4);
+                        if (int_rva == 0 && ft_rva == 0) break;
+                        const auto int_off = pe->rva_to_offset(u32(int_rva));
+                        if (!int_off.has_value()) continue;
+                        for (size_t s = 0; s < kMaxSlotsPerDesc; ++s) {
+                            const size_t se = *int_off + s * ptr_w;
+                            if (se + ptr_w > ctx.image.size()) break;
+                            const u64 thunk = rd_le(&ctx.image[se], ptr_w);
+                            if (thunk == 0) break;
+                            if (thunk & (u64(1) << 63)) continue;  // x64 ordinal
+                            const auto n_off = pe->rva_to_offset(u32(thunk & 0xFFFFFFFFu));
+                            if (!n_off.has_value() || *n_off + 18 > ctx.image.size()) continue;
+                            if (std::memcmp(ctx.image.data() + *n_off + 2,
+                                            "GetThreadContext", 16) == 0 &&
+                                ctx.image[*n_off + 18] == 0) {
+                                drx.gtc_slot_va = base + ft_rva + u64(s) * ptr_w;
+                                gtc_found = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if (gtc_found) {
+            // CONTEXT 暂存（.wvmp 尾部，16 对齐；x64 0x4D0 / x86 0x2CC）。
+            const size_t ctx_size = plus ? 0x4D0u : 0x2CCu;
+            const u64 ctx_off = (wvmp->data.size() + 15) / 16 * 16;
+            drx.ctx_va = base + wvmp->requested_rva + ctx_off;
+            drx.ctx_flags = plus ? 0x00100010u : 0x00010010u;  // CONTEXT_DEBUG_REGISTERS
+            wvmp->data.resize(static_cast<size_t>(ctx_off), 0);
+            wvmp->data.resize(wvmp->data.size() + ctx_size, 0);
+        } else {
+            ctx.diag.report(Severity::Note, name(),
+                            "目标未导入 kernel32!GetThreadContext，DRx 检查面跳过（保守降级）");
+        }
+    }
     const std::vector<u8> stub =
         assemble_callback_stub(is_x86, (imp != nullptr && imp->active) ? imp : nullptr,
-                               pe->image_base, adb_init);
+                               pe->image_base, adb_init,
+                               (drx_requested && drx.gtc_slot_va != 0) ? &drx : nullptr);
     const u64 cb_off = align_up(wvmp->data.size(), 16);
     const u64 idx_off = align_up(cb_off + stub.size(), 8);
     const OriginalTls orig = read_original_tls(ctx, *pe);

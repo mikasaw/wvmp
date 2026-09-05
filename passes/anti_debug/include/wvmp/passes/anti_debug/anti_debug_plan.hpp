@@ -18,6 +18,10 @@ inline constexpr u32 kNtGlobalFlag  = 1u << 1;  // PEB+NtGlobalFlag & 0x70 != 0
 //   x64: PEB = [gs:0x30 → TEB + 0x60]；NtGlobalFlag @ PEB+0xBC
 //   x86: PEB = [fs:0x18 → TEB + 0x30]；NtGlobalFlag @ PEB+0x68
 inline constexpr u32 kV1All = kBeingDebugged | kNtGlobalFlag;
+// MIT-470 (T13)：DRx 硬件断点检查（Dr0-Dr3 任一非零 = 有硬件断点）。
+// 仅 TLS init 面消费（需经 IAT 调 GetThreadContext，伪句柄 -2 免导入；
+// 目标未导入 GetThreadContext → 该面静默跳过）；stub 入口前缀面忽略此位。
+inline constexpr u32 kHardwareBreakpoints = 1u << 2;
 } // namespace tech
 
 // 命中响应策略（v1 恒 FailFast）：

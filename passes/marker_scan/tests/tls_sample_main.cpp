@@ -27,6 +27,14 @@ static void touch_virtual_protect() {
                    PAGE_READWRITE, &oldp);
 }
 
+// MIT-470：保证 IAT 含 kernel32!GetThreadContext（DRx 检查面硬依赖）。
+// 对当前线程读一次 DEBUG_REGISTERS CONTEXT——行为无害（Dr0-3 恒 0）。
+static void touch_get_thread_context() {
+    CONTEXT c;
+    c.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+    GetThreadContext(GetCurrentThread(), &c);
+}
+
 // 用户 TLS 回调：进程附加时置哨兵。打包后本回调经 tls_hook 的新数组继续
 // 被 loader 调用（合并面）。
 static void NTAPI wvmp_tls_cb(PVOID, DWORD reason, PVOID) {
@@ -57,6 +65,7 @@ static void rgn_tls(void) {
 
 int main() {
     touch_virtual_protect();
+    touch_get_thread_context();
     rgn_tls();
     std::printf("tls g=%08X hit=%08X\n",
                 static_cast<uint32_t>(g_tls_work),
