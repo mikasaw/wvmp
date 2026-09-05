@@ -8,6 +8,7 @@
 
 #include "wvmp/framework/context.hpp"
 #include "wvmp/framework/keys.hpp"
+#include "wvmp/framework/protect_levels.hpp"
 #include "wvmp/framework/registry.hpp"
 #include "wvmp/passes/pe_loader/pe_image.hpp"
 
@@ -282,6 +283,12 @@ std::span<const std::string_view> TlsHookPass::provides_keys() const {
 }
 
 void TlsHookPass::run(ProtectionContext& ctx) {
+    // MIT-468：[tls] enabled=false → 本 pass 空转（配置关断，镜像零改动）。
+    if (const ProtectRules* rules = ctx.find_slot<ProtectRules>(kProtectRules);
+        rules != nullptr && rules->has_tls_enabled && !rules->tls_enabled) {
+        ctx.diag.report(Severity::Note, name(), "TLS 回调基建已按配置关闭（[tls] enabled=false）");
+        return;
+    }
     // .wvmp 节（stub_link 产出）缺席 = 无可挂靠内容 → 空转（镜像零改动）。
     NewSection* wvmp = nullptr;
     if (auto* sections = ctx.find_slot<std::vector<NewSection>>(kNewSections))

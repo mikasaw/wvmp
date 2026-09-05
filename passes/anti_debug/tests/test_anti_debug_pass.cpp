@@ -28,7 +28,7 @@ TEST(AntiDebugPass, WritesPlanWithV1Techniques) {
     EXPECT_FALSE(ctx.diag.has_errors());
     bool has_note = false;
     for (const auto& d : ctx.diag.items())
-        if (d.message.find("BeingDebugged") != std::string::npos) has_note = true;
+        if (d.message.find("PEB 检查已启用") != std::string::npos) has_note = true;
     EXPECT_TRUE(has_note);
 }
 

@@ -22,7 +22,8 @@ namespace {
 // 确定性：独立 Rng（ctx.seed ^ 盐，不消费 ctx.rng —— 下游虚拟化/stub 的
 // 随机序列零扰动，无 mutate 管道回归基线零回踩）；按 functions 序逐函数
 // 逐块逐边界消费，同 seed 逐字节可复现。
-// 密度（v1 代码常量，披露）：每个插入边界 P(nop)=0.10、P(junk mov)=0.15。
+// 密度：v1 代码常量 P(nop)=0.10、P(junk mov)=0.15；MIT-468 起 [mutate]
+// density 可覆写 nop 密度（ProtectRules.has_mutate_density 在场时）。
 
 constexpr u64 kMutateSeedSalt = 0x4D55544154452121ull;  // "MUTATE!!" LE
 constexpr double kNopProbability = 0.10;
@@ -120,6 +121,11 @@ void MutatePass::run(ProtectionContext& ctx) {
     // MIT-457 档位对齐：level=none 的函数不会被 virtualize 消费，跳过变异
     //（变异产物无人消费，省时且日志口径与虚拟化面一致）。
     const ProtectRules* rules = ctx.find_slot<ProtectRules>(kProtectRules);
+    // MIT-468：[mutate] density 覆写 nop 概率（has_* 哨兵；缺省 = 0.10）。
+    const double nop_probability =
+        (rules != nullptr && rules->has_mutate_density)
+            ? static_cast<double>(rules->mutate_density) / 100.0
+            : kNopProbability;
 
     Rng rng(ctx.seed ^ kMutateSeedSalt);
     size_t junk_movs = 0, nops = 0, blocks_touched = 0;
@@ -146,7 +152,7 @@ void MutatePass::run(ProtectionContext& ctx) {
                 //（块尾保守全活），天然短路。
                 if (!dead[i].empty()) {
                     const u64 host = block.insns[i == block.insns.size() ? i - 1 : i].addr;
-                    if (rng.chance(kNopProbability)) {
+                    if (rng.chance(nop_probability)) {
                         ir::Insn nop;
                         nop.op = ir::Op::Nop;
                         nop.size = junk_size;

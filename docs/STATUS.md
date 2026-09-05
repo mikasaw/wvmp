@@ -414,3 +414,23 @@ T10.1 ticket；v1 扩面 = init 期零误报 PEB 面。
 占位体不变；keystone 对 `mov rax,gs:[0x30]` 可能出 moffs64 形（65 48 A1）
 —— 测试双编码兼容）；tls_e2e.sh 2/2 升级 11-pass（+anti_debug：stub
 前缀 + init 面同 run 验证，byte-exact + EB FE 探针）；multiseed 20/20。
+
+## MIT-468 (T11 · 保护参数配置化收尾) ✅ 2026-09-05
+
+**交付**：ProtectRules 追加参数面（has_* 三态哨兵，缺省 = 现状行为——
+直连 API 未装配配置的镜像零改动）：mutate_density（0-100，nop 概率覆写）、
+anti_debug_techniques（裸位域 bit0=BeingDebugged / bit1=NtGlobalFlag，
+framework 不反向依赖 pass 头，消费方透传）、anti_debug_init（TLS init 面
+开关）、tls_enabled（TLS 基建面开关）。TOML 严格 schema 扩三表：
+[mutate] density / [anti_debug] being_debugged,nt_global_flag,init /
+[tls] enabled——子键严格拒绝（含顶层键误写位置的吸入防线）；CLI 摘要
+新增「参数」行（仅在任一参数显式配置时打印）。
+消费方：mutate（nop 概率 = density/100 覆写 0.10 常量）、anti_debug
+（techniques/init_techniques 覆写）、tls_hook（enabled=false → 空转 + 不写
+kTlsPlan → pe_writer 不动 dd9）。
+
+**验证**：ctest 23/23（cli_tests 39 用例含 4 新：三表解析 + 哨兵缺省 +
+density 越界 + 未知子键；tls_hook_tests +1 配置关断；anti_debug note
+文案断言随实现更新）；端到端实证：[mutate] density=0 → "未注入垃圾指令"、
+[anti_debug] 位面=1/init=off → 检查块按位面裁剪、CLI 参数行输出、打包
+产物 rc=0；tls_e2e 2/2；multiseed 20/20。

@@ -50,6 +50,20 @@ struct ProtectRules {
     ProtectLevel default_level = ProtectLevel::Virtualize;
     std::vector<FunctionProtectRule> functions;
 
+    // —— MIT-468 (T11)：保护参数配置面（三态 has_*：缺省 = 现状行为）——
+    // anti_debug_techniques 为裸位域（bit0 = PEB.BeingDebugged，bit1 =
+    // PEB.NtGlobalFlag；位语义单一来源 = passes/anti_debug 的 tech::*，
+    // framework 不反向依赖 pass 头，消费方原样透传）。缺省值仅在场时
+    // 生效（has_* 哨兵），直连 API 未装配配置的镜像行为不变。
+    bool has_mutate_density = false;
+    u32  mutate_density = 10;            // nop 填充密度百分比（0-100）
+    bool has_anti_debug_techniques = false;
+    u32  anti_debug_techniques = 0x3;    // 位域（见上注）
+    bool has_anti_debug_init = false;
+    bool anti_debug_init = true;         // init 期 TLS 检查面开关
+    bool has_tls_enabled = false;
+    bool tls_enabled = true;             // TLS 回调基建面开关
+
     // 解析某函数的档位：显式规则覆盖缺省；index 规则先评、rva 规则后评
     // （rva 是跨重编译唯一较稳的选择器，后评 = 与 index 规则同时命中时
     // rva 胜；解析期已拒同选择器重复，双通道撞同一函数且档位不同的矛盾

@@ -120,6 +120,20 @@ int cmd_protect(const wvmp::cli::ArgsResult& args) {
                     wvmp::to_string(config.rules.default_level).data(),
                     config.rules.functions.size());
     }
+    const auto& pr = config.rules;
+    if (pr.has_mutate_density || pr.has_anti_debug_techniques ||
+        pr.has_anti_debug_init || pr.has_tls_enabled) {
+        std::printf("[wvmp] 参数  :");
+        if (pr.has_mutate_density)
+            std::printf(" mutate 密度=%u%%", pr.mutate_density);
+        if (pr.has_anti_debug_techniques)
+            std::printf(" anti_debug 位面=%u", pr.anti_debug_techniques);
+        if (pr.has_anti_debug_init)
+            std::printf(" anti_debug init=%s", pr.anti_debug_init ? "on" : "off");
+        if (pr.has_tls_enabled)
+            std::printf(" tls=%s", pr.tls_enabled ? "on" : "off");
+        std::printf("\n");
+    }
     std::printf("[wvmp] %s\n", describe_pipeline(pipeline).c_str());
 
     if (args.dry_run) {

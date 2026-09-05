@@ -12,6 +12,7 @@
 
 #include "wvmp/framework/context.hpp"
 #include "wvmp/framework/keys.hpp"
+#include "wvmp/framework/protect_levels.hpp"
 
 #include <gtest/gtest.h>
 
@@ -384,6 +385,31 @@ TEST(TlsHookNoop, NoWvmpSectionLeavesNoPlan) {
 std::vector<u8> read_file(const std::filesystem::path& p) {
     std::ifstream f(p, std::ios::binary);
     return {std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>()};
+}
+
+
+// —— MIT-468：[tls] enabled=false 配置关断 ——
+TEST(TlsHookAdbInit, ConfigDisabledSkipsWithNoPlan) {
+    const u64 base = 0x140000000;
+    ProtectionContext ctx;
+    ctx.image = make_image(true, 0x8664, base);
+    ctx.slot<PeImage>(kPeImage) = make_meta(true, 0x8664, base);
+    NewSection sec;
+    sec.name = ".wvmp";
+    sec.data.assign(16, 0);
+    sec.requested_rva = 0x2000u;
+    ctx.slot<std::vector<NewSection>>(kNewSections).push_back(sec);
+    ProtectRules rules;
+    rules.has_tls_enabled = true;
+    rules.tls_enabled = false;
+    ctx.slot<ProtectRules>(kProtectRules) = rules;
+
+    TlsHookPass pass;
+    pass.run(ctx);
+
+    // 不写 kTlsPlan 槽（pe_writer 不动 dd9）+ 镜像零改动。
+    EXPECT_EQ(ctx.find_slot<tls_hook::TlsPlan>(kTlsPlan), nullptr);
+    EXPECT_EQ(ctx.find_slot<std::vector<NewSection>>(kNewSections)->at(0).data.size(), 16u);
 }
 
 TEST(TlsDirPatch, X64WritesDirectoryEntry) {

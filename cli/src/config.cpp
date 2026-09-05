@@ -121,7 +121,8 @@ ConfigResult parse_config(const std::filesystem::path& file) {
     // "未知键忽略" 口径会让这类配置静默失效零告警——保护工具的配置打错
     // 必须响，不能静默吞。
     constexpr std::string_view kTopLevelKeys[] = {"input", "output", "seed", "arch",
-                                                  "default_level", "functions", "passes"};
+                                                  "default_level", "functions", "passes",
+                                                  "mutate", "anti_debug", "tls"};
     for (const auto& [key, value] : tbl) {
         bool known = false;
         for (auto k : kTopLevelKeys)
@@ -129,8 +130,8 @@ ConfigResult parse_config(const std::filesystem::path& file) {
         if (!known)
             return fail("config 未知顶层字段 '" + std::string(key.str()) +
                         "'（允许: input/output/seed/arch/default_level/functions/"
-                        "passes——⚠️ 顶层键必须写在任何 [[表头]] 之前，否则会被 "
-                        "TOML 作用域规则吸进表内）");
+                        "passes/mutate/anti_debug/tls——⚠️ 顶层键必须写在任何 "
+                        "[[表头]] 之前，否则会被 TOML 作用域规则吸进表内）");
     }
 
     // input / output：必填非空字符串。
@@ -306,6 +307,79 @@ ConfigResult parse_config(const std::filesystem::path& file) {
             result.value.rules.functions.push_back(rule);
             ++entry_no;
         }
+    }
+
+    // —— MIT-468 (T11)：保护参数三表（均可省略 = 现状缺省；子键严格
+    // schema，未知子键显式拒绝——同顶层键的静默吞防线）。——
+
+    // [mutate] density = 0..100（nop 填充密度百分比；0 = 关闭填充）。
+    if (const toml::node* mutate_node = tbl.get("mutate")) {
+        const toml::table* mt = mutate_node->as_table();
+        if (!mt) return fail("config 字段 'mutate' 必须是表（[mutate]）");
+        for (const auto& [key, value] : *mt)
+            if (key.str() != "density")
+                return fail("config [mutate] 未知子键 '" + std::string(key.str()) +
+                            "'（允许: density）");
+        const toml::node* dn = mt->get("density");
+        if (dn == nullptr) return fail("config [mutate] 缺少子键 'density'");
+        auto density = dn->value<std::int64_t>();
+        if (!density)
+            return fail("config [mutate] 'density' 必须是整数（0-100）");
+        if (*density < 0 || *density > 100)
+            return fail("config [mutate] 'density' 超界（0-100）："
+                        + std::to_string(*density));
+        result.value.rules.has_mutate_density = true;
+        result.value.rules.mutate_density = static_cast<u32>(*density);
+    }
+
+    // [anti_debug] being_debugged / nt_global_flag / init（默认全开）。
+    if (const toml::node* adb_node = tbl.get("anti_debug")) {
+        const toml::table* at = adb_node->as_table();
+        if (!at) return fail("config 字段 'anti_debug' 必须是表（[anti_debug]）");
+        u32 techniques = 0;
+        for (const auto& [key, value] : *at)
+            if (key.str() != "being_debugged" && key.str() != "nt_global_flag" &&
+                key.str() != "init")
+                return fail("config [anti_debug] 未知子键 '" + std::string(key.str()) +
+                            "'（允许: being_debugged/nt_global_flag/init）");
+        result.value.rules.has_anti_debug_techniques = true;
+        result.value.rules.has_anti_debug_init = true;
+        // 类型严格校验：布尔子键允许 bool 与 0/1 整数（toml++ permissive
+        // 语义，直觉一致），字符串/浮点等一律可读报错（验收 issue：静默
+        // 回落缺省 = 配置写错零告警，不可接受）。
+        for (const char* k : {"being_debugged", "nt_global_flag", "init"}) {
+            const toml::node* n = at->get(k);
+            if (n != nullptr && !n->is_boolean() && !n->is_integer())
+                return fail("config [anti_debug] '" + std::string(k) +
+                            "' 必须是布尔值（true/false 或 0/1）");
+        }
+        auto get_bool = [&](const char* k, bool dflt) {
+            if (auto v = at->get(k)) {
+                if (auto b = v->value<bool>()) return *b;
+            }
+            return dflt;
+        };
+        if (get_bool("being_debugged", true)) techniques |= 0x1;
+        if (get_bool("nt_global_flag", true)) techniques |= 0x2;
+        result.value.rules.anti_debug_techniques = techniques;
+        result.value.rules.anti_debug_init = get_bool("init", true);
+    }
+
+    // [tls] enabled（默认 true；false = tls_hook 空转）。
+    if (const toml::node* tls_node = tbl.get("tls")) {
+        const toml::table* tt = tls_node->as_table();
+        if (!tt) return fail("config 字段 'tls' 必须是表（[tls]）");
+        for (const auto& [key, value] : *tt)
+            if (key.str() != "enabled")
+                return fail("config [tls] 未知子键 '" + std::string(key.str()) +
+                            "'（允许: enabled）");
+        const toml::node* en = tt->get("enabled");
+        if (en == nullptr) return fail("config [tls] 缺少子键 'enabled'");
+        auto enabled = en->value<bool>();
+        if (!enabled)
+            return fail("config [tls] 'enabled' 必须是布尔值");
+        result.value.rules.has_tls_enabled = true;
+        result.value.rules.tls_enabled = *enabled;
     }
 
     result.ok = true;

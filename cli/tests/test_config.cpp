@@ -203,6 +203,87 @@ TEST(ConfigParse, WindowsPathUntouched) {
     std::filesystem::remove_all(win_dir, ec);
 }
 
+
+// —— MIT-468 (T11)：保护参数三表（mutate / anti_debug / tls）——
+
+TEST(ConfigParse, ProtectOptionTablesParse) {
+    const TempToml toml(
+        "input  = \"target.exe\"\n"
+        "output = \"out.exe\"\n"
+        "\n"
+        "[mutate]\n"
+        "density = 25\n"
+        "[anti_debug]\n"
+        "being_debugged = true\n"
+        "nt_global_flag = false\n"
+        "init = false\n"
+        "[tls]\n"
+        "enabled = false\n"
+    );
+    const auto result = wvmp::cli::parse_config(toml.path());
+    ASSERT_TRUE(result.ok) << result.error;
+    const auto& rules = result.value.rules;
+    EXPECT_TRUE(rules.has_mutate_density);
+    EXPECT_EQ(rules.mutate_density, 25u);
+    EXPECT_TRUE(rules.has_anti_debug_techniques);
+    EXPECT_EQ(rules.anti_debug_techniques, 0x1u);  // 仅 BeingDebugged
+    EXPECT_TRUE(rules.has_anti_debug_init);
+    EXPECT_FALSE(rules.anti_debug_init);
+    EXPECT_TRUE(rules.has_tls_enabled);
+    EXPECT_FALSE(rules.tls_enabled);
+}
+
+TEST(ConfigParse, ProtectOptionTablesOmittedAreSentinelFree) {
+    const TempToml toml(
+        "input  = \"target.exe\"\n"
+        "output = \"out.exe\"\n"
+    );
+    const auto result = wvmp::cli::parse_config(toml.path());
+    ASSERT_TRUE(result.ok) << result.error;
+    const auto& rules = result.value.rules;
+    EXPECT_FALSE(rules.has_mutate_density);
+    EXPECT_FALSE(rules.has_anti_debug_techniques);
+    EXPECT_FALSE(rules.has_anti_debug_init);
+    EXPECT_FALSE(rules.has_tls_enabled);
+}
+
+TEST(ConfigParse, MutateDensityOutOfBoundsRejected) {
+    const TempToml toml(
+        "input  = \"t.exe\"\n"
+        "output = \"o.exe\"\n"
+        "[mutate]\n"
+        "density = 101\n"
+    );
+    const auto result = wvmp::cli::parse_config(toml.path());
+    EXPECT_FALSE(result.ok);
+    EXPECT_NE(result.error.find("0-100"), std::string::npos);
+}
+
+TEST(ConfigParse, UnknownSubkeysRejected) {
+    const TempToml toml(
+        "input  = \"t.exe\"\n"
+        "output = \"o.exe\"\n"
+        "[tls]\n"
+        "enabled = true\n"
+        "mode = \"aggressive\"\n"
+    );
+    const auto result = wvmp::cli::parse_config(toml.path());
+    EXPECT_FALSE(result.ok);
+    EXPECT_NE(result.error.find("mode"), std::string::npos);
+}
+
+TEST(ConfigParse, AntiDebugStringBoolRejected) {
+    const TempToml toml(
+        "input  = \"t.exe\"\n"
+        "output = \"o.exe\"\n"
+        "[anti_debug]\n"
+        "init = \"false\"\n"
+    );
+    const auto result = wvmp::cli::parse_config(toml.path());
+    EXPECT_FALSE(result.ok);
+    EXPECT_NE(result.error.find("必须是布尔值"), std::string::npos);
+}
+
 TEST(ConfigParse, MsysFallbackNotFound) {
     const auto result = wvmp::cli::parse_config(
         std::filesystem::path("/tmp/wvmp_does_not_exist_12345.toml"));

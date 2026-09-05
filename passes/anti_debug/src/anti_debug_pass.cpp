@@ -3,7 +3,10 @@
 #include "wvmp/passes/anti_debug/anti_debug_plan.hpp"
 #include "wvmp/framework/context.hpp"
 #include "wvmp/framework/keys.hpp"
+#include "wvmp/framework/protect_levels.hpp"
 #include "wvmp/framework/registry.hpp"
+
+#include <string>
 
 namespace wvmp::passes {
 
@@ -25,15 +28,25 @@ namespace wvmp::passes {
 //   - 每函数粒度（[[functions]] anti_debug=false 豁免）留 T3 后续扩展。
 
 void AntiDebugPass::run(ProtectionContext& ctx) {
+    // MIT-468：[anti_debug] 位面覆写（has_* 哨兵；缺省 = kV1All 全开 +
+    // init 镜像）。techniques 裸位域语义单一来源 = tech::*（framework
+    // 不反向依赖 pass 头，这里原样透传）。
+    u32 techniques = anti_debug::tech::kV1All;
+    bool init = true;
+    if (const ProtectRules* rules = ctx.find_slot<ProtectRules>(kProtectRules)) {
+        if (rules->has_anti_debug_techniques) techniques = rules->anti_debug_techniques;
+        if (rules->has_anti_debug_init) init = rules->anti_debug_init;
+    }
     const anti_debug::AntiDebugPlan plan{
-        anti_debug::tech::kV1All,
+        techniques,
         anti_debug::response::kFailFast,
-        anti_debug::tech::kV1All,  // MIT-467: init 期镜像（TLS 回调执行面）
+        init ? techniques : 0,  // MIT-467: init 期面（TLS 回调执行面）
     };
     ctx.slot<anti_debug::AntiDebugPlan>(kAntiDebugPlan) = plan;
     ctx.diag.report(Severity::Note, name(),
-                    "PEB.BeingDebugged + PEB.NtGlobalFlag 检查已启用"
-                    "（stub 入口前缀 + TLS init 面，FailFast 响应）");
+                    "PEB 检查已启用（stub 入口前缀 + TLS init 面，FailFast 响应；"
+                    "位面 = " + std::to_string(techniques) + "/init " +
+                    (init ? "on" : "off") + "）");
 }
 
 WVMP_REGISTER_PASS(AntiDebugPass)
