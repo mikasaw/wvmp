@@ -14,4 +14,8 @@ inline constexpr std::string_view kCryptPlan="crypt.plan";
 // MIT-463 anti_debug-v1：反调试计划（anti_debug pass 写入 → stub_link 消费）。
 // 契约模型见 passes/anti_debug/include/wvmp/passes/anti_debug/anti_debug_plan.hpp。
 inline constexpr std::string_view kAntiDebugPlan="anti_debug.plan";
+// MIT-465 TLS 回调基建：TLS 目录计划（tls_hook pass 写入 → pe_writer 消费，
+// 落 DataDirectory[9]）。契约模型见 passes/tls_hook/include/wvmp/passes/
+// tls_hook/tls_plan.hpp。
+inline constexpr std::string_view kTlsPlan="tls.plan";
 }

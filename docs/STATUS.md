@@ -347,3 +347,25 @@ x64 dump `ffd4728901812932…`/161,861B sha256 逐字节恒等、wvmpTest x64
 X3d 立项数据 = 本单 x86 客户态分布表（wrapped 位点 14，gate 13/14，
 gate 率 92.9%）；X5b（区域内 push 栈深 gate + 可选参数窗扩宽 + 跳表匹配器
 S32 参数化 + REG-REG 位测试 lifter 面）按缺陷优先级另立项。
+
+## MIT-465 (T8 · TLS 回调基建 v1) ✅ 2026-09-05
+
+**交付**：新 pass `tls_hook`（Emit，stub_link 之后）——在 .wvmp 尾部追加
+「v1 占位回调桩（x64 `31 C0 C3` / x86 `31 C0 C2 0C 00` stdcall）+ 回调
+数组 + IMAGE_TLS_DIRECTORY + index 槽」，经新槽 `tls.plan`
+（`wvmp_pass_tls_plan` INTERFACE 契约头）交给 pe_writer 落
+DataDirectory[9]（NumberOfRvaAndSizes<10 显式 C1 失败）。原 PE 已有 TLS
+时 6 字段保留、数组重排为 [我们的回调, 原回调…, NULL]（我们的排第一）。
+.opt-in：管道不含 tls_hook 时镜像逐字节零改动；.wvmp 缺席时空转。
+
+**验证**：ctest 22/22（新增 tls_hook_tests ×7：双架构布局/字节/合并/
+noop + pe_writer dd9 表项 + 小 NumberOfRvaAndSizes 失败）；新
+`scripts/tls_e2e.sh` 2/2（双架构 9-pass 全栈：mutate+crypt 合并 note +
+dd9/数组 [our][orig][NULL] 解析 + native/packed byte-exact + **EB FE
+挂起探针实证我们的回调在入口前执行**）；multiseed_crypt 20/20 基线
+零回归。新增样本 `tls_sample_main.cpp`（.CRT$XLB + _tls_used + sdk
+marker，x64/x86 plain-cl 双构建，`wvmp_tls_samples` 目标）。
+
+**方法论教训（写入 GAPS MIT-465-G1 旁证）**：TLS 回调执行于初始断点之前
+→ cdb `-c` 断点法不可观测；int3/异常探针可被 loader init SEH 吞噬 →
+不可靠。终判据 = EB FE 无限循环探针（挂起 vs 正常退出，零歧义）。

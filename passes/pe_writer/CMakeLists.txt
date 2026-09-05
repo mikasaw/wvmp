@@ -15,6 +15,7 @@ target_link_libraries(wvmp_pass_pe_writer PRIVATE
     wvmp::ir
     wvmp::common
     wvmp_pass_pe_loader
+    wvmp_pass_tls_plan    # MIT-465: TlsPlan 契约头（INTERFACE，不吸 tls_hook 对象）
 )
 wvmp_target_warnings(wvmp_pass_pe_writer)
 

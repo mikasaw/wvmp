@@ -20,6 +20,7 @@ set(WVMP_ALL_PASSES
     integrity_crc
     import_protect
     stub_link
+    tls_hook
 )
 
 set(WVMP_PASS_OBJECTS)

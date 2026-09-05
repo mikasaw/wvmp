@@ -8,7 +8,9 @@
 #include "wvmp/framework/keys.hpp"
 #include "wvmp/framework/registry.hpp"
 #include "wvmp/passes/pe_loader/pe_image.hpp"
+#include "wvmp/passes/tls_hook/tls_plan.hpp"
 
+#include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <stdexcept>
@@ -55,6 +57,13 @@ constexpr u16 kImageDllCharacteristicsForceIntegrity = 0x0080;
 // 保护后一律清除的两个位 (MVP P0 #3 替代方案 A): DYNAMIC_BASE + FORCE_INTEGRITY.
 constexpr u16 kDllCharsClearMask = static_cast<u16>(
     kImageDllCharacteristicsDynamicBase | kImageDllCharacteristicsForceIntegrity);
+
+// MIT-465: DataDirectory[9] (IMAGE_DIRECTORY_ENTRY_TLS) 表项写入。目录区在
+// 可选头内的偏移 PE32+ = 112 / PE32 = 96，NumberOfRvaAndSizes 在其前 4 字节
+// （108 / 92）；与 tls_hook 侧的读路径同布局独立声明（模块边界约定）。
+size_t opt_num_rva_sizes_off(bool plus) { return plus ? 108u : 92u; }
+size_t opt_data_dir_off(bool plus) { return plus ? 112u : 96u; }
+constexpr size_t kTlsDirIndex = 9;
 
 } // namespace
 
@@ -110,6 +119,41 @@ void PeWriterPass::run(ProtectionContext& ctx) {
         fail(ctx, "CheckSum 字段越界（nt_headers_offset=" + std::to_string(nt_off) + "）");
     if (chk_off % 2 != 0)
         fail(ctx, "CheckSum 字段未按 u16 对齐（nt_headers_offset=" + std::to_string(nt_off) + "）");
+
+    // 1.9) MIT-465: TLS 目录表项 —— tls_hook（Emit 阶段）已把
+    //   IMAGE_TLS_DIRECTORY / 回调数组放进 .wvmp，经 kTlsPlan 槽交来目录
+    //   RVA；这里落 DataDirectory[9] 表项（在 checksum 之前，保证校验和
+    //   覆盖新表项）。槽缺席 = 管道不含 tls_hook，镜像一个字节不动。
+    if (auto* tls = ctx.find_slot<tls_hook::TlsPlan>(kTlsPlan)) {
+        const u16 opt_magic = static_cast<u16>(
+            static_cast<u16>(ctx.image[size_t(nt_off) + 24]) |
+            (static_cast<u16>(ctx.image[size_t(nt_off) + 25]) << 8));
+        const bool plus = opt_magic == 0x020B;  // PE32+（0x010B = PE32）
+        const size_t num_off = size_t(nt_off) + 24 + opt_num_rva_sizes_off(plus);
+        const size_t dd_off =
+            size_t(nt_off) + 24 + opt_data_dir_off(plus) + kTlsDirIndex * 8;
+        if (num_off + 4 > ctx.image.size() || dd_off + 8 > ctx.image.size())
+            fail(ctx, "可选头数据目录区越界，无法写入 TLS 目录表项");
+        const u32 num_dirs = static_cast<u32>(ctx.image[num_off]) |
+                             (static_cast<u32>(ctx.image[num_off + 1]) << 8) |
+                             (static_cast<u32>(ctx.image[num_off + 2]) << 16) |
+                             (static_cast<u32>(ctx.image[num_off + 3]) << 24);
+        if (num_dirs < kTlsDirIndex + 1)
+            fail(ctx, "NumberOfRvaAndSizes=" + std::to_string(num_dirs) +
+                          " < 10，放不下 TLS 表项（ NumberOfRvaAndSizes 不可扩，"
+                          "可选项头定长区内无空位）");
+        {
+            ByteWriter wt(ctx.image);
+            wt.patch_u32(dd_off, static_cast<u32>(tls->tls_dir_rva));
+            wt.patch_u32(dd_off + 4, tls->tls_dir_size);
+        }
+        char tls_buf[96];
+        std::snprintf(tls_buf, sizeof(tls_buf),
+                      "已写 TLS 目录表项: RVA 0x%llX, size %u（DataDirectory[9]）",
+                      static_cast<unsigned long long>(tls->tls_dir_rva),
+                      tls->tls_dir_size);
+        ctx.diag.report(Severity::Note, name(), tls_buf);
+    }
 
     // 2) 重算 PE checksum：清零 → 标准算法（u16 累加 + 文件总长）→ patch
     //    回 ctx.image（输出文件由镜像写出，随之携带新 checksum）。

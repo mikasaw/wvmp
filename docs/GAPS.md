@@ -1555,3 +1555,24 @@ stub xmm 同步、x86 参数窗），当前证据不足以定位残余消费点�
 **教训入册**：VM 槽的消费者不止 IR 读集——运行时把客户槽 Marshal 进
 原生 ABI 的每条通路（callgate/ExitNative/xmm 同步）都是隐式读；IR 级
 变换的 liveness 必须把"槽 → 原生 ABI"面纳入读集后才能安全写槽。
+
+## MIT-465-G1：本机 loader 对部分 exe 本体的 TLS 回调静默跳过（未结，2026-09-05）
+
+**现象**：本机（Windows build 26200）上，同一套 TLS 目录/数组字节：
+tlsref2（plain cl 构建，带 CRT TLS 基建 _tls_used/_tls_index）打包后
+回调链被正常调用（E2E 铁证）；而 snake/string_ops/x86 CMake 样本——
+无论是打包产物还是纯 python 手工注入（绕开打包管线）——loader 读 dd9
+（垃圾 RVA → LdrpAllocateTlsEntry AV）却从不调用回调。
+
+**已排除**（逐项对照实验）：目录 6 字段语义（REF 本体同字段触发）、
+零长 raw 区间、Characteristics、index 槽位置（.data/.wvmp 等价）、
+节数（6/7 等价）、追加节位置、manifest（dd2=0 仍跳过）、checksum、
+CFG/GuardFlags（双方均 0）、回调桩位置、文件名。
+
+**残留假设**：loader/shim 层按文件本体特征（非 PE 头结构）做的决策；
+对本基建无害——tls_hook 产出字节正确，配套 E2E 样本已选可触发形态。
+
+**影响面**：T9（import 解密）/T10（init 反调试）落 TLS 时，其可观测
+性验证须用 E2E 样本池（wvmp_tls_sample）而非 CMake 管产样本；对真实
+发行目标需先做回调触发探针自检（后续 ticket：自检探针写进 tls_hook
+诊断或独立 verifier 工具）。

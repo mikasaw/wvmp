@@ -111,6 +111,25 @@ if(WIN32 AND MSVC AND EXISTS "${WVMP_VS_DIR}/VC/Auxiliary/Build/vcvarsamd64_x86.
         DEPENDS "${WVMP_X86_E2E_SAMPLE_DIR}/wvmp_x86_callgate_sample.exe")
 endif()
 
+# —— MIT-465 (T8): TLS 感知样本（tls_sample_main.cpp，双架构 plain-cl 构建
+# 配方，见 build_tls_sample.bat 头注）——scripts/tls_e2e.sh 的回归对象：
+# tls_hook 合并 + 回调链打包后仍被执行 + 行为零回归。环境缺 VS 时跳过。
+if(WIN32 AND MSVC AND EXISTS "${WVMP_VS_DIR}/VC/Auxiliary/Build/vcvars64.bat"
+        AND EXISTS "${WVMP_VS_DIR}/VC/Auxiliary/Build/vcvarsamd64_x86.bat")
+    set(WVMP_TLS_SAMPLE_X64 "${CMAKE_BINARY_DIR}/wvmp_tls_sample.exe")
+    set(WVMP_TLS_SAMPLE_X86 "${CMAKE_BINARY_DIR}/x86_samples/wvmp_x86_tls_sample.exe")
+    add_custom_command(
+        OUTPUT "${WVMP_TLS_SAMPLE_X64}" "${WVMP_TLS_SAMPLE_X86}"
+        COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/build_tls_sample.bat"
+                "${WVMP_TLS_SAMPLE_X64}" "${WVMP_TLS_SAMPLE_X86}"
+        DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/tls_sample_main.cpp"
+                "${CMAKE_CURRENT_SOURCE_DIR}/build_tls_sample.bat"
+        COMMENT "TLS 感知样本双架构构建 (MIT-465: plain-cl 配方)"
+        VERBATIM)
+    add_custom_target(wvmp_tls_samples ALL
+        DEPENDS "${WVMP_TLS_SAMPLE_X64}" "${WVMP_TLS_SAMPLE_X86}")
+endif()
+
 # M2-4：端到端虚拟化样例（区域仅含白名单指令）。
 add_executable(wvmp_virt_sample virtual_sample_main.cpp)
 target_link_libraries(wvmp_virt_sample PRIVATE wvmp::sdk)
