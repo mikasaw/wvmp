@@ -118,7 +118,8 @@ run_one() { # $1 = sample, $2 = plus(1|0), $3 = arch
     cfg="$tmp/e2e.toml"
     out_win="$(cygpath -m "$tmp")/wvmp_tls_out.exe"
 
-    # 10-pass：multiseed_crypt 全栈 + import_protect + tls_hook
+    # 11-pass：multiseed_crypt 全栈 + anti_debug（stub 前缀 + TLS init 面）
+# + import_protect + tls_hook
     # （stub_link 之后、pe_writer 之前；import 镜像先于 TLS 块追加）。
     cat > "$cfg" <<EOF
 input  = "$(cygpath -m "$sample")"
@@ -137,6 +138,8 @@ name = "mutate"
 name = "virtualize"
 [[passes]]
 name = "crypt"
+[[passes]]
+name = "anti_debug"
 [[passes]]
 name = "stub_link"
 [[passes]]

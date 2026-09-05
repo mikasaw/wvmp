@@ -5,6 +5,8 @@
 #include "wvmp/passes/tls_hook/tls_hook_pass.hpp"
 #include "wvmp/passes/tls_hook/tls_plan.hpp"
 
+#include "wvmp/passes/anti_debug/anti_debug_plan.hpp"
+
 #include "wvmp/passes/pe_loader/pe_image.hpp"
 #include "wvmp/passes/pe_writer/pe_writer_pass.hpp"
 
@@ -15,6 +17,7 @@
 
 #include <cstring>
 #include <fstream>
+#include <string>
 #include <iterator>
 #include <vector>
 
@@ -256,6 +259,113 @@ TEST(TlsHookMerge, PreservesOriginalFieldsAndAppendsCallbacks) {
     EXPECT_EQ(rd(d, 72, 8), f.end);
     EXPECT_EQ(rd(d, 80, 8), f.index);
     EXPECT_EQ(rd(d, 88, 8), base + 0x2020u);
+}
+
+// MIT-467：init 期 PEB 检查块挂 TLS 回调（anti_debug 计划驱动）。
+TEST(TlsHookAdbInit, X64CarriesPebCheckBlock) {
+    const u64 base = 0x140000000;
+    ProtectionContext ctx;
+    ctx.image = make_image(true, 0x8664, base);
+    ctx.slot<PeImage>(kPeImage) = make_meta(true, 0x8664, base);
+    NewSection sec;
+    sec.name = ".wvmp";
+    sec.data.assign(16, 0);
+    sec.requested_rva = 0x2000u;
+    ctx.slot<std::vector<NewSection>>(kNewSections).push_back(sec);
+    wvmp::passes::anti_debug::AntiDebugPlan adb;
+    adb.techniques = wvmp::passes::anti_debug::tech::kV1All;
+    adb.init_techniques = wvmp::passes::anti_debug::tech::kV1All;
+    ctx.slot<wvmp::passes::anti_debug::AntiDebugPlan>(kAntiDebugPlan) = adb;
+
+    TlsHookPass pass;
+    pass.run(ctx);
+
+    const auto* plan = ctx.find_slot<tls_hook::TlsPlan>(kTlsPlan);
+    ASSERT_NE(plan, nullptr);
+    const auto& d = ctx.find_slot<std::vector<NewSection>>(kNewSections)->at(0).data;
+    const size_t cb = size_t(plan->callback_rva - 0x2000);
+    // x64 TEB 走访：mov rax, gs:[0x30]。keystone 可能出两种编码：
+    //   65 48 8B 04 25 30 00 00 00（disp32 形）或
+    //   65 48 A1 30 00 00 00 00 00 00（moffs64 形）——均语义等价。
+    bool found = false;
+    for (size_t i = cb; i + 10 <= d.size(); ++i) {
+        const bool disp32 = d[i] == 0x65 && d[i+1] == 0x48 && d[i+2] == 0x8B &&
+                            d[i+3] == 0x04 && d[i+4] == 0x25 && d[i+5] == 0x30;
+        const bool moffs = d[i] == 0x65 && d[i+1] == 0x48 && d[i+2] == 0xA1 &&
+                           d[i+3] == 0x30;
+        if (disp32 || moffs) { found = true; break; }
+    }
+    if (!found) {
+        char hexs[3];
+        std::string dump;
+        for (size_t i = cb; i + 1 <= d.size() && i < cb + 80; ++i) {
+            std::snprintf(hexs, sizeof(hexs), "%02X", d[i]);
+            dump += hexs;
+        }
+        ADD_FAILURE() << "stub bytes: " << dump;
+    }
+    EXPECT_TRUE(found);
+}
+
+TEST(TlsHookAdbInit, X86CarriesPebCheckBlock) {
+    const u64 base = 0x400000;
+    ProtectionContext ctx;
+    ctx.image = make_image(false, 0x014C, base);
+    ctx.slot<PeImage>(kPeImage) = make_meta(false, 0x014C, base);
+    NewSection sec;
+    sec.name = ".wvmp";
+    sec.data.assign(16, 0);
+    sec.requested_rva = 0x2000u;
+    ctx.slot<std::vector<NewSection>>(kNewSections).push_back(sec);
+    wvmp::passes::anti_debug::AntiDebugPlan adb;
+    adb.init_techniques = wvmp::passes::anti_debug::tech::kBeingDebugged;  // 位面裁剪
+    ctx.slot<wvmp::passes::anti_debug::AntiDebugPlan>(kAntiDebugPlan) = adb;
+
+    TlsHookPass pass;
+    pass.run(ctx);
+
+    const auto* plan = ctx.find_slot<tls_hook::TlsPlan>(kTlsPlan);
+    ASSERT_NE(plan, nullptr);
+    const auto& d = ctx.find_slot<std::vector<NewSection>>(kNewSections)->at(0).data;
+    const size_t cb = size_t(plan->callback_rva - 0x2000);
+    // x86 TEB 走访：mov eax, fs:[0x18] = 64 A1 18 00 00 00。
+    bool found = false;
+    for (size_t i = cb; i + 6 <= d.size(); ++i) {
+        if (d[i] == 0x64 && d[i+1] == 0xA1 && d[i+2] == 0x18 &&
+            d[i+3] == 0x00 && d[i+4] == 0x00 && d[i+5] == 0x00) { found = true; break; }
+    }
+    EXPECT_TRUE(found);
+    // 位面裁剪：NtGlobalFlag 检查（test eax, 0x70 = A9 70 00 00 00）不在场。
+    bool ntg = false;
+    for (size_t i = cb; i + 5 <= d.size(); ++i) {
+        if (d[i] == 0xA9 && d[i+1] == 0x70) { ntg = true; break; }
+    }
+    EXPECT_FALSE(ntg);
+}
+
+TEST(TlsHookAdbInit, DisabledLeavesPlaceholderBytes) {
+    const u64 base = 0x140000000;
+    ProtectionContext ctx;
+    ctx.image = make_image(true, 0x8664, base);
+    ctx.slot<PeImage>(kPeImage) = make_meta(true, 0x8664, base);
+    NewSection sec;
+    sec.name = ".wvmp";
+    sec.data.assign(16, 0);
+    sec.requested_rva = 0x2000u;
+    ctx.slot<std::vector<NewSection>>(kNewSections).push_back(sec);
+    wvmp::passes::anti_debug::AntiDebugPlan adb;
+    adb.init_techniques = 0;  // 关闭 init 面
+    ctx.slot<wvmp::passes::anti_debug::AntiDebugPlan>(kAntiDebugPlan) = adb;
+
+    TlsHookPass pass;
+    pass.run(ctx);
+
+    const auto& d = ctx.find_slot<std::vector<NewSection>>(kNewSections)->at(0).data;
+    // v1 占位体：31 C0 C3（无 TEB 走访字节）。
+    ASSERT_GE(d.size(), 19u);
+    EXPECT_EQ(d[16], 0x31u);
+    EXPECT_EQ(d[17], 0xC0u);
+    EXPECT_EQ(d[18], 0xC3u);
 }
 
 TEST(TlsHookNoop, NoWvmpSectionLeavesNoPlan) {

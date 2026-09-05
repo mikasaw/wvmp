@@ -4,6 +4,8 @@
 
 #include "wvmp/passes/import_protect/import_plan.hpp"
 
+#include "wvmp/passes/anti_debug/anti_debug_plan.hpp"
+
 #include "wvmp/framework/context.hpp"
 #include "wvmp/framework/keys.hpp"
 #include "wvmp/framework/registry.hpp"
@@ -109,7 +111,58 @@ OriginalTls read_original_tls(ProtectionContext& ctx, const PeImage& pe) {
     return res;
 }
 
+// MIT-467：init 期 PEB 检查块（TLS 回调执行面，早于进程入口——抓附加型
+// 调试器）。字节面与 T5 stub 入口前缀同模板（gs/fs → TEB → PEB →
+// BeingDebugged / NtGlobalFlag，命中 FailFast 写 [0] 确定性 AV）。独立
+// 装配（stub_gen 为 stub_link 内部头）；rax 被蹭 push/pop 保存。
+std::string build_adb_init_asm(bool is_x86, u32 techniques) {
+    std::string o;
+    namespace tech = wvmp::passes::anti_debug::tech;
+    const char* kNl = "\n";
+    if (is_x86) {
+        o += std::string("push eax") + kNl;
+        o += std::string("mov eax, dword ptr fs:[0x18]") + kNl;   // TEB
+        o += std::string("mov eax, dword ptr [eax+0x30]") + kNl;  // PEB
+        if (techniques & tech::kBeingDebugged) {
+            o += std::string("cmp byte ptr [eax+2], 0") + kNl;
+            o += std::string("jne wvadb_fail") + kNl;
+        }
+        if (techniques & tech::kNtGlobalFlag) {
+            o += std::string("mov eax, dword ptr [eax+0x68]") + kNl;
+            o += std::string("test eax, 0x70") + kNl;
+            o += std::string("jne wvadb_fail") + kNl;
+        }
+        o += std::string("pop eax") + kNl;
+        o += std::string("jmp wvadb_done") + kNl;
+        o += std::string("wvadb_fail:") + kNl;
+        o += std::string("xor eax, eax") + kNl;
+        o += std::string("mov dword ptr [eax], 0") + kNl;
+        o += std::string("wvadb_done:") + kNl;
+    } else {
+        o += std::string("push rax") + kNl;
+        o += std::string("mov rax, qword ptr gs:[0x30]") + kNl;   // TEB
+        o += std::string("mov rax, qword ptr [rax+0x60]") + kNl;  // PEB
+        if (techniques & tech::kBeingDebugged) {
+            o += std::string("cmp byte ptr [rax+2], 0") + kNl;
+            o += std::string("jne wvadb_fail") + kNl;
+        }
+        if (techniques & tech::kNtGlobalFlag) {
+            o += std::string("mov eax, dword ptr [rax+0xBC]") + kNl;
+            o += std::string("test eax, 0x70") + kNl;
+            o += std::string("jne wvadb_fail") + kNl;
+        }
+        o += std::string("pop rax") + kNl;
+        o += std::string("jmp wvadb_done") + kNl;
+        o += std::string("wvadb_fail:") + kNl;
+        o += std::string("xor eax, eax") + kNl;
+        o += std::string("mov qword ptr [rax], 0") + kNl;
+        o += std::string("wvadb_done:") + kNl;
+    }
+    return o;
+}
+
 // TLS 回调体装配：
+//   - adb_init != 0：init 期 PEB 检查块前缀（MIT-467）。
 //   - imp == nullptr：v1 占位（清返回值立即返回；x86 stdcall ret 0Ch 自清
 //     12B 栈参）。
 //   - imp != nullptr（MIT-466）：IAT 回填——原 IAT 页已被 loader 重新只读
@@ -119,15 +172,16 @@ OriginalTls read_original_tls(ProtectionContext& ctx, const PeImage& pe) {
 //     约定，与 stub 链一致）。DF=0 为 ABI 既有约定。
 std::vector<u8> assemble_callback_stub(bool is_x86,
                                        const import_protect::ImportPlan* imp,
-                                       u64 image_base) {
+                                       u64 image_base,
+                                       u32 adb_init) {
     ks_engine* ks = nullptr;
     if (ks_open(KS_ARCH_X86, is_x86 ? KS_MODE_32 : KS_MODE_64, &ks) != KS_ERR_OK)
         throw std::runtime_error("tls_hook: ks_open failed");
     ks_option(ks, KS_OPT_SYNTAX, KS_OPT_SYNTAX_INTEL);
-    char src[640];
+    std::string body;
+    if (adb_init != 0) body += build_adb_init_asm(is_x86, adb_init);
     if (imp == nullptr) {
-        std::snprintf(src, sizeof(src), "%s",
-                      is_x86 ? "xor eax, eax\nret 0Ch" : "xor eax, eax\nret");
+        body += is_x86 ? "xor eax, eax\nret 0Ch" : "xor eax, eax\nret";
     } else {
         const u64 mirror_va = image_base + imp->mirror_rva;
         const u64 orig_va = image_base + imp->iat_base_rva;
@@ -137,11 +191,12 @@ std::vector<u8> assemble_callback_stub(bool is_x86,
         // 重指），原 IAT 槽仍是文件残值（hint RVA），直接调用必跳飞。
         const u64 vp_iat_va =
             image_base + imp->mirror_rva + (imp->vp_slot_rva - imp->iat_base_rva);
+        char buf[700];
         if (is_x86) {
             // x86：绝对内存立即数可直接编码；VirtualProtect = stdcall。
             // esi/edi 为 callee-saved（被 rep movsd 使用），必须保存/恢复，
             // 否则破坏 loader 回调链状态（实测：数组第 2 项不再被调用）。
-            std::snprintf(src, sizeof(src),
+            std::snprintf(buf, sizeof(buf),
                           "push 0x%llX\n"                       // lpflOldProtect
                           "push 0x04\n"                          // flNewProtect = PAGE_READWRITE
                           "push 0x%llX\n"                        // dwSize
@@ -163,13 +218,14 @@ std::vector<u8> assemble_callback_stub(bool is_x86,
                           mirror_va, orig_va, imp->iat_bytes / 4,
                           oldprot_va, oldprot_va, imp->page_bytes, page_va,
                           vp_iat_va);
+            body += buf;
         } else {
             // x64：VirtualProtect(rcx=addr, rdx=size, r8d=new, r9=&old)，
             // 槽地址经 rax 间接调用；恢复时旧保护值经 r10 读出。rsi/rdi 为
             // callee-saved（x64 ABI），回填前后必须保存/恢复。回调自身作为
             // 调用方需提供 32B shadow space（push×2 + sub 0x28 = 0x38：
             // 入口 rsp≡8 mod 16 → 8-0x38 ≡ 0 对齐保持）。
-            std::snprintf(src, sizeof(src),
+            std::snprintf(buf, sizeof(buf),
                           "push rsi\npush rdi\n"
                           "sub rsp, 0x28\n"
                           "mov rcx, 0x%llX\n"
@@ -195,11 +251,12 @@ std::vector<u8> assemble_callback_stub(bool is_x86,
                           page_va, imp->page_bytes, oldprot_va, vp_iat_va,
                           mirror_va, orig_va, imp->iat_bytes / 8,
                           page_va, imp->page_bytes, oldprot_va, oldprot_va, vp_iat_va);
+            body += buf;
         }
     }
     unsigned char* enc = nullptr;
     size_t size = 0, count = 0;
-    const int rc = ks_asm(ks, src, 0, &enc, &size, &count);
+    const int rc = ks_asm(ks, body.c_str(), 0, &enc, &size, &count);
     std::vector<u8> out;
     if (rc == KS_ERR_OK && enc != nullptr && size > 0)
         out.assign(enc, enc + size);
@@ -251,9 +308,13 @@ void TlsHookPass::run(ProtectionContext& ctx) {
     // MIT-466：kImportPlan 在场（import_protect 先行）时回调体携带 IAT
     // 回填循环；槽缺席 = v1 占位体。
     const auto* imp = ctx.find_slot<import_protect::ImportPlan>(kImportPlan);
+    // MIT-467：init 期检查位（anti_debug 计划；0 = 关闭）。
+    u32 adb_init = 0;
+    if (const auto* adb = ctx.find_slot<wvmp::passes::anti_debug::AntiDebugPlan>(kAntiDebugPlan))
+        adb_init = adb->init_techniques;
     const std::vector<u8> stub =
         assemble_callback_stub(is_x86, (imp != nullptr && imp->active) ? imp : nullptr,
-                               pe->image_base);
+                               pe->image_base, adb_init);
     const u64 cb_off = align_up(wvmp->data.size(), 16);
     const u64 idx_off = align_up(cb_off + stub.size(), 8);
     const OriginalTls orig = read_original_tls(ctx, *pe);

@@ -28,11 +28,12 @@ void AntiDebugPass::run(ProtectionContext& ctx) {
     const anti_debug::AntiDebugPlan plan{
         anti_debug::tech::kV1All,
         anti_debug::response::kFailFast,
+        anti_debug::tech::kV1All,  // MIT-467: init 期镜像（TLS 回调执行面）
     };
     ctx.slot<anti_debug::AntiDebugPlan>(kAntiDebugPlan) = plan;
     ctx.diag.report(Severity::Note, name(),
                     "PEB.BeingDebugged + PEB.NtGlobalFlag 检查已启用"
-                    "（stub 入口前缀，FailFast 响应）");
+                    "（stub 入口前缀 + TLS init 面，FailFast 响应）");
 }
 
 WVMP_REGISTER_PASS(AntiDebugPass)

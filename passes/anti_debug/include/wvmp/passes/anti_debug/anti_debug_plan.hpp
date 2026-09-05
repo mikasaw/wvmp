@@ -32,6 +32,10 @@ inline constexpr u32 kFailFast = 0;
 struct AntiDebugPlan {
     u32 techniques = tech::kV1All;
     u32 response = response::kFailFast;
+    // MIT-467 (T10)：init 期检查位（TLS 回调执行面，早于进程入口——抓
+    // 附加型调试器）。默认镜像 techniques（零误报面同源）；0 = 关闭。
+    // rdtsc 计时/DRx 硬件断点面留 T10.1（误报校准 / CONTEXT 通路）。
+    u32 init_techniques = tech::kV1All;
 };
 
 } // namespace wvmp::passes::anti_debug

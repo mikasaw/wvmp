@@ -395,3 +395,22 @@ rep movs 体）；tls_e2e.sh 2/2 双架构 10-pass（mutate+crypt+import_protect
 导致 loader 回调链在数组第 2 项前终止（EB FE 探针实证）；② x86 恢复调用
 漏压 flNewProtect（3/4 参数）→ stdcall 栈失衡。x64 侧同时补 rsi/rdi 保存
 （x64 ABI 同为 nonvolatile）与 shadow space。
+
+## MIT-467 (T10 · anti_debug 扩面：init 期检查) ✅ 2026-09-05
+
+**交付**：AntiDebugPlan 追加 `init_techniques` 位面（append-only 字段，
+anti_debug pass 默认镜像 techniques = kV1All，0 = 关闭）；tls_hook 消费
+kAntiDebugPlan——init_techniques ≠ 0 时 TLS 回调体前置 init 期 PEB 检查块
+（gs/fs → TEB → PEB → BeingDebugged / NtGlobalFlag，命中 FailFast 写 [0]；
+字节面与 T5 stub 前缀同模板，独立装配）。执行面覆盖顺序：init（TLS，早于
+入口）→ stub 前缀（每次虚拟化入口）。
+
+**选型披露（D 级默认拍板）**：rdtsc 计时（误报需校准预算）与 DRx 硬件
+断点（用户态读 DRx 特权受限，需 GetThreadContext 通路）均不进 v1，留
+T10.1 ticket；v1 扩面 = init 期零误报 PEB 面。
+
+**验证**：ctest 23/23（tls_hook_tests 扩至 10 用例：x64/x86 init 块字节
+在场 + 位面裁剪（仅 BeingDebugged 时 NtGlobalFlag 字节不在场）+ 关闭时
+占位体不变；keystone 对 `mov rax,gs:[0x30]` 可能出 moffs64 形（65 48 A1）
+—— 测试双编码兼容）；tls_e2e.sh 2/2 升级 11-pass（+anti_debug：stub
+前缀 + init 面同 run 验证，byte-exact + EB FE 探针）；multiseed 20/20。

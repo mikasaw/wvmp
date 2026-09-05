@@ -6,6 +6,8 @@ target_link_libraries(wvmp_tls_hook_tests PRIVATE
     wvmp_pass_tls_hook
     $<TARGET_OBJECTS:wvmp_pass_tls_hook>
     wvmp_pass_tls_plan
+    wvmp_pass_import_plan
+    wvmp_pass_anti_debug_plan
     wvmp_pass_pe_loader
     wvmp_pass_pe_writer
     wvmp::framework
