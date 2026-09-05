@@ -434,3 +434,18 @@ density 越界 + 未知子键；tls_hook_tests +1 配置关断；anti_debug note
 文案断言随实现更新）；端到端实证：[mutate] density=0 → "未注入垃圾指令"、
 [anti_debug] 位面=1/init=off → 检查块按位面裁剪、CLI 参数行输出、打包
 产物 rc=0；tls_e2e 2/2；multiseed 20/20。
+
+## MIT-469 (T12 · TLS 依赖面自检探针) ✅ 2026-09-06
+
+**交付**：`scripts/tls_selfcheck.sh <packed.exe> <x64|x86>`——TLS 依赖面
+可检测化：① EB FE 挂起探针（合并数组第 0 项改 jmp $，8s 超时判据 = 我们
+的回调在入口前执行；正常退出 = 回调链未生效，FAIL rc=1）；② 无 TLS 目录
+→ FAIL；③ x64 附加镜像解析面（cdb post-TLS dump dd1 重指镜像区 vs 文件
+态乱数比对；x86 WOW64 初始断点早于 TLS → 文档化跳过）。
+
+**重大改判（MIT-465-G1 修订，见 GAPS）**：EB FE 探针（唯一无吞噬歧义的
+观测手段）实证 TLS 回调在本机**全目标**执行——snake/string_ops/x86 管产
+系 + plain-cl 系 + multiseed 池 7/7 自检 PASS；此前"loader 跳过"结论系
+探针缺陷三连（int3 可被 init SEH 吞噬 / syscall 桩失准 / cdb 断点早于
+TLS）+ TEB 向量红鲱鱼。**TLS 依赖面（init 反调试 / IAT 回填）在全部已测
+目标上可用**；GAPS 原条目改判留档（探针方法论为长期资产）。

@@ -1556,26 +1556,29 @@ stub xmm 同步、x86 参数窗），当前证据不足以定位残余消费点�
 原生 ABI 的每条通路（callgate/ExitNative/xmm 同步）都是隐式读；IR 级
 变换的 liveness 必须把"槽 → 原生 ABI"面纳入读集后才能安全写槽。
 
-## MIT-465-G1：本机 loader 对部分 exe 本体的 TLS 回调静默跳过（未结，2026-09-05）
+## MIT-465-G1（改判：探针缺陷假象，2026-09-06 复核）——TLS 回调在本机全目标执行
 
-**现象**：本机（Windows build 26200）上，同一套 TLS 目录/数组字节：
-tlsref2（plain cl 构建，带 CRT TLS 基建 _tls_used/_tls_index）打包后
-回调链被正常调用（E2E 铁证）；而 snake/string_ops/x86 CMake 样本——
-无论是打包产物还是纯 python 手工注入（绕开打包管线）——loader 读 dd9
-（垃圾 RVA → LdrpAllocateTlsEntry AV）却从不调用回调。
+**原记录**（2026-09-05）：认为本机 loader 对部分 exe 本体（CMake 管产
+snake 系）静默跳过 TLS 回调，并附"PE 头结构差异全排除"的对照记录。
 
-**已排除**（逐项对照实验）：目录 6 字段语义（REF 本体同字段触发）、
-零长 raw 区间、Characteristics、index 槽位置（.data/.wvmp 等价）、
-节数（6/7 等价）、追加节位置、manifest（dd2=0 仍跳过）、checksum、
-CFG/GuardFlags（双方均 0）、回调桩位置、文件名。
+**改判依据（EB FE 探针，无吞噬歧义）**：TLS 自检探针（scripts/
+tls_selfcheck.sh，把合并数组第 0 项改为 `jmp $` 死循环，挂起=执行）对
+snake/string_ops/x86 全部管产目标 + plain-cl 目标均报"回调在入口前执行"，
+且 x64 镜像解析面（dd1 重指后运行期 != 文件态乱数）全部成立。**"G1 跳过"
+不存在**；此前三路证据全部为测量缺陷：
 
-**残留假设**：loader/shim 层按文件本体特征（非 PE 头结构）做的决策；
-对本基建无害——tls_hook 产出字节正确，配套 E2E 样本已选可触发形态。
+1. **int3/异常探针**：TLS 回调期的异常可被 loader init SEH 吞噬（回调后
+   流程继续）——int3 rc=0 ≠ 回调未执行；
+2. **syscall 终止桩**：NtTerminateProcess 桩在已知-good 目标上同样 rc=0
+   （校准失败），探针本身失效；
+3. **cdb 初始断点法**：TLS 回调执行于初始断点之前，断点观测不到（x64
+   成立；x86 WOW64 初始断点甚至早于 TLS——反而给了 post-TLS 前的观测窗）；
+4. **TEB.ThreadLocalStoragePointer=NULL**：零长 TLS 数据不分配向量，正常。
 
-**影响面**：T9（import 解密）/T10（init 反调试）落 TLS 时，其可观测
-性验证须用 E2E 样本池（wvmp_tls_sample）而非 CMake 管产样本；对真实
-发行目标需先做回调触发探针自检（后续 ticket：自检探针写进 tls_hook
-诊断或独立 verifier 工具）。
+**保留的有效结论**：EB FE 挂起探针是 TLS 面唯一可靠观测手段，已产品化为
+`scripts/tls_selfcheck.sh`；核验过 wvmp_tls_sample 池 + multiseed 池全目标。
+若未来主机/目标形态出现真"跳过"，自检脚本 FAIL 分支即哨兵。
+
 
 ## MIT-466 v1 裁剪披露（2026-09-05）
 
