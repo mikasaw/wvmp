@@ -34,6 +34,14 @@ constexpr size_t kMaxOriginalCallbacks = 256;
 constexpr size_t kMaxDescriptors = 1024;   // MIT-470: 描述符链上限（同 import_protect 口径）
 constexpr size_t kMaxSlotsPerDesc = 4096;  // MIT-470: 单描述符槽上限
 
+// MIT-471：rdtsc 计时检查阈值（周期数，单一来源）。判据 = 包裹检查窗的
+// 两读数差。正常执行（数十条指令）≈ 10^2-10^3 周期；任务切换/中断毛刺
+// ≈ 10^4-10^5；单步调试（每条指令一次陷阱，调试器往返 ≫10^4 周期/步 ×
+// 全窗）≥ 10^6。0x7A120 = 500k：高于毛刺、远低于单步全程——本机校准
+// 脚本 scripts/calibrate_rdtsc.sh 提供分布依据（ calibration 记录见
+// STATUS T15 行）。改阈值须重跑校准并在提交中披露。
+constexpr u64 kRdtscThresholdCycles = 500000;
+
 // MIT-470：DRx 检查面装配参数（GetThreadContext IAT 槽 + CONTEXT 暂存）。
 struct DrxInfo {
     u64 gtc_slot_va = 0;   // GetThreadContext 的 IAT 槽 VA（迁移态 = 镜像槽）
@@ -171,6 +179,62 @@ std::string build_adb_init_asm(bool is_x86, u32 techniques) {
     return o;
 }
 
+std::string hex64(u64 v) {
+    char b[32];
+    std::snprintf(b, sizeof(b), "%llX", static_cast<unsigned long long>(v));
+    return b;
+}
+
+// MIT-471：rdtsc 计时检查（包裹检查窗）。open = 第一次读数（存易失寄存
+// 器/x86 存 .wvmp 暂存）；close = 第二次读数 + 64 位差（x64）/ 32 位低差
+// + 进位警戒（x86 用 sbb，进位即超阈——窗口内 TSC 64 位回绕概率≈0）。
+// 阈值以上 → FailFast。寄存器纪律：x64 用 r11（volatile，检查窗内无人用）；
+// x86 全走绝对寻址暂存。
+std::string build_rdtsc_open_asm(bool is_x86, u64 scratch_va) {
+    std::string o;
+    if (is_x86) {
+        o += std::string("rdtsc") + char(10);
+        o += std::string("mov dword ptr [0x" + hex64(scratch_va) + "], eax") + char(10);
+        o += std::string("mov dword ptr [0x" + hex64(scratch_va + 4) + "], edx") + char(10);
+    } else {
+        o += std::string("rdtsc") + char(10);
+        o += std::string("mov r11, rax") + char(10);
+    }
+    return o;
+}
+
+std::string build_rdtsc_close_asm(bool is_x86, u64 scratch_va) {
+    std::string o;
+    const std::string th = hex64(kRdtscThresholdCycles);
+    // fail 标签在本块内自定义（rdtsc 面可独立于 DRx 面出现——纯 rdtsc 时
+    // drx_fail 不存在，ja 悬空 = 装配失败，验收实测 errno=144）。
+    if (is_x86) {
+        o += std::string("rdtsc") + char(10);
+        o += std::string("sub eax, dword ptr [0x" + hex64(scratch_va) + "]") + char(10);
+        o += std::string("sbb edx, dword ptr [0x" + hex64(scratch_va + 4) + "]") + char(10);
+        o += std::string("cmp edx, 0") + char(10);
+        o += std::string("jne rdtsc_fail") + char(10);
+        o += std::string("cmp eax, 0x" + th) + char(10);
+        o += std::string("ja rdtsc_fail") + char(10);
+        o += std::string("jmp rdtsc_done") + char(10);
+        o += std::string("rdtsc_fail:") + char(10);
+        o += std::string("xor eax, eax") + char(10);
+        o += std::string("mov dword ptr [eax], 0") + char(10);
+        o += std::string("rdtsc_done:") + char(10);
+    } else {
+        o += std::string("rdtsc") + char(10);
+        o += std::string("sub rax, r11") + char(10);
+        o += std::string("cmp rax, 0x" + th) + char(10);
+        o += std::string("ja rdtsc_fail") + char(10);
+        o += std::string("jmp rdtsc_done") + char(10);
+        o += std::string("rdtsc_fail:") + char(10);
+        o += std::string("xor eax, eax") + char(10);
+        o += std::string("mov qword ptr [rax], 0") + char(10);
+        o += std::string("rdtsc_done:") + char(10);
+    }
+    return o;
+}
+
 // TLS 回调体装配：
 //   - adb_init != 0：init 期 PEB 检查块前缀（MIT-467）。
 //   - imp == nullptr：v1 占位（清返回值立即返回；x86 stdcall ret 0Ch 自清
@@ -184,13 +248,20 @@ std::vector<u8> assemble_callback_stub(bool is_x86,
                                        const import_protect::ImportPlan* imp,
                                        u64 image_base,
                                        u32 adb_init,
-                                       const DrxInfo* drx) {
+                                       const DrxInfo* drx,
+                                       bool rdtsc_on,
+                                       u64 rdtsc_scratch_va) {
     ks_engine* ks = nullptr;
     if (ks_open(KS_ARCH_X86, is_x86 ? KS_MODE_32 : KS_MODE_64, &ks) != KS_ERR_OK)
         throw std::runtime_error("tls_hook: ks_open failed");
     ks_option(ks, KS_OPT_SYNTAX, KS_OPT_SYNTAX_INTEL);
     std::string body;
+    if (rdtsc_on) body += build_rdtsc_open_asm(is_x86, rdtsc_scratch_va);
     if (adb_init != 0) body += build_adb_init_asm(is_x86, adb_init);
+    // MIT-471 窗口口径：rdtsc close 紧跟 PEB 块（测量窗 = 确定性指令序列）。
+    // DRx 的 GTC 系统调用在窗外——系统调用时长波动大（合法大差值），包进
+    // 窗内会误报（实测 x64 rc=139）。
+    if (rdtsc_on) body += build_rdtsc_close_asm(is_x86, rdtsc_scratch_va);
     if (drx != nullptr && drx->gtc_slot_va != 0) {
         // MIT-470：DRx 硬件断点检查——GetThreadContext(伪句柄 -2, CONTEXT)
         // 取 CONTEXT_DEBUG_REGISTERS，Dr0-Dr3 任一非零 → FailFast。GTC 调用
@@ -370,9 +441,11 @@ std::vector<u8> assemble_callback_stub(bool is_x86,
     const ks_err err = ks_errno(ks);
     if (enc) ks_free(enc);
     ks_close(ks);
-    if (out.empty())
+    if (out.empty()) {
+        // 诊断面：装配串随异常带出（源码 review 与验收取证用）。
         throw std::runtime_error("tls_hook: ks_asm failed errno=" +
-                                 std::to_string(int(err)));
+                                 std::to_string(int(err)) + " src=[" + body + "]");
+    }
     return out;
 }
 
@@ -481,10 +554,21 @@ void TlsHookPass::run(ProtectionContext& ctx) {
                             "目标未导入 kernel32!GetThreadContext，DRx 检查面跳过（保守降级）");
         }
     }
+    // MIT-471：rdtsc 暂存（仅 x86 需要；x64 存 r11）。8 字节 .wvmp 尾部。
+    u64 rdtsc_scratch_va = 0;
+    const bool rdtsc_requested = (adb_init & 0x8) != 0;
+    if (rdtsc_requested && is_x86) {
+        const u64 sc_off = (wvmp->data.size() + 7) / 8 * 8;
+        rdtsc_scratch_va = base + wvmp->requested_rva + sc_off;
+        wvmp->data.resize(static_cast<size_t>(sc_off), 0);
+        wvmp->data.resize(wvmp->data.size() + 8, 0);
+    }
     const std::vector<u8> stub =
         assemble_callback_stub(is_x86, (imp != nullptr && imp->active) ? imp : nullptr,
                                pe->image_base, adb_init,
-                               (drx_requested && drx.gtc_slot_va != 0) ? &drx : nullptr);
+                               (drx_requested && drx.gtc_slot_va != 0) ? &drx : nullptr,
+                               rdtsc_requested,
+                               rdtsc_requested ? rdtsc_scratch_va : 0);
     const u64 cb_off = align_up(wvmp->data.size(), 16);
     const u64 idx_off = align_up(cb_off + stub.size(), 8);
     const OriginalTls orig = read_original_tls(ctx, *pe);

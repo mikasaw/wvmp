@@ -475,3 +475,27 @@ SetThreadContext(Dr0=0xdeadbeef) 回读）否决。返工：偏移修正 + 防�
 20/20。**第三轮复核实弹闭环**：调试器 CREATE_THREAD 后武装 Dr0=0xdeadbeef
 → packed 产物 drx_fail 写 NULL → exit=0xC0000005（FailFast 实际发生）；
 无武装对照跑通零误触发。样本补 touch_get_thread_context。
+
+## MIT-471 (T15 · anti_debug 扩面三：rdtsc 计时检查校准版) ✅ 2026-09-06
+
+**交付**：tech::kTimingRdtsc = 1<<3（append-only；仅 TLS init 面消费）；
+配置 [anti_debug] rdtsc（opt-in，缺省 false，布尔严格校验）。tls_hook：
+rdtsc 开（close）两段包裹 **PEB 检查块**（测量窗 = 确定性指令序列）；x64
+读数存 r11（volatile）+ 64 位差；x86 存 .wvmp 8 字节暂存 + sub/sbb 64 位
+差；阈值单一来源 kRdtscThresholdCycles = 500000；超阈 FailFast（自带
+rdtsc_fail/rdtsc_done 标签——rdtsc 面可独立于 DRx 面出现，复用 drx_fail
+会悬空装配失败）。
+
+**校准**：scripts/calibrate_rdtsc.sh（KUSER_SHARED_DATA 等形探针 ×20000
+轮）：min=1 / p50=41 / p95=42 / max=756，零样本超 500k——阈值 ≈ p95 的
+1.2 万倍、实测 max 的 660 倍；毛刺区（10^4-10^5）之下界亦被覆盖。改阈值
+须重跑校准并披露。
+
+**开发实录（三坑）**：① rdtsc 面独立出现时 ja rdtsc_fail 悬空（复用
+drx_fail 标签）→ 自带 fail 处理；② x64 gating 误要求 scratch（x64 存
+r11 无需暂存）→ 显式 bool 参数；③ 测量窗误包 GTC 系统调用 → 合法大差值
+误报 FailFast（x64 rc=139 实测）→ 窗口收窄至 PEB 块。
+
+**验证**：ctest 23/23（tls_hook_tests 15 用例：rdtsc 双 0F 31 + 阈值
+imm 比较字节在场/关闭时缺席）；tls_e2e.sh 2/2（11-pass + drx=true +
+rdtsc=true，byte-exact 零误触发）；multiseed 20/20。

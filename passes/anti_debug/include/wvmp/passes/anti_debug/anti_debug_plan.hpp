@@ -22,6 +22,11 @@ inline constexpr u32 kV1All = kBeingDebugged | kNtGlobalFlag;
 // 仅 TLS init 面消费（需经 IAT 调 GetThreadContext，伪句柄 -2 免导入；
 // 目标未导入 GetThreadContext → 该面静默跳过）；stub 入口前缀面忽略此位。
 inline constexpr u32 kHardwareBreakpoints = 1u << 2;
+// MIT-471 (T15)：rdtsc 计时检查（仅 TLS init 面消费）。rdtsc 包裹 PEB 检查
+// 块，两读数差超阈值 = 单步调试特征（单步陷阱开销远大于块本体执行）→
+// FailFast。零导入依赖（rdtsc 用户态直接可用）。阈值常量单一来源在
+// tls_hook（本机校准脚本 scripts/calibrate_rdtsc.sh 提供分布依据）。
+inline constexpr u32 kTimingRdtsc = 1u << 3;
 } // namespace tech
 
 // 命中响应策略（v1 恒 FailFast）：

@@ -515,6 +515,66 @@ TEST(TlsHookAdbInit, X64DrxOffsetsAreDebugRegisterSlots) {
     EXPECT_TRUE(ok_flags);
 }
 
+
+// MIT-471：rdtsc 计时面（bit3）——两次 rdtsc（0F 31）+ 阈值比较在场；
+// 关闭时 rdtsc 字节不在场。
+TEST(TlsHookAdbInit, RdtscFaceBytesPresence) {
+    const u64 base = 0x140000000;
+    ProtectionContext ctx;
+    ctx.image = make_image(true, 0x8664, base);
+    ctx.slot<PeImage>(kPeImage) = make_meta(true, 0x8664, base);
+    NewSection sec;
+    sec.name = ".wvmp";
+    sec.data.assign(16, 0);
+    sec.requested_rva = 0x2000u;
+    ctx.slot<std::vector<NewSection>>(kNewSections).push_back(sec);
+    wvmp::passes::anti_debug::AntiDebugPlan adb;
+    adb.init_techniques = wvmp::passes::anti_debug::tech::kTimingRdtsc;
+    ctx.slot<wvmp::passes::anti_debug::AntiDebugPlan>(kAntiDebugPlan) = adb;
+
+    TlsHookPass pass;
+    pass.run(ctx);
+
+    const auto* plan = ctx.find_slot<tls_hook::TlsPlan>(kTlsPlan);
+    ASSERT_NE(plan, nullptr);
+    const auto& d = ctx.find_slot<std::vector<NewSection>>(kNewSections)->at(0).data;
+    const size_t cb = size_t(plan->callback_rva - 0x2000);
+    int rdtsc_count = 0;
+    bool threshold = false;
+    for (size_t i = cb; i + 7 <= d.size(); ++i) {
+        if (d[i] == 0x0F && d[i+1] == 0x31) ++rdtsc_count;
+        // cmp rax, 0x7A120 = 48 3D 20 A1 07 00（阈值 500000 单一来源）
+        if (d[i] == 0x48 && d[i+1] == 0x3D && d[i+2] == 0x20 &&
+            d[i+3] == 0xA1 && d[i+4] == 0x07 && d[i+5] == 0x00) threshold = true;
+    }
+    EXPECT_GE(rdtsc_count, 2);
+    EXPECT_TRUE(threshold);
+}
+
+TEST(TlsHookAdbInit, RdtscDisabledAbsent) {
+    const u64 base = 0x140000000;
+    ProtectionContext ctx;
+    ctx.image = make_image(true, 0x8664, base);
+    ctx.slot<PeImage>(kPeImage) = make_meta(true, 0x8664, base);
+    NewSection sec;
+    sec.name = ".wvmp";
+    sec.data.assign(16, 0);
+    sec.requested_rva = 0x2000u;
+    ctx.slot<std::vector<NewSection>>(kNewSections).push_back(sec);
+    wvmp::passes::anti_debug::AntiDebugPlan adb;
+    adb.init_techniques = wvmp::passes::anti_debug::tech::kBeingDebugged;  // 无 bit3
+    ctx.slot<wvmp::passes::anti_debug::AntiDebugPlan>(kAntiDebugPlan) = adb;
+
+    TlsHookPass pass;
+    pass.run(ctx);
+
+    const auto& d = ctx.find_slot<std::vector<NewSection>>(kNewSections)->at(0).data;
+    int rdtsc_count = 0;
+    for (size_t i = 16; i + 1 < d.size(); ++i)
+        if (d[i] == 0x0F && d[i+1] == 0x31) ++rdtsc_count;
+    EXPECT_EQ(rdtsc_count, 0);
+}
+
 TEST(TlsHookNoop, NoWvmpSectionLeavesNoPlan) {
     ProtectionContext ctx;
     ctx.image = make_image(true, 0x8664, 0x140000000);
