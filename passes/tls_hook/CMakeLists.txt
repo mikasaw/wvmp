@@ -9,6 +9,7 @@ target_link_libraries(wvmp_pass_tls_hook PRIVATE
     wvmp::framework
     wvmp::common
     wvmp_pass_pe_loader    # NewSection / PeImage 模型
+    wvmp_pass_import_plan  # MIT-466: ImportPlan 契约头（INTERFACE，可选消费）
 )
 wvmp_target_warnings(wvmp_pass_tls_hook)
 

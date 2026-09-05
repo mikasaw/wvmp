@@ -18,6 +18,15 @@
 static volatile uint32_t g_tls_hit = 0;
 static volatile uint32_t g_tls_work = 0;
 
+// import_protect v1 硬依赖：目标 IAT 须含 kernel32!VirtualProtect（TLS
+// 回调回填原 IAT 页前需解除只读保护）。对 .data 页做一次等值改保护——
+// 行为无害，仅保证导入面存在。
+static void touch_virtual_protect() {
+    DWORD oldp = 0;
+    VirtualProtect(const_cast<uint32_t*>(&g_tls_hit), sizeof(g_tls_hit),
+                   PAGE_READWRITE, &oldp);
+}
+
 // 用户 TLS 回调：进程附加时置哨兵。打包后本回调经 tls_hook 的新数组继续
 // 被 loader 调用（合并面）。
 static void NTAPI wvmp_tls_cb(PVOID, DWORD reason, PVOID) {
@@ -47,6 +56,7 @@ static void rgn_tls(void) {
 }
 
 int main() {
+    touch_virtual_protect();
     rgn_tls();
     std::printf("tls g=%08X hit=%08X\n",
                 static_cast<uint32_t>(g_tls_work),

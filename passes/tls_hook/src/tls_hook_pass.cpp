@@ -2,6 +2,8 @@
 
 #include "wvmp/passes/tls_hook/tls_plan.hpp"
 
+#include "wvmp/passes/import_protect/import_plan.hpp"
+
 #include "wvmp/framework/context.hpp"
 #include "wvmp/framework/keys.hpp"
 #include "wvmp/framework/registry.hpp"
@@ -107,18 +109,94 @@ OriginalTls read_original_tls(ProtectionContext& ctx, const PeImage& pe) {
     return res;
 }
 
-// v1 占位回调桩：VOID NTAPI TlsCallback(PVOID, DWORD, PVOID)。
-//   x64（Win64 xABI）: xor eax,eax; ret          —— 31 C0 C3（keystone 选
-//     XOR r/m,r 编码形式）
-//   x86（stdcall）    : xor eax,eax; ret 0Ch     —— 31 C0 C2 0C 00（自清 12B 栈参）
-// T9/T10 将在 ret 前展开 init 期逻辑（import 解密 / PEB 检查）。
-std::vector<u8> assemble_callback_stub(bool is_x86) {
+// TLS 回调体装配：
+//   - imp == nullptr：v1 占位（清返回值立即返回；x86 stdcall ret 0Ch 自清
+//     12B 栈参）。
+//   - imp != nullptr（MIT-466）：IAT 回填——原 IAT 页已被 loader 重新只读
+//     保护，先 VirtualProtect（经其 IAT 槽调用，此时导入解析已完成）解除
+//     写保护 → rep movs 把 .wvmp 镜像整段回填原 .rdata IAT 区 → 按保存值
+//     恢复保护 → 占位收尾。绝对立即数 = image_base + RVA（本机非 ASLR
+//     约定，与 stub 链一致）。DF=0 为 ABI 既有约定。
+std::vector<u8> assemble_callback_stub(bool is_x86,
+                                       const import_protect::ImportPlan* imp,
+                                       u64 image_base) {
     ks_engine* ks = nullptr;
     if (ks_open(KS_ARCH_X86, is_x86 ? KS_MODE_32 : KS_MODE_64, &ks) != KS_ERR_OK)
         throw std::runtime_error("tls_hook: ks_open failed");
     ks_option(ks, KS_OPT_SYNTAX, KS_OPT_SYNTAX_INTEL);
-    // 桩内无相对寻址，装配基址 0 即可（位置无关）。
-    const char* src = is_x86 ? "xor eax, eax\nret 0Ch" : "xor eax, eax\nret";
+    char src[640];
+    if (imp == nullptr) {
+        std::snprintf(src, sizeof(src), "%s",
+                      is_x86 ? "xor eax, eax\nret 0Ch" : "xor eax, eax\nret");
+    } else {
+        const u64 mirror_va = image_base + imp->mirror_rva;
+        const u64 orig_va = image_base + imp->iat_base_rva;
+        const u64 page_va = image_base + imp->page_rva;
+        const u64 oldprot_va = image_base + imp->oldprot_rva;
+        // VirtualProtect 调用走「镜像中对应槽」：loader 只解析镜像（dd1 已
+        // 重指），原 IAT 槽仍是文件残值（hint RVA），直接调用必跳飞。
+        const u64 vp_iat_va =
+            image_base + imp->mirror_rva + (imp->vp_slot_rva - imp->iat_base_rva);
+        if (is_x86) {
+            // x86：绝对内存立即数可直接编码；VirtualProtect = stdcall。
+            // esi/edi 为 callee-saved（被 rep movsd 使用），必须保存/恢复，
+            // 否则破坏 loader 回调链状态（实测：数组第 2 项不再被调用）。
+            std::snprintf(src, sizeof(src),
+                          "push 0x%llX\n"                       // lpflOldProtect
+                          "push 0x04\n"                          // flNewProtect = PAGE_READWRITE
+                          "push 0x%llX\n"                        // dwSize
+                          "push 0x%llX\n"                        // lpAddress（页基）
+                          "call dword ptr [0x%llX]\n"            // VirtualProtect(IAT 槽)
+                          "push esi\npush edi\n"
+                          "mov esi, 0x%llX\n"
+                          "mov edi, 0x%llX\n"
+                          "mov ecx, 0x%llX\n"
+                          "rep movsd dword ptr [edi], dword ptr [esi]\n"
+                          "pop edi\npop esi\n"
+                          "push 0x%llX\n"                        // lpflOldProtect（暂存）
+                          "push dword ptr [0x%llX]\n"            // flNewProtect = 保存的旧保护值
+                          "push 0x%llX\n"                        // dwSize
+                          "push 0x%llX\n"                        // lpAddress（页基）
+                          "call dword ptr [0x%llX]\n"
+                          "xor eax, eax\nret 0Ch",
+                          oldprot_va, imp->page_bytes, page_va, vp_iat_va,
+                          mirror_va, orig_va, imp->iat_bytes / 4,
+                          oldprot_va, oldprot_va, imp->page_bytes, page_va,
+                          vp_iat_va);
+        } else {
+            // x64：VirtualProtect(rcx=addr, rdx=size, r8d=new, r9=&old)，
+            // 槽地址经 rax 间接调用；恢复时旧保护值经 r10 读出。rsi/rdi 为
+            // callee-saved（x64 ABI），回填前后必须保存/恢复。回调自身作为
+            // 调用方需提供 32B shadow space（push×2 + sub 0x28 = 0x38：
+            // 入口 rsp≡8 mod 16 → 8-0x38 ≡ 0 对齐保持）。
+            std::snprintf(src, sizeof(src),
+                          "push rsi\npush rdi\n"
+                          "sub rsp, 0x28\n"
+                          "mov rcx, 0x%llX\n"
+                          "mov edx, 0x%llX\n"
+                          "mov r8d, 0x04\n"
+                          "mov r9, 0x%llX\n"
+                          "mov rax, 0x%llX\n"
+                          "call qword ptr [rax]\n"
+                          "mov rsi, 0x%llX\n"
+                          "mov rdi, 0x%llX\n"
+                          "mov rcx, 0x%llX\n"
+                          "rep movsq qword ptr [rdi], qword ptr [rsi]\n"
+                          "mov rcx, 0x%llX\n"
+                          "mov edx, 0x%llX\n"
+                          "mov r10, 0x%llX\n"
+                          "mov r8d, dword ptr [r10]\n"
+                          "mov r9, 0x%llX\n"
+                          "mov rax, 0x%llX\n"
+                          "call qword ptr [rax]\n"
+                          "add rsp, 0x28\n"
+                          "pop rdi\npop rsi\n"
+                          "xor eax, eax\nret",
+                          page_va, imp->page_bytes, oldprot_va, vp_iat_va,
+                          mirror_va, orig_va, imp->iat_bytes / 8,
+                          page_va, imp->page_bytes, oldprot_va, oldprot_va, vp_iat_va);
+        }
+    }
     unsigned char* enc = nullptr;
     size_t size = 0, count = 0;
     const int rc = ks_asm(ks, src, 0, &enc, &size, &count);
@@ -170,7 +248,12 @@ void TlsHookPass::run(ProtectionContext& ctx) {
     const u64 base = pe->image_base;
 
     // —— .wvmp 尾部追加布局：[回调桩 16 对齐][index 槽 8][回调数组 8][TLS 目录 8] ——
-    const std::vector<u8> stub = assemble_callback_stub(is_x86);
+    // MIT-466：kImportPlan 在场（import_protect 先行）时回调体携带 IAT
+    // 回填循环；槽缺席 = v1 占位体。
+    const auto* imp = ctx.find_slot<import_protect::ImportPlan>(kImportPlan);
+    const std::vector<u8> stub =
+        assemble_callback_stub(is_x86, (imp != nullptr && imp->active) ? imp : nullptr,
+                               pe->image_base);
     const u64 cb_off = align_up(wvmp->data.size(), 16);
     const u64 idx_off = align_up(cb_off + stub.size(), 8);
     const OriginalTls orig = read_original_tls(ctx, *pe);

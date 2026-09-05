@@ -18,4 +18,8 @@ inline constexpr std::string_view kAntiDebugPlan="anti_debug.plan";
 // 落 DataDirectory[9]）。契约模型见 passes/tls_hook/include/wvmp/passes/
 // tls_hook/tls_plan.hpp。
 inline constexpr std::string_view kTlsPlan="tls.plan";
+// MIT-466 import_protect v1：IAT 迁移计划（import_protect 写入 → tls_hook
+// 消费，TLS 回调内回填原 IAT 区）。契约模型见 passes/import_protect/
+// include/wvmp/passes/import_protect/import_plan.hpp。
+inline constexpr std::string_view kImportPlan="import.plan";
 }

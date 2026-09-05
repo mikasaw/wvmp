@@ -369,3 +369,29 @@ marker，x64/x86 plain-cl 双构建，`wvmp_tls_samples` 目标）。
 **方法论教训（写入 GAPS MIT-465-G1 旁证）**：TLS 回调执行于初始断点之前
 → cdb `-c` 断点法不可观测；int3/异常探针可被 loader init SEH 吞噬 →
 不可靠。终判据 = EB FE 无限循环探针（挂起 vs 正常退出，零歧义）。
+
+## MIT-466 (T9 · import_protect v1) ✅ 2026-09-05
+
+**交付**：`import_protect` pass 填实（Emit，stub_link 之后、tls_hook 之前）。
+IAT 迁移 v1 语义（关键洞察：loader 解析只读 INT、只写 FirstThunk）：
+- 解析 dd[1] 描述符链；以 INT 数槽（INT/IAT 平行同长）；要求全部 FirstThunk
+  落同一连续区（含终止槽，逐对相接校验），否则整单保守回退；
+- 镜像 IAT 追加 .wvmp（8 对齐，文件态 = seed 派生乱数）；各描述符
+  FirstThunk RVA 原地重指镜像切片；INT 原位保留；
+- 硬依赖：目标须导入 kernel32!VirtualProtect（回填需解除原 IAT 页只读
+  保护），IAT 中定位其槽；未导入 → 保守回退；
+- TLS 回调（tls_hook 扩展，kImportPlan 槽）执行面：VirtualProtect 解除
+  原页写保护（**调用走镜像中对应槽**——loader 只解析镜像，原槽仍是文件
+  残值）→ `rep movs` 整段回填原 IAT 区 → 按保存值恢复保护。
+- 回退面：无 dd1 / 绑定导入 / 槽超限 / 非连续 / 无 VP / 无 .wvmp → 整单
+  放弃，镜像零改动（Note 留痕）。
+
+**验证**：ctest 23/23（新 import_protect_tests ×4：连续迁移 + FirstThunk/
+INT 断言 + VP 槽/页/oldprot + 绑定导入回退 + 无导入 noop + tls_hook 联动
+rep movs 体）；tls_e2e.sh 2/2 双架构 10-pass（mutate+crypt+import_protect
++tls_hook 全栈：迁移 note + byte-exact + EB FE 探针）；multiseed 20/20。
+
+**调试实录（x86 两连坑，均已修）**：① esi/edi 是 callee-saved，回填桩裸改
+导致 loader 回调链在数组第 2 项前终止（EB FE 探针实证）；② x86 恢复调用
+漏压 flNewProtect（3/4 参数）→ stdcall 栈失衡。x64 侧同时补 rsi/rdi 保存
+（x64 ABI 同为 nonvolatile）与 shadow space。

@@ -1,15 +1,16 @@
 #!/usr/bin/env bash
-# MIT-465: TLS 回调基建 E2E 回归（tls_hook pass 进管道）。
+# MIT-465/466: TLS 回调基建 + IAT 迁移 E2E 回归（tls_hook + import_protect）。
 #
 # 样本 = wvmp_tls_sample（双架构，.CRT$XLB 自带用户 TLS 回调 + sdk marker
 # 区域；构建配方见 build_tls_sample.bat 头注）。
 #
 # 判据（每架构）：
-#   1. protect rc=0 且 tls_hook 报告「并入原回调 1 个」（合并面成立）；
+#   1. protect rc=0 且 tls_hook 报告「并入原回调 1 个」（合并面成立）、
+#      import_protect 报告「IAT 迁移」（迁移面成立）；
 #   2. PE 结构解析：DataDirectory[9] 指向合法 IMAGE_TLS_DIRECTORY，回调数组
 #      = [占位回调][原回调][NULL]；
 #   3. native vs packed stdout/rc byte-exact（打包后用户回调照常打印、虚拟化
-#      行为不变——loader 在入口前调用了合并后的回调链）；
+#      行为不变、IAT 回填正确——loader 在入口前调用了合并后的回调链）；
 #   4. EB FE 挂起探针打在数组第 0 项（我们的占位回调）上：进程 8s 不退出
 #      = 我们的 v1 回调确实在入口前被执行（无 SEH 吞噬歧义的铁判据）。
 #
@@ -117,7 +118,8 @@ run_one() { # $1 = sample, $2 = plus(1|0), $3 = arch
     cfg="$tmp/e2e.toml"
     out_win="$(cygpath -m "$tmp")/wvmp_tls_out.exe"
 
-    # 9-pass：multiseed_crypt 全栈 + tls_hook（stub_link 之后、pe_writer 之前）。
+    # 10-pass：multiseed_crypt 全栈 + import_protect + tls_hook
+    # （stub_link 之后、pe_writer 之前；import 镜像先于 TLS 块追加）。
     cat > "$cfg" <<EOF
 input  = "$(cygpath -m "$sample")"
 output = "$out_win"
@@ -138,6 +140,8 @@ name = "crypt"
 [[passes]]
 name = "stub_link"
 [[passes]]
+name = "import_protect"
+[[passes]]
 name = "tls_hook"
 [[passes]]
 name = "pe_writer"
@@ -155,6 +159,10 @@ EOF
     fi
     if ! echo "$out" | grep -q "并入原回调 1 个"; then
         echo "[tls-e2e] FAIL $arch merge note missing (期望并入原回调 1 个)" >&2
+        fail=$((fail + 1)); rm -rf "$tmp"; return
+    fi
+    if ! echo "$out" | grep -q "IAT 迁移"; then
+        echo "[tls-e2e] FAIL $arch import migrate note missing" >&2
         fail=$((fail + 1)); rm -rf "$tmp"; return
     fi
 
