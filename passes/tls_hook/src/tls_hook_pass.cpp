@@ -468,14 +468,18 @@ void TlsHookPass::run(ProtectionContext& ctx) {
         ctx.diag.report(Severity::Note, name(), "TLS 回调基建已按配置关闭（[tls] enabled=false）");
         return;
     }
-    // .wvmp 节（stub_link 产出）缺席 = 无可挂靠内容 → 空转（镜像零改动）。
-    NewSection* wvmp = nullptr;
+    // MIT-472 W^X 拆节：回调桩（代码）→ .wvmpc（RX）；index/数组/目录/暂存
+    // （数据）→ .wvmp（RW）。两节（stub_link 产出）任一缺席 → 空转。
+    NewSection* wvmp = nullptr;    // 数据节（RW）
+    NewSection* wvmpc = nullptr;   // 代码节（RX）
     if (auto* sections = ctx.find_slot<std::vector<NewSection>>(kNewSections))
-        for (auto& s : *sections)
-            if (s.name == ".wvmp") { wvmp = &s; break; }
-    if (wvmp == nullptr) {
+        for (auto& s : *sections) {
+            if (s.name == ".wvmp") wvmp = &s;
+            if (s.name == ".wvmpc") wvmpc = &s;
+        }
+    if (wvmp == nullptr || wvmpc == nullptr) {
         ctx.diag.report(Severity::Note, name(),
-                        "无 .wvmp 节（stub_link 未产出），跳过 TLS 回调基建");
+                        "无 .wvmp/.wvmpc 节（stub_link 未产出），跳过 TLS 回调基建");
         return;
     }
     const PeImage* pe = ctx.find_slot<PeImage>(kPeImage);
@@ -490,7 +494,8 @@ void TlsHookPass::run(ProtectionContext& ctx) {
     const u64 sec_rva = wvmp->requested_rva;
     const u64 base = pe->image_base;
 
-    // —— .wvmp 尾部追加布局：[回调桩 16 对齐][index 槽 8][回调数组 8][TLS 目录 8] ——
+    // —— 追加布局：回调桩 → .wvmpc（16 对齐）；[index 槽 8][回调数组 8]
+    // [TLS 目录 8] → .wvmp 尾部（8 对齐）——
     // MIT-466：kImportPlan 在场（import_protect 先行）时回调体携带 IAT
     // 回填循环；槽缺席 = v1 占位体。
     const auto* imp = ctx.find_slot<import_protect::ImportPlan>(kImportPlan);
@@ -569,13 +574,15 @@ void TlsHookPass::run(ProtectionContext& ctx) {
                                (drx_requested && drx.gtc_slot_va != 0) ? &drx : nullptr,
                                rdtsc_requested,
                                rdtsc_requested ? rdtsc_scratch_va : 0);
-    const u64 cb_off = align_up(wvmp->data.size(), 16);
-    const u64 idx_off = align_up(cb_off + stub.size(), 8);
+    // 代码节偏移（.wvmpc 尾部 16 对齐）。
+    const u64 cb_off = align_up(wvmpc->data.size(), 16);
+    // 数据节偏移（.wvmp 尾部）：index 槽 8B → 回调数组 → TLS 目录。
+    const u64 idx_off = align_up(wvmp->data.size(), 8);
     const OriginalTls orig = read_original_tls(ctx, *pe);
     const u64 array_off = align_up(idx_off + 8, 8);
     const u64 dir_off = align_up(array_off + (2 + orig.callbacks.size()) * ptr_w, 8);
 
-    const u64 cb_rva = sec_rva + cb_off;
+    const u64 cb_rva = wvmpc->requested_rva + cb_off;
     const u64 cb_va = base + cb_rva;
     const u64 idx_va = base + sec_rva + idx_off;
     const u64 array_rva = sec_rva + array_off;
@@ -604,8 +611,9 @@ void TlsHookPass::run(ProtectionContext& ctx) {
         dir.callbacks = array_va;
     }
 
-    wvmp->data.resize(static_cast<size_t>(cb_off), 0);
-    wvmp->data.insert(wvmp->data.end(), stub.begin(), stub.end());
+    // 回调桩 → 代码节 .wvmpc（RX）；index/数组/目录 → 数据节 .wvmp（RW）。
+    wvmpc->data.resize(static_cast<size_t>(cb_off), 0);
+    wvmpc->data.insert(wvmpc->data.end(), stub.begin(), stub.end());
     wvmp->data.resize(static_cast<size_t>(idx_off), 0);
     append_le(wvmp->data, 0, 8);  // index 槽（加载器写 TLS slot index）
     wvmp->data.resize(static_cast<size_t>(array_off), 0);

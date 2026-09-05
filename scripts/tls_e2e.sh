@@ -71,6 +71,16 @@ for i in range(4):
 assert len(ents) == 3, 'array expected [our][orig][NULL], got %r' % (ents,)
 assert ents[2] == 0 and ents[0] != 0 and ents[1] != 0, 'bad entries'
 our_rva = ents[0] - ib
+# MIT-472 W^X 节属性断言：.wvmpc = RX（0x60000020）、.wvmp = RW（0xC0000040）
+wchars = {}
+for i in range(nsec):
+    sh = table + i * 40
+    nm = data[sh:sh+8].split(b'\x00')[0].decode()
+    ch = struct.unpack_from('<I', data, sh + 36)[0]
+    if nm in ('.wvmp', '.wvmpc'):
+        wchars[nm] = ch
+assert wchars.get('.wvmpc') == 0x60000020, '.wvmpc must be RX, got %X' % wchars.get('.wvmpc', -1)
+assert wchars.get('.wvmp') == 0xC0000040, '.wvmp must be RW, got %X' % wchars.get('.wvmp', -1)
 orig_rva = ents[1] - ib
 assert rva2off(our_rva) is not None and rva2off(orig_rva) is not None, 'callback not mapped'
 print('dir_rva=0x%X arr_rva=0x%X our_rva=0x%X orig_rva=0x%X' % (dd_rva, cbarr - ib, our_rva, orig_rva))

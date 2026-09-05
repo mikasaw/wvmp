@@ -499,3 +499,19 @@ r11 无需暂存）→ 显式 bool 参数；③ 测量窗误包 GTC 系统调用
 **验证**：ctest 23/23（tls_hook_tests 15 用例：rdtsc 双 0F 31 + 阈值
 imm 比较字节在场/关闭时缺席）；tls_e2e.sh 2/2（11-pass + drx=true +
 rdtsc=true，byte-exact 零误触发）；multiseed 20/20。
+
+## MIT-472 (T16 · .wvmp W^X 拆节) ✅ 2026-09-06
+
+**交付**：单 RWX `.wvmp` 拆为两节——`.wvmpc`（RX，0x60000020：解释器 +
+入口 stub + TLS 回调桩，只执行不写）+ `.wvmp`（RW，0xC0000040：字节码
+blob（解密期被写）/ 镜像 IAT（loader 写）/ oldprot / CONTEXT 暂存 / rdtsc
+暂存 / TLS index/数组/目录）。stub_link 双节布局：前置尺寸遍历（x86 gate
+缓存 + blob 尺寸合计——blob 先验可算，无循环依赖）→ 数据节落 max_end、
+代码节落数据节末端；stub_link/tls_hook/import_protect 三 pass 适配双节
+寻址。数据节保留 ".wvmp" 名（import 镜像消费方零改动）。
+
+**验证**：ctest 23/23（tls_hook_tests 适配双节夹具重构 + 新增
+OnlyDataSectionStillNoop；stub_link_tests 断言双节特征 RW/RX + blob 入
+数据节 + stub 入代码节）；tls_e2e.sh 2/2 + **新增 W^X 节属性断言**
+（.wvmpc=RX / .wvmp=RW，双架构）；multiseed 20/20；tls_selfcheck 双目标
+PASS（RX 代码执行 + RW 数据解析在真实 loader 下成立）。

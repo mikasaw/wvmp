@@ -32,7 +32,11 @@ namespace isa = wvmp::regvm::isa;
 u64 align_up(u64 v, u64 a) { return a == 0 ? v : ((v + a - 1) / a) * a; }
 
 // RWX + 已初始化数据：解释器/字节码/stub 同节共存，v1 不做 W^X 分离。
-constexpr u32 kWvmpChars = 0xE000'0040;
+// MIT-472 W^X 拆节后两节特征（单一来源）：
+//   .wvmp  数据节 RW  = CNT_INITIALIZED_DATA | MEM_READ | MEM_WRITE
+//   .wvmpc 代码节 RX  = CNT_CODE | MEM_EXECUTE | MEM_READ
+constexpr u32 kWvmpDataChars = 0xC000'0040;
+constexpr u32 kWvmpCodeChars = 0x6000'0020;
 
 // IMAGE_FILE_MACHINE_I386（x86 32 位目标）。与 pe_loader/marker_scan 同值
 // 独立声明（模块边界，pe_image.cpp 解析白名单为单一语义源）。
@@ -105,19 +109,25 @@ void StubLinkPass::run(ProtectionContext& ctx) {
         is_x86 ? regvm::runtime::generate_runtime_x86(ctx.rng)
                : regvm::runtime::generate_runtime(ctx.rng);
 
-    // 新节 RVA：既有节虚拟末端之后按 SectionAlignment 对齐。
+    // 新节 RVA（MIT-472 W^X 拆节）：数据节 .wvmp（RW：字节码 blob 等，
+    // 解密期/回填期被写）落既有节末端；代码节 .wvmpc（RX：解释器 + stub，
+    // 只执行不写）落数据节末端。blob 尺寸可先验（无需生成 stub）→ 先定
+    // d 布局再依序生成 stub，无循环依赖。
     u64 sec_align = pe->section_alignment != 0 ? pe->section_alignment : 0x1000;
     u64 max_end = 0x1000;
     for (const auto& s : pe->sections)
         max_end = std::max<u64>(max_end, align_up(u64(s.virtual_addr) + std::max(s.virtual_size, s.raw_size), sec_align));
-    const u64 section_rva = align_up(max_end, sec_align);
+    const u64 data_section_rva = align_up(max_end, sec_align);
 
     // —— 布局与装配 ——
-    std::vector<u8> payload;
-    payload.reserve(rt.image.code.size() + vfs->size() * 256);
-    payload.insert(payload.end(), rt.image.code.begin(), rt.image.code.end());
-    payload.resize(static_cast<size_t>(align_up(payload.size(), 16)), 0);
-    const u64 rt_entry = section_rva;  // 解释器入口 = 节基址（vm_entry_offset=0）
+    // 前置 pass（import 镜像 / TLS 数据 / 暂存）也只追加数据节；代码追加
+    // .wvmpc。
+    std::vector<u8> data_payload;
+    std::vector<u8> code_payload;
+    code_payload.reserve(rt.image.code.size() + vfs->size() * 256);
+    data_payload.reserve(vfs->size() * 512);
+    code_payload.insert(code_payload.end(), rt.image.code.begin(), rt.image.code.end());
+    code_payload.resize(static_cast<size_t>(align_up(code_payload.size(), 16)), 0);
 
     struct Patch {
         u64 begin_rva, end_rva, stub_rva;
@@ -145,8 +155,33 @@ void StubLinkPass::run(ProtectionContext& ctx) {
         return nullptr;
     };
 
+    // MIT-472 (W^X 拆节) 前置尺寸遍历：先跑 x86 白名单 gate（结果缓存）+
+    // 合计 blob 尺寸 → 定位数据节/代码节 RVA（blob 尺寸可先验，无需生成
+    // stub，无循环依赖）。
+    std::vector<char> gated(vfs->size(), 0);
+    u64 data_total = 0;
+    for (size_t vfs_index = 0; vfs_index < vfs->size(); ++vfs_index) {
+        if (is_x86) {
+            const std::vector<int> bad =
+                unsupported_x86_ops((*vfs)[vfs_index].program.bytecode);
+            if (!bad.empty()) {
+                gated[vfs_index] = 1;
+                continue;
+            }
+        }
+        const crypt::CryptedFunction* crypted = plan_of(vfs_index);
+        const size_t blob_size = crypted != nullptr
+                                     ? crypted->encrypted_blob.size()
+                                     : (*vfs)[vfs_index].program.bytecode.size();
+        data_total += static_cast<u64>(align_up(blob_size, 8));
+    }
+    const u64 code_rva = align_up(
+        data_section_rva + align_up(data_total, sec_align), sec_align);
+    const u64 rt_entry = code_rva;  // 解释器入口 = 代码节基址（vm_entry_offset=0）
+
     // ⚠️ 索引循环：x86 白名单 gate 的提前 continue 也占用一个 vfs 下标，
     // plan 配对（crypted = plan_of(i)）必须与 kVmProgram 下标严格同步。
+    // gate 判定复用前置遍历缓存（gated[]）。
     for (size_t vfs_index = 0; vfs_index < vfs->size(); ++vfs_index) {
         const auto& vf = (*vfs)[vfs_index];
         // MIT-446 (X4)：x86 白名单 gate——字节码含 x86 运行时跳表缺项
@@ -154,14 +189,10 @@ void StubLinkPass::run(ProtectionContext& ctx) {
         // 阻断 C2 类静默错（翻译成功、区域覆写后运行即 Halt）。x64 路径
         // 不经过本 gate（行为零变化）。
         if (is_x86) {
-            const std::vector<int> bad = unsupported_x86_ops(vf.program.bytecode);
-            if (!bad.empty()) {
-                std::string ops;
-                for (int op : bad) ops += " " + std::to_string(op);
+            if (gated[vfs_index]) {
                 ctx.diag.report(Severity::Note, name(),
                                 "函数 " + vf.name + " 含 x86 运行时未支持的 VmOp" +
-                                    "（opcode:" + ops +
-                                    " ），跳过虚拟化（保持原生，x86 白名单 gate）");
+                                    "，跳过虚拟化（保持原生，x86 白名单 gate）");
                 continue;
             }
         }
@@ -169,18 +200,18 @@ void StubLinkPass::run(ProtectionContext& ctx) {
         // MIT-458: 有加密计划时发射密文 blob（32B 明文头 + 密文流 + 8B 尾
         // 旗标），stub 携带 one-shot 解密块；x86 白名单 gate 仍读明文
         // （vf.program.bytecode，加密定长且 gate 在本 pass 内先于发射执行，
-        // 密文不进 gate）。
+        // 密文不进 gate）。MIT-472: blob 落数据节 .wvmp（RW）。
         const crypt::CryptedFunction* crypted = plan_of(vfs_index);
-        const u64 blob_off = align_up(payload.size(), 8);
-        payload.resize(static_cast<size_t>(blob_off), 0);
+        const u64 blob_off = align_up(data_payload.size(), 8);
+        data_payload.resize(static_cast<size_t>(blob_off), 0);
         const std::vector<u8>& blob_bytes =
             crypted ? crypted->encrypted_blob : vf.program.bytecode;
-        payload.insert(payload.end(), blob_bytes.begin(), blob_bytes.end());
-        const u64 blob_stream_rva = section_rva + blob_off + 32;  // 跳过 blob 头
+        data_payload.insert(data_payload.end(), blob_bytes.begin(), blob_bytes.end());
+        const u64 blob_stream_rva = data_section_rva + blob_off + 32;  // 跳过 blob 头
 
-        const u64 stub_off = align_up(payload.size(), 16);
-        payload.resize(static_cast<size_t>(stub_off), 0);
-        const u64 stub_rva = section_rva + stub_off;
+        const u64 stub_off = align_up(code_payload.size(), 16);
+        code_payload.resize(static_cast<size_t>(stub_off), 0);
+        const u64 stub_rva = code_rva + stub_off;
         std::vector<u8> stub;
         try {
             // MIT-458: 加密函数的 stub 携带 one-shot 解密块参数（流/旗标 VA
@@ -220,7 +251,7 @@ void StubLinkPass::run(ProtectionContext& ctx) {
                             "函数 " + vf.name + " stub 生成失败（保持原生）: " + e.what());
             continue;
         }
-        payload.insert(payload.end(), stub.begin(), stub.end());
+        code_payload.insert(code_payload.end(), stub.begin(), stub.end());
         patches.push_back({vf.begin_rva, vf.end_rva, stub_rva});
     }
 
@@ -254,21 +285,38 @@ void StubLinkPass::run(ProtectionContext& ctx) {
         for (i64 i = 5; i < region_len; ++i) code[i] = 0xCC;
     }
 
-    // —— 新节请求交给 pe_writer ——
-    NewSection req;
-    req.name = ".wvmp";
-    req.data = std::move(payload);
-    req.characteristics = kWvmpChars;
-    req.requested_rva = static_cast<u32>(section_rva);
-    const size_t payload_size = req.data.size();
-    ctx.slot<std::vector<NewSection>>(kNewSections).push_back(std::move(req));
+    // —— 新节请求交给 pe_writer（MIT-472 W^X 拆节：两节）——
+    // .wvmp（RW，0xC0000040）：字节码 blob 等数据面（解密期被写）。
+    // .wvmpc（RX，0x60000020）：解释器 + 入口 stub 代码面（只执行不写）。
+    // 先请求 .wvmp（数据）再 .wvmpc（代码），requested_rva 保持连续。
+    NewSection data_req;
+    data_req.name = ".wvmp";
+    data_req.data = std::move(data_payload);
+    data_req.characteristics = kWvmpDataChars;
+    data_req.requested_rva = static_cast<u32>(data_section_rva);
+    const size_t data_size = data_req.data.size();
 
-    char rva_buf[24];
+    NewSection code_req;
+    code_req.name = ".wvmpc";
+    code_req.data = std::move(code_payload);
+    code_req.characteristics = kWvmpCodeChars;
+    code_req.requested_rva = static_cast<u32>(code_rva);
+    const size_t code_size = code_req.data.size();
+
+    auto& new_sections = ctx.slot<std::vector<NewSection>>(kNewSections);
+    new_sections.push_back(std::move(data_req));
+    new_sections.push_back(std::move(code_req));
+
+    char rva_buf[48], crva_buf[48];
     std::snprintf(rva_buf, sizeof(rva_buf), "%llX",
-                  static_cast<unsigned long long>(section_rva));
+                  static_cast<unsigned long long>(data_section_rva));
+    std::snprintf(crva_buf, sizeof(crva_buf), "%llX",
+                  static_cast<unsigned long long>(code_rva));
     ctx.diag.report(Severity::Note, name(),
-                    "已生成 " + std::to_string(patches.size()) + " 个入口 stub，.wvmp 节 " +
-                        std::to_string(payload_size) + " 字节 @ RVA 0x" + rva_buf);
+                    "已生成 " + std::to_string(patches.size()) + " 个入口 stub，数据节 .wvmp " +
+                        std::to_string(data_size) + " 字节 @ RVA 0x" + rva_buf +
+                        "，代码节 .wvmpc " + std::to_string(code_size) + " 字节 @ RVA 0x" +
+                        crva_buf);
 }
 
 WVMP_REGISTER_PASS(StubLinkPass)

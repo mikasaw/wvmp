@@ -200,7 +200,14 @@ TEST(ImportProtectMigrate, TlsHookCarriesBackfillLoop) {
     ProtectionContext ctx;
     ctx.image = make_image(true, 0x8664, base);
     ctx.slot<PeImage>(kPeImage) = make_meta(true, 0x8664, base);
+    // MIT-472 W^X 拆节：镜像 → 数据节 .wvmp；回调桩 → 代码节 .wvmpc。
     ctx.slot<std::vector<NewSection>>(kNewSections).push_back(make_wvmp(0x3000));
+    NewSection csec;
+    csec.name = ".wvmpc";
+    csec.data.assign(16, 0);
+    csec.characteristics = 0x60000020u;
+    csec.requested_rva = 0x4000u;
+    ctx.slot<std::vector<NewSection>>(kNewSections).push_back(csec);
     ctx.image = make_import_fixture(base).image;
 
     ImportProtectPass imp;
@@ -208,16 +215,17 @@ TEST(ImportProtectMigrate, TlsHookCarriesBackfillLoop) {
     ASSERT_NE(ctx.find_slot<ImportPlan>(kImportPlan), nullptr);
     const u64 mirror_rva = ctx.find_slot<ImportPlan>(kImportPlan)->mirror_rva;
 
-    // 先放一个原 TLS 目录（合并路径 + 回填体同桩验证）。
-    ImportFixture dummy = make_import_fixture(base);
-    (void)dummy;
     TlsHookPass tls;
     tls.run(ctx);
 
     const auto* plan = ctx.find_slot<tls_hook::TlsPlan>(kTlsPlan);
     ASSERT_NE(plan, nullptr);
-    const auto& d = ctx.find_slot<std::vector<NewSection>>(kNewSections)->at(0).data;
-    const size_t cb_off = size_t(plan->callback_rva - 0x3000);
+    std::vector<u8> const* code = nullptr;
+    for (const auto& sc : *ctx.find_slot<std::vector<NewSection>>(kNewSections))
+        if (sc.name == ".wvmpc") code = &sc.data;
+    ASSERT_NE(code, nullptr);
+    const auto& d = *code;
+    const size_t cb_off = size_t(plan->callback_rva - 0x4000);
     // 回调体含 rep movsq（F3 48 A5）——回填循环在场。
     bool found = false;
     for (size_t i = cb_off; i + 3 <= d.size(); ++i)

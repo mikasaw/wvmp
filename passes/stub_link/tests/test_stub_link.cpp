@@ -135,22 +135,29 @@ TEST(StubLinkPass, OverwritesEntryAndRequestsSection) {
                                      (u32(code[3]) << 16) | (u32(code[4]) << 24));
     const u64 stub_rva = 0x1100 + 5 + rel;
 
-    // 新节请求。
+    // 新节请求（MIT-472 W^X 拆节：.wvmp 数据节 + .wvmpc 代码节）。
     const auto* reqs = ctx.find_slot<std::vector<NewSection>>(wvmp::kNewSections);
     ASSERT_NE(reqs, nullptr);
-    ASSERT_EQ(reqs->size(), static_cast<size_t>(1));
-    const NewSection& req = reqs->front();
-    EXPECT_EQ(req.name, ".wvmp");
-    EXPECT_GT(req.requested_rva, 0u);
-    EXPECT_EQ(req.requested_rva % kSecAlign, 0u);
-    ASSERT_GT(req.data.size(), static_cast<size_t>(64));
-    EXPECT_GE(stub_rva, req.requested_rva);
-    EXPECT_LT(stub_rva, req.requested_rva + req.data.size());
+    ASSERT_EQ(reqs->size(), static_cast<size_t>(2));
+    const NewSection& data_req = (*reqs)[0];
+    const NewSection& code_req = (*reqs)[1];
+    EXPECT_EQ(data_req.name, ".wvmp");
+    EXPECT_EQ(code_req.name, ".wvmpc");
+    EXPECT_EQ(data_req.characteristics, 0xC000'0040u);  // RW
+    EXPECT_EQ(code_req.characteristics, 0x6000'0020u);  // RX
+    EXPECT_GT(data_req.requested_rva, 0u);
+    EXPECT_EQ(data_req.requested_rva % kSecAlign, 0u);
+    EXPECT_GT(code_req.requested_rva, data_req.requested_rva);
+    EXPECT_EQ(code_req.requested_rva % kSecAlign, 0u);
+    ASSERT_GT(code_req.data.size(), static_cast<size_t>(64));
+    // 入口 stub（.text E9 目标）落在代码节内。
+    EXPECT_GE(stub_rva, code_req.requested_rva);
+    EXPECT_LT(stub_rva, code_req.requested_rva + code_req.data.size());
 
-    // payload 含 blob magic。
+    // 数据节含 blob magic。
     bool has_blob = false;
-    for (size_t i = 0; i + 4 <= req.data.size(); ++i)
-        if (std::memcmp(&req.data[i], "WVMP", 4) == 0) has_blob = true;
+    for (size_t i = 0; i + 4 <= data_req.data.size(); ++i)
+        if (std::memcmp(&data_req.data[i], "WVMP", 4) == 0) has_blob = true;
     EXPECT_TRUE(has_blob);
 
     // 区域余量 INT3 填充（0x40 字节区域，E9 后全 CC）。
