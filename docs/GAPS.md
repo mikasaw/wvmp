@@ -1798,3 +1798,29 @@ word[96] 中途 Halt 折叠（跳表匹配半成功 fallback）。
 kern.md5 仍崩 → 跳表候选不止 Reg-Jmp 形态（或半翻译 fallback 面 wider）。
 **下轮首步 = 函数级二分**：WVMP_MUTATE_ONLY_FN=N 只注入第 N 个函数，14
 次实验锁定肇事函数 → 读该函数 IR/发射面 → 精确修复。
+
+## MIT-480 续（T6.3 函数级二分结果，2026-09-07）——系统性 translator 插入敏感缺陷
+
+**函数级二分实测**（无 crypt 7-pass，全部注入仅落在单个函数 N）：
+fn=0 绿 / **fn=1 崩** / **fn=2 崩** / fn=3 绿 / **fn=4 崩** / fn=5 绿 /
+**fn=6 崩** / **fn=7 崩**（fn=8..13 未测，模式已明）——多个函数任一插
+入即崩，且崩点均在 kern.md5 入口（byte 7023 一致）。**系统性 translator
+插入敏感缺陷**，非单函数/单模式问题。
+
+**证据链汇总**（T6.3 修复输入）：
+1. 单 Nop（block 0xD65B host=0xD65B）→ 崩；单 Nop（host=0xD678）→ b64
+   软失败；同块不同位置不同症状。
+2. blob1 解码 diff（全注入 vs 零注入，词数 130↔124）：divergence 起点
+   word[94] Callgate aux 36→30（目标错位）+ word[96] Halt 中途折叠。
+3. 致命块 IR 全量 dump 在案（14 insn，全走 RCX 的 /Od 溢出码形）。
+4. 多函数任一插入均崩 → 与具体函数无关，与"插入了东西"本身相关。
+
+**根因候选（按概率）**：① translator Scratch 分配器对插入敏感（sc.take
+序改变 → 后续 VM 词的 scratch 槽变化，若某 handler 对 scratch 槽有隐含
+假设即断）；② next_ip_of/块切分地址键的同址/移位序；③ Emitter 的
+pending-jump 回填在插入后的序数漂移。修复需 VM 级 trace（per-word 执行
+对拍）或 translator 不变量审计——**独立专项，非 mutate 侧可修**。
+
+**现状裁定**：junk-Mov 关闭（维持）；Nop 注入也受同一缺陷影响（ mutate
+nop-only 新落位可崩——**生产建议：mutate 密度 ≥1 时对含 callgate/复杂
+区域的产物跑双跑对拍**；历史绿色包属落位幸运）。
