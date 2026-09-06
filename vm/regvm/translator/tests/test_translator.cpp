@@ -121,7 +121,16 @@ void expect_is(const VmInsn& g, VmOp op, OpKind ak, u8 ra, OpKind bk, u8 rb, u32
     EXPECT_EQ(g.b_kind, bk);
     EXPECT_EQ(g.reg_b, rb);
     EXPECT_EQ(g.aux, aux);
-    EXPECT_EQ(g.cond_or_size, cs);
+    // MIT-474 (T18)：flags 写 op 的 cond 位 2 = flags-dead 标记，由翻译期
+    // 跨块 liveness 数据驱动（快照不钉；标记有无由 FlagsLiveness 专测断
+    // 言），size 语义 = 低 2 位。
+    if (isa::flag_sem_of(op) == isa::FlagSem::kWrite ||
+        isa::flag_sem_of(op) == isa::FlagSem::kWriteReadMerge ||
+        isa::flag_sem_of(op) == isa::FlagSem::kWriteReadReg) {
+        EXPECT_EQ(static_cast<u8>(g.cond_or_size & 3), static_cast<u8>(cs & 3));
+    } else {
+        EXPECT_EQ(g.cond_or_size, cs);
+    }
 }
 
 const u8 kRax = isa::vm_reg_of(ir::Reg::Rax);
@@ -302,6 +311,115 @@ TEST(Translate, TwoBlockLayoutAndOffsets) {
     expect_is(d.insns[3], VmOp::Add, OpKind::Reg, kRax, OpKind::Imm, 0, 2, kS32);
     expect_is(d.insns[4], VmOp::Jmp, OpKind::None, 0, OpKind::None, 0, 1, kS64);
     expect_is(d.insns[5], VmOp::Halt, OpKind::None, 0, OpKind::None, 0, 0, 0);
+}
+
+// ---------------------------------------------------------------------------
+// MIT-474 (T18)：跨块 flags liveness —— 死 flags 写打 cond 位 2 标记。
+// 断言口径：markable 写 op 的 flags_dead_field(cond) 有/无（size 位不在此
+// 钉，快照测试已有覆盖）。
+// ---------------------------------------------------------------------------
+
+namespace {
+bool dead(const VmInsn& g) { return isa::flags_dead_field(g.cond_or_size); }
+} // namespace
+
+TEST(Translate, FlagsLivenessTrailingWriteMarked) {
+    // add rax,2 → Halt：无读者 → 死写标记。
+    const auto r = wvmp::regvm::translator::translate_function(fn_of({
+        blk(0x1000, {alu(ir::Op::Add, ir::Operand::reg_(ir::Reg::Rax),
+                         ir::Operand::imm_(2), ir::Size::S32)}),
+    }));
+    const Decoded d = decode_program(r.program);
+    ASSERT_EQ(d.insns.size(), static_cast<size_t>(3));  // Add + Jmp+1 + Halt
+    EXPECT_TRUE(dead(d.insns[0]));
+}
+
+TEST(Translate, FlagsLivenessReadKeepsWriteAlive) {
+    // add rax,2 → Jcc：Jcc 读 flags → 写活。
+    const auto r = wvmp::regvm::translator::translate_function(fn_of({
+        blk(0x1000, {alu(ir::Op::Add, ir::Operand::reg_(ir::Reg::Rax),
+                         ir::Operand::imm_(2), ir::Size::S32),
+                     jump(ir::Op::Jcc, 0x2000)}),
+        blk(0x2000, {mov_imm(ir::Reg::Rcx, 7, ir::Size::S32)}),
+    }));
+    const Decoded d = decode_program(r.program);
+    ASSERT_EQ(d.insns.size(), static_cast<size_t>(6));
+    EXPECT_FALSE(dead(d.insns[0]));  // Add（Jcc 紧随）
+    EXPECT_EQ(d.insns[3].op, VmOp::Mov);  // b1 首词（无 flags 语义，不标记）
+}
+
+TEST(Translate, FlagsLivenessOnlyLastWriteAlive) {
+    // add rax,1 ; add rbx,2 ; Jcc：前写被后写覆盖 → 前死后活。
+    const auto r = wvmp::regvm::translator::translate_function(fn_of({
+        blk(0x1000, {alu(ir::Op::Add, ir::Operand::reg_(ir::Reg::Rax),
+                         ir::Operand::imm_(1), ir::Size::S32),
+                     alu(ir::Op::Add, ir::Operand::reg_(ir::Reg::Rbx),
+                         ir::Operand::imm_(2), ir::Size::S32),
+                     jump(ir::Op::Jcc, 0x2000)}),
+        blk(0x2000, {mov_imm(ir::Reg::Rcx, 7, ir::Size::S32)}),
+    }));
+    const Decoded d = decode_program(r.program);
+    ASSERT_EQ(d.insns.size(), static_cast<size_t>(7));
+    EXPECT_TRUE(dead(d.insns[0]));   // 第一写：被第二写覆盖
+    EXPECT_FALSE(dead(d.insns[1]));  // 第二写：Jcc 读它
+}
+
+TEST(Translate, FlagsLivenessBranchUnionAlive) {
+    // b0: add rax,1 ; jne L2   b1(L2): jne L3?? —— 简化：分支两路在读者前
+    // 汇合 → 两路写都活。b0: add rax,1 ; jne 0x2000 ；b1: add rbx,2（fall）
+    // ；b2: jne 0x3000?? —— 直接形态：b0 的写沿"取/不取"两路都到达 b2 的
+    // Jcc 读者 → b0 活；b1 的写同理。
+    const auto r = wvmp::regvm::translator::translate_function(fn_of({
+        blk(0x1000, {alu(ir::Op::Add, ir::Operand::reg_(ir::Reg::Rax),
+                         ir::Operand::imm_(1), ir::Size::S32),
+                     jump(ir::Op::Jcc, 0x2000)}),
+        blk(0x1800, {alu(ir::Op::Add, ir::Operand::reg_(ir::Reg::Rbx),
+                         ir::Operand::imm_(2), ir::Size::S32)}),
+        blk(0x2000, {jump(ir::Op::Jcc, 0x3000)}),
+        blk(0x3000, {mov_imm(ir::Reg::Rcx, 7, ir::Size::S32)}),
+    }));
+    const Decoded d = decode_program(r.program);
+    ASSERT_EQ(d.insns.size(), static_cast<size_t>(10));
+    // b0: [0]=Add [1]=Jcc [2]=Jmp+1；b1: [3]=Add [4]=Jmp+1；b2: [5]=Jcc
+    // [6]=Jmp+1；b3: [7]=Mov [8]=Jmp+1 [9]=Halt。
+    EXPECT_FALSE(dead(d.insns[0]));  // 取路径直达 b2 读者
+    EXPECT_FALSE(dead(d.insns[3]));  // 不取路径 fall 进 b2 读者
+}
+
+TEST(Translate, FlagsLivenessMergeReaderKeepsPredecessorAlive) {
+    // add rax,1 ; rol rax,1（合并型：读旧 ZF/SF/PF）→ add 活；rol 后无读者
+    // → rol 自身死标记。
+    const auto r = wvmp::regvm::translator::translate_function(fn_of({
+        blk(0x1000, {alu(ir::Op::Add, ir::Operand::reg_(ir::Reg::Rax),
+                         ir::Operand::imm_(1), ir::Size::S32),
+                     alu(ir::Op::Rol, ir::Operand::reg_(ir::Reg::Rax),
+                         ir::Operand::imm_(1), ir::Size::S32)}),
+    }));
+    const Decoded d = decode_program(r.program);
+    ASSERT_GE(d.insns.size(), static_cast<size_t>(4));
+    // rol 为合并型写：自身结果无读者 → 死标记；此时 add 的状态只经 rol
+    // 结果对外可见，结果不可观察 ⇒ add 同为死写（kill 语义）。
+    EXPECT_TRUE(dead(d.insns[0]));
+    EXPECT_TRUE(dead(d.insns[1]));
+    EXPECT_EQ(d.insns[1].op, VmOp::Rol);
+}
+
+TEST(Translate, FlagsLivenessAdcSbbRegDepKeepsPredecessor) {
+    // MIT-474 验收 B1 裁决：adc/sbb 的 CF_in 流入目的寄存器值（dst =
+    // a + b + CF_in）——输入侧恒读者，前驱写永不标记（128 位加法惯用法
+    // add; adc 的正确性前提）；adc 自身 flags 写仍可标记。
+    const auto r = wvmp::regvm::translator::translate_function(fn_of({
+        blk(0x1000, {alu(ir::Op::Add, ir::Operand::reg_(ir::Reg::Rax),
+                         ir::Operand::reg_(ir::Reg::Rbx), ir::Size::S64),
+                     alu(ir::Op::Adc, ir::Operand::reg_(ir::Reg::Rdx),
+                         ir::Operand::reg_(ir::Reg::Rsi), ir::Size::S64)}),
+    }));
+    const Decoded d = decode_program(r.program);
+    ASSERT_GE(d.insns.size(), static_cast<size_t>(4));
+    EXPECT_EQ(d.insns[0].op, VmOp::Add);
+    EXPECT_FALSE(dead(d.insns[0]));   // add：adc 读它的 CF_in（寄存器依赖）
+    EXPECT_EQ(d.insns[1].op, VmOp::Adc);
+    EXPECT_TRUE(dead(d.insns[1]));    // adc 自身 flags 写：后无读者
 }
 
 TEST(Translate, RetTerminatorNeedsNoFallthrough) {

@@ -1416,7 +1416,7 @@ struct Translator {
     // reg_a = dst VM 槽索引、reg_b = src VM 槽索引，handler 据此 lea 出
     // dst 槽地址做 native RMW，xadd 旧值写回 src 槽）。零新 VmOp、零编码
     // 改动、vm_op.hpp 冻结面零触碰。x64 不走本分支（G4 残余 gate 面不变；
-    // x64 handler 逐字节不动 = dump ffd47289 恒等约束）。REG-IMM（bts
+    // x64 handler 逐字节不动 = dump ffd47289(旧, MIT-474 换代→67cfa727) 恒等约束）。REG-IMM（bts
     // reg, imm8）不在本单面内，照旧 gate。
     bool emit_lock_bit_reg_dst(Emitter& em, const ir::Insn& in, VmOp vop) {
         const u8 sz = isa::size_field(in.size);
@@ -3398,6 +3398,87 @@ struct StackWalkVerdict {
     return v;
 }
 
+// ---------------------------------------------------------------------------
+// MIT-474 (T18)：跨块 flags liveness → 死 flags 写标记。
+//
+// 词流 CFG（回填后 aux = 相对词序号，i32 补码）：i → i+1（fall-through）；
+// Jcc → {i+1, i+aux}；Jmp → {i+aux}；Halt/Ret/ExitNative → 汇（无后继）。
+// 反向数据流（live = "该状态在下一个 flags 写之前被某读者读"）：
+//   kRead            → live_in = true
+//   kWrite/kWriteReadMerge → live_in = false（写即杀）；live_out == false
+//                      时本写打 flags-dead 标记（cond 位 2）
+//   kNone            → live_in = live_out
+// 块汇合 = 后继 live_in 并集，worklist 至不动点。区域末端（Halt/Ret/
+// ExitNative/越界）= 汇且 VM flags 不跨区（stub 每区清零 ctx）→ 末端死写
+// 真死。保守性：aux 越界/回填残留（|rel| > 流长）即整体放弃（零标记 =
+// 旧行为）；未知 op 一律 kNone 顺延。
+void mark_dead_flag_writes(std::vector<isa::VmInsn>& code) {
+    const size_t n = code.size();
+    if (n == 0) return;
+    auto target_of = [&](size_t i) -> i64 {
+        return static_cast<i64>(i) + static_cast<i32>(code[i].aux);
+    };
+    auto succ_ok = [&](size_t t) { return t < n; };
+    // 后继表（≤2/词）。
+    std::vector<size_t> succ_begin(n + 1, 0);
+    std::vector<size_t> succ;
+    succ.reserve(n * 2);
+    for (size_t i = 0; i < n; ++i) {
+        succ_begin[i] = succ.size();
+        const auto op = code[i].op;
+        const bool is_jcc = op == VmOp::Jcc;
+        const bool is_jmp = op == VmOp::Jmp;
+        const bool is_sink = op == VmOp::Halt || op == VmOp::Ret ||
+                             op == VmOp::ExitNative;
+        if (is_jcc || is_jmp) {
+            const i64 t = target_of(i);
+            if (t < 0 || t >= static_cast<i64>(n)) return;  // 保守放弃
+            if (is_jcc && i + 1 < n) succ.push_back(i + 1);
+            succ.push_back(static_cast<size_t>(t));
+        } else if (!is_sink) {
+            if (i + 1 < n) succ.push_back(i + 1);
+        }
+    }
+    succ_begin[n] = succ.size();
+    // 反向不动点。
+    std::vector<u8> live_in(n, 0);
+    for (bool changed = true; changed;) {
+        changed = false;
+        for (size_t i = n; i-- > 0;) {
+            const auto sem = isa::flag_sem_of(code[i].op);
+            u8 out = 0;
+            for (size_t k = succ_begin[i]; k < succ_begin[i + 1]; ++k)
+                out = static_cast<u8>(out | live_in[succ[k]]);
+            u8 in;
+            if (sem == isa::FlagSem::kRead) in = 1;
+            else if (sem == isa::FlagSem::kNone) in = out;
+            else if (sem == isa::FlagSem::kWriteReadMerge) in = out;
+            // 合并型写（rol/inc 保旧位）：旧状态位**流入 flags 结果**——前
+            // 驱写的可观察性经合并延续，按透传处理（live_in = live_out）。
+            else if (sem == isa::FlagSem::kWriteReadReg) in = 1;
+            // adc/sbb（MIT-474 验收 B1 裁决）：CF_in 流入**目的寄存器值**
+            //（dst = a + b + CF_in），寄存器消费无条件可观察——输入侧恒读
+            // 者，前驱写永不标记；自身 flags 写仍可标记（tail 跳过不影响块
+            // 体寄存器计算）。
+            // 纯写（kWrite）：杀旧状态。
+            else in = 0;
+            if (in != live_in[i]) { live_in[i] = in; changed = true; }
+        }
+    }
+    // 死写标记（kWrite / kWriteReadMerge / kWriteReadReg 且 live_out ==
+    // false——adc/sbb 自身 flags 写可标记，tail 跳过不影响块体寄存器计算）。
+    for (size_t i = 0; i < n; ++i) {
+        const auto sem = isa::flag_sem_of(code[i].op);
+        if (sem != isa::FlagSem::kWrite && sem != isa::FlagSem::kWriteReadMerge &&
+            sem != isa::FlagSem::kWriteReadReg)
+            continue;
+        u8 out = 0;
+        for (size_t k = succ_begin[i]; k < succ_begin[i + 1]; ++k)
+            out = static_cast<u8>(out | live_in[succ[k]]);
+        if (!out) code[i].cond_or_size = isa::set_flags_dead(code[i].cond_or_size);
+    }
+}
+
 } // namespace
 
 TranslateResult translate_function(const ir::FunctionRegion& fn) {
@@ -3564,6 +3645,10 @@ TranslateResult translate_function(const ir::FunctionRegion& fn,
                         static_cast<i64>(pj.index);
         code[pj.index].aux = static_cast<u32>(static_cast<i32>(rel));
     }
+
+    // MIT-474 (T18)：跨块 flags liveness → 死 flags 写打 cond 位 2 标记
+    //（运行时 4 处 tail 据此跳过整段捕获/装配；见 encoding.hpp 契约注）。
+    mark_dead_flag_writes(code);
 
     // 序列化：VmInsn 流 -> blob -> 字节。
     std::vector<u8> stream;

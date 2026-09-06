@@ -749,7 +749,13 @@ public:
     // cmpxchg/ucomis…）。只写部分标志的指令族不得走此全量装配（会把 guest
     // 应保留的位覆写成 handler 内部宿主状态），见 flags_tail_partial。
     std::string flags_tail(u64 dispatch, bool cf_preset) const {
+        const std::string skip = "fskip" + std::to_string(seq());
         std::string o;
+        // MIT-474 (T18) flags-dead 标记路由：cond 位 2 = 翻译期 liveness 证
+        // 明本写无读者 → 整段捕获/装配跳过，VM flags 保持前值（正确性契约
+        // 见 encoding.hpp kFlagsDeadBit 注：欠实现安全，过实现禁止）。
+        o += std::string("    test ") + r64(t_[8]) + ", " + hex(1u << 20) + "\n";
+        o += "    jnz " + skip + "\n";
         o += std::string("    mov ") + r64(flags_) + ", " + r64(t_[6]) + "\n";
         if (!cf_preset) o += std::string("    shl ") + r64(t_[3]) + ", 1\n";
         o += std::string("    or ") + r64(flags_) + ", " + r64(t_[3]) + "\n";
@@ -760,6 +766,7 @@ public:
         o += std::string("    shl ") + r64(t_[9]) + ", 4\n";
         o += std::string("    or ") + r64(flags_) + ", " + r64(t_[9]) + "\n";
         o += std::string("    mov qword ptr [") + r64(ctx_) + " + 0x98], " + r64(flags_) + "\n";
+        o += skip + ":\n";
         o += advance(dispatch);
         return o;
     }
@@ -787,13 +794,19 @@ public:
     // = 本函数的"保留掩码 + 部分或入"骨架——届时把 CF/OF 也并入保留掩码
     // （掩码 0x1F 全保留、零 or 入、zero5/setcc5 整段省略），零新 VmOp。
     std::string flags_tail_partial(u64 dispatch) const {
+        const std::string skip = "fskip" + std::to_string(seq());
         std::string o;
+        // MIT-474: 同 flags_tail 的标记路由（合并型写：无读者时跳过 = 状态
+        // 保持前值，与"合并结果无读者"等价）。
+        o += std::string("    test ") + r64(t_[8]) + ", " + hex(1u << 20) + "\n";
+        o += "    jnz " + skip + "\n";
         o += std::string("    and ") + r64(flags_) + ", " + imm(0x19) + "\n";
         o += std::string("    shl ") + r64(t_[3]) + ", 1\n";
         o += std::string("    or ") + r64(flags_) + ", " + r64(t_[3]) + "\n";
         o += std::string("    shl ") + r64(t_[4]) + ", 2\n";
         o += std::string("    or ") + r64(flags_) + ", " + r64(t_[4]) + "\n";
         o += std::string("    mov qword ptr [") + r64(ctx_) + " + 0x98], " + r64(flags_) + "\n";
+        o += skip + ":\n";
         o += advance(dispatch);
         return o;
     }
@@ -806,6 +819,9 @@ public:
     // 最先排放。每个块自带终结跳转（jmp <tail>），块间绝不串行跌落。
     std::string size_chain(const std::array<std::string, 4>& blocks, const std::string& tag) const {
         std::string o;
+        // MIT-474：cond 位 2 = flags-dead 标记随 4 位域一起被抽到这里——
+        // 尺寸语义只看低 2 位（标记由 tail 的独立 test 消费），链头先掩码。
+        o += std::string("    and ") + r64(t_[2]) + ", 3\n";
         for (int i = 0; i < 3; ++i) {
             o += std::string("    cmp ") + r64(t_[2]) + ", " + imm(size_perm_[i]) + "\n";
             o += "    je sz" + std::to_string(size_perm_[i]) + "_" + tag + "\n";
@@ -3812,9 +3828,15 @@ public:
     // 获区，取 [ctx+0x98] 旧值 bit1 —— 读取发生在新值写入前（装配首段读、
     // 末条才写）。
     std::string flags_tail_x86(bool cf_from_old, u64 dispatch) const {
+        const std::string skip = "fskip" + std::to_string(seq());
         const std::string A = r32x(t_[0]);
         const std::string B = r32x(t_[1]);
         std::string o;
+        // MIT-474 (T18) flags-dead 标记路由（x86 版）：标记在指令字 lo 双字
+        // 的 cond 位 2（帧槽内存 test，无寄存器压力）。
+        o += std::string("    test dword ptr ") + xf(kX86FInsnLo) + ", " +
+             hex(1u << 20) + "\n";
+        o += "    jnz " + skip + "\n";
         o += std::string("    movzx ") + A + ", byte ptr " + xf(kX86FCC + 0) + "\n";
         if (cf_from_old) {
             o += std::string("    mov ") + B + ", dword ptr [" + r32x(ctx_) + " + 0x98]\n";
@@ -3837,6 +3859,7 @@ public:
         o += std::string("    shl ") + B + ", " + imm(4) + "\n";
         o += std::string("    or ") + A + ", " + B + "\n";
         o += std::string("    mov dword ptr [") + r32x(ctx_) + " + 0x98], " + A + "\n";
+        o += skip + ":\n";
         o += advance_x86(dispatch);
         return o;
     }
@@ -3852,9 +3875,14 @@ public:
     // 顺序纪律）。G8a flagless 变体（rorx/shlx/sarx/shrx）接入点预留同 x64
     // flags_tail_partial 注（届时并入保留掩码 0x1F 全保留、零 or 入）。
     std::string flags_tail_partial_x86(u64 dispatch) const {
+        const std::string skip = "fskip" + std::to_string(seq());
         const std::string A = r32x(t_[0]);
         const std::string B = r32x(t_[1]);
         std::string o;
+        // MIT-474: 同 flags_tail_x86 的标记路由（合并型写，x86 版）。
+        o += std::string("    test dword ptr ") + xf(kX86FInsnLo) + ", " +
+             hex(1u << 20) + "\n";
+        o += "    jnz " + skip + "\n";
         o += std::string("    mov ") + A + ", dword ptr [" + r32x(ctx_) + " + 0x98]\n";
         o += std::string("    and ") + A + ", " + imm(0x19) + "\n";
         o += std::string("    movzx ") + B + ", byte ptr " + xf(kX86FCC + 1) + "\n";
@@ -3864,6 +3892,7 @@ public:
         o += std::string("    shl ") + B + ", " + imm(2) + "\n";
         o += std::string("    or ") + A + ", " + B + "\n";
         o += std::string("    mov dword ptr [") + r32x(ctx_) + " + 0x98], " + A + "\n";
+        o += skip + ":\n";
         o += advance_x86(dispatch);
         return o;
     }
@@ -3882,6 +3911,8 @@ public:
     std::string size_chain_x86(const std::string blocks[3], const std::string& tag,
                                u64 dispatch) const {
         std::string o;
+        // MIT-474：同 x64——cond 位 2 标记随域落帧，链头先掩码低 2 位。
+        o += std::string("    and dword ptr ") + xf(kX86FSize) + ", 3\n";
         for (int i = 0; i < 3; ++i) {
             o += std::string("    cmp dword ptr ") + xf(kX86FSize) + ", " +
                  imm(x86_size_perm_[i]) + "\n";

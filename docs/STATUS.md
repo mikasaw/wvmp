@@ -570,3 +570,55 @@ B.5 crash guard 注记；T17 不触碰原生样本二进制，T17 前既状）�
 dump @12345 `ffd47289…`/161,861B sha256 逐字节恒等 = 缺省模式零扰动
 机器证明**。冻结契约零 diff（fetch_decrypt 走 append-only 缺省重载）；
 blob 级 crypt 面零改动。
+
+
+## MIT-474 (T18 · flags 活跃性消除) ✅ 2026-09-06
+
+**交付**：M3 性能末位项——翻译期跨块 flags liveness，死 flags 写由解释器
+handler 跳过整段捕获/装配（zero5/setcc5/flags_tail，x64 ~21 条动态指令/
+写；每个纯写 handler 均受益）。
+
+- **ISA 标记位**：cond_or_size 位 2（kFlagsDeadBit=0x4；4 位域 64 位编码
+  本已用尽，唯一余量 = 算术类 size 只用低 2 位）。size 语义 f&3 零改动
+  （field_size 既有掩码）。encoding.hpp 单一来源：kFlagsDeadBit /
+  flags_dead_field / set_flags_dead / flag_sem_of（FlagSem 五分类，写入
+  面语义审计定稿：25 纯写 + 6 合并型写 + 2 寄存器依赖写 + 5 读者）。
+- **运行时**：4 处 tail（flags_tail / flags_tail_partial / flags_tail_x86 /
+  flags_tail_partial_x86）头部 test+jnz 路由到 skip 出口（x64 test T8,
+  0x100000；x86 test dword [esp+InsnLo], 0x100000——帧槽内存 test，无寄
+  存器压力）。**尺寸链同步修**：标记位随 4 位域流入尺寸链（cond=6 匹配
+  不到任何尺寸 → 落 S64 防御 no-op → 整条指令被跳过——x86 E2E segfault
+  实测），两处 size_chain(_x86) 链头 and 3 掩码。
+- **翻译期**：translate_function 回填后 mark_dead_flag_writes（词流 CFG
+  反向不动点；Halt/Ret/ExitNative = 汇；区域边界 = stub 清零 ctx 故 VM
+  flags 不跨区，末端死写真死；aux 越界即整体放弃 = 零标记旧行为）。
+- **测试**：FlagsLiveness 五专测（尾写标记 / 读者保活 / 前写被覆盖 /
+  分支并集 / 合并型读者）；expect_is 改 writer 标记无关（标记数据驱动
+  不入快照）。
+
+**开发实录（三坑）**：
+1. **尺寸链吞标记**（x86 E2E segfault 定位）：cond 位 2 未掩码，标记后的
+   6/7 匹配不到尺寸 → 防御 no-op 整条跳过。修 = 链头 and 3。
+2. **ExitNative 读者漏分类**（multiseed +10 fail 定位）：条件形式经
+   cond_eval 读 VM flags 决定退出——非 sink。保守统一按 kRead。
+3. **合并型写透传**（atomic_incdec inc_cf 探针抓出）：rol/inc 的旧状态
+   位**流入 flags 结果**（add CF=1 → inc 保 CF → jc），前驱可观察性经合
+   并延续——live_in = live_out（透传）而非 kill。旧实现把合并当 kill →
+   add 被死标记 → CF=1 被清。样本 SDM 语义探针当场抓获。
+4. **adc/sbb 寄存器依赖拆类**（验收 B1 裁决，REJECT 后修复）：adc/sbb 的
+   CF_in 流入**目的寄存器值**（dst = a + b + CF_in），非仅 flags 输出—
+   —透传规则对其不成立（寄存器消费无条件可观察）。FlagSem 拆出
+   kWriteReadReg：输入侧恒读者（前驱写永不标记，128 位加法 add; adc 惯
+   用法的正确性前提），自身 flags 写仍可标记。独立 harness 实证
+  `add; adc; halt` 原 pass 标记 add → rbx 用陈旧 CF_in。新增专测
+   FlagsLivenessAdcSbbRegDepKeepsPredecessor。
+
+**验证**：build 0/0；ctest 23/23（translator 102→108，+6 liveness 专
+测含 B1 回归）；x86 交叉电池 PASS；fetch_crypt_e2e 2/2 + tls_e2e 2/2（互斥面/弱
+耦合面零回踩）；**multiseed 305 pass / 30 fail = T17 基线复原**（30 =
+6 个 SSE/VEX 样本 native=139 自崩，T17 前既状）；**新 x64 dump 锚
+`67cfa727506fc060b6d3fb3a0b020e554eaf4d3f1100b129792402b1e5a48aaf`/
+164,329B（seed=12345）**——旧锚 `ffd47289…`/161,861B 作废（tail 分支 +
+尺寸链掩码为代码结构变化，handler 语义不变），stub_gen/translator 注释
+内旧锚引用随本单更新口径。冻结契约零 diff（标记走 cond 位 2 余量 +
+append-only 助手）。

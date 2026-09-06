@@ -1631,3 +1631,36 @@ REX 前缀归位；8B + mod00/rm100 + SIB scale=11 识别取指），int3 一次
 丁 + 异常处理器逐指令打印关键寄存器。int3 的 RIP 报告在 CC 处或其后一字
 节（两种都要接）；TF 每步自动清零须逐步重装；补丁点若落指令中间，还原
 后从中间恢复执行 = jmp 落垃圾（实测炸栈）。
+
+
+## MIT-474（flags 活跃性消除）收口——cond 位 2 标记协议与 liveness 语义裁决（2026-09-06）
+
+**标记协议**（encoding.hpp 单一来源，三处消费）：cond_or_size 位 2 =
+flags-dead。① 4 处 tail（x64/x86 × 全量/合并）test+jnz 跳过捕获装配；
+② 尺寸链链头 and 3（标记不入尺寸比较）；③ 翻译期 mark_dead_flag_writes
+独占置位。**正确性契约：欠实现安全**（运行时忽略标记 = 旧行为仍正确），
+过实现禁止（非写 op 携带标记 = 未定义）——flag_sem_of 分类表是唯一授
+权源，新 VmOp 入表前不得借道。
+
+**liveness 语义裁决**（词流 CFG，区域级；验收 REJECT 后修订稿）：
+kRead=live 源头；kWrite=kill；**kWriteReadMerge=透传**（live_in =
+live_out）——旧状态位只流入 flags 输出（rol 保 ZF/SF/PF、inc 保 CF），
+前驱可观察性经合并延续，atomic_incdec 样本 inc_cf 探针（SDM: inc 不写
+CF）实证 kill 语义错、透传对。**kWriteReadReg（adc/sbb 专属）=输入侧恒
+读者**（live_in = 1）——验收 B1 实证 adc/sbb 的 CF_in 流入**目的寄存器
+值**（dst = a + b + CF_in），与 merge 的"旧位只进 flags"本质不同：透传
+只保证"合并结果无读者 ⇒ 前写可跳"，对寄存器依赖不成立（`add; adc; halt`
+中 add 被透传规则标记 → adc 用陈旧 CF_in 算 dst → 寄存器值错，128 位加
+法惯用法即触）。自身 flags 写三类均仍可标记。ExitNative = kRead（条件
+形式 cond_eval；无条件直退形保守同判）。区域末端真死：stub 每区清零
+ctx，VM flags 不跨区。
+
+**G4a 行翻正**：flags 活跃性消除 ✅（本节）。强度面遗留 = 无（标记不改
+变可观察行为，纯性能）；对照优化（同 seed 字节码差异披露）：死写 tail
+在解释器侧静态跳过，blob 不变（标记位本身是唯一字节差异）。
+
+**锚点换代**：x64 dump 锚 ffd47289…/161,861B → 67cfa727…/164,329B
+（+2,468B = 33 处 tail 的 test/jnz/skip 出口 + 尺寸链掩码 + 标签）。此
+为 D2 口径的**计划内换代**（首例）：换代纪律 = ① STATUS 披露新锚全值；
+② 旧锚在全部消费点（stub_gen/translator 注释、dump 测试注释）同步作废；
+③ 换代后 5 seeds 复跑 dump 稳定（同 seed 逐字节可复现不因换代失效）。

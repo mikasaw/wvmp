@@ -273,7 +273,7 @@ std::string build_adb_asm_x86(u32 techniques) {
 }
 
 // x64 stub 汇编（MIT-446 (X4) B.1 起更名 x64 专形；D2 恒等铁约束：函数体
-// 逐字保留，x64 asm_dump sha ffd47289… 恒等是机器证明项）。
+// 逐字保留，x64 asm_dump sha ffd47289(旧, MIT-474 换代→67cfa727)… 恒等是机器证明项）。
 std::string build_stub_asm_x64(u64 rt_entry_rva, u64 resume_rva, u64 image_base,
                                const StubCrypt* crypt, const StubAntiDebug* adb) {
     std::string o;

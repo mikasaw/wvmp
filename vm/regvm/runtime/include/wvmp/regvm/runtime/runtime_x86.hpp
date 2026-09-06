@@ -27,7 +27,7 @@ namespace wvmp::regvm::runtime {
 // 吸收 guest push（净深 <= G 字节由翻译期栈深 gate 保证，见 translator.cpp
 // 栈深 walk），保存区/ctx/执行帧整体下移 G。N 由 B.1 实测 p99(=64B) 定 +
 // 2 倍固定余量 = 128（32 dword；x86 池与 wvmpTest 语料 (v)@128 存活率
-// 13/14，@256/@512 无增益）。x64 面无 guard（dump ffd47289 恒等约束），
+// 13/14，@256/@512 无增益）。x64 面无 guard（dump ffd47289(旧, MIT-474 换代→67cfa727) 恒等约束），
 // x64 侧由 translator 栈深 walk budget=0 兜底（D4 双 arch 对称纪律）。
 inline constexpr u64 kX86GuardBytes = 128;
 // 派生式：guard + 4 callee-saved push + ctx + 0x80 余量（余量含义不变：槽位
