@@ -43,7 +43,13 @@ constexpr double kJunkMovProbability = 0.15;
 // 消费面在 IR 不可见的 VM 级（callgate 邻域），IR 侧审计无法闭合 →
 // **维持默认关闭**（宁挂账勿错）；全部强化设施保留（CFG 活跃度对 Nop
 // 注入面同样生效），重启启用需 VM 级 dataflow 工具（T6.2，见 GAPS）。
-constexpr bool kEnableJunkMov = false;  // TODO(T6-bisect): 二分期保持开
+// ⚠️ MIT-479 (T6.2) 快速通道实测：含 Call 块禁注入**不充分**——142 Mov
+// 全部落在无 Call 块，wvmpTest kern.md5 仍崩；进一步二分（WVMP_NOP_LIMIT）
+// 定位到**单个 Nop**（region[1] block=0xD65B，host=0xD65F）即致
+// kern.b64 软失败——该块 IR 地址含非原生边界的 lifter 合成地址，指向
+// translator/lifter 地址键行为在 mutate 同址插入下的缺陷（T6.3 立案）。
+// junk-Mov 维持默认关闭（宁挂账勿错）；CFG 活跃度等强化设施保留。
+constexpr bool kEnableJunkMov = false;
 
 // 垃圾目的的候选 GP 集（按 arch；rsp 排除——栈写语义由栈深 walk 专管，
 // 任何额外 rsp 写都改变 walk 建模）。

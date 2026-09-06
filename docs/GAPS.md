@@ -1755,6 +1755,30 @@ liveness 对该面**原理性不可见**（消费发生在 VM 执行期，不在
 失败样本全部位于含 callgate 的区域）。**快速通道候选：含 Call 的块内
 禁止注入**（本单未验证，T6.2 首试）。
 
+## MIT-479（T6.2 快速通道实测）——callgate 假设被否 + 单 Nop 复现 + T6.3 立案（2026-09-07）
+
+**快速通道实测（否定）**：含 Call 块禁注入（142 Mov 全落无 Call 块）→
+kern.md5 仍崩。callgate 邻域假设**被否**。
+
+**二分深化（决定性）**：WVMP_NOP_LIMIT/WVMP_JUNK_LIMIT 钩子（rng 前缀
+确定性保持）逐级收缩——
+- junk 全禁（limit=0，仅 Nop 新落位）**仍崩** → 与 junk Mov 无关；
+- **单个 Nop** 即复现：region[1]（marker@0xc9c7，kern.b64 wrapper）
+  block=0xD65B host=0xD65F 注入 1 个 Nop → kern.b64_rfc4648_vectors
+  软失败（结果错）；
+- 该块 IR 地址含 **lifter 微展开合成地址**（0xD65F/0xD666/0xD66A/0xD66D
+  均非原生指令边界——原生 0xD65D 为 `and eax,0xFF` 5 字节立即数内），
+  mutate 以 `下一条 IR insn 的 addr` 作 host 插入 → 出现 **同地址插入
+  对**（NOP 与 Sub 同键 0xD65F），指向 translator/lifter 地址键行为
+  （next_ip_of/bidx/载体匹配等 insert_or_assign 面）在 mutate 同址插
+  入下的未定义序。
+
+**T6.3 立案**：mutate 同址插入 × 地址键 translator 行为——修复方向：
+① mutate 插入物 addr 改为"前一条真实 insn 的 addr + 插入序偏移"或直接
+复用前一条 addr 的既有同址纪律（MIT-426 Movaps 先例审计）；② 审计
+next_ip_of/载体匹配/jump-table 匹配在同址对下的取值序。修复后重跑本单
+的单 Nop 复现（确定性最小用例）→ 绿色再议 junk-Mov 重启用。
+
 **方法论**：二分钩子（注入上限 env，rng 前缀确定性保持——先取全部
 rng 再决定发射）是确定性变换失败定位的通用工具；"nop-only 绿色"不能作
 为机制安全证据（落位幸运），必须以注入/不注入对照实验分离变量。

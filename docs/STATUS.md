@@ -772,3 +772,21 @@ translator 发射面生成"VmOp × 槽"精确读写矩阵，mutate 直接消费�
 **验证**：build 0/0；ctest 23/23（mutate 5 用例含新口径）；multiseed
 **335/335**；x64 dump 锚 67cfa727… 恒等；tls/fetch E2E 2/2。冻结契约
 零 diff。
+
+
+## MIT-479 (T6.2 · 含 Call 块禁注入快速通道——实测否定 + 单 Nop 最小复现) ✅ 2026-09-07
+
+**交付**：T6.2 快速通道实测（否定）+ 二分深化定位到最小复现 + T6.3 立案。
+
+- **快速通道**：含 Call 块禁注入（142 Mov 全落无 Call 块）→ kern.md5 仍
+  崩 → callgate 邻域假设被否。
+- **二分深化**（WVMP_JUNK_LIMIT/WVMP_NOP_LIMIT env 钩子，rng 前缀确定性
+  保持）：junk 全禁仅 Nop 新落位仍崩 → **单个 Nop**（region[1]
+  block=0xD65B host=0xD65F）即致 kern.b64 软失败。该块 IR 地址含 lifter
+  微展开合成地址（0xD65F 等非原生指令边界），mutate 以下一条 IR insn 的
+  addr 作 host → 同地址插入对 → 指向 translator/lifter 地址键行为在
+  mutate 同址插入下的缺陷 → **T6.3 立案**（GAPS MIT-479 节含修复方向）。
+- **裁定**：junk-Mov 维持默认关闭；T20 的 CFG 活跃度与 T6 的隐式读审计
+  设施保留（普适硬化）。
+
+**验证**：build 0/0；ctest 23/23（mutate 5 用例）；multiseed 335/335。
