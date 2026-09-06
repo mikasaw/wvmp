@@ -50,6 +50,18 @@ public:
     // blob = 32B 明文头 + 密文流；长度不变；尾部 <4B 字节保持明文
     // （blob 流恒 8 对齐，本分支为防御面）。
     static void encrypt_with_key(u32 key0, std::vector<u8>& blob);
+
+    // MIT-473 (C 点取指级加密)：逐指令字（8B = 2×u32）**位置键流**加密——
+    // 流保持密文态，解密在解释器 dispatch（asmgen 织入，键基 = blob 头
+    // seed 字段）。  per word i: K_i = key0 + i*STEP（u32 环加）；字的
+    // lo/hi 两半同 xor K_i。仅依赖字序 → 跳转/回跳/imm aux 字任意取指序
+    // 全兼容。key0 写入 blob 头 seed 字段（offset 16）。blob 长度不变。
+    // 返回 key0（便于调用方记录）。解密面仅供测试（解释器侧为 asm 织入）。
+    // ⚠️ STEP 与 lo/hi 同 K 语义在本文件与 asmgen build_dispatch(_x86)
+    // 织入块各一份——改任一侧必须复跑双架构 FetchDecryptSemanticParity +
+    // scripts/fetch_crypt_e2e.sh。
+    static u32 encrypt_fetch_with_key(u32 key0, std::vector<u8>& blob);
+    static void decrypt_fetch_with_key(u32 key0, std::vector<u8>& blob);
 };
 
 // codec 工厂（未知名返回 nullptr）。与 create_backend 同款约定。

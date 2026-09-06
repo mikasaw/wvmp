@@ -141,4 +141,8 @@ struct RuntimeGenResult {
 // 线程安全性：单线程保护管道内使用（Rng 非线程安全）。
 [[nodiscard]] RuntimeGenResult generate_runtime(wvmp::Rng& rng);
 
+// MIT-473: 取指级加密变体（fetch_decrypt = dispatch 织入 xor_chain 原位解
+// 密；缺省重载保持锚点 dump 恒等）。append-only 重载（不改冻结签名）。
+[[nodiscard]] RuntimeGenResult generate_runtime(wvmp::Rng& rng, bool fetch_decrypt);
+
 } // namespace wvmp::regvm::runtime

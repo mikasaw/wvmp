@@ -109,6 +109,56 @@ TEST(XorChainCodec, ContractFaceUsesOneRngDraw) {
     EXPECT_EQ(a, b);
 }
 
+
+// —— MIT-473 (C 点取指级加密)：逐指令字链加密 ——
+
+TEST(XorChainFetch, RoundTripPreservesStreamAndSetsSeed) {
+    const u32 key0 = 0xCAFEBABEu;
+    auto plain = make_sample_blob();
+    auto cipher = plain;
+    // 头 seed 字段（offset 16）初值清零以验证写入。
+    cipher[16] = cipher[17] = cipher[18] = cipher[19] = 0;
+    codecs::XorChainCodec::encrypt_fetch_with_key(key0, cipher);
+    EXPECT_NE(cipher, plain);
+    // 头 seed = key0（解释器初态载体）。
+    const u32 seed = u32(cipher[16]) | (u32(cipher[17]) << 8) |
+                     (u32(cipher[18]) << 16) | (u32(cipher[19]) << 24);
+    EXPECT_EQ(seed, key0);
+    // 头其余字节（seed 槽外）与尾 2B 不动。
+    EXPECT_EQ(cipher[0], 0xAAu);
+    EXPECT_EQ(cipher[15], 0xAAu);
+    EXPECT_EQ(cipher[20], 0xAAu);
+    EXPECT_EQ(cipher[31], 0xAAu);
+    EXPECT_EQ(cipher[48], 0x5Au);  // 尾（流 32..48 之外）
+    EXPECT_EQ(cipher[49], 0xA5u);
+    codecs::XorChainCodec::decrypt_fetch_with_key(key0, cipher);
+    // 流区逐字节还原（头 seed 槽留存初态属设计；头/尾其余本就未动）。
+    for (size_t i = 32; i < plain.size(); ++i) EXPECT_EQ(cipher[i], plain[i]) << "byte " << i;
+}
+
+TEST(XorChainFetch, KnownVectorPositionKeystream) {
+    // 手推已知向量（位置键流）：K_i = key0 + i*STEP（STEP = 0x9E3779B1）；
+    // 字 i 的 lo/hi 两半同 xor K_i。key0 = 0x11111111：
+    //   字0: K0 = key0；c_lo = 0 ^ K0 = 0x11111111；c_hi = 0xDEADBEEF ^ K0
+    //   字1: K1 = key0 + STEP；c = 0x12345678 ^ K1
+    const u32 key0 = 0x11111111u;
+    const u32 step = 0x9E3779B1u;
+    auto blob = make_sample_blob();  // 32B 头 + 16B 流（2 字）+ 2B 尾
+    const u32 words[] = {0x00000000u, 0xDEADBEEFu, 0x12345678u, 0xFFFFFFFFu};
+    codecs::XorChainCodec::encrypt_fetch_with_key(key0, blob);
+    const auto rd32 = [&](size_t off) {
+        return u32(blob[off]) | (u32(blob[off + 1]) << 8) | (u32(blob[off + 2]) << 16) |
+               (u32(blob[off + 3]) << 24);
+    };
+    const u32 k0 = key0, k1 = key0 + step;
+    EXPECT_EQ(rd32(32), words[0] ^ k0);           // 字0 lo
+    EXPECT_EQ(rd32(36), words[1] ^ k0);           // 字0 hi
+    EXPECT_EQ(rd32(40), words[2] ^ k1);           // 字1 lo
+    EXPECT_EQ(rd32(44), words[3] ^ k1);           // 字1 hi
+    // 字序敏感性：不同字序同明文 → 密文异（K 随字序变化）。
+    EXPECT_NE(words[0] ^ k0, words[2] ^ k1);
+}
+
 TEST(CodecFactory, XorChainRegisteredUnknownNull) {
     auto c = codecs::create_codec("xor_chain");
     ASSERT_NE(c, nullptr);

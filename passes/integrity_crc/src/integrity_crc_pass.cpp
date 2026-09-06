@@ -25,6 +25,14 @@ namespace wvmp::passes {
 //（MIT-465 TLS 基建后续单）。
 
 void IntegrityCrcPass::run(ProtectionContext& ctx) {
+    // MIT-473: 取指级加密无 blob 尾区（[flag][crc] 面不存在）→ 本 pass
+    // 无校验对象，跳过（Note 留痕）。
+    if (const auto* plan0 = ctx.find_slot<crypt::CryptPlan>(kCryptPlan);
+        plan0 != nullptr && plan0->fetch_mode) {
+        ctx.diag.report(Severity::Note, name(),
+                        "crypt fetch 模式无 blob 尾区，integrity 校验跳过");
+        return;
+    }
     auto* plan = ctx.find_slot<crypt::CryptPlan>(kCryptPlan);
     if (plan == nullptr || plan->functions.empty()) {
         ctx.diag.report(Severity::Note, name(),

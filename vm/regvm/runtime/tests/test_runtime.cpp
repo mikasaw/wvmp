@@ -20,6 +20,7 @@
 #include "wvmp/regvm/runtime/runtime.hpp"
 
 #include "wvmp/common/rng.hpp"
+#include "wvmp/regvm/codecs/xor_chain.hpp"
 #include "wvmp/regvm/isa/encoding.hpp"
 #include "wvmp/regvm/isa/vm_op.hpp"
 #include "wvmp/regvm/isa/vm_reg.hpp"
@@ -3941,6 +3942,103 @@ TEST(Interpreter, CbwCarrierSlotSemantics) {
         isa::append_insn(s, halt());                                         // 12
         const auto ctx = run_stream(entry, s, scratch.data());
         EXPECT_EQ(ctx.regs[0], 0xABCD'EF01'2345'FF80ull);  // 高 48 保 + 低 16 符号扩展
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MIT-473 (C 点取指级加密)：fetch 模式语义对等。
+// 同一字节码流明文跑一遍（fetch=false），再经 encrypt_fetch_with_key 加密
+//（seed 写头 offset 16）+ fetch=true 运行时跑一遍，regs/ret_value/pc 终态
+// 逐位一致。流覆盖：imm 算术、双路 jcc（取/不取）、回边循环（位置键在
+// 跳转/回跳下仍一致）、Load/Store。多种子稳定性同语义电池口径。
+// ---------------------------------------------------------------------------
+namespace {
+// 搭建语义探针流（词序 = 执行序；jcc 双路径 + 回边保证跳转目标词也被取指）。
+std::vector<u8> make_fetch_probe_stream() {
+    std::vector<u8> s;
+    const u8 sz64 = isa::size_field(ir::Size::S64);
+    isa::append_insn(s, mov_imm(0, 0, ir::Size::S64));          // 0: v0 = 0
+    isa::append_insn(s, mov_imm(1, 5, ir::Size::S64));          // 1: v1 = 5
+    isa::append_insn(s, bin(isa::VmOp::Add, 0, 1, ir::Size::S64));  // 2 循环头
+    isa::append_insn(s, bin(isa::VmOp::Dec, 1, 1, ir::Size::S64));  // 3
+    isa::append_insn(s, jcc(ir::Cond::Ne, u32(-2)));            // 4 → 回 2
+    isa::append_insn(s, isa::make_insn(isa::VmOp::Mov, isa::OpKind::Reg, 4,
+                                       isa::OpKind::Reg, 0, 0, sz64));  // 5: v4 = v0
+    isa::append_insn(s, bin_imm(isa::VmOp::And, 4, 1, ir::Size::S64));  // 6: v4 &= 1
+    isa::append_insn(s, jcc(ir::Cond::Ne, 2));                  // 7: 奇 → 跳过 +100
+    isa::append_insn(s, bin_imm(isa::VmOp::Add, 0, 100, ir::Size::S64));  // 8 不执行
+    isa::append_insn(s, mov_imm(2, 0x1234, ir::Size::S64));     // 9: v2 = 0x1234
+    isa::append_insn(s, isa::make_insn(isa::VmOp::StoreRva, isa::OpKind::Reg, 2,
+                                       isa::OpKind::Reg, 2, 0, sz64));  // 10: [scratch+v2] = v2
+    isa::append_insn(s, isa::make_insn(isa::VmOp::LoadRva, isa::OpKind::Reg, 3,
+                                       isa::OpKind::Reg, 2, 0, sz64));  // 11: v3 = [scratch+v2]
+    isa::append_insn(s, bin(isa::VmOp::Add, 0, 3, ir::Size::S64));  // 12: v0 += v3
+    isa::append_insn(s, halt());                                // 13
+    return s;
+}
+} // namespace
+
+TEST(Interpreter, FetchDecryptSemanticParity) {
+    namespace codecs = wvmp::regvm::codecs;
+    const std::vector<u8> plain = make_fetch_probe_stream();
+    ASSERT_EQ(plain.size() % 8, 0u);
+    alignas(16) std::array<u8, 0x10000> scratch{};
+    const u64 scratch_va = reinterpret_cast<u64>(scratch.data());
+
+    // 明文基线（fetch=false）：多 seed 下终态须一致。
+    std::vector<u64> base_regs;
+    u64 base_ret = 0, base_pc = 0;
+    for (const u32 seed : {1u, 7u, 0xC0FFEEu}) {
+        wvmp::Rng rng(seed);
+        const auto result = rt::generate_runtime(rng, false);
+        RwxImage rwx(result.image.code);
+        std::vector<u8> stream = plain;
+        rt::VmContext ctx;
+        ctx.bytecode = stream.data();
+        ctx.pc = 0;
+        ctx.scratch_mem = scratch_va;
+        rwx.entry()(&ctx);
+        if (base_regs.empty()) {
+            base_regs.assign(std::begin(ctx.regs), std::end(ctx.regs));
+            base_ret = ctx.ret_value;
+            base_pc = ctx.pc;
+        } else {
+            EXPECT_EQ(std::vector<u64>(std::begin(ctx.regs), std::end(ctx.regs)), base_regs);
+        }
+    }
+    // 语义自检：循环 5 轮求和 5+4+3+2+1=15；v0 奇 → 跳过 +100；
+    // store/load 往返后 v0 = 15 + 0x1234。
+    EXPECT_EQ(base_regs[0], 15ull + 0x1234ull);
+    EXPECT_EQ(base_regs[3], 0x1234ull);
+    EXPECT_EQ(base_regs[1], 0ull);
+
+    for (const u32 seed : {1u, 7u, 0xC0FFEEu}) {
+        wvmp::Rng rng(seed);
+        const auto result = rt::generate_runtime(rng, true);
+        RwxImage rwx(result.image.code);
+        // blob = 32B 头 + 流；加密后 seed 在头 offset 16（= bytecode - 0x10）。
+        std::vector<u8> blob(codecs::kBlobHeaderBytes, 0);
+        blob.insert(blob.end(), plain.begin(), plain.end());
+        const std::vector<u8> plain_copy = blob;
+        const u32 key0 = 0x5A5AC3C3u + seed;
+        codecs::XorChainCodec::encrypt_fetch_with_key(key0, blob);
+        // 加密确实发生（流词被改、头 16B 不动、seed 落位）。
+        EXPECT_NE(blob, plain_copy);
+        EXPECT_EQ(0, std::memcmp(blob.data(), plain_copy.data(), 16));
+        u32 seed_hdr = 0;
+        std::memcpy(&seed_hdr, blob.data() + 16, 4);
+        EXPECT_EQ(seed_hdr, key0);
+
+        rt::VmContext ctx;
+        ctx.bytecode = blob.data() + codecs::kBlobHeaderBytes;
+        ctx.pc = 0;
+        ctx.scratch_mem = scratch_va;
+        rwx.entry()(&ctx);
+        // 终态与明文基线逐位一致（regs 全量 + ret_value + pc）。
+        EXPECT_EQ(std::vector<u64>(std::begin(ctx.regs), std::end(ctx.regs)), base_regs)
+            << "seed=" << seed;
+        EXPECT_EQ(ctx.ret_value, base_ret);
+        EXPECT_EQ(ctx.pc, base_pc);
     }
 }
 } // namespace

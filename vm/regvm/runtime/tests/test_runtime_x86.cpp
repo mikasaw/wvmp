@@ -25,6 +25,7 @@
 #include "wvmp/regvm/runtime/runtime_x86.hpp"
 
 #include "wvmp/common/rng.hpp"
+#include "wvmp/regvm/codecs/xor_chain.hpp"
 #include "wvmp/regvm/isa/encoding.hpp"
 #include "wvmp/regvm/isa/vm_op.hpp"
 #include "wvmp/regvm/isa/vm_reg.hpp"
@@ -3045,5 +3046,85 @@ TEST(X86Battery, StepTagS32LiveAndS64NoopGuard) {
         std::memcpy(scratch.data() + (top + 4), &planted2, 4);
         const auto ctx2 = run(s);
         expect_slot32(ctx2, 19, planted2);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MIT-473 (C 点取指级加密)：x86 fetch 模式语义对等（同 x64 口径）。
+// 明文流 fetch=false 基线 vs encrypt_fetch_with_key 加密 + fetch=true 运行
+// 时，终态逐位一致。S32 域：回边循环求和、取/不取分支、RVA 访存往返。
+// ---------------------------------------------------------------------------
+TEST(X86Battery, FetchDecryptSemanticParity) {
+    namespace codecs = wvmp::regvm::codecs;
+    const u8 sz32 = isa::size_field(ir::Size::S32);
+    std::vector<u8> plain;
+    isa::append_insn(plain, bin_imm(isa::VmOp::Mov, 0, 0, ir::Size::S32));   // 0: v0 = 0
+    isa::append_insn(plain, bin_imm(isa::VmOp::Mov, 1, 5, ir::Size::S32));   // 1: v1 = 5
+    isa::append_insn(plain, bin(isa::VmOp::Add, 0, 1, ir::Size::S32));       // 2 循环头
+    isa::append_insn(plain, bin(isa::VmOp::Dec, 1, 1, ir::Size::S32));       // 3
+    isa::append_insn(plain, jcc(ir::Cond::Ne, u32(-2)));                     // 4 → 回 2
+    isa::append_insn(plain, bin(isa::VmOp::Mov, 4, 0, ir::Size::S32));       // 5: v4 = v0
+    isa::append_insn(plain, bin_imm(isa::VmOp::And, 4, 1, ir::Size::S32));   // 6: v4 &= 1
+    isa::append_insn(plain, jcc(ir::Cond::Ne, 2));                           // 7: 奇 → 跳过
+    isa::append_insn(plain, bin_imm(isa::VmOp::Add, 0, 100, ir::Size::S32)); // 8 不执行
+    isa::append_insn(plain, bin_imm(isa::VmOp::Mov, 2, 0x1234, ir::Size::S32));  // 9
+    isa::append_insn(plain, isa::make_insn(isa::VmOp::StoreRva, isa::OpKind::Reg, 2,
+                                           isa::OpKind::Reg, 2, 0, sz32));   // 10
+    isa::append_insn(plain, isa::make_insn(isa::VmOp::LoadRva, isa::OpKind::Reg, 3,
+                                           isa::OpKind::Reg, 2, 0, sz32));   // 11
+    isa::append_insn(plain, bin(isa::VmOp::Add, 0, 3, ir::Size::S32));       // 12
+    isa::append_insn(plain, halt());                                         // 13
+    ASSERT_EQ(plain.size() % 8, 0u);
+
+    alignas(16) std::array<u8, 0x10000> scratch{};
+    const u32 scratch_va = static_cast<u32>(reinterpret_cast<uintptr_t>(scratch.data()));
+
+    auto run_once = [&](const rt::RuntimeGenResult& gen, u8* bytecode) {
+        rt::VmContext ctx;
+        ctx.bytecode = bytecode;
+        ctx.pc = 0;
+        ctx.scratch_mem = scratch_va;
+        ctx.regs[isa::vm_reg_of(ir::Reg::Rsp)] = 0;
+        RwxImage rwx(gen.image.code);
+        rwx.entry()(&ctx);
+        return ctx;
+    };
+
+    // 明文基线（fetch=false）。
+    std::vector<u64> base_regs;
+    u64 base_ret = 0, base_pc = 0;
+    for (const u32 seed : {1u, 7u, 0xC0FFEEu}) {
+        wvmp::Rng rng(seed);
+        const auto gen = rt::generate_runtime_x86(rng, false);
+        std::vector<u8> stream = plain;
+        const auto ctx = run_once(gen, stream.data());
+        if (base_regs.empty()) {
+            base_regs.assign(std::begin(ctx.regs), std::end(ctx.regs));
+            base_ret = ctx.ret_value;
+            base_pc = ctx.pc;
+        } else {
+            EXPECT_EQ(std::vector<u64>(std::begin(ctx.regs), std::end(ctx.regs)), base_regs);
+        }
+    }
+    EXPECT_EQ(base_regs[0], 15ull + 0x1234ull);
+    EXPECT_EQ(base_regs[3], 0x1234ull);
+    EXPECT_EQ(base_regs[1], 0ull);
+
+    // 加密态（fetch=true）：位置键流 + dispatch 织入解密，终态须逐位一致。
+    for (const u32 seed : {1u, 7u, 0xC0FFEEu}) {
+        wvmp::Rng rng(seed);
+        const auto gen = rt::generate_runtime_x86(rng, true);
+        std::vector<u8> blob(codecs::kBlobHeaderBytes, 0);
+        blob.insert(blob.end(), plain.begin(), plain.end());
+        const u32 key0 = 0x5A5AC3C3u + seed;
+        codecs::XorChainCodec::encrypt_fetch_with_key(key0, blob);
+        u32 seed_hdr = 0;
+        std::memcpy(&seed_hdr, blob.data() + 16, 4);
+        ASSERT_EQ(seed_hdr, key0);
+        const auto ctx = run_once(gen, blob.data() + codecs::kBlobHeaderBytes);
+        EXPECT_EQ(std::vector<u64>(std::begin(ctx.regs), std::end(ctx.regs)), base_regs)
+            << "seed=" << seed;
+        EXPECT_EQ(ctx.ret_value, base_ret);
+        EXPECT_EQ(ctx.pc, base_pc);
     }
 }

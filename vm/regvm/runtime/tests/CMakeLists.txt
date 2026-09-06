@@ -6,6 +6,7 @@ add_executable(wvmp_regvm_runtime_tests
 target_link_libraries(wvmp_regvm_runtime_tests PRIVATE
     wvmp_regvm_runtime
     wvmp_regvm_isa
+    wvmp_regvm_codecs
     wvmp::vm
     wvmp::ir
     wvmp::common
@@ -27,6 +28,7 @@ if(WVMP_WITH_CAPSTONE AND CMAKE_SIZEOF_VOID_P EQUAL 4)
     target_link_libraries(wvmp_regvm_runtime_tests_x86 PRIVATE
         wvmp_regvm_runtime
         wvmp_regvm_isa
+        wvmp_regvm_codecs
         wvmp::vm
         wvmp::ir
         wvmp::common

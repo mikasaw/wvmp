@@ -176,6 +176,76 @@ TEST(CryptPass, NameRuleCryptFalseExemptsFunction) {
     EXPECT_EQ(plan->functions[0].name, "fn1");
 }
 
+
+// —— MIT-473 (C 点取指级加密)：fetch 模式 ——
+
+TEST(CryptPass, FetchModeEncryptsWithHeaderSeedAndNoTrailer) {
+    wvmp::ProtectionContext ctx;
+    fill_vfs(ctx);
+    const auto* vfs =
+        ctx.find_slot<std::vector<wvmp::passes::VirtualizedFunction>>(wvmp::kVmProgram);
+    const std::vector<u8> plain[2] = {(*vfs)[0].program.bytecode,
+                                      (*vfs)[1].program.bytecode};
+
+    wvmp::ProtectRules rules;
+    rules.has_crypt_fetch = true;
+    rules.crypt_fetch = true;
+    ctx.slot<wvmp::ProtectRules>(wvmp::kProtectRules) = rules;
+
+    wvmp::passes::CryptPass pass;
+    ctx.seed = 12345;
+    pass.run(ctx);
+
+    const auto* plan = ctx.find_slot<wvmp::passes::crypt::CryptPlan>(wvmp::kCryptPlan);
+    ASSERT_NE(plan, nullptr);
+    EXPECT_TRUE(plan->fetch_mode);
+    ASSERT_EQ(plan->functions.size(), size_t{2});
+    for (size_t i = 0; i < plan->functions.size(); ++i) {
+        const auto& e = plan->functions[i];
+        // fetch 模式忽略每函数豁免 → 全函数有条目。
+        EXPECT_EQ(e.vfs_index, i);
+        // 无 8B 尾区（one-shot 旗标面不存在）；流长不变。
+        EXPECT_EQ(e.encrypted_blob.size(), plain[i].size());
+        EXPECT_FALSE(e.has_crc);
+        // 头 seed = key0（解释器初态载体）。
+        const u32 seed = static_cast<u32>(e.encrypted_blob[16]) |
+                         (static_cast<u32>(e.encrypted_blob[17]) << 8) |
+                         (static_cast<u32>(e.encrypted_blob[18]) << 16) |
+                         (static_cast<u32>(e.encrypted_blob[19]) << 24);
+        EXPECT_EQ(seed, e.key0);
+        // 流已变（非明文）。
+        EXPECT_NE(std::memcmp(e.encrypted_blob.data() + 32, plain[i].data() + 32,
+                              plain[i].size() - 32), 0);
+    }
+    EXPECT_FALSE(ctx.diag.has_errors());
+}
+
+TEST(CryptPass, FetchModeIgnoresPerFunctionExemption) {
+    wvmp::ProtectionContext ctx;
+    fill_vfs(ctx);
+    wvmp::ProtectRules rules;
+    rules.has_crypt_fetch = true;
+    rules.crypt_fetch = true;
+    // 首函数豁免（fetch 模式下应被忽略——共享 dispatch 无法按函数分叉）。
+    auto& r0 = rules.functions.emplace_back();
+    r0.has_name = true;
+    r0.name = (*ctx.find_slot<std::vector<wvmp::passes::VirtualizedFunction>>(
+                  wvmp::kVmProgram))[0].name;
+    r0.level = wvmp::ProtectLevel::Virtualize;
+    r0.has_crypt = true;
+    r0.crypt = false;
+    ctx.slot<wvmp::ProtectRules>(wvmp::kProtectRules) = rules;
+
+    wvmp::passes::CryptPass pass;
+    ctx.seed = 7;
+    pass.run(ctx);
+
+    const auto* plan = ctx.find_slot<wvmp::passes::crypt::CryptPlan>(wvmp::kCryptPlan);
+    ASSERT_NE(plan, nullptr);
+    EXPECT_TRUE(plan->fetch_mode);
+    EXPECT_EQ(plan->functions.size(), size_t{2});  // 豁免被忽略：仍是 2 条
+}
+
 TEST(CryptPass, ExemptionDoesNotShiftKeyStream) {
     // MIT-461 验收 REJECT 项修复钉：密钥流按 vfs 序无条件消费（豁免函数
     // 也消费一次）——加一条豁免规则后，其余已加密函数的 key0 与无豁免

@@ -38,6 +38,12 @@ struct CryptedFunction {
 struct CryptPlan {
     std::string algo;  // = kAlgoXorChain（v1 恒；非此值的 plan 由 stub_link 拒）
     std::vector<CryptedFunction> functions;
+    // MIT-473 (C 点取指级加密)：fetch 模式 = 流保持密文态，解释器 dispatch
+    // 织入逐指令解密（初态 = blob 头 seed 字段）。与 blob 级互斥（fetch 时
+    // stub 不发射 one-shot 解密块；integrity_crc 无尾区可校验 → 跳过）。
+    // ⚠️ fetch 模式忽略每函数 crypt 豁免（运行时共享一份 dispatch，无法
+    // 按函数分叉；全部虚拟化函数统一取指加密），Note 披露。
+    bool fetch_mode = false;
 };
 
 } // namespace wvmp::passes::crypt

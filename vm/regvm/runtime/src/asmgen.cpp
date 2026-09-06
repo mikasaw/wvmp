@@ -448,7 +448,8 @@ public:
     // MIT-443 (X3a)：生成码体位宽双模。默认 X64 —— 既有路径逐字节不变（D6：
     // x64 输出按同 seed dump 对账恒等）；X86 = KS_MODE_32 码体（x86 电池面）。
     enum class HostArch { X64, X86 };
-    explicit AsmGen(Rng& rng, HostArch arch = HostArch::X64) : rng_(rng), arch_(arch) {}
+    explicit AsmGen(Rng& rng, HostArch arch = HostArch::X64, bool fetch_decrypt = false)
+        : rng_(rng), arch_(arch), fetch_decrypt_(fetch_decrypt) {}
 
     void roll() {
         if (arch_ == HostArch::X86) { roll_x86(); return; }
@@ -623,6 +624,29 @@ public:
         o += std::string("    mov ") + r64(t_[0]) + ", qword ptr [" + r64(ctx_) + "]\n";
         o += std::string("    mov ") + r64(t_[8]) + ", qword ptr [" + r64(t_[0]) + " + " +
              r64(pc_) + "*8]\n";
+        if (fetch_decrypt_) {
+            // MIT-473 (C 点取指级加密)：fetch 后原位解密。位置键流 K =
+            // seed + PC × STEP（u32 环加，仅依赖字序 → 跳转/循环/imm aux
+            // 字任意取指序全兼容）；字内 lo/hi 两半同 xor K（与 codec
+            // encrypt_fetch_with_key 逐位一致）；初态在 blob 头 seed 字段 =
+            // 流基址 -0x10。
+            // ⚠️ K 先全 32 位环加（add/imul r64 变体 + imm32 会符号扩展且被
+            // keystone 拒，errno 512，实测），再复制到 64 位上下两半、一次
+            // 64 位 xor 解密整个字——**绝不能对 T8 做 32 位 xor**：x86-64
+            // 32 位写零扩展会把寄存器高 32 位（= 加密的 hi 半字）清零
+            //（单步实测：w0 0x0000004D_000E4001 经首次 xor 后高半即毁）。
+            // 立即数必须 hex()——keystone 裸数字按 16 进制解析（P6）。
+            o += std::string("    mov ") + rs(t_[0], 2) + ", dword ptr [" + r64(t_[0]) + " - " + hex(16) + "]\n";  // key0
+            o += std::string("    mov ") + rs(t_[2], 2) + ", " + rs(pc_, 2) + "\n";       // 字序 = PC
+            o += std::string("    mov ") + rs(t_[3], 2) + ", " + rs(t_[2], 2) + "\n";
+            o += std::string("    imul ") + rs(t_[3], 2) + ", " + rs(t_[3], 2) + ", " +
+                 hex(0x9E3779B1ull) + "\n";
+            o += std::string("    add ") + rs(t_[3], 2) + ", " + rs(t_[0], 2) + "\n";   // K（32 位环加）
+            o += std::string("    mov ") + rs(t_[2], 2) + ", " + rs(t_[3], 2) + "\n";   // 暂存 K（t2 dispatch 内已死）
+            o += std::string("    shl ") + r64(t_[3]) + ", " + hex(32) + "\n";          // K << 32
+            o += std::string("    or ") + r64(t_[3]) + ", " + r64(t_[2]) + "\n";        // K 复制到上下两半
+            o += std::string("    xor ") + r64(t_[8]) + ", " + r64(t_[3]) + "\n";       // 64 位一次解密 lo+hi
+        }
         o += std::string("    mov ") + r64(t_[0]) + ", " + r64(t_[8]) + "\n";
         o += std::string("    and ") + r64(t_[0]) + ", " + imm(kTableEntries - 1) + "\n";
         o += std::string("    mov ") + r64(t_[1]) + ", qword ptr [" + r64(base_) + " + " +
@@ -3668,6 +3692,23 @@ public:
              " + " + r32x(t_[1]) + "*8 + " + imm(4) + "]\n";
         o += std::string("    mov dword ptr ") + xf(kX86FInsnLo) + ", " + r32x(t_[2]) + "\n";
         o += std::string("    mov dword ptr ") + xf(kX86FAux) + ", " + r32x(t_[3]) + "\n";
+        if (fetch_decrypt_) {
+            // MIT-473: x86 织入——lo/hi 已落帧（帧槽 RW），位置键流解密
+            //（K = blob 头 seed + 字序 × STEP，仅依赖字序；初态 = blob 头
+            // seed 字段 = 流基址 -16）。⚠️ 顺序纪律：先 `mov ecx, t1`（PC
+            // 寄存器值）再 `mov eax, [t0-0x10]`（key0）——t0/t1 都可能被
+            // 分配到 eax（kX86ByteCapable 含 eax），先毁 eax 再读 t1 就会
+            // 把 key0 当 PC（K 全错，实测）；且 PC 必须取寄存器值，加 []
+            // 是把 PC 当地址解引用（pc=0 → 读地址 0 segfault，实测）。
+            // ecx 不在 x86 分配池（保留移位计数），作 K 暂存绝对安全。
+            o += std::string("    mov ecx, ") + r32x(t_[1]) + "\n";                                // PC（字序）先取
+            o += std::string("    mov eax, dword ptr [") + r32x(t_[0]) + " - " + hex(16) + "]\n";  // key0 后读
+            o += std::string("    imul ecx, ecx, ") + hex(0x9E3779B1ull) + "\n";                   // STEP
+            o += std::string("    add ecx, eax\n");                                                // K
+            o += std::string("    xor dword ptr ") + xf(kX86FInsnLo) + ", ecx\n";
+            o += std::string("    xor dword ptr ") + xf(kX86FAux) + ", ecx\n";
+            o += std::string("    mov ") + r32x(t_[2]) + ", dword ptr " + xf(kX86FInsnLo) + "\n";
+        }
         o += std::string("    and ") + r32x(t_[2]) + ", " + imm(kTableEntries - 1) + "\n";
         o += std::string("    mov ") + r32x(t_[1]) + ", dword ptr [" + r32x(base_) +
              " + " + r32x(t_[2]) + "*8 + " + hex(table_off) + "]\n";
@@ -5592,6 +5633,9 @@ public:
 private:
     Rng& rng_;
     HostArch arch_ = HostArch::X64;
+    // MIT-473: 取指级解密织入开关（缺省 false = 缺省管道解释器字节与锚点
+    // dump 逐字节恒等；true 时 dispatch fetch 后织入 xor_chain 原位解密）。
+    bool fetch_decrypt_ = false;
     int ctx_ = 0, pc_ = 0, flags_ = 0, base_ = 0;
     int t_[10] = {};
     std::array<int, 4> size_perm_{};
@@ -5727,9 +5771,10 @@ std::vector<HandlerDef> x86_handler_table() {
 
 // MIT-443 (X3a)：双模管线。x64 路径（arch=X64）逐字保留既有序列 —— roll/
 // 两遍法/handler 表/dump 输出全部原样，D6 恒等按同 seed dump 逐字节对账。
-RuntimeGenResult generate_runtime_arch(wvmp::Rng& rng, AsmGen::HostArch arch) {
+RuntimeGenResult generate_runtime_arch(wvmp::Rng& rng, AsmGen::HostArch arch,
+                                       bool fetch_decrypt = false) {
     using isa::VmOp;
-    AsmGen g(rng, arch);
+    AsmGen g(rng, arch, fetch_decrypt);
     g.roll();
     KsSession ks(arch == AsmGen::HostArch::X86 ? unsigned(KS_MODE_32)
                                                : unsigned(KS_MODE_64));
@@ -5985,9 +6030,20 @@ RuntimeGenResult generate_runtime(wvmp::Rng& rng) {
     return generate_runtime_arch(rng, AsmGen::HostArch::X64);
 }
 
+// MIT-473: 取指级加密变体（fetch_decrypt = dispatch 织入 xor_chain 原位解
+// 密；缺省重载保持锚点恒等）。运行时契约头随本单同步（append-only 重载）。
+RuntimeGenResult generate_runtime(wvmp::Rng& rng, bool fetch_decrypt) {
+    return generate_runtime_arch(rng, AsmGen::HostArch::X64, fetch_decrypt);
+}
+
 // x86 入口（runtime_x86.hpp，MIT-443 (X3a)）：KS_MODE_32 码体 + 电池集 handler。
 RuntimeGenResult generate_runtime_x86(wvmp::Rng& rng) {
     return generate_runtime_arch(rng, AsmGen::HostArch::X86);
+}
+
+// MIT-473: x86 取指级加密变体（weave 见 build_dispatch_x86）。
+RuntimeGenResult generate_runtime_x86(wvmp::Rng& rng, bool fetch_decrypt) {
+    return generate_runtime_arch(rng, AsmGen::HostArch::X86, fetch_decrypt);
 }
 
 // MIT-446 (X4)：x86 已登记 opcode 清单（runtime_x86.hpp 契约）。单一来源 =

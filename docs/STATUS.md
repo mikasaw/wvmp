@@ -515,3 +515,58 @@ OnlyDataSectionStillNoop；stub_link_tests 断言双节特征 RW/RX + blob 入
 数据节 + stub 入代码节）；tls_e2e.sh 2/2 + **新增 W^X 节属性断言**
 （.wvmpc=RX / .wvmp=RW，双架构）；multiseed 20/20；tls_selfcheck 双目标
 PASS（RX 代码执行 + RW 数据解析在真实 loader 下成立）。
+
+
+## MIT-473 (T17 · C 点取指级加密) ✅ 2026-09-06
+
+**交付**：逐指令取指级加密（M3 强度面第三级，与 blob 级 one-shot 互斥）——
+
+- **codec**：`encrypt_fetch_with_key` / `decrypt_fetch_with_key`
+  （xor_chain）：位置键流 K_i = key0 + i×STEP（u32 环加，STEP =
+  0x9E3779B1），字 i 的 lo/hi 两半**同 xor K_i**；仅依赖字序 → 跳转/回跳/
+  imm aux 字任意取指序全兼容；key0 写 blob 头 seed 字段（offset 16，
+  kBlobHeaderBytes = 32 明文头内）。
+- **asmgen**：dispatch fetch 后条件织入原位解密（AsmGen /
+  generate_runtime(_x86) 增 append-only bool `fetch_decrypt`，缺省 false =
+  锚点恒等）。x64：K 全 32 位环加 → 复制到 64 位上下两半（mov + shl 32 +
+  or）→ **一次 64 位 xor** 解密整字；x86：帧槽内存 xor（lo/hi 同 K，
+  ecx 暂存 K 不占分配池）。
+- **管道接线**：crypt pass fetch 分支（`has_crypt_fetch && crypt_fetch`；
+  忽略每函数豁免；plan.fetch_mode）；integrity_crc fetch 模式跳过（无
+  blob 尾区，Note 披露）；stub_link fetch_mode 透传 generate_runtime 且
+  不发射 one-shot crypt_ptr；ProtectRules `has_crypt_fetch` 三态哨兵；
+  config `[crypt] fetch` 严格布尔。
+- **测试**：`FetchDecryptSemanticParity`（x64 + x86 双电池：明文基线 vs
+  加密 + fetch 运行时 × 3 种子终态逐位一致；流覆盖回边循环求和 / 取或不
+  取分支 / RVA 访存往返 / 终态 regs 全量 + ret_value + pc）；新增
+  scripts/fetch_crypt_e2e.sh（双架构 11-pass + 取指级 note + W^X 节属性
+  断言 + native vs packed byte-exact）。
+
+**开发实录（四坑，全部实测抓出）**：
+1. keystone 裸数字按 16 进制解析（P6 重蹈）——"16" → 0x16；位移/移位量
+   全部 hex()。
+2. PC 寄存器解引用——x64 `mov r11d, [r12]` 把 PC 当地址；x86 同款
+   `mov ecx, [t1]` 漏网（pc=0 → 读地址 0 segfault，实测）→ 改寄存器到
+   寄存器。
+3. **x86-64 32 位写零扩展**（本单最深坑）：对 T8 做 32 位 xor
+   （`xor r15d, r12d`）按 ABI 把寄存器**高 32 位清零**——高 32 位恰是
+   加密的 hi 半字，首次 xor 即毁；后续 ror/xor/rol 全在残骸上运算。症状
+   = 首指令即 halt、regs 全零、**与 K 对错无关**（K=0 明文直通同样炸，
+   借此排除密码学面）。修复 = K 环加后复制双半、一次 64 位 xor。取证手
+   段 = VEH int3（取指指令动态定位，REX 前缀归位）+ TF 单步逐指令打印
+   （off=0x49 处 rdx 高半 0x4D→0 铁证）。
+4. x86 t1==eax 分配冲突：kX86ByteCapable 含 eax，织入先毁 eax（key0 载
+   入）再 `mov ecx, t1` 会把 key0 当 PC（K 全错，实测）→ 顺序纪律 = 先
+   取 PC 再读 key0；ecx 不在 x86 分配池（保留移位计数），作 K 暂存绝对
+   安全。
+
+**验证**：build 0/0；ctest 23/23；x86 交叉电池 46/46（新增
+X86Battery.FetchDecryptSemanticParity）；fetch_crypt_e2e.sh 2/2；fc2
+（fetch 无 anti_debug 隔离配置）`g=D54D628D hit=C0C0BEEF` rc=0 与
+native 逐位一致；tls_e2e.sh 2/2（fetch 改动零回踩）；multiseed 305
+pass / 30 fail——30 = 6 个 SSE/VEX 样本（aligned_mov/sse_bridge/
+sse_fin/vex128 族）× 5 seeds，**全部 native=139 样本自身崩溃**（MIT-427
+B.5 crash guard 注记；T17 不触碰原生样本二进制，T17 前既状）；**x64
+dump @12345 `ffd47289…`/161,861B sha256 逐字节恒等 = 缺省模式零扰动
+机器证明**。冻结契约零 diff（fetch_decrypt 走 append-only 缺省重载）；
+blob 级 crypt 面零改动。

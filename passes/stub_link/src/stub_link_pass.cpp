@@ -105,9 +105,18 @@ void StubLinkPass::run(ProtectionContext& ctx) {
     // PeImage.machine 分叉 arch——x86 目标产出 KS_MODE_32 码体
     // （generate_runtime_x86）+ Win32 cdecl stub；x64 路径逐字节不变。
     const bool is_x86 = pe->machine == kMachineX86;
+    // MIT-473: crypt 计划 fetch 模式 → 运行时 dispatch 织入逐指令解密
+    //（缺省重载 = 无织入，锚点 dump 恒等）。计划槽查找提前于此（生成参数
+    // 需要）；algo 校验仍在后续 crypt 计划块。
+    const crypt::CryptPlan* plan = ctx.find_slot<crypt::CryptPlan>(kCryptPlan);
+    // fetch_mode 先于 algo 校验消费：CryptPass 是 CryptPlan 唯一写者且恒
+    // 置 algo=kAlgoXorChain，故 fetch_mode=true 蕴含 blob 已按位置键流加
+    // 密——若未来出现第二写者（algo≠xor_chain 却置 fetch_mode），此处会
+    // 织入解密而 blob 明文；届时必须先在此加 algo 断言。
+    const bool fetch_mode = plan != nullptr && plan->fetch_mode;
     const regvm::runtime::RuntimeGenResult rt =
-        is_x86 ? regvm::runtime::generate_runtime_x86(ctx.rng)
-               : regvm::runtime::generate_runtime(ctx.rng);
+        is_x86 ? regvm::runtime::generate_runtime_x86(ctx.rng, fetch_mode)
+               : regvm::runtime::generate_runtime(ctx.rng, fetch_mode);
 
     // 新节 RVA（MIT-472 W^X 拆节）：数据节 .wvmp（RW：字节码 blob 等，
     // 解密期/回填期被写）落既有节末端；代码节 .wvmpc（RX：解释器 + stub，
@@ -137,7 +146,6 @@ void StubLinkPass::run(ProtectionContext& ctx) {
     // MIT-458 (crypt-v1)：加密计划（crypt pass 在 Transform 阶段写入；
     // 槽缺席 = 无加密，全部走明文路径，v1 前行为逐字节不变）。algo 不认识
     // 则整单拒绝加密（保守：宁可明文也不发一个解不开的镜像）。
-    const crypt::CryptPlan* plan = ctx.find_slot<crypt::CryptPlan>(kCryptPlan);
     if (plan != nullptr && plan->algo != crypt::kAlgoXorChain) {
         ctx.diag.report(Severity::Warning, name(),
                         "crypt plan algo '" + plan->algo + "' 不受支持，忽略加密计划");
@@ -220,7 +228,8 @@ void StubLinkPass::run(ProtectionContext& ctx) {
             // v1 前现形）。
             StubCrypt crypt_param{};
             const StubCrypt* crypt_ptr = nullptr;
-            if (crypted != nullptr) {
+            // MIT-473: fetch 模式无 one-shot 解密块（dispatch 织入解密）。
+            if (crypted != nullptr && !fetch_mode) {
                 crypt_param.stream_va = pe->image_base + blob_stream_rva;
                 crypt_param.flag_va = crypt_param.stream_va + crypted->stream_bytes;
                 crypt_param.key0 = crypted->key0;

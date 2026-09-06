@@ -69,6 +69,9 @@ static_assert(kX86ExitSlotDepth == 0x2D8, "x86 exit slot depth regressed");
 // std::runtime_error。线程安全性：单线程保护管道内使用（Rng 非线程安全）。
 [[nodiscard]] RuntimeGenResult generate_runtime_x86(wvmp::Rng& rng);
 
+// MIT-473: x86 取指级加密变体（append-only 重载）。
+[[nodiscard]] RuntimeGenResult generate_runtime_x86(wvmp::Rng& rng, bool fetch_decrypt);
+
 // MIT-446 (X4)：x86 运行时跳表已登记的 opcode 集合（= asmgen.cpp x86 handler
 // 表的 opcode 列，单一事实来源——表加行本函数自动跟随，禁第二份手抄清单）。
 // 消费方 = stub_link pass 的 x86 白名单 gate：字节码含集合外 VmOp 的函数整函

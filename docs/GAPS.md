@@ -1591,3 +1591,43 @@ snake/string_ops/x86 全部管产目标 + plain-cl 目标均报"回调在入口�
 - 依赖 T8 回调执行时机：MIT-465-G1 所列 loader 跳过形态的目标上，回填
   不会发生（原 IAT 停留文件态 → 原生导入调用会崩）。E2E 用可触发样本池；
   发行目标需先跑回调自检探针（后续 ticket）。
+
+
+## MIT-473（C 点取指级加密）收口——位置键流 + x86-64 32 位写零扩展实录（2026-09-06）
+
+**设计定稿**：C 点取指级加密（逐指令解密）与 blob 级 one-shot 互斥
+（config `[crypt] fetch = true` / ProtectRules.has_crypt_fetch）。键流 =
+**位置键**：K_i = key0 + i×STEP（u32 环加，STEP = 0x9E3779B1），字 i 的
+lo/hi 两半同 xor K_i——K 只依赖字序（PC），不依赖取指历史 → 跳转/回跳/
+imm aux 字直读全兼容（链式键流在此翻车后改位置键，链式方案作废）。key0
+存 blob 头 seed 字段（offset 16，明文头 32B 内），解释器经
+`[bytecode - 0x10]` 读取——**codec（加密）与 asmgen（解密）的常数/布局/
+半字语义三处同步纪律**：改任一侧必须复跑双架构 FetchDecryptSemanticParity
++ fetch_crypt_e2e.sh。
+
+**永久纪律 1（asmgen x64 面）：绝不对 T8（指令字寄存器）做 32 位写。**
+x86-64 任何 32 位寄存器写（含 xor r32, r32）零扩展清零高 32 位——高半字
+恰是加密的 aux/imm 面，首次 32 位 xor 即毁。实测：K=0（明文直通）同样
+炸，首次误诊为"K 语义不一致"延误一轮；VEH int3 + TF 单步抓出
+（off=0x49：rdx 0x0000004D_000E4001 → 0x00000000_000E4001）。正解 = 键
+在 32 位域算完 → mov/shl 32/or 复制双半 → 一次 64 位 xor。
+
+**永久纪律 2（asmgen x86 面）：织入块用 eax/ecx 前必须核对分配池。**
+kX86ByteCapable = {eax, edx, ebx}——t0/t1 可为 eax；kX86 池 6 槽
+（eax/edx/ebx/ebp/esi/edi），ecx 保留移位计数不在池内（唯一绝对安全的
+织入暂存）。两坑实录：① PC 必须取寄存器值（`mov ecx, t1`），加 [] 是把
+PC 当地址解引用（pc=0 → 读 0 页 segfault）；② 顺序纪律 = 先取 PC（ecx）
+再读 key0（eax）——t1==eax 时先毁 eax 再读 t1 = 把 key0 当 PC。
+
+**面矩阵**：fetch 模式 × integrity_crc = 跳过（无尾区，Note 披露）；
+fetch × blob 级 crypt = 互斥（crypt pass 内 fetch 分支短路 one-shot）；
+fetch × 每函数豁免 = 豁免被忽略（整流加密，披露）；fetch × W^X 拆节 =
+兼容（blob 解密期写 .wmp 数据节，代码节只读执行）——fetch_crypt_e2e.sh
+双架构断言 .wvmpc=RX / .wvmp=RW。
+
+**取证方法论沉淀**（T15 EB FE 探针之后第二件）：VM 级分歧用
+**VEH int3 + TF 单步**定位——RWX 页内动态识别指令边界（FF E? jmp r64 +
+REX 前缀归位；8B + mod00/rm100 + SIB scale=11 识别取指），int3 一次性补
+丁 + 异常处理器逐指令打印关键寄存器。int3 的 RIP 报告在 CC 处或其后一字
+节（两种都要接）；TF 每步自动清零须逐步重装；补丁点若落指令中间，还原
+后从中间恢复执行 = jmp 落垃圾（实测炸栈）。

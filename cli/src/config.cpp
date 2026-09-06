@@ -122,7 +122,7 @@ ConfigResult parse_config(const std::filesystem::path& file) {
     // 必须响，不能静默吞。
     constexpr std::string_view kTopLevelKeys[] = {"input", "output", "seed", "arch",
                                                   "default_level", "functions", "passes",
-                                                  "mutate", "anti_debug", "tls"};
+                                                  "mutate", "anti_debug", "tls", "crypt"};
     for (const auto& [key, value] : tbl) {
         bool known = false;
         for (auto k : kTopLevelKeys)
@@ -130,7 +130,7 @@ ConfigResult parse_config(const std::filesystem::path& file) {
         if (!known)
             return fail("config 未知顶层字段 '" + std::string(key.str()) +
                         "'（允许: input/output/seed/arch/default_level/functions/"
-                        "passes/mutate/anti_debug/tls——⚠️ 顶层键必须写在任何 "
+                        "passes/mutate/anti_debug/tls/crypt——⚠️ 顶层键必须写在任何 "
                         "[[表头]] 之前，否则会被 TOML 作用域规则吸进表内）");
     }
 
@@ -366,6 +366,22 @@ ConfigResult parse_config(const std::filesystem::path& file) {
         if (get_bool("rdtsc", false)) techniques |= 0x8;    // MIT-471: rdtsc 面（opt-in）
         result.value.rules.anti_debug_techniques = techniques;
         result.value.rules.anti_debug_init = get_bool("init", true);
+    }
+
+    // [crypt] fetch（MIT-473：取指级加密开关，默认 false = blob 级）。
+    if (const toml::node* crypt_node = tbl.get("crypt")) {
+        const toml::table* ct = crypt_node->as_table();
+        if (!ct) return fail("config 字段 'crypt' 必须是表（[crypt]）");
+        for (const auto& [key, value] : *ct)
+            if (key.str() != "fetch")
+                return fail("config [crypt] 未知子键 '" + std::string(key.str()) +
+                            "'（允许: fetch）");
+        const toml::node* fn = ct->get("fetch");
+        if (fn == nullptr) return fail("config [crypt] 缺少子键 'fetch'");
+        auto fetch = fn->value<bool>();
+        if (!fetch) return fail("config [crypt] 'fetch' 必须是布尔值");
+        result.value.rules.has_crypt_fetch = true;
+        result.value.rules.crypt_fetch = *fetch;
     }
 
     // [tls] enabled（默认 true；false = tls_hook 空转）。

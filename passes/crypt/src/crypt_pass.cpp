@@ -67,13 +67,20 @@ void CryptPass::run(ProtectionContext& ctx) {
     plan.algo = std::string(crypt::kAlgoXorChain);
     plan.functions.reserve(vfs->size());
 
+    // MIT-473: 取指级加密（[crypt] fetch=true）——流保持密文态，解释器
+    // dispatch 织入逐指令解密（初态 = blob 头 seed）。运行时共享一份
+    // dispatch，无法按函数分叉 → 全部虚拟化函数统一加密（忽略每函数
+    // crypt 豁免，Note 披露）；integrity_crc 无尾区可校验 → 跳过面。
+    const bool fetch_mode =
+        rules != nullptr && rules->has_crypt_fetch && rules->crypt_fetch;
+
     size_t encrypted = 0, exempted = 0;
     for (size_t i = 0; i < vfs->size(); ++i) {
         const auto& vf = (*vfs)[i];
         // 密钥流无条件按 vfs 序消费（含豁免函数）——保证"只加一条豁免
         // 规则"时不改变任何已加密函数的 key0（MIT-461 验收 REJECT 项修复）。
         const u32 key0 = static_cast<u32>(key_rng.next());
-        if (rules != nullptr) {
+        if (!fetch_mode && rules != nullptr) {
             const auto override_crypt =
                 rules->crypt_for(vf.begin_rva, i, vf.name);
             if (override_crypt.has_value() && !*override_crypt) {
@@ -86,6 +93,16 @@ void CryptPass::run(ProtectionContext& ctx) {
         entry.name = vf.name;
         entry.key0 = key0;
         entry.encrypted_blob = vf.program.bytecode;
+        if (fetch_mode) {
+            // 取指级：流保持密文态，初态写头 seed；无 8B 尾区（one-shot
+            // 旗标面不存在）；integrity_crc 消费 plan.fetch_mode 跳过。
+            regvm::codecs::XorChainCodec::encrypt_fetch_with_key(entry.key0,
+                                                                 entry.encrypted_blob);
+            entry.has_crc = false;
+            plan.functions.push_back(std::move(entry));
+            ++encrypted;
+            continue;
+        }
         regvm::codecs::XorChainCodec::encrypt_with_key(entry.key0, entry.encrypted_blob);
         // 尾旗标：flag=1（已加密）；旗标 RVA = 流起点 + stream_bytes（stub
         // 侧按此计算，见 stub_gen.cpp 解密块）。
@@ -100,13 +117,19 @@ void CryptPass::run(ProtectionContext& ctx) {
         ++encrypted;
     }
 
+    plan.fetch_mode = fetch_mode;
     ctx.slot<crypt::CryptPlan>(kCryptPlan) = std::move(plan);
+    const std::string exempt_note =
+        (!fetch_mode && exempted > 0)
+            ? "；豁免 " + std::to_string(exempted) + " 个（crypt=false）"
+            : (fetch_mode ? "；fetch 模式忽略每函数豁免" : "");
     ctx.diag.report(Severity::Note, name(),
                     "已加密 " + std::to_string(encrypted) + "/" +
                         std::to_string(vfs->size()) + " 个 VM 程序（xor_chain，"
-                        "seed 派生密钥，stub 入口 one-shot 解密）" +
-                        (exempted > 0 ? "；豁免 " + std::to_string(exempted) + " 个（crypt=false）"
-                                      : ""));
+                        "seed 派生密钥，" +
+                        (fetch_mode ? std::string("取指级 dispatch 解密")
+                                    : std::string("stub 入口 one-shot 解密")) +
+                        "）" + exempt_note);
 }
 
 WVMP_REGISTER_PASS(CryptPass)
