@@ -1782,3 +1782,19 @@ next_ip_of/载体匹配/jump-table 匹配在同址对下的取值序。修复后
 **方法论**：二分钩子（注入上限 env，rng 前缀确定性保持——先取全部
 rng 再决定发射）是确定性变换失败定位的通用工具；"nop-only 绿色"不能作
 为机制安全证据（落位幸运），必须以注入/不注入对照实验分离变量。
+
+
+## MIT-480（T6.3 第一阶段）——VM blob 解码 diff 锁定 divergence + 函数级门控（2026-09-07）
+
+**blob 解码方法论**（wvmpTest kern 崩调查沉淀）：.wvmp 节按 "WVMP"
+magic 走多 blob；blob 头 offset+12 = 流 word 数，流起于 offset+16；解码
+= 每 8B word：op=低 14 位、reg_a=22..26、reg_b=27..31、aux=32..63。
+对拍两包（仅注入数不同）→ blob1（region[1] b64 wrapper）词数 130↔124，
+divergence 起点 word[94]：Callgate aux 36→30（目标错位 = 野 call）+
+word[96] 中途 Halt 折叠（跳表匹配半成功 fallback）。
+
+**门控现状**：share-prev 地址纪律（修复同址对 next_ip_of 自指——历史
+落位全绿实证）+ 含 Reg 间接跳转函数整函数禁注入（拦 1 函数）双门控下
+kern.md5 仍崩 → 跳表候选不止 Reg-Jmp 形态（或半翻译 fallback 面 wider）。
+**下轮首步 = 函数级二分**：WVMP_MUTATE_ONLY_FN=N 只注入第 N 个函数，14
+次实验锁定肇事函数 → 读该函数 IR/发射面 → 精确修复。

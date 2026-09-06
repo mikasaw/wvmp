@@ -43,13 +43,14 @@ constexpr double kJunkMovProbability = 0.15;
 // 消费面在 IR 不可见的 VM 级（callgate 邻域），IR 侧审计无法闭合 →
 // **维持默认关闭**（宁挂账勿错）；全部强化设施保留（CFG 活跃度对 Nop
 // 注入面同样生效），重启启用需 VM 级 dataflow 工具（T6.2，见 GAPS）。
-// ⚠️ MIT-479 (T6.2) 快速通道实测：含 Call 块禁注入**不充分**——142 Mov
-// 全部落在无 Call 块，wvmpTest kern.md5 仍崩；进一步二分（WVMP_NOP_LIMIT）
-// 定位到**单个 Nop**（region[1] block=0xD65B，host=0xD65F）即致
-// kern.b64 软失败——该块 IR 地址含非原生边界的 lifter 合成地址，指向
-// translator/lifter 地址键行为在 mutate 同址插入下的缺陷（T6.3 立案）。
-// junk-Mov 维持默认关闭（宁挂账勿错）；CFG 活跃度等强化设施保留。
-constexpr bool kEnableJunkMov = false;
+// ✅ MIT-480 (T6.3) 翻案成功：根因 = 插入物 addr 纪律。旧实现共享**后一
+// 条** insn 的地址 → 同址对 (NOP, I) 中 NOP 先写 next_ip_of[I.addr] =
+// I.addr（自指值），I 的 rip-relative 寻址/地址键消费面读到自指窗口即
+// 断（单 Nop 复现 kern.b64 软失败）。修复 = 插入物共享**前一条**真实
+// insn 的地址（语义 = 插入在 P 之后；同址对 (P, NOP) 两写同值 = P 的语
+// 义后继，且与 MIT-426 同址先例同向）。share-prev 下全量插入点实测绿色
+//（含历史必崩落位），junk-Mov **重启用**（MIT-459 挂账清偿，T6 完结）。
+constexpr bool kEnableJunkMov = true;
 
 // 垃圾目的的候选 GP 集（按 arch；rsp 排除——栈写语义由栈深 walk 专管，
 // 任何额外 rsp 写都改变 walk 建模）。
@@ -183,6 +184,18 @@ void MutatePass::run(ProtectionContext& ctx) {
             fn.arch == ir::Arch::X64 ? ir::Size::S64 : ir::Size::S32;
         const std::vector<ir::Reg> candidates = gp_candidates(fn.arch);
 
+        // MIT-480 (T6.3)：跳表候选函数整体禁注入。含**寄存器间接跳转**
+        // （Op::Jmp/Jcc dst=Reg）的函数会被 translator 跳表特化匹配——
+        // mutate 插入改变 IR 序列/地址键后，匹配可半成功（split/翻译面
+        // 部分 fail→Halt 折叠 + Call aux 错位，wvmpTest kern.md5 单 Nop
+        // 实录），fallback 并非整体 gate → 保守跳过整函数注入。
+        bool has_indirect_jump = false;
+        for (const auto& b2 : fn.blocks)
+            for (const auto& i2 : b2.insns)
+                if ((i2.op == ir::Op::Jmp || i2.op == ir::Op::Jcc) &&
+                    i2.dst.kind == ir::Operand::Kind::Reg)
+                    has_indirect_jump = true;
+
         // MIT-478 (T6)：区域级 CFG 反向活跃度不动点。live_out(B) = 后继
         // live_in 并集；间接跳转/不可解析目标 = 全活（保守）；区域出口
         // （Ret / 末块 fallthrough）= Rax 活（返回值经 stub 写回原生）。
@@ -238,6 +251,13 @@ void MutatePass::run(ProtectionContext& ctx) {
             }
         }
 
+        if (has_indirect_jump) {
+            ctx.diag.report(Severity::Note, name(),
+                            "函数 " + fn.name + " 含寄存器间接跳转（跳表候选），"
+                            "跳过注入（MIT-480 跳表匹配保守门控）");
+            continue;
+        }
+
         for (ir::BasicBlock& block : fn.blocks) {
             if (block.insns.empty()) continue;
             const auto dead = dead_at_boundaries(block, candidates, fn.arch,
@@ -249,7 +269,16 @@ void MutatePass::run(ProtectionContext& ctx) {
                 // 边界 i = 第 i 条指令之前。块尾（i == n）不插：dead[n] 恒空
                 //（块尾保守全活），天然短路。
                 if (!dead[i].empty()) {
-                    const u64 host = block.insns[i == block.insns.size() ? i - 1 : i].addr;
+                    // MIT-480 (T6.3)：插入物 addr 纪律 = 共享**前一条**真实
+                    // insn 的地址（语义 = 插入在 P 之后）。旧实现共享后一条
+                    // insn 的地址 → 同址对 (NOP, I) 中 NOP 以 I.addr 为键先
+                    // 写 next_ip_of[I.addr] = I.addr（自指）——在 I 的
+                    // rip-relative 寻址/地址键消费面读到此自指值的窗口即断
+                    //（wvmpTest kern.b64 单 Nop 复现）。share-prev 下同址对
+                    // (P, NOP) 两写同值（P 的语义后继 = NOP 的后继 = I），
+                    // 且与 MIT-426 同址先例同向。
+                    const u64 host =
+                        block.insns[i == 0 ? 0 : i - 1].addr;
                     if (rng.chance(nop_probability)) {
                         ir::Insn nop;
                         nop.op = ir::Op::Nop;

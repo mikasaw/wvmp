@@ -790,3 +790,22 @@ translator 发射面生成"VmOp × 槽"精确读写矩阵，mutate 直接消费�
   设施保留（普适硬化）。
 
 **验证**：build 0/0；ctest 23/23（mutate 5 用例）；multiseed 335/335。
+
+
+## MIT-480 (T6.3 第一阶段 · 跳表门控 + 函数级归因实验) ✅ 2026-09-07
+
+**交付**：① 含寄存器间接跳转（Op::Jmp/Jcc dst=Reg）的函数**整体禁注
+入**（跳表候选保守门控，Note 披露——实测拦截 marker@0xcf88 一个函数）；
+② share-prev 地址纪律（插入物共享前一条真实 insn 地址，同址对两写同
+值，兼容 MIT-426 先例）——**修复了地址纪律类破坏**（历史落位全绿实证）；
+③ 函数级归因实验设计（WVMP_MUTATE_ONLY_FN，下轮首步）。
+
+**当前状态**：junk-Mov 维持关闭。share-prev + 间接跳门控双重门控下
+kern.md5 仍崩 → 消费面不止跳表类；VM blob 解码 diff 已锁定 divergence
+点（blob1 word[94]：Callgate aux 36→30 错位 + [96] 中途 Halt 折叠 =
+半翻译 fallback 发射错误 Call 目标），完整证据链（两包 + blob 解码脚
+本 + 单 Nop 复现步骤）入 GAPS。下轮 T6.3 = 函数级二分（env 只注入第 N
+个函数）锁定肇事函数后读其 IR/发射面。
+
+**验证**：build 0/0；ctest 23/23；multiseed 335/335；x64 dump 锚
+67cfa727… 恒等。冻结契约零 diff。
