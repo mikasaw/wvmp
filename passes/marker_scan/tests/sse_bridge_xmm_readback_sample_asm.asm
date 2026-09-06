@@ -64,6 +64,7 @@ ENDM
 bsh_movd_in PROC
     mov rbx, rdx
     load_all
+    sub   rsp, 28h                    ; MIT-475: shadow space + alignment (x64 ABI)
     call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     mov  eax, 0A5A5A5A5h
     movd xmm0, eax                  ; 66 0F 6E C0 (桥 load w4)
@@ -73,6 +74,7 @@ bsh_movd_in PROC
     mov rax, 0BBBBBBBBBBBBBBBBh   ; GP 哨兵 (mov r/m64, imm64 不可编码)
     mov [rbx + 16*8], rax
     sink_slots
+    add   rsp, 28h                    ; MIT-475
     ret
 bsh_movd_in ENDP
 
@@ -81,6 +83,7 @@ bsh_movd_in ENDP
 bsh_movq_in PROC
     mov rbx, rdx
     load_all
+    sub   rsp, 28h                    ; MIT-475: shadow space + alignment (x64 ABI)
     call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     mov  rax, 1122334455667788h
     movq xmm0, rax                  ; 66 48 0F 6E C0 (桥 load w8)
@@ -90,6 +93,7 @@ bsh_movq_in PROC
     mov rax, 0BBBBBBBBBBBBBBBBh
     mov [rbx + 16*8], rax
     sink_slots
+    add   rsp, 28h                    ; MIT-475
     ret
 bsh_movq_in ENDP
 
@@ -101,6 +105,7 @@ bsh_movq_in ENDP
 bsh_movd_out PROC
     mov rbx, rdx
     load_all
+    sub   rsp, 28h                    ; MIT-475: shadow space + alignment (x64 ABI)
     call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     movd eax, xmm0                  ; 66 0F 7E C0 (桥 store w4)
     mov [rbx + 16*8], rax           ; 区内 Store: Rax 槽 64 位全量落盘
@@ -108,6 +113,7 @@ bsh_movd_out PROC
     nop
     call ?marker_end@sdk@wvmp@@YAXXZ
     sink_slots
+    add   rsp, 28h                    ; MIT-475
     ret
 bsh_movd_out ENDP
 
@@ -115,6 +121,7 @@ bsh_movd_out ENDP
 bsh_movq_out PROC
     mov rbx, rdx
     load_all
+    sub   rsp, 28h                    ; MIT-475: shadow space + alignment (x64 ABI)
     call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     movq rax, xmm0                  ; 66 48 0F 7E C0 (桥 store w8)
     mov [rbx + 16*8], rax           ; 区内 Store 落盘
@@ -122,6 +129,7 @@ bsh_movq_out PROC
     nop
     call ?marker_end@sdk@wvmp@@YAXXZ
     sink_slots
+    add   rsp, 28h                    ; MIT-475
     ret
 bsh_movq_out ENDP
 
@@ -130,6 +138,7 @@ bsh_movq_out ENDP
 bsh_movq_xmm_zero PROC
     mov rbx, rdx
     load_all
+    sub   rsp, 28h                    ; MIT-475: shadow space + alignment (x64 ABI)
     call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     db 0F3h, 0Fh, 7Eh, 0C1h         ; movq xmm0, xmm1 (F3, 高 64 清零)
     nop
@@ -138,6 +147,7 @@ bsh_movq_xmm_zero PROC
     mov rax, 0BBBBBBBBBBBBBBBBh
     mov [rbx + 16*8], rax
     sink_slots
+    add   rsp, 28h                    ; MIT-475
     ret
 bsh_movq_xmm_zero ENDP
 
@@ -147,6 +157,7 @@ bsh_movq_xmm_zero ENDP
 bsh_movq_xmm_d6 PROC
     mov rbx, rdx
     load_all
+    sub   rsp, 28h                    ; MIT-475: shadow space + alignment (x64 ABI)
     call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     db 066h, 0Fh, 0D6h, 0C8h        ; movq xmm0, xmm1 (66 0F D6 reg-reg; C8 = dst r/m 位)
     nop
@@ -155,6 +166,7 @@ bsh_movq_xmm_d6 PROC
     mov rax, 0BBBBBBBBBBBBBBBBh
     mov [rbx + 16*8], rax
     sink_slots
+    add   rsp, 28h                    ; MIT-475
     ret
 bsh_movq_xmm_d6 ENDP
 
@@ -163,6 +175,7 @@ bsh_movq_xmm_d6 ENDP
 bsh_movd_mem_in PROC
     mov rbx, rdx
     load_all
+    sub   rsp, 28h                    ; MIT-475: shadow space + alignment (x64 ABI)
     call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     movd xmm0, dword ptr [g_bsh32]   ; 66 0F 6E 05 (mem load w4)
     nop
@@ -171,6 +184,7 @@ bsh_movd_mem_in PROC
     mov rax, 0BBBBBBBBBBBBBBBBh
     mov [rbx + 16*8], rax
     sink_slots
+    add   rsp, 28h                    ; MIT-475
     ret
 bsh_movd_mem_in ENDP
 
@@ -179,6 +193,7 @@ bsh_movd_mem_in ENDP
 bsh_movq_mem_in PROC
     mov rbx, rdx
     load_all
+    sub   rsp, 28h                    ; MIT-475: shadow space + alignment (x64 ABI)
     call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     movq xmm0, qword ptr [g_bsh64]   ; 66 REX.W 0F 6E / F3 0F 7E (mem load w8)
     nop
@@ -187,6 +202,7 @@ bsh_movq_mem_in PROC
     mov rax, 0BBBBBBBBBBBBBBBBh
     mov [rbx + 16*8], rax
     sink_slots
+    add   rsp, 28h                    ; MIT-475
     ret
 bsh_movq_mem_in ENDP
 
@@ -195,6 +211,7 @@ bsh_movq_mem_in ENDP
 bsh_movq_mem_out PROC
     mov rbx, rdx
     load_all
+    sub   rsp, 28h                    ; MIT-475: shadow space + alignment (x64 ABI)
     call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     movq qword ptr [g_bshout64], xmm0   ; 66 REX.W 0F 7E / 66 0F D6 (mem store w8)
     nop
@@ -203,6 +220,7 @@ bsh_movq_mem_out PROC
     mov rax, 0BBBBBBBBBBBBBBBBh
     mov [rbx + 16*8], rax
     sink_slots
+    add   rsp, 28h                    ; MIT-475
     ret
 bsh_movq_mem_out ENDP
 

@@ -622,3 +622,36 @@ handler 跳过整段捕获/装配（zero5/setcc5/flags_tail，x64 ~21 条动态�
 尺寸链掩码为代码结构变化，handler 语义不变），stub_gen/translator 注释
 内旧锚引用随本单更新口径。冻结契约零 diff（标记走 cond 位 2 余量 +
 append-only 助手）。
+
+
+## MIT-475 (T19 · SSE/VEX 六样本 native=139 根因清偿) ✅ 2026-09-07
+
+**交付**：MIT-425 (G1b) 带病入库的样本面缺陷清偿——六样本
+（aligned_mov ×2 / sse_bridge ×2 / sse_fin / vex128）原生 segfault 根因
+定位与修复。**产品代码零 diff**（仅 6 个 .asm 样本文件）。
+
+**根因**（cdb 三层定位，历经两轮假设修正）：
+1. 崩溃画面：`rip=0x41C80000`（= 25.0f 的 IEEE754 位型）+ 全缓冲 stdout
+   掩盖了已发生的输出（"启动期崩溃"为假象——实际崩在 main 执行中）。
+2. 函数级定位（per-fn 断点）：AV 前**最后进入 fn_mulss_rr** 且其后无
+   marker_end → 崩在该 asm 区域内。
+3. 指令级定位（marker_begin 反汇编）：SDK 体首条
+   `mov [rsp+8], rcx`（= x64 ABI shadow space 参数 home 写）。asm 裸调
+   **未预留 shadow space** → 该写落在调用者 PROC 的返回地址槽
+  （entry_rsp+8）→ rcx（首参 = float 位型 0x41C80000）覆盖返回地址 →
+   PROC `ret` 跳进浮点常量。旁证闭环：崩溃时 rax=0x42480000 = mulss
+   结果 50.0f（已执行到 movd eax,xmm0 后的 ret）。
+
+**修复**：79 个 PROC 补 `sub rsp, 0x28`（32B shadow + 栈对齐：call 前
+rsp%16=0）+ 每个 ret 前 `add rsp, 0x28`；4 个已有帧的 PROC
+（amv_dqa_stack 族，push rbx + sub 0x30）合规跳过。sub/add 均在 marker
+区域外 → **虚拟化区域字节零变化**（区域 = begin/end 调用点之间）。
+
+**方法论沉淀**：stdout 全缓冲让"崩溃位置"表象失真（首输出前崩 ≠ 启动
+期崩）；cdb 的 k 栈回溯在栈值污染时会给伪帧（`__xt_z+0x10` 数据地址被
+当 call site 解读——硬件断点 ba e1 证伪）；per-fn 断点 + marker 边界
+断点（BEGIN/END 打印）双夹逼是区域级崩溃的定位范式。
+
+**验证**：六样本 native rc=0（含 atomic_incdec——MIT-474 B1 修复顺带
+带活）；**multiseed 335/335 首次全绿**（历史最好 305/30）；ctest
+23/23；x64 dump 锚 67cfa727… 恒等（产品零触碰）。冻结契约零 diff。

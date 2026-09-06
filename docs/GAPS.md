@@ -1664,3 +1664,25 @@ ctx，VM flags 不跨区。
 为 D2 口径的**计划内换代**（首例）：换代纪律 = ① STATUS 披露新锚全值；
 ② 旧锚在全部消费点（stub_gen/translator 注释、dump 测试注释）同步作废；
 ③ 换代后 5 seeds 复跑 dump 稳定（同 seed 逐字节可复现不因换代失效）。
+
+
+## MIT-475（样本面 shadow space 缺陷）收口——asm 调 C++ 桩的 ABI 纪律（2026-09-07）
+
+**教训**：MASM .asm 直接 `call` C++ SDK 桩（marker_begin/end）时，x64
+ABI 的 shadow space（32B）与 16 字节栈对齐是**硬要求**——即使桩体
+"看起来不写栈"（/Od 的参数 home 写 `mov [rsp+8], rcx` 在 entry 即发生，
+早于任何"桩体是否用栈"的判断）。未预留时该写落在调用者返回地址槽，
+覆盖值 = rcx 当前值；若 rcx 恰是位型参数（SSE 样本的 float 位图案），
+ret 即跳入数据。**asm 侧调用任何 C++ 函数的样板** = PROC 入口
+`sub rsp, 28h` + 每个 ret 前 `add rsp, 0x28`（0x28 = 32B shadow + 8B
+对齐垫；有 push 的帧各自计算，保证 call 前 rsp%16==0）。
+
+**为什么 MIT-425 验收漏过**：G1b 验收以打包面（gate note/虚拟化语义）
+为准，六样本 native 面当时已崩但被 MIT-427 的 crash guard 文档化为
+"已知既状"而未清偿——**样本 native rc=0 应为样本入库验收的一等判据**
+（本单起补入纪律）。
+
+**marker_begin 首参契约澄清**：`const char*` 名字指针不被桩体解引用
+（仅为让编译器在调用点前物化字符串地址供 marker_scan 解析区域名）——
+asm 裸调 rcx=垃圾不直接崩，崩的是 shadow space 缺失的 home 写。两回事，
+勿混。

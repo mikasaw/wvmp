@@ -62,6 +62,7 @@ ENDM
 ash_dqa_rr PROC
     mov rbx, rdx
     load_all
+    sub   rsp, 28h                    ; MIT-475: shadow space + alignment (x64 ABI)
     call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     movdqa xmm0, xmm1               ; 66 0F 6F C1 (全宽拷贝)
     nop
@@ -69,6 +70,7 @@ ash_dqa_rr PROC
     call ?marker_end@sdk@wvmp@@YAXXZ
     sink_rax
     sink_slots
+    add   rsp, 28h                    ; MIT-475
     ret
 ash_dqa_rr ENDP
 
@@ -76,6 +78,7 @@ ash_dqa_rr ENDP
 ash_dqa_rr7 PROC
     mov rbx, rdx
     load_all
+    sub   rsp, 28h                    ; MIT-475: shadow space + alignment (x64 ABI)
     call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     db 066h, 0Fh, 07Fh, 0C8h        ; movdqa xmm0, xmm1 (7F 形)
     nop
@@ -83,6 +86,7 @@ ash_dqa_rr7 PROC
     call ?marker_end@sdk@wvmp@@YAXXZ
     sink_rax
     sink_slots
+    add   rsp, 28h                    ; MIT-475
     ret
 ash_dqa_rr7 ENDP
 
@@ -90,6 +94,7 @@ ash_dqa_rr7 ENDP
 ash_dqu_rr PROC
     mov rbx, rdx
     load_all
+    sub   rsp, 28h                    ; MIT-475: shadow space + alignment (x64 ABI)
     call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     movdqu xmm0, xmm1               ; F3 0F 6F C1
     nop
@@ -97,6 +102,7 @@ ash_dqu_rr PROC
     call ?marker_end@sdk@wvmp@@YAXXZ
     sink_rax
     sink_slots
+    add   rsp, 28h                    ; MIT-475
     ret
 ash_dqu_rr ENDP
 
@@ -145,6 +151,7 @@ ash_dqu_stack_unal ENDP
 ash_dqa_rip_load PROC
     mov rbx, rdx
     load_all
+    sub   rsp, 28h                    ; MIT-475: shadow space + alignment (x64 ABI)
     call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     movdqa xmm0, xmmword ptr [g_ash_src]   ; 66 0F 6F 05 (rip load)
     nop
@@ -152,6 +159,7 @@ ash_dqa_rip_load PROC
     call ?marker_end@sdk@wvmp@@YAXXZ
     sink_rax
     sink_slots
+    add   rsp, 28h                    ; MIT-475
     ret
 ash_dqa_rip_load ENDP
 
@@ -160,6 +168,7 @@ ash_dqa_rip_load ENDP
 ash_dqa_rip_store PROC
     mov rbx, rdx
     load_all
+    sub   rsp, 28h                    ; MIT-475: shadow space + alignment (x64 ABI)
     call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     movdqa xmmword ptr [g_ash_out], xmm0   ; 66 0F 7F 05 (rip store)
     nop
@@ -167,6 +176,7 @@ ash_dqa_rip_store PROC
     call ?marker_end@sdk@wvmp@@YAXXZ
     sink_rax
     sink_slots
+    add   rsp, 28h                    ; MIT-475
     ret
 ash_dqa_rip_store ENDP
 
@@ -174,6 +184,7 @@ ash_dqa_rip_store ENDP
 ash_vdqa_rr PROC
     mov rbx, rdx
     load_all
+    sub   rsp, 28h                    ; MIT-475: shadow space + alignment (x64 ABI)
     call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     vmovdqa xmm0, xmm1              ; C5 F9 6F C1 (VEX 镜像)
     nop
@@ -181,6 +192,7 @@ ash_vdqa_rr PROC
     call ?marker_end@sdk@wvmp@@YAXXZ
     sink_rax
     sink_slots
+    add   rsp, 28h                    ; MIT-475
     ret
 ash_vdqa_rr ENDP
 
@@ -188,6 +200,7 @@ ash_vdqa_rr ENDP
 ash_vdqu_rr PROC
     mov rbx, rdx
     load_all
+    sub   rsp, 28h                    ; MIT-475: shadow space + alignment (x64 ABI)
     call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     vmovdqu xmm0, xmm1              ; C5 FA 6F C1
     nop
@@ -195,6 +208,7 @@ ash_vdqu_rr PROC
     call ?marker_end@sdk@wvmp@@YAXXZ
     sink_rax
     sink_slots
+    add   rsp, 28h                    ; MIT-475
     ret
 ash_vdqu_rr ENDP
 

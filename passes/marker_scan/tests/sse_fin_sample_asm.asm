@@ -38,6 +38,7 @@ fin_mulss_rr PROC
     movd xmm1, edx                   ; 区外: b
 
     ; ===== marker region begin =====
+    sub   rsp, 28h                    ; MIT-475: shadow space + alignment (x64 ABI)
     call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     mulss xmm0, xmm1                 ; F3 0F 59 C1 (scalar single)
     nop
@@ -46,6 +47,7 @@ fin_mulss_rr PROC
     ; ===== marker region end =====
 
     movd eax, xmm0                   ; 低 32 位 (区外)
+    add   rsp, 28h                    ; MIT-475
     ret
 fin_mulss_rr ENDP
 
@@ -55,6 +57,7 @@ fin_mulsd_rr PROC
     movq xmm1, rdx
 
     ; ===== marker region begin =====
+    sub   rsp, 28h                    ; MIT-475: shadow space + alignment (x64 ABI)
     call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     mulsd xmm0, xmm1                 ; F2 0F 59 C1 (scalar double)
     nop
@@ -63,6 +66,7 @@ fin_mulsd_rr PROC
     ; ===== marker region end =====
 
     movq rax, xmm0
+    add   rsp, 28h                    ; MIT-475
     ret
 fin_mulsd_rr ENDP
 
@@ -72,6 +76,7 @@ fin_mulsd_mem PROC
     movq xmm0, rcx
 
     ; ===== marker region begin =====
+    sub   rsp, 28h                    ; MIT-475: shadow space + alignment (x64 ABI)
     call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     mulsd xmm0, qword ptr [g_fin_d]  ; F2 0F 59 05 rel32 (rip mem 源)
     nop
@@ -80,6 +85,7 @@ fin_mulsd_mem PROC
     ; ===== marker region end =====
 
     movq rax, xmm0
+    add   rsp, 28h                    ; MIT-475
     ret
 fin_mulsd_mem ENDP
 
@@ -90,6 +96,7 @@ fin_mulps_rr PROC
     movq xmm1, rdx
 
     ; ===== marker region begin =====
+    sub   rsp, 28h                    ; MIT-475: shadow space + alignment (x64 ABI)
     call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     mulps xmm0, xmm1                 ; 0F 59 C1 (packed single)
     nop
@@ -98,6 +105,7 @@ fin_mulps_rr PROC
     ; ===== marker region end =====
 
     movq rax, xmm0
+    add   rsp, 28h                    ; MIT-475
     ret
 fin_mulps_rr ENDP
 
@@ -107,6 +115,7 @@ fin_mulpd_rr PROC
     movq xmm1, rdx
 
     ; ===== marker region begin =====
+    sub   rsp, 28h                    ; MIT-475: shadow space + alignment (x64 ABI)
     call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     mulpd xmm0, xmm1                 ; 66 0F 59 C1 (packed double)
     nop
@@ -115,6 +124,7 @@ fin_mulpd_rr PROC
     ; ===== marker region end =====
 
     movq rax, xmm0
+    add   rsp, 28h                    ; MIT-475
     ret
 fin_mulpd_rr ENDP
 
@@ -123,6 +133,7 @@ fin_mulps_mem PROC
     movq xmm0, rcx
 
     ; ===== marker region begin =====
+    sub   rsp, 28h                    ; MIT-475: shadow space + alignment (x64 ABI)
     call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     mulps xmm0, xmmword ptr [g_fin_ps]  ; 0F 59 05 rel32 (rip mem 源)
     nop
@@ -131,6 +142,7 @@ fin_mulps_mem PROC
     ; ===== marker region end =====
 
     movq rax, xmm0
+    add   rsp, 28h                    ; MIT-475
     ret
 fin_mulps_mem ENDP
 
@@ -143,6 +155,7 @@ fin_andnps_rr PROC
     movq xmm1, rdx
 
     ; ===== marker region begin =====
+    sub   rsp, 28h                    ; MIT-475: shadow space + alignment (x64 ABI)
     call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     andnps xmm0, xmm1                ; 0F 55 C1
     nop
@@ -151,6 +164,7 @@ fin_andnps_rr PROC
     ; ===== marker region end =====
 
     movq rax, xmm0
+    add   rsp, 28h                    ; MIT-475
     ret
 fin_andnps_rr ENDP
 
@@ -161,6 +175,7 @@ fin_andnpd_rr PROC
     movq xmm1, rdx
 
     ; ===== marker region begin =====
+    sub   rsp, 28h                    ; MIT-475: shadow space + alignment (x64 ABI)
     call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     andnpd xmm0, xmm1                ; 66 0F 55 C1
     nop
@@ -169,6 +184,7 @@ fin_andnpd_rr PROC
     ; ===== marker region end =====
 
     movq rax, xmm0
+    add   rsp, 28h                    ; MIT-475
     ret
 fin_andnpd_rr ENDP
 
@@ -179,6 +195,7 @@ fin_pandn_rr PROC
     movq xmm1, rdx
 
     ; ===== marker region begin =====
+    sub   rsp, 28h                    ; MIT-475: shadow space + alignment (x64 ABI)
     call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     pandn  xmm0, xmm1                ; 66 0F DF C1
     nop
@@ -187,6 +204,7 @@ fin_pandn_rr PROC
     ; ===== marker region end =====
 
     movq rax, xmm0
+    add   rsp, 28h                    ; MIT-475
     ret
 fin_pandn_rr ENDP
 
@@ -197,6 +215,7 @@ fin_pand_rr PROC
     movq xmm1, rdx
 
     ; ===== marker region begin =====
+    sub   rsp, 28h                    ; MIT-475: shadow space + alignment (x64 ABI)
     call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     pand   xmm0, xmm1                ; 66 0F DB C1
     nop
@@ -205,6 +224,7 @@ fin_pand_rr PROC
     ; ===== marker region end =====
 
     movq rax, xmm0
+    add   rsp, 28h                    ; MIT-475
     ret
 fin_pand_rr ENDP
 
@@ -214,6 +234,7 @@ fin_por_rr PROC
     movq xmm1, rdx
 
     ; ===== marker region begin =====
+    sub   rsp, 28h                    ; MIT-475: shadow space + alignment (x64 ABI)
     call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     por    xmm0, xmm1                ; 66 0F EB C1
     nop
@@ -222,6 +243,7 @@ fin_por_rr PROC
     ; ===== marker region end =====
 
     movq rax, xmm0
+    add   rsp, 28h                    ; MIT-475
     ret
 fin_por_rr ENDP
 
@@ -231,6 +253,7 @@ fin_pxor_rr PROC
     movq xmm1, rdx
 
     ; ===== marker region begin =====
+    sub   rsp, 28h                    ; MIT-475: shadow space + alignment (x64 ABI)
     call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     pxor   xmm0, xmm1                ; 66 0F EF C1
     nop
@@ -239,6 +262,7 @@ fin_pxor_rr PROC
     ; ===== marker region end =====
 
     movq rax, xmm0
+    add   rsp, 28h                    ; MIT-475
     ret
 fin_pxor_rr ENDP
 
@@ -248,6 +272,7 @@ fin_pand_mem PROC
     movq xmm0, rcx
 
     ; ===== marker region begin =====
+    sub   rsp, 28h                    ; MIT-475: shadow space + alignment (x64 ABI)
     call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     pand   xmm0, xmmword ptr [g_fin_pi]  ; 66 0F DB 05 rel32
     nop
@@ -256,6 +281,7 @@ fin_pand_mem PROC
     ; ===== marker region end =====
 
     movq rax, xmm0
+    add   rsp, 28h                    ; MIT-475
     ret
 fin_pand_mem ENDP
 
@@ -267,6 +293,7 @@ fin_paddq_neg PROC
     movq xmm1, rdx
 
     ; ===== marker region begin =====
+    sub   rsp, 28h                    ; MIT-475: shadow space + alignment (x64 ABI)
     call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     paddq  xmm0, xmm1                ; 66 0F D4 C1 (gate 负例)
     nop
@@ -275,6 +302,7 @@ fin_paddq_neg PROC
     ; ===== marker region end =====
 
     movq rax, xmm0
+    add   rsp, 28h                    ; MIT-475
     ret
 fin_paddq_neg ENDP
 
