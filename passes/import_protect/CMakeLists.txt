@@ -10,6 +10,13 @@ target_link_libraries(wvmp_pass_import_protect PRIVATE
     wvmp::common
     wvmp_pass_pe_loader    # NewSection / PeImage 模型
 )
+# MIT-477 (T9.1)：x64 引用重写扫描需 capstone（与 lifter 同款 OBJECT 传递
+# 纪律，见 lifter/CMakeLists.txt 注）。
+if(TARGET wvmp::capstone)
+    target_link_libraries(wvmp_pass_import_protect PRIVATE wvmp::capstone)
+    target_link_libraries(wvmp_pass_import_protect INTERFACE
+        $<BUILD_INTERFACE:$<TARGET_OBJECTS:capstone>>)
+endif()
 wvmp_target_warnings(wvmp_pass_import_protect)
 
 # import_protect ↔ tls_hook 契约头（import_plan.hpp）独立 INTERFACE 目标：

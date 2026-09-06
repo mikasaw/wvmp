@@ -693,3 +693,40 @@ seed 0 稳定复现；生产 multiseed seed 未命中故未暴露）。
 电池 PASS；multiseed **335/335**；fetch_crypt_e2e 2/2 + tls_e2e 2/2；
 x64 dump 锚 67cfa727… 恒等（asmgen 语义面零变化——roll 修复只影响 x86
 分配，x64 逐字节不动）。冻结契约零 diff。
+
+
+## MIT-477 (T9.1 · IAT 引用重写——import 迁移完整方案) ✅ 2026-09-07
+
+**交付**：import_protect 补齐引用重写面——x64 目标 EXECUTE 节内所有
+rip 相对引用原 IAT 槽的指令（call/jmp [rip+d]、mov reg,[rip+d] 等）
+disp 重指 .wvmp 镜像等价槽（mirror_rva + (target − iat_base)）。运行
+期调用面提前到 loader 填镜像时刻；TLS 回填保留为兜底（未重写引用——
+数据指针、x86 绝对寻址——仍可用，零行为风险）。
+
+- **双扫描**：线性 capstone 反汇编（失败步进 1 字节）+ **锚点补漏扫**
+  （FF 15/25 与 (REX)? 8B modrm(00/101) 逐候选独立解码）——线性在数据
+  混排区失步漏过真实引用（单测实录），锚点不受失步影响。守卫三连 =
+  8B 槽对齐（伪命中几乎必然非对齐）+ 回读校验（addr+size+disp==target）
+  + int32 disp 界。幂等：已重写位点 disp 指镜像、target 不再落原 span。
+- **x86 砍面**：绝对寻址 + .reloc 联动复杂，v1 不重写（note 明示，回填
+  兜底），披露入 GAPS。
+- **测试**：X64CodeRefRewrite（FF 15 正例 / mov r64 正例 / 槽中间非对齐
+  负例 / span 外负例）；tls_e2e 新增静态断言（x64：note 计数 > 0 + 新
+  scripts/verifier/check_import_rewrite.py 扫打包镜像 EXECUTE 节 rip 引
+  用原 IAT 必须为 0——native/packed 双文件对照解析；x86：明示不重写
+  note）。cli 侧无新面。
+
+**开发实录（三坑）**：
+1. cs_disasm_iter 契约：detail 开启时 cs_insn.detail 必须指向有效存储
+  （cs_malloc 统一分配）——栈上裸 cs_insn 的 detail 为 0xCC 垫充，桩内
+  memset 直接 AV（cdb 定位 X86_getInstruction）。
+2. disp32 符号扩展：memcpy 4 字节进 i64 是**零扩展**——负 disp（向前引
+  用）roundtrip 校验全部误判跳过（CLI 实测 39 处全是正向引用所以"成
+  功"，掩盖了 bug；单测负 disp 当场抓获）。正解 = 读 u32 再 cast i32。
+3. cs 地址游标：cs_disasm_iter 会把地址参数推进到指令之后——锚点扫描
+  用推进后的值算 target 双倍加 size（线性分支用 insn->address 无此问
+  题）。修复 = 一律以 insn->address 为准。
+
+**验证**：build 0/0；ctest 23/23（import_protect 6 用例）；multiseed
+**335/335**；tls_e2e 2/2（含新静态断言）；fetch_crypt_e2e 2/2；x64
+dump 锚 67cfa727… 恒等（import_protect 不触解释器）。冻结契约零 diff。

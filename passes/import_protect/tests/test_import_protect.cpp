@@ -195,6 +195,71 @@ TEST(ImportProtectMigrate, X64ContiguousMigration) {
     EXPECT_GT(nonzero, 0u);
 }
 
+// MIT-477 (T9.1)：x64 rip 引用重写——.text 内 call [rip+IAT] / mov r64,
+// [rip+IAT] 的 disp 重指镜像等价槽；槽对齐判据外的伪命中不动。
+TEST(ImportProtectMigrate, X64CodeRefRewrite) {
+    const u64 base = 0x140000000;
+    ProtectionContext ctx;
+    ctx.image = make_image(true, 0x8664, base);
+    ctx.slot<PeImage>(kPeImage) = make_meta(true, 0x8664, base);
+    ctx.slot<std::vector<NewSection>>(kNewSections).push_back(make_wvmp(0x3000));
+    ImportFixture fx = make_import_fixture(base);
+    ctx.image = fx.image;
+
+    // .text 内植引用（.text = RVA 0x1000..0x2000）：
+    //   @0x1600: FF 15 disp32  → call [0x1200]（IAT 槽 0，8 对齐）
+    //   @0x1610: 48 8B 05 disp32 → mov rax,[0x1208]（IAT 槽 1）
+    //   @0x1620: FF 15 disp32  → call [0x1204]（槽中间，非对齐 → 不改写）
+    //   @0x1630: FF 15 disp32  → call [0x1300]（跨出 span → 不改写）
+    const auto rv2off = [](u32 rva) { return size_t(rva) - 0x1000 + 0x400; };
+    auto put_ff15 = [&](u32 at, u32 target) {
+        ctx.image[rv2off(at)] = 0xFF;
+        ctx.image[rv2off(at) + 1] = 0x15;
+        const u32 d = u32(i64(target) - i64(at + 6));
+        for (int b = 0; b < 4; ++b)
+            ctx.image[rv2off(at) + 2 + b] = u8((d >> (8 * b)) & 0xFF);
+    };
+    put_ff15(0x1600, 0x1200);
+    put_ff15(0x1610, 0x1300);  // 占位，稍后被 mov 覆写前 3 字节——独立排布
+    {
+        // mov rax,[rip+disp] @0x1610 → 0x1208
+        ctx.image[rv2off(0x1610)] = 0x48;
+        ctx.image[rv2off(0x1610) + 1] = 0x8B;
+        ctx.image[rv2off(0x1610) + 2] = 0x05;
+        const u32 d = u32(i64(0x1208) - i64(0x1610 + 7));
+        for (int b = 0; b < 4; ++b)
+            ctx.image[rv2off(0x1610) + 3 + b] = u8((d >> (8 * b)) & 0xFF);
+    }
+    put_ff15(0x1620, 0x1204);  // 非对齐
+    put_ff15(0x1630, 0x1300);  // INT1 区（span 外：span = [0x1200,0x1228)）
+    const std::vector<u8> raw_backup(ctx.image);
+
+    ImportProtectPass pass;
+    pass.run(ctx);
+
+    const auto* plan = ctx.find_slot<ImportPlan>(kImportPlan);
+    ASSERT_NE(plan, nullptr);
+    ASSERT_EQ(plan->mirror_rva, 0x3040u);
+
+    // 槽 0 引用 → 镜像槽 0：new_disp = 0x3040 - 0x1606。
+    {
+        const i64 want = i64(0x3040) - i64(0x1606);
+        u32 raw32 = 0;
+        std::memcpy(&raw32, &ctx.image[rv2off(0x1600) + 2], 4);
+        EXPECT_EQ(static_cast<i64>(static_cast<i32>(raw32)), want);
+    }
+    // mov rax 形 → 镜像槽 1：new_disp = 0x3048 - 0x1617。
+    {
+        const i64 want = i64(0x3048) - i64(0x1617);
+        u32 raw32 = 0;
+        std::memcpy(&raw32, &ctx.image[rv2off(0x1610) + 3], 4);
+        EXPECT_EQ(static_cast<i64>(static_cast<i32>(raw32)), want);
+    }
+    // 非对齐 / span 外引用原样保留。
+    EXPECT_EQ(std::memcmp(&ctx.image[rv2off(0x1620)], &raw_backup[rv2off(0x1620)], 6), 0);
+    EXPECT_EQ(std::memcmp(&ctx.image[rv2off(0x1630)], &raw_backup[rv2off(0x1630)], 6), 0);
+}
+
 TEST(ImportProtectMigrate, TlsHookCarriesBackfillLoop) {
     const u64 base = 0x140000000;
     ProtectionContext ctx;

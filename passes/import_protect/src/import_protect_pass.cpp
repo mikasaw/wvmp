@@ -7,6 +7,8 @@
 #include "wvmp/framework/registry.hpp"
 #include "wvmp/passes/pe_loader/pe_image.hpp"
 
+#include <capstone/capstone.h>
+
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
@@ -112,6 +114,177 @@ std::span<const std::string_view> ImportProtectPass::requires_keys() const {
 std::span<const std::string_view> ImportProtectPass::provides_keys() const {
     static constexpr std::string_view kProvides[] = {kImportPlan};
     return kProvides;
+}
+
+// ---------------------------------------------------------------------------
+// MIT-477 (T9.1)：x64 代码引用重写——EXECUTE 节内所有 rip 相对引用原 IAT
+// 槽的指令，disp 重指 .wvmp 镜像等价槽（mirror_rva + (target - iat_base)）。
+// 扫描 = 线性 capstone 反汇编（解码失败步进 1 字节，抗数据混排）；disp
+// 位置 = encoding.modrm_offset + 2（mod=00/rm=101 无 SIB），并以"指令地址
+// + 长度 + disp == 目标"回读校验兜底（不符即跳过，保守）。x86 目标不重写
+// （绝对寻址 + .reloc 联动复杂，v1 砍面；TLS 回填兜底仍覆盖未重写引用）。
+// 返回重写条数。
+static size_t rewrite_iat_code_refs(ProtectionContext& ctx, const PeImage& pe,
+                                    u64 iat_base, u64 iat_span, u64 mirror_rva) {
+    csh h = 0;
+    if (cs_open(CS_ARCH_X86, CS_MODE_64, &h) != CS_ERR_OK)
+        throw std::runtime_error("import_protect: cs_open failed");
+    cs_option(h, CS_OPT_DETAIL, CS_OPT_ON);
+    // cs_disasm_iter 要求 insn.detail 指向有效存储（capstone 5 契约）——
+    // cs_malloc 统一分配并初始化；栈上裸 cs_insn 的 detail 为垃圾 → 桩内
+    // memset AV（实测）。
+    cs_insn* insn = cs_malloc(h);
+    if (insn == nullptr) {
+        cs_close(&h);
+        throw std::runtime_error("import_protect: cs_malloc failed");
+    }
+    size_t rewritten = 0;
+    for (const auto& sec : pe.sections) {
+        if ((sec.characteristics & 0x2000'0000u) == 0) continue;  // EXECUTE
+        const auto sec_off = pe.rva_to_offset(sec.virtual_addr);
+        if (!sec_off.has_value()) continue;
+        // 长度钳制到镜像实际末端（头表 raw_size 与文件布局偶尔不符——
+        // 钳制而非整节跳过，扫描照常覆盖可见部分）。
+        size_t len = sec.raw_size;
+        if (static_cast<u64>(*sec_off) >= ctx.image.size()) continue;
+        len = static_cast<size_t>(
+            std::min<u64>(len, ctx.image.size() - *sec_off));
+        if (len == 0) continue;
+        const u8* cur = ctx.image.data() + *sec_off;
+        size_t pos = 0;
+        u64 va = sec.virtual_addr;  // cs 地址游标（RVA 空间）
+        while (pos < len) {
+            size_t remain = len - pos;
+            const u8* p = cur + pos;
+            u64 at = va;
+            if (!cs_disasm_iter(h, &p, &remain, &at, insn)) {
+                ++pos;
+                ++va;
+                continue;
+            }
+            // 定位 rip 相对内存操作数
+            bool hit = false;
+            i64 disp = 0;
+            {
+                const cs_x86& x = insn->detail->x86;
+                for (size_t k = 0; k < x.op_count && !hit; ++k) {
+                    const cs_x86_op& op = x.operands[k];
+                    if (op.type != X86_OP_MEM) continue;
+                    if (op.mem.base != X86_REG_RIP) continue;
+                    hit = true;
+                    disp = op.mem.disp;
+                }
+            }
+            if (hit) {
+                const u64 target = insn->address + insn->size +
+                                   static_cast<u64>(static_cast<i64>(disp));
+                // 槽对齐判据：合法 IAT 引用命中 8B 对齐槽起点；线性扫描
+                // 漂移产生的伪 rip 命中几乎必然非对齐 → 跳过（防误改写）。
+                if (target >= iat_base && target + 4 <= iat_base + iat_span &&
+                    (target - iat_base) % 8 == 0) {
+                    // disp 字段定位：mod=00/rm=101 时 disp32 紧跟 1 字节
+                    // modrm → modrm_offset + 1；capstone 缺席时按 FF 15/25
+                    // 形（size-4）兜底。回读校验不符即跳过（保守）。
+                    const cs_x86& x = insn->detail->x86;
+                    size_t disp_off = 0;
+                    bool ok = false;
+                    if (x.encoding.modrm_offset != 0 ||
+                        (x.encoding.modrm_offset == 0 && insn->size >= 6 &&
+                         insn->bytes[0] == 0xFF &&
+                         (insn->bytes[1] == 0x15 || insn->bytes[1] == 0x25))) {
+                        disp_off = x.encoding.modrm_offset != 0
+                                       ? x.encoding.modrm_offset + 1
+                                       : insn->size - 4;
+                        ok = disp_off + 4 <= insn->size;
+                    } else {
+                        ok = false;
+                    }
+                    if (ok) {
+                        // disp32 是有符号值——必须读 u32 后符号扩展（直接
+                        // memcpy 进 i64 是零扩展，负 disp 全部误判，实测）。
+                        u32 raw32 = 0;
+                        std::memcpy(&raw32, insn->bytes + disp_off, 4);
+                        const i64 cur_disp = static_cast<i64>(static_cast<i32>(raw32));
+                        if (insn->address + insn->size + cur_disp == target) {
+                            const u64 new_target = mirror_rva + (target - iat_base);
+                            const i64 new_disp =
+                                cur_disp + static_cast<i64>(new_target) -
+                                static_cast<i64>(target);
+                            const i64 lo = -0x8000'0000LL, hi = 0x7FFF'FFFFLL;
+                            if (new_disp >= lo && new_disp <= hi) {
+                                u8* raw = ctx.image.data() + *sec_off + pos;
+                                for (int b = 0; b < 4; ++b)
+                                    raw[disp_off + b] =
+                                        static_cast<u8>((static_cast<u64>(new_disp) >>
+                                                         (8 * b)) & 0xFF);
+                                ++rewritten;
+                            }
+                        }
+                    }
+                }
+            }
+            pos += insn->size;
+            va += insn->size;
+        }
+        // —— 锚点补漏扫描（MIT-477）：线性反汇编在数据混排区失步会漏过
+        // 真实引用（单测实录）。锚点 = FF 15/25（call/jmp [rip]）与
+        // (REX)? 8B modrm(00/101)（mov r32/r64, [rip]）——逐候选偏移独立
+        // 解码，不受失步影响；与线性共享同一套对齐/回读/span 守卫（对已
+        // 重写位点幂等：其 disp 已指镜像、target 不再落原 span）。
+        for (size_t i = 0; i + 3 <= len; ++i) {
+            const u8* b = cur + i;
+            size_t clen = 0;
+            if (b[0] == 0xFF && (b[1] == 0x15 || b[1] == 0x25)) {
+                clen = 6;              // FF /2 /4：call/jmp [rip+disp32]
+            } else if ((b[0] == 0x8B || (b[0] >= 0x40 && b[0] <= 0x4F)) &&
+                       b[1] == 0x8B && (b[2] & 0xC7) == 0x05) {
+                clen = (b[0] >= 0x40 && b[0] <= 0x4F) ? 7 : 6;  // (REX) 8B /r mov r32/r64
+            } else {
+                continue;
+            }
+            if (i + clen > len) continue;
+            size_t remain = clen;
+            const u8* p = b;
+            u64 at = sec.virtual_addr + i;
+            if (!cs_disasm_iter(h, &p, &remain, &at, insn)) continue;
+            if (insn->size != clen) continue;
+            const cs_x86& x = insn->detail->x86;
+            bool hit = false;
+            i64 disp = 0;
+            for (size_t k = 0; k < x.op_count && !hit; ++k) {
+                const cs_x86_op& op = x.operands[k];
+                if (op.type == X86_OP_MEM && op.mem.base == X86_REG_RIP) {
+                    hit = true;
+                    disp = op.mem.disp;
+                }
+            }
+            if (!hit) continue;
+            const u64 target = insn->address + insn->size +
+                               static_cast<u64>(static_cast<i64>(disp));
+            if (!(target >= iat_base && target + 4 <= iat_base + iat_span &&
+                  (target - iat_base) % 8 == 0))
+                continue;
+            size_t disp_off = x.encoding.modrm_offset != 0 ? x.encoding.modrm_offset + 1
+                                                           : (clen == 6 ? 2 : 3);
+            if (disp_off + 4 > insn->size) continue;
+            u32 raw32 = 0;
+            std::memcpy(&raw32, insn->bytes + disp_off, 4);
+            const i64 cur_disp = static_cast<i64>(static_cast<i32>(raw32));
+            if (insn->address + insn->size + cur_disp != target) continue;
+            const u64 new_target = mirror_rva + (target - iat_base);
+            const i64 new_disp = cur_disp + static_cast<i64>(new_target) -
+                                 static_cast<i64>(target);
+            if (new_disp < -0x8000'0000LL || new_disp > 0x7FFF'FFFFLL) continue;
+            u8* raw = ctx.image.data() + *sec_off + i;
+            for (int b2 = 0; b2 < 4; ++b2)
+                raw[disp_off + b2] =
+                    static_cast<u8>((static_cast<u64>(new_disp) >> (8 * b2)) & 0xFF);
+            ++rewritten;
+        }
+    }
+    cs_free(insn, 1);
+    cs_close(&h);
+    return rewritten;
 }
 
 void ImportProtectPass::run(ProtectionContext& ctx) {
@@ -245,6 +418,14 @@ void ImportProtectPass::run(ProtectionContext& ctx) {
             ctx.image[ft_offsets[i] + b] = static_cast<u8>((new_ft >> (8 * b)) & 0xFF);
     }
 
+    // MIT-477 (T9.1)：x64 代码引用重写——.text 内 rip 相对引用原 IAT 的指
+    // 令重指镜像等价槽。回填（TLS 回调）保留为兜底（未重写的引用——数据指
+    // 针、x86 绝对寻址——仍可用），运行期调用面则提前到 loader 填镜像时刻。
+    size_t refs_rewritten = 0;
+    if (pe->machine != kMachineX86) {
+        refs_rewritten = rewrite_iat_code_refs(ctx, *pe, base, span, mirror_rva);
+    }
+
     import_protect::ImportPlan plan;
     plan.active = true;
     plan.iat_base_rva = base;
@@ -258,13 +439,22 @@ void ImportProtectPass::run(ProtectionContext& ctx) {
     plan.oldprot_rva = oldprot_rva;
     ctx.slot<import_protect::ImportPlan>(kImportPlan) = plan;
 
-    char buf[160];
-    std::snprintf(buf, sizeof(buf),
-                  "IAT 迁移：%u 描述符 / %u 槽（0x%llX 字节）→ .wvmp 镜像 @ RVA 0x%llX"
-                  "（INT 原位；回填由 TLS 回调执行）",
-                  plan.descriptor_count, plan.slot_count,
-                  static_cast<unsigned long long>(span),
-                  static_cast<unsigned long long>(mirror_rva));
+    char buf[192];
+    if (pe->machine != kMachineX86) {
+        std::snprintf(buf, sizeof(buf),
+                      "IAT 迁移：%u 描述符 / %u 槽（0x%llX 字节）→ .wvmp 镜像 @ RVA 0x%llX"
+                      "（INT 原位；回填由 TLS 回调执行；代码引用重写 %zu 处）",
+                      plan.descriptor_count, plan.slot_count,
+                      static_cast<unsigned long long>(span),
+                      static_cast<unsigned long long>(mirror_rva), refs_rewritten);
+    } else {
+        std::snprintf(buf, sizeof(buf),
+                      "IAT 迁移：%u 描述符 / %u 槽（0x%llX 字节）→ .wvmp 镜像 @ RVA 0x%llX"
+                      "（INT 原位；回填由 TLS 回调执行；x86 不做引用重写，回填兜底）",
+                      plan.descriptor_count, plan.slot_count,
+                      static_cast<unsigned long long>(span),
+                      static_cast<unsigned long long>(mirror_rva));
+    }
     ctx.diag.report(Severity::Note, name(), buf);
 }
 
