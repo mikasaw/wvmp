@@ -493,6 +493,14 @@ void TlsHookPass::run(ProtectionContext& ctx) {
     const size_t ptr_w = plus ? 8 : 4;      // 指针宽度（数组项 / 目录字段）
     const u64 sec_rva = wvmp->requested_rva;
     const u64 base = pe->image_base;
+    // MIT-476 预留区游标（stub_link 置初值 = blobs 末端；槽缺席 = 旧尾部
+    // 追加语义，grow_ok = 允许扩容）。
+    u64 cur = wvmp->data.size();
+    bool grow_ok = true;
+    if (auto* r = ctx.find_slot<u64>(kEmitReserveBase)) {
+        cur = *r;
+        grow_ok = false;
+    }
 
     // —— 追加布局：回调桩 → .wvmpc（16 对齐）；[index 槽 8][回调数组 8]
     // [TLS 目录 8] → .wvmp 尾部（8 对齐）——
@@ -547,13 +555,11 @@ void TlsHookPass::run(ProtectionContext& ctx) {
             }
         }
         if (gtc_found) {
-            // CONTEXT 暂存（.wvmp 尾部，16 对齐；x64 0x4D0 / x86 0x2CC）。
+            // CONTEXT 暂存（MIT-476 预留区，16 对齐；x64 0x4D0 / x86 0x2CC）。
             const size_t ctx_size = plus ? 0x4D0u : 0x2CCu;
-            const u64 ctx_off = (wvmp->data.size() + 15) / 16 * 16;
+            const u64 ctx_off = emit_reserve_take(wvmp->data, cur, 16, ctx_size, grow_ok);
             drx.ctx_va = base + wvmp->requested_rva + ctx_off;
             drx.ctx_flags = plus ? 0x00100010u : 0x00010010u;  // CONTEXT_DEBUG_REGISTERS
-            wvmp->data.resize(static_cast<size_t>(ctx_off), 0);
-            wvmp->data.resize(wvmp->data.size() + ctx_size, 0);
         } else {
             ctx.diag.report(Severity::Note, name(),
                             "目标未导入 kernel32!GetThreadContext，DRx 检查面跳过（保守降级）");
@@ -563,10 +569,8 @@ void TlsHookPass::run(ProtectionContext& ctx) {
     u64 rdtsc_scratch_va = 0;
     const bool rdtsc_requested = (adb_init & 0x8) != 0;
     if (rdtsc_requested && is_x86) {
-        const u64 sc_off = (wvmp->data.size() + 7) / 8 * 8;
+        const u64 sc_off = emit_reserve_take(wvmp->data, cur, 8, 8, grow_ok);
         rdtsc_scratch_va = base + wvmp->requested_rva + sc_off;
-        wvmp->data.resize(static_cast<size_t>(sc_off), 0);
-        wvmp->data.resize(wvmp->data.size() + 8, 0);
     }
     const std::vector<u8> stub =
         assemble_callback_stub(is_x86, (imp != nullptr && imp->active) ? imp : nullptr,
@@ -574,13 +578,16 @@ void TlsHookPass::run(ProtectionContext& ctx) {
                                (drx_requested && drx.gtc_slot_va != 0) ? &drx : nullptr,
                                rdtsc_requested,
                                rdtsc_requested ? rdtsc_scratch_va : 0);
-    // 代码节偏移（.wvmpc 尾部 16 对齐）。
+    // 代码节偏移（.wvmpc 尾部 16 对齐；代码节后无节，保持尾部追加）。
     const u64 cb_off = align_up(wvmpc->data.size(), 16);
-    // 数据节偏移（.wvmp 尾部）：index 槽 8B → 回调数组 → TLS 目录。
-    const u64 idx_off = align_up(wvmp->data.size(), 8);
+    // 数据节（MIT-476 预留区）：index 槽 8B → 回调数组 → TLS 目录。
+    const u64 idx_off = emit_reserve_take(wvmp->data, cur, 8, 8, grow_ok);
     const OriginalTls orig = read_original_tls(ctx, *pe);
-    const u64 array_off = align_up(idx_off + 8, 8);
-    const u64 dir_off = align_up(array_off + (2 + orig.callbacks.size()) * ptr_w, 8);
+    const u64 array_off = emit_reserve_take(wvmp->data, cur, 8,
+                                            (2 + orig.callbacks.size()) * ptr_w,
+                                            grow_ok);
+    const u64 dir_size_bytes = plus ? 40u : 24u;
+    const u64 dir_off = emit_reserve_take(wvmp->data, cur, 8, dir_size_bytes, grow_ok);
 
     const u64 cb_rva = wvmpc->requested_rva + cb_off;
     const u64 cb_va = base + cb_rva;
@@ -588,7 +595,7 @@ void TlsHookPass::run(ProtectionContext& ctx) {
     const u64 array_rva = sec_rva + array_off;
     const u64 array_va = base + array_rva;
     const u64 dir_rva = sec_rva + dir_off;
-    const u32 dir_size = plus ? 40u : 24u;
+    const u32 dir_size = static_cast<u32>(dir_size_bytes);
 
     // 回调数组：[我们的回调, …原回调…, NULL]（我们的排第一，先于原回调执行）。
     std::vector<u8> array_bytes;
@@ -614,17 +621,24 @@ void TlsHookPass::run(ProtectionContext& ctx) {
     // 回调桩 → 代码节 .wvmpc（RX）；index/数组/目录 → 数据节 .wvmp（RW）。
     wvmpc->data.resize(static_cast<size_t>(cb_off), 0);
     wvmpc->data.insert(wvmpc->data.end(), stub.begin(), stub.end());
-    wvmp->data.resize(static_cast<size_t>(idx_off), 0);
-    append_le(wvmp->data, 0, 8);  // index 槽（加载器写 TLS slot index）
-    wvmp->data.resize(static_cast<size_t>(array_off), 0);
-    wvmp->data.insert(wvmp->data.end(), array_bytes.begin(), array_bytes.end());
-    wvmp->data.resize(static_cast<size_t>(dir_off), 0);
-    append_le(wvmp->data, dir.start, ptr_w);
-    append_le(wvmp->data, dir.end, ptr_w);
-    append_le(wvmp->data, dir.index, ptr_w);
-    append_le(wvmp->data, dir.callbacks, ptr_w);
-    append_le(wvmp->data, dir.zero_fill, 4);
-    append_le(wvmp->data, dir.characteristics, 4);
+    {
+        // index 槽（加载器写 TLS slot index）+ 数组 + 目录字段：预留区内直写。
+        u8* base_p = wvmp->data.data();
+        for (int i = 0; i < 8; ++i) base_p[idx_off + i] = 0;
+        std::memcpy(base_p + array_off, array_bytes.data(), array_bytes.size());
+        const u64 fields[6] = {dir.start, dir.end, dir.index, dir.callbacks,
+                               dir.zero_fill, dir.characteristics};
+        const u32 fw[6] = {static_cast<u32>(ptr_w), static_cast<u32>(ptr_w),
+                           static_cast<u32>(ptr_w), static_cast<u32>(ptr_w), 4, 4};
+        u64 at = dir_off;
+        for (int i = 0; i < 6; ++i) {
+            for (u32 b = 0; b < fw[i]; ++b)
+                base_p[at + b] = u8((fields[i] >> (8 * b)) & 0xFF);
+            at += fw[i];
+        }
+    }
+
+    if (auto* r = ctx.find_slot<u64>(kEmitReserveBase)) *r = cur;
 
     tls_hook::TlsPlan plan;
     plan.tls_dir_rva = dir_rva;

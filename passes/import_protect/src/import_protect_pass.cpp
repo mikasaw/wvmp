@@ -207,20 +207,25 @@ void ImportProtectPass::run(ProtectionContext& ctx) {
     const u64 page_rva = base & ~u64(0xFFF);
     const u64 page_bytes = ((base + span + 0xFFF) & ~u64(0xFFF)) - page_rva;
 
-    // 镜像追加 .wvmp（8 对齐），文件态 = seed 派生乱数（掩盖静态分析；
-    // 加载期被 loader 以真实地址整段覆写，TLS 回调再回填原 IAT 区）。
-    // 镜像之后追加 8 字节 oldprot 暂存（可写 .wvmp 内，初始 0）。
-    const u64 mirror_off = (wvmp->data.size() + 7) / 8 * 8;
-    const u64 mirror_rva = wvmp->requested_rva + mirror_off;
+    // MIT-476：镜像写入 .wvmp 预留区（emit_reserve_take 协议，见
+    // pe_image.hpp）——节尺寸恒定，代码节连续性不再依赖对齐垫片。
+    // 镜像之后 8 字节 oldprot 暂存（初始 0）。预留槽缺席（旧夹具）=
+    // 旧"尾部追加"语义（grow_ok）。
+    u64 cur = wvmp->data.size();
+    bool grow_ok = true;
+    if (auto* r = ctx.find_slot<u64>(kEmitReserveBase)) {
+        cur = *r;
+        grow_ok = false;
+    }
     const size_t span_bytes = static_cast<size_t>(span);
-    wvmp->data.resize(static_cast<size_t>(mirror_off), 0);
-    const size_t fill_begin = wvmp->data.size();
-    wvmp->data.resize(fill_begin + span_bytes);
+    const u64 mirror_off = emit_reserve_take(wvmp->data, cur, 8, span_bytes, grow_ok);
+    const u64 mirror_rva = wvmp->requested_rva + mirror_off;
     for (size_t i = 0; i < span_bytes; ++i)
-        wvmp->data[fill_begin + i] = static_cast<u8>(ctx.rng.next() & 0xFF);
-    const u64 oldprot_off = (wvmp->data.size() + 7) / 8 * 8;
+        wvmp->data[static_cast<size_t>(mirror_off) + i] =
+            static_cast<u8>(ctx.rng.next() & 0xFF);
+    const u64 oldprot_off = emit_reserve_take(wvmp->data, cur, 8, 8, grow_ok);
     const u64 oldprot_rva = wvmp->requested_rva + oldprot_off;
-    wvmp->data.resize(static_cast<size_t>(oldprot_off) + 8, 0);
+    if (auto* r = ctx.find_slot<u64>(kEmitReserveBase)) *r = cur;
 
     // 各描述符 FirstThunk RVA 原地重指镜像切片。先全部解析偏移再统一
     // 写入——消除写循环内二次映射失败的半改窗口（MIT-466 验收 issue）。

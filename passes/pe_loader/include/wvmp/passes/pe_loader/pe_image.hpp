@@ -118,4 +118,33 @@ struct SectionPlacement {
     u32 raw_size = 0;    // 对齐后的 SizeOfRawData
 };
 
+// ---------------------------------------------------------------------------
+// MIT-476 (T20)：Emit 阶段数据节预留区协议。
+//
+// stub_link 生成 .wvmp 时把 payload 预扩至 blobs + kEmitReserveBytes，并把
+// "下一个可写偏移"（= blobs 末端）放入 kEmitReserveBase 槽；后续 Emit pass
+// （import_protect 镜像 IAT/oldprot、tls_hook CONTEXT/rdtsc/TLS 面）经
+// emit_reserve_take 在预留区内对齐分配。节最终尺寸恒定 = blobs + 预留 →
+// 代码节 requested_rva（stub 链接期已烘焙进 rel32）的连续性校验不再依赖
+// 节对齐垫片吸收追加（T16 验收票①：追加超垫片即 "not contiguous" 硬失
+// 败）；全 gate（零 blob）时数据节也恒非空（票②）。
+inline constexpr u64 kEmitReserveBytes = 0x2000;  // 8KB（实测追加峰值 ~2KB）
+
+// 从预留区对齐分配 bytes；返回区内偏移（调用方 + requested_rva 得 RVA）。
+// grow_ok = 预留槽缺席（旧夹具/单测）时的旧"尾部追加"语义：空间不足即
+// 扩容；协议模式下不足则抛错（明确预算超限，优于静默重叠）。
+[[nodiscard]] inline u64 emit_reserve_take(std::vector<u8>& data, u64& cursor,
+                                           u64 align, u64 bytes, bool grow_ok) {
+    const u64 off = (cursor + align - 1) / align * align;
+    if (off + bytes > data.size()) {
+        if (!grow_ok)
+            throw std::runtime_error("emit data reserve exhausted: need " +
+                                     std::to_string(off + bytes) + ", budget " +
+                                     std::to_string(data.size()));
+        data.resize(static_cast<size_t>(off + bytes), 0);
+    }
+    cursor = off + bytes;
+    return off;
+}
+
 } // namespace wvmp::passes

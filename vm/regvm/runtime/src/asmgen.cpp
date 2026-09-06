@@ -522,12 +522,24 @@ public:
         base_ = kX86CalleeSaved[bi];
         // 数据临时 t_[0]/t_[1]：字节可编码集 {eax,edx,ebx} 均匀抽 2（S8
         // native 子寄存器名硬约束 —— bpl/sil/dil 为 REX 专属名 32 位不可编
-        // 码，见文件头 kX86 池注）。
-        const u64 a0 = rng_.uniform(0u, 2u);
-        u64 a1 = rng_.uniform(0u, 1u);
+        // 码，见文件头 kX86 池注）。⚠️ MIT-476：候选集必须先剔除 ctx_/base_
+        // 已占用的 ebx（kX86ByteCapable ∩ kX86CalleeSaved = {ebx}）——旧实
+        // 现无剔除，t0/t1 撞上 ctx_=ebx 时 rest 填充塌缩成 3 项 →
+        // std::array<int,2> 越界写（Debug assert / Release 静默损坏），且
+        // t0==ctx_ 本身即角色冲突（scratch 写毁 ctx 指针）。候选剔除后
+        // 恒剩 ≥2（ebx 至多被占一次，eax/edx 恒空闲）。
+        int cand[3];
+        int nc = 0;
+        for (int i = 0; i < 3; ++i) {
+            const int r = kX86ByteCapable[i];
+            if (r == ctx_ || r == base_) continue;
+            cand[nc++] = r;
+        }
+        const u64 a0 = rng_.uniform(0u, static_cast<u64>(nc - 1));
+        u64 a1 = rng_.uniform(0u, static_cast<u64>(nc - 2));
         if (a1 >= a0) ++a1;
-        t_[0] = kX86ByteCapable[a0];
-        t_[1] = kX86ByteCapable[a1];
+        t_[0] = cand[a0];
+        t_[1] = cand[a1];
         // 寻址临时 t_[2]/t_[3]：池剩余 2 位随机洗牌（无宽度名约束）。
         std::array<int, 2> rest{};
         int j = 0;

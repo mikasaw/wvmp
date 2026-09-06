@@ -284,6 +284,43 @@ TEST(ConfigParse, AntiDebugStringBoolRejected) {
     EXPECT_NE(result.error.find("必须是布尔值"), std::string::npos);
 }
 
+// MIT-476 (T20 / T17 验收建议 4)：[crypt] fetch 严格 schema 负例三连。
+TEST(ConfigParse, CryptFetchStringBoolRejected) {
+    const TempToml toml(
+        "input  = \"t.exe\"\n"
+        "output = \"o.exe\"\n"
+        "[crypt]\n"
+        "fetch = \"yes\"\n"
+    );
+    const auto result = wvmp::cli::parse_config(toml.path());
+    EXPECT_FALSE(result.ok);
+    EXPECT_NE(result.error.find("必须是布尔值"), std::string::npos);
+}
+
+TEST(ConfigParse, CryptFetchFloatBoolRejected) {
+    const TempToml toml(
+        "input  = \"t.exe\"\n"
+        "output = \"o.exe\"\n"
+        "[crypt]\n"
+        "fetch = 1.5\n"
+    );
+    const auto result = wvmp::cli::parse_config(toml.path());
+    EXPECT_FALSE(result.ok);
+    EXPECT_NE(result.error.find("必须是布尔值"), std::string::npos);
+}
+
+TEST(ConfigParse, CryptUnknownSubkeyRejected) {
+    const TempToml toml(
+        "input  = \"t.exe\"\n"
+        "output = \"o.exe\"\n"
+        "[crypt]\n"
+        "mode = \"xor\"\n"
+    );
+    const auto result = wvmp::cli::parse_config(toml.path());
+    EXPECT_FALSE(result.ok);
+    EXPECT_NE(result.error.find("mode"), std::string::npos);
+}
+
 TEST(ConfigParse, MsysFallbackNotFound) {
     const auto result = wvmp::cli::parse_config(
         std::filesystem::path("/tmp/wvmp_does_not_exist_12345.toml"));

@@ -655,3 +655,41 @@ rsp%16=0）+ 每个 ret 前 `add rsp, 0x28`；4 个已有帧的 PROC
 **验证**：六样本 native rc=0（含 atomic_incdec——MIT-474 B1 修复顺带
 带活）；**multiseed 335/335 首次全绿**（历史最好 305/30）；ctest
 23/23；x64 dump 锚 67cfa727… 恒等（产品零触碰）。冻结契约零 diff。
+
+
+## MIT-476 (T20 · stub_link 布局健壮化——T16 三张后续票清偿) ✅ 2026-09-07
+
+**交付**：T16 验收产出的三张 Park 票一并清偿（同源于 stub_link 布局 +
+诊断），外加顺带挖出并修复一个预存在的 asmgen x86 隐性越界。
+
+- **票①（code_rva 余量耦合）**：code_rva（stub 链接期烘焙进 .text E9
+  rel32 与 stub 内部引用）此前按纯 blobs 尺寸计算，后续 Emit pass
+  （import_protect 镜像 IAT/oldprot、tls_hook CONTEXT/rdtsc/TLS 面）向
+  .wvmp 的追加全靠节对齐垫片（≤4KB）吸收——追加超垫片即 "not
+  contiguous" 硬失败。修复 = **Emit 预留区协议**：stub_link 把 .wvmp
+  payload 预扩至 blobs + kEmitReserveBytes（8KB），并把"下一个可写偏移"
+  放 kEmitReserveBase 槽；两个消费 pass 经 emit_reserve_take 在预留区内
+  对齐分配（槽缺席 = 旧尾部追加语义，旧夹具零改动兼容）。节最终尺寸
+  恒定 → 连续性恒成立。
+- **票②（x86 全 gate 空数据节）**：所有函数被白名单 gate 时 blobs=0 →
+  .wvmp 空节被 add_sections 拒绝。预留区使数据节恒非空（≥8KB）。
+- **票③（gate 诊断微损）**：gate note 此前只说"含未支持的 VmOp"，
+  unsupported_x86_ops 返回的具体 opcode 列表被丢弃。修复 = note 携带
+  opcode 名清单（isa::to_string，截前 8 个 + 省略号）。
+- **测试**：X86AllGatedEmitsNonEmptyDataSection（x86 全 gate：数据节
+  ≥8KB / code_rva > data_rva / note 含 "movsxd"）；顺带落地 T17 验收建议
+  4——[crypt] fetch 严格 schema 负例三连（string/float/未知子键，
+  cli_tests 5 用例）。
+
+**顺带发现并修复（预存在隐性越界）**：roll_x86 的 t0/t1 从字节可编码集
+{eax,edx,ebx} 抽取但**未与 ctx_/base_ 去重**——ebx ∈ 两个集合交集，当
+ctx_/base_ 占 ebx 且 t0/t1 撞上时：rest 填充塌缩成 3 项 →
+std::array<int,2> 越界写（Debug assert / Release 静默损坏），且 t0==ctx_
+本身即角色冲突。修复 = 候选集先剔除 ctx_/base_ 已占（ebx 至多占一次，
+eax/edx 恒空闲，候选恒 ≥2）。触发面 = x86 解释器 roll 的 rng 状态（
+seed 0 稳定复现；生产 multiseed seed 未命中故未暴露）。
+
+**验证**：build 0/0；ctest 23/23（stub_link 5 用例含新增）；x86 交叉
+电池 PASS；multiseed **335/335**；fetch_crypt_e2e 2/2 + tls_e2e 2/2；
+x64 dump 锚 67cfa727… 恒等（asmgen 语义面零变化——roll 修复只影响 x86
+分配，x64 逐字节不动）。冻结契约零 diff。

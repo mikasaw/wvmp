@@ -166,7 +166,9 @@ void StubLinkPass::run(ProtectionContext& ctx) {
     // MIT-472 (W^X 拆节) 前置尺寸遍历：先跑 x86 白名单 gate（结果缓存）+
     // 合计 blob 尺寸 → 定位数据节/代码节 RVA（blob 尺寸可先验，无需生成
     // stub，无循环依赖）。
+
     std::vector<char> gated(vfs->size(), 0);
+    std::vector<std::vector<int>> gated_ops(vfs->size());
     u64 data_total = 0;
     for (size_t vfs_index = 0; vfs_index < vfs->size(); ++vfs_index) {
         if (is_x86) {
@@ -174,6 +176,7 @@ void StubLinkPass::run(ProtectionContext& ctx) {
                 unsupported_x86_ops((*vfs)[vfs_index].program.bytecode);
             if (!bad.empty()) {
                 gated[vfs_index] = 1;
+                gated_ops[vfs_index] = bad;  // MIT-476: 诊断带 opcode 名（票③）
                 continue;
             }
         }
@@ -183,6 +186,15 @@ void StubLinkPass::run(ProtectionContext& ctx) {
                                      : (*vfs)[vfs_index].program.bytecode.size();
         data_total += static_cast<u64>(align_up(blob_size, 8));
     }
+    // MIT-476（票①/②）：后续 Emit pass（import_protect 镜像 IAT/oldprot、
+    // tls_hook CONTEXT/rdtsc/TLS 面）向 .wvmp 写入——code_rva 此前按纯
+    // blobs 尺寸计算，追加全靠节对齐垫片（≤4KB）吸收，超垫片即
+    // "not contiguous" 硬失败；全 gate（零 blob）时数据节为空被
+    // add_sections 拒绝。预留 8KB 并随节发射（ emit_reserve_take 协议见
+    // pe_image.hpp），节最终尺寸恒定 → 连续性恒成立、数据节恒非空。
+    const u64 blobs_total = data_total;
+    data_total += kEmitReserveBytes;
+
     const u64 code_rva = align_up(
         data_section_rva + align_up(data_total, sec_align), sec_align);
     const u64 rt_entry = code_rva;  // 解释器入口 = 代码节基址（vm_entry_offset=0）
@@ -198,9 +210,16 @@ void StubLinkPass::run(ProtectionContext& ctx) {
         // 不经过本 gate（行为零变化）。
         if (is_x86) {
             if (gated[vfs_index]) {
+                std::string ops;
+                for (size_t k = 0; k < gated_ops[vfs_index].size() && k < 8; ++k) {
+                    if (k != 0) ops += ",";
+                    ops += isa::to_string(
+                        static_cast<isa::VmOp>(gated_ops[vfs_index][k]));
+                }
+                if (gated_ops[vfs_index].size() > 8) ops += ",…";
                 ctx.diag.report(Severity::Note, name(),
-                                "函数 " + vf.name + " 含 x86 运行时未支持的 VmOp" +
-                                    "，跳过虚拟化（保持原生，x86 白名单 gate）");
+                                "函数 " + vf.name + " 含 x86 运行时未支持的 VmOp（" +
+                                    ops + "），跳过虚拟化（保持原生，x86 白名单 gate）");
                 continue;
             }
         }
@@ -293,6 +312,12 @@ void StubLinkPass::run(ProtectionContext& ctx) {
             code[1 + b] = u8((rel_u >> (8 * b)) & 0xFF);
         for (i64 i = 5; i < region_len; ++i) code[i] = 0xCC;
     }
+
+    // MIT-476：blob 末端起为 Emit 预留区（预扩零垫）；后续 pass 经
+    // kEmitReserveBase 槽内的游标在区内分配（pe_image.hpp 协议注）。
+
+    data_payload.resize(static_cast<size_t>(data_total), 0);
+    ctx.slot<u64>(kEmitReserveBase) = blobs_total;
 
     // —— 新节请求交给 pe_writer（MIT-472 W^X 拆节：两节）——
     // .wvmp（RW，0xC0000040）：字节码 blob 等数据面（解密期被写）。

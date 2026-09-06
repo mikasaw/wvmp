@@ -2,6 +2,10 @@
 #include <string_view>
 namespace wvmp {
 inline constexpr std::string_view kImage="image", kFunctions="functions", kLiftedIr="ir.lifted", kVmProgram="vm.program", kVmRuntime="vm.runtime", kNewSections="pe.new_sections";
+// MIT-476：.wvmp 数据节预留区"下一个可写偏移"（stub_link 置初值 = blobs
+// 末端；import_protect/tls_hook 读写推进）。类型 u64，槽未置 = 旧"尾部
+// 追加"语义（旧夹具/单测兼容）。
+inline constexpr std::string_view kEmitReserveBase="pe.emit_reserve_base";
 // pe_loader 产出的 PE 结构模型（PeImage）所在扩展槽——M1 起为 marker_scan/lifter
 // 等分析类 pass 的共享依赖（提供方：pe_loader）。
 inline constexpr std::string_view kPeImage="pe.image_meta";

@@ -22,6 +22,8 @@
 
 #include <gtest/gtest.h>
 
+#include <cstdio>
+
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
@@ -162,6 +164,56 @@ TEST(StubLinkPass, OverwritesEntryAndRequestsSection) {
 
     // 区域余量 INT3 填充（0x40 字节区域，E9 后全 CC）。
     for (size_t i = 5; i < 0x40; ++i) EXPECT_EQ(code[i], 0xCC) << "byte " << i;
+}
+
+// MIT-476 (T20)：x86 全 gate —— 零 blob 时数据节恒非空（emit 预留区，
+// 票②）、代码节 RVA > 数据节 RVA（票①），gate note 携带未支持 opcode
+// 名（票③）。
+TEST(StubLinkPass, X86AllGatedEmitsNonEmptyDataSection) {
+    auto ctx = make_ctx_with_one_function();
+    {   // PeImage 槽改 x86 形（machine=0x014C / PE32）。全 gate 路径不写
+        // .text / 不依赖镜像字节，槽字段足够驱动 x86 分支。
+        PeImage meta = ctx.slot<PeImage>(wvmp::kPeImage);
+        meta.machine = 0x014C;
+        meta.is_pe32_plus = false;
+        ctx.slot<PeImage>(wvmp::kPeImage) = meta;
+    }
+    {   // 程序换成含 x86 未支持 op（Movsxd）的流。
+        std::vector<u8> stream;
+        isa::append_insn(stream, isa::make_insn(isa::VmOp::Movsxd, isa::OpKind::Reg,
+                                                0, isa::OpKind::Reg, 1, 0, 3));
+        isa::append_insn(stream, isa::make_insn(isa::VmOp::Halt, isa::OpKind::None, 0,
+                                                isa::OpKind::None, 0));
+        const auto blob = isa::make_blob(wvmp::ir::Arch::X86, 0, std::move(stream));
+        std::vector<u8> serialized;
+        wvmp::ByteWriter w(serialized);
+        isa::write_blob(w, blob);
+        auto& vfs = ctx.slot<std::vector<VirtualizedFunction>>(wvmp::kVmProgram);
+        vfs.front().program.bytecode = std::move(serialized);
+    }
+
+    wvmp::passes::StubLinkPass pass;
+    pass.run(ctx);
+
+    ASSERT_FALSE(ctx.diag.has_errors());
+
+    const auto* reqs = ctx.find_slot<std::vector<NewSection>>(wvmp::kNewSections);
+    ASSERT_NE(reqs, nullptr);
+    ASSERT_EQ(reqs->size(), static_cast<size_t>(2));
+    const NewSection& data_req = (*reqs)[0];
+    const NewSection& code_req = (*reqs)[1];
+    // 票②：全 gate（零 blob）数据节恒非空（emit 预留区）。
+    EXPECT_GE(data_req.data.size(), wvmp::passes::kEmitReserveBytes);
+    // 票①：代码节落在数据节（含预留）对齐端之后。
+    EXPECT_GT(code_req.requested_rva, data_req.requested_rva);
+    EXPECT_EQ(code_req.requested_rva % kSecAlign, 0u);
+    // 票③：gate note 携带未支持 opcode 名。
+    bool note_found = false;
+    for (const auto& d : ctx.diag.items())
+        if (d.message.find("movsxd") != std::string::npos &&
+            d.message.find("白名单 gate") != std::string::npos)
+            note_found = true;
+    EXPECT_TRUE(note_found);
 }
 
 TEST(StubLinkPass, UnmappableRegionKeepsNative) {

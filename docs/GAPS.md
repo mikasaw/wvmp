@@ -1686,3 +1686,25 @@ ret 即跳入数据。**asm 侧调用任何 C++ 函数的样板** = PROC 入口
 （仅为让编译器在调用点前物化字符串地址供 marker_scan 解析区域名）——
 asm 裸调 rcx=垃圾不直接崩，崩的是 shadow space 缺失的 home 写。两回事，
 勿混。
+
+
+## MIT-476（stub_link 布局健壮化）收口——Emit 预留区协议 + roll_x86 去重纪律（2026-09-07）
+
+**预留区协议**（pe_image.hpp 单一来源）：stub_link 预扩 .wvmp 至
+blobs + kEmitReserveBytes（8KB）并置 kEmitReserveBase 游标槽；消费方
+（import_protect/tls_hook）emit_reserve_take 对齐分配、推进游标、写回
+槽。协议不变量：① 节最终尺寸恒定（blobs + 8KB）→ 代码节连续性恒成立；
+② 追加超预算 = 显式 throw（优于静默重叠/对齐垫片侥幸）；③ 游标槽缺席
+= 旧尾部追加语义（单测夹具零改动）。预算依据：实测追加峰值 ~2KB
+（CONTEXT 0x4D0 + 镜像 IAT + TLS 面），8KB ≈ 4× 余量；代价 = 每个打包
+产物 .wvmp 恒 +8KB 文件体积（换确定性）。扩预算须同步 pe_image.hpp 注。
+
+**roll_x86 去重纪律**：多角色寄存器抽取（ctx_/base_/t0/t1/rest）必须
+在**抽取时**剔除已占角色（本单修复：字节可编码集 {eax,edx,ebx} 与
+callee-saved {ebx,ebp,esi,edi} 交于 ebx）；越界写发生在 j!=2 校验**之
+前**（rest[j++] 先写后查）——"事后校验"兜不住"写入时越界"。触发面 =
+x86 roll 的 rng 状态（seed 0 复现；生产 multiseed 未命中——推断：历史
+x86 pack 的 ctx.rng 状态恰好未撞，属时间 bomb 而非不可能事件）。
+
+**T16 三票清偿口径**：余量耦合 → 预留协议；空数据节 → 预留恒非空；
+诊断微损 → note 带 opcode 名（isa::to_string 单一来源，截断 8 + 省略）。
