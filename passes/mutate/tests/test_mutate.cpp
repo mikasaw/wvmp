@@ -173,31 +173,50 @@ TEST(MutatePass, InsertionSurfaceInvariant) {
         EXPECT_EQ(j, orig.size());  // 原始序列原序完整保留
     }
 
-    // 反向扫描（插入物透明）：junk Mov 的 dst 在其边界处必须不活。
-    std::vector<char> live(static_cast<size_t>(Reg::Count), 1);
-    for (size_t idx = block.insns.size(); idx-- > 0;) {
-        const Insn& i = block.insns[idx];
-        if (is_junk[idx]) {
-            EXPECT_FALSE(i.updates_flags);
-            ASSERT_TRUE(i.op == wvmp::ir::Op::Nop || i.op == wvmp::ir::Op::Mov);
-            if (i.op == wvmp::ir::Op::Mov) {
-                ASSERT_EQ(i.src.kind, wvmp::ir::Operand::Kind::Imm);
-                EXPECT_NE(i.dst.reg, Reg::Rsp);
-                EXPECT_EQ(live[static_cast<size_t>(i.dst.reg)], 0)
-                    << "junk Mov 写入边界处活性寄存器 (slot "
-                    << static_cast<int>(i.dst.reg) << ")";
-            } else {
-                EXPECT_EQ(i.dst.kind, wvmp::ir::Operand::Kind::None);  // Nop 无操作数
+    // MIT-478 (T6)：块内前向健全性——junk Mov 注入后到块尾之间，dst 不得
+    // 在任何重定义之前被读（读集 = Reg 源/mem 基变址/RMW 目的 + 隐式读面
+    // Call 参数与 Ret/Div/Idiv/Mul/Cmpxchg/Cdq 的 Rax）。跨块可见性由
+    // pass 内区域级 CFG 反向活跃度保证（此处单块程序 = 单块，无后继）。
+    {
+        static const wvmp::ir::Op kRaxReaders[] = {
+            wvmp::ir::Op::Call, wvmp::ir::Op::Ret, wvmp::ir::Op::Div,
+            wvmp::ir::Op::Idiv, wvmp::ir::Op::Mul, wvmp::ir::Op::Cmpxchg,
+            wvmp::ir::Op::Cdq};
+        const auto reads = [&](const Insn& i, Reg r) {
+            if (r == Reg::Flags || r == Reg::Rip) return false;
+            bool rd = false;
+            if (i.src.kind == wvmp::ir::Operand::Kind::Reg && i.src.reg == r) rd = true;
+            if (i.src2.kind == wvmp::ir::Operand::Kind::Reg && i.src2.reg == r) rd = true;
+            if (i.dst.kind == wvmp::ir::Operand::Kind::Reg && i.dst.reg == r &&
+                i.updates_flags)
+                rd = true;
+            if (i.dst.kind == wvmp::ir::Operand::Kind::Mem) {
+                if (i.dst.mem.base == r || i.dst.mem.index == r) rd = true;
             }
-            continue;  // 插入物透明：不更新 live
-        }
-        if (i.src.kind == wvmp::ir::Operand::Kind::Reg)
-            live[static_cast<size_t>(i.src.reg)] = 1;
-        if (i.dst.kind == wvmp::ir::Operand::Kind::Reg) {
-            if (i.updates_flags)  // RMW（Add 等）：目的也是读
-                live[static_cast<size_t>(i.dst.reg)] = 1;
-            if (i.op == wvmp::ir::Op::Mov)  // 纯定义杀
-                live[static_cast<size_t>(i.dst.reg)] = 0;
+            if (i.src.kind == wvmp::ir::Operand::Kind::Mem) {
+                if (i.src.mem.base == r || i.src.mem.index == r) rd = true;
+            }
+            for (auto op : kRaxReaders)
+                if (i.op == op && r == Reg::Rax) rd = true;
+            if (i.op == wvmp::ir::Op::Call && r == Reg::Rcx) rd = true;
+            return rd;
+        };
+        const auto defines = [&](const Insn& i, Reg r) {
+            return i.dst.kind == wvmp::ir::Operand::Kind::Reg && i.dst.reg == r &&
+                   !i.updates_flags && i.op == wvmp::ir::Op::Mov;
+        };
+        for (size_t idx = 0; idx < block.insns.size(); ++idx) {
+            const Insn& j = block.insns[idx];
+            if (!is_junk[idx] || j.op != wvmp::ir::Op::Mov) continue;
+            EXPECT_FALSE(j.updates_flags);
+            ASSERT_EQ(j.src.kind, wvmp::ir::Operand::Kind::Imm);
+            EXPECT_NE(j.dst.reg, Reg::Rsp);
+            for (size_t k = idx + 1; k < block.insns.size(); ++k) {
+                if (reads(block.insns[k], j.dst.reg))
+                    ADD_FAILURE() << "junk dst 在块内重定义前被读 (slot "
+                                  << static_cast<int>(j.dst.reg) << " @ insn " << k << ")";
+                if (defines(block.insns[k], j.dst.reg)) break;
+            }
         }
     }
 }

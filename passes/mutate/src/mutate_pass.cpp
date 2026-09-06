@@ -5,6 +5,7 @@
 #include "wvmp/framework/protect_levels.hpp"
 #include "wvmp/framework/registry.hpp"
 
+#include <unordered_map>
 #include <vector>
 
 namespace wvmp::passes {
@@ -34,7 +35,15 @@ constexpr double kJunkMovProbability = 0.15;
 // mutate 节）。按"宁 gate 勿错"纪律 v1 只发 Nop 注入（E2E byte-exact 已证）；
 // junk-Mov 需系统性审计槽隐式消费面（callgate/ExitNative/xmm 同步/参数窗）
 // 后另行翻案。
-constexpr bool kEnableJunkMov = false;
+// ⚠️ MIT-478 (T6) 二次翻案尝试（2026-09-07）：隐式读审计完备化（Ret/
+// Div/Idiv/Mul/Cmpxchg/Cdq → Rax 入册）+ 区域级 CFG 反向活跃度（跨块可
+// 见性洞闭合）后，junk-Mov 仍在 wvmpTest kern 面复现失败——两条新实证：
+// junk rcx（b64 wrapper region[0]，0xD56E/0xD573，重定义后经 callgate
+// 调原生）→ 进程崩溃；junk rax（region[1] 0xD5D7+）→ b64 内核结果错。
+// 消费面在 IR 不可见的 VM 级（callgate 邻域），IR 侧审计无法闭合 →
+// **维持默认关闭**（宁挂账勿错）；全部强化设施保留（CFG 活跃度对 Nop
+// 注入面同样生效），重启启用需 VM 级 dataflow 工具（T6.2，见 GAPS）。
+constexpr bool kEnableJunkMov = false;  // TODO(T6-bisect): 二分期保持开
 
 // 垃圾目的的候选 GP 集（按 arch；rsp 排除——栈写语义由栈深 walk 专管，
 // 任何额外 rsp 写都改变 walk 建模）。
@@ -73,41 +82,68 @@ bool is_pure_def(const ir::Insn& in) {
 // 寄存器即使块内"再无读取"也必须视为 Call 处的活值，否则垃圾写入经
 // callgate 漏进原生 callee（wvmpTest kern.md5 首通实录：junk rcx → 原生
 // callee 拿野指针 → 崩溃）。x86 cdecl 参数走客户栈，无此面。
+// 单条指令的反向转移：按读集点亮 live（含 MIT-478 隐式读补录），pure-def
+// 目的随后熄灭（读写并存的非 pure-def 目的保持活）。
+static void insn_transfer(const ir::Insn& in, std::vector<char>& live, ir::Arch arch) {
+    const auto read_reg = [&](const ir::Operand& o) {
+        if (o.kind == ir::Operand::Kind::Reg && o.reg != ir::Reg::Rip &&
+            o.reg != ir::Reg::Flags)
+            live[static_cast<size_t>(o.reg)] = 1;
+    };
+    // Call 隐式读（MIT-459 首通实录）：callgate 把客户 rcx/rdx/r8/r9 槽作
+    // 为 Win64 原生参数传被调方，rax 低 8 位 = 变参浮标（x86 cdecl 走客户
+    // 栈，无此面）。
+    if (in.op == ir::Op::Call && arch == ir::Arch::X64) {
+        for (ir::Reg r : {ir::Reg::Rcx, ir::Reg::Rdx, ir::Reg::R8, ir::Reg::R9,
+                          ir::Reg::Rax})
+            live[static_cast<size_t>(r)] = 1;
+    }
+    // MIT-478 (T6) 隐式读审计补录（IR 操作数未声明的槽消费面）：
+    //   Ret        → Rax（区域返回值经 stub 写回原生 rax）；
+    //   Div/Idiv   → Rax（dividend 低半槽，handler 从 Rax/Rdx 拼装，IR 仅
+    //                dst=Rdx tag 声明高半——MIT-404 协议）；
+    //   Mul        → Rax（隐式乘数 + 积低半写 Rax，dst=Rdx tag 同款）；
+    //   Cmpxchg    → Rax（累加器比较，MIT-341 注明 "read Rax 槽"）；
+    //   Cdq        → Rax（符号扩展源，零显式操作数——MIT-404；cdqe 归一
+    //                为 dst=src=Rax 声明形，已覆盖）。
+    // Div/Idiv/Mul 的 Rdx 侧由 dst-tag 非 pure-def 读路径天然覆盖。
+    if (in.op == ir::Op::Ret || in.op == ir::Op::Div || in.op == ir::Op::Idiv ||
+        in.op == ir::Op::Mul || in.op == ir::Op::Cmpxchg || in.op == ir::Op::Cdq) {
+        live[static_cast<size_t>(ir::Reg::Rax)] = 1;
+    }
+    if (!is_pure_def(in)) read_reg(in.dst);
+    read_reg(in.src);
+    if (in.src2.kind == ir::Operand::Kind::Reg) read_reg(in.src2);
+    const auto read_mem = [&](const ir::Operand& o) {
+        if (o.kind != ir::Operand::Kind::Mem) return;
+        if (o.mem.base != ir::Reg::Flags && o.mem.base != ir::Reg::Rip)
+            live[static_cast<size_t>(o.mem.base)] = 1;
+        if (o.mem.index != ir::Reg::Flags) live[static_cast<size_t>(o.mem.index)] = 1;
+    };
+    read_mem(in.dst);
+    read_mem(in.src);
+    // 纯定义杀：目的在更早边界（含本插入点）不再活。
+    if (is_pure_def(in) && in.dst.kind == ir::Operand::Kind::Reg)
+        live[static_cast<size_t>(in.dst.reg)] = 0;
+}
+
 std::vector<std::vector<ir::Reg>> dead_at_boundaries(const ir::BasicBlock& block,
                                                      const std::vector<ir::Reg>& candidates,
-                                                     ir::Arch arch) {
+                                                     ir::Arch arch,
+                                                     const std::vector<char>& live_out) {
     const size_t n = block.insns.size();
     std::vector<std::vector<ir::Reg>> dead(n + 1);
-    std::vector<char> live(static_cast<size_t>(ir::Reg::Count), 1);
+    // MIT-478 (T6)：块内活跃度从 live_out(B)（后继块 live_in 并集，区域级
+    // CFG 反向不动点，见 run() 内构建）起步反向传播——替换旧"块尾保守全
+    // 活"假设；跨块可见性洞（块内死 + 后继未重定义先读）由此闭合。
+    std::vector<char> live(static_cast<size_t>(ir::Reg::Count), 0);
+    for (size_t r = 0; r < live.size(); ++r)
+        live[r] = r < live_out.size() ? live_out[r] : 0;
 
     for (size_t i = n; i-- > 0;) {
         const ir::Insn& in = block.insns[i];
-        // 读集：Reg 源 + mem 基址/变址 + （非纯定义的）目的 + Call 隐式读。
-        const auto read_reg = [&](const ir::Operand& o) {
-            if (o.kind == ir::Operand::Kind::Reg && o.reg != ir::Reg::Rip &&
-                o.reg != ir::Reg::Flags)
-                live[static_cast<size_t>(o.reg)] = 1;
-        };
-        if (in.op == ir::Op::Call && arch == ir::Arch::X64) {
-            for (ir::Reg r : {ir::Reg::Rcx, ir::Reg::Rdx, ir::Reg::R8, ir::Reg::R9,
-                              ir::Reg::Rax})
-                live[static_cast<size_t>(r)] = 1;
-        }
-        if (!is_pure_def(in)) read_reg(in.dst);
-        read_reg(in.src);
-        if (in.src2.kind == ir::Operand::Kind::Reg) read_reg(in.src2);
-        const auto read_mem = [&](const ir::Operand& o) {
-            if (o.kind != ir::Operand::Kind::Mem) return;
-            if (o.mem.base != ir::Reg::Flags && o.mem.base != ir::Reg::Rip)
-                live[static_cast<size_t>(o.mem.base)] = 1;
-            if (o.mem.index != ir::Reg::Flags) live[static_cast<size_t>(o.mem.index)] = 1;
-        };
-        read_mem(in.dst);
-        read_mem(in.src);
-        // 纯定义杀：目的在更早边界（含本插入点）不再活。
-        if (is_pure_def(in) && in.dst.kind == ir::Operand::Kind::Reg)
-            live[static_cast<size_t>(in.dst.reg)] = 0;
-        // 记录本边界（第 i 条之前）的死集；边界 n（块尾）恒空，不记录。
+        insn_transfer(in, live, arch);
+        // 记录本边界（第 i 条之前）的死集；边界 n（块尾）由 live_out 覆盖。
         if (i < n)
             for (ir::Reg r : candidates)
                 if (!live[static_cast<size_t>(r)]) dead[i].push_back(r);
@@ -141,9 +177,65 @@ void MutatePass::run(ProtectionContext& ctx) {
             fn.arch == ir::Arch::X64 ? ir::Size::S64 : ir::Size::S32;
         const std::vector<ir::Reg> candidates = gp_candidates(fn.arch);
 
+        // MIT-478 (T6)：区域级 CFG 反向活跃度不动点。live_out(B) = 后继
+        // live_in 并集；间接跳转/不可解析目标 = 全活（保守）；区域出口
+        // （Ret / 末块 fallthrough）= Rax 活（返回值经 stub 写回原生）。
+        const size_t nb = fn.blocks.size();
+        std::unordered_map<u64, size_t> bidx;
+        for (size_t bi = 0; bi < nb; ++bi) bidx.emplace(fn.blocks[bi].addr, bi);
+        std::vector<std::vector<size_t>> succs(nb);
+        std::vector<char> unknown(nb, 0);
+        std::vector<char> exit_fn(nb, 0);  // 区域出口 fallthrough（Rax 可见）
+        for (size_t bi = 0; bi < nb; ++bi) {
+            const auto& ins = fn.blocks[bi].insns;
+            if (ins.empty()) continue;
+            const ir::Insn& last = ins.back();
+            auto add_target = [&](u64 t) {
+                auto it = bidx.find(t);
+                if (it != bidx.end()) succs[bi].push_back(it->second);
+                else unknown[bi] = 1;
+            };
+            if (last.op == ir::Op::Jmp || last.op == ir::Op::Jcc) {
+                if (last.dst.kind == ir::Operand::Kind::Imm)
+                    add_target(static_cast<u64>(last.dst.imm));
+                else
+                    unknown[bi] = 1;
+                if (last.op == ir::Op::Jcc) {
+                    if (bi + 1 < nb) succs[bi].push_back(bi + 1);
+                    else exit_fn[bi] = 1;
+                }
+            } else if (last.op == ir::Op::Ret) {
+                // 区域出口（Ret 自身在 insn_transfer 强制 Rax 活）。
+            } else {
+                if (bi + 1 < nb) succs[bi].push_back(bi + 1);
+                else exit_fn[bi] = 1;
+            }
+        }
+        std::vector<std::vector<char>> live_in(nb, std::vector<char>(static_cast<size_t>(ir::Reg::Count), 0));
+        std::vector<std::vector<char>> live_out_v(nb, std::vector<char>(static_cast<size_t>(ir::Reg::Count), 0));
+        for (bool changed = true; changed;) {
+            changed = false;
+            for (size_t bi = nb; bi-- > 0;) {
+                std::vector<char> out(static_cast<size_t>(ir::Reg::Count), 0);
+                for (size_t s2 : succs[bi])
+                    for (size_t r = 0; r < out.size(); ++r) out[r] |= live_in[s2][r];
+                if (unknown[bi]) std::fill(out.begin(), out.end(), static_cast<char>(1));
+                if (exit_fn[bi]) out[static_cast<size_t>(ir::Reg::Rax)] = 1;
+                std::vector<char> in = out;
+                const auto& ins2 = fn.blocks[bi].insns;
+                for (size_t i = ins2.size(); i-- > 0;) insn_transfer(ins2[i], in, fn.arch);
+                if (in != live_in[bi] || out != live_out_v[bi]) {
+                    live_in[bi] = in;
+                    live_out_v[bi] = out;
+                    changed = true;
+                }
+            }
+        }
+
         for (ir::BasicBlock& block : fn.blocks) {
             if (block.insns.empty()) continue;
-            const auto dead = dead_at_boundaries(block, candidates, fn.arch);
+            const auto dead = dead_at_boundaries(block, candidates, fn.arch,
+                                                 live_out_v[&block - fn.blocks.data()]);
             std::vector<ir::Insn> mutated;
             mutated.reserve(block.insns.size() + 8);
             bool inserted = false;
@@ -161,14 +253,16 @@ void MutatePass::run(ProtectionContext& ctx) {
                         ++nops;
                         inserted = true;
                     } else if (kEnableJunkMov && rng.chance(kJunkMovProbability)) {
+                        // MIT-478 (T6)：dead[i] 已由区域级 CFG 反向活跃度背书
+                        //（live_out(B) 折入后继可见性 + 隐式读补录），直接注入。
                         const size_t pick =
                             static_cast<size_t>(rng.uniform(0, dead[i].size() - 1));
+                        const u32 junk_imm = static_cast<u32>(rng.next());
                         ir::Insn junk;
                         junk.op = ir::Op::Mov;
                         junk.size = junk_size;
                         junk.dst = ir::Operand::reg_(dead[i][pick]);
-                        junk.src =
-                            ir::Operand::imm_(static_cast<i64>(static_cast<u32>(rng.next())));
+                        junk.src = ir::Operand::imm_(static_cast<i64>(junk_imm));
                         junk.addr = host;
                         mutated.push_back(junk);
                         ++junk_movs;

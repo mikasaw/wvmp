@@ -1729,3 +1729,32 @@ imm32 后旧 reloc 项会把 load-time delta 加到新地址上——需同步�
 翻转面（检测敏感），但依赖"重写完备"证明（reloc 全扫 + 数据指针零命中
 + 代码全重写），证据链不足即冒险；v1 = 重写 + 回填双轨（零风险），完备
 性证明与跳回填 = T9.2。
+
+
+## MIT-478（junk-Mov 二次翻案）收口——IR 侧审计的边界实证（2026-09-07）
+
+**审计表定稿**（IR 操作数未声明的 VM 槽消费面，截至本单）：Call(x64) →
+{rcx,rdx,r8,r9,rax}；Ret → {rax}；Div/Idiv → {rax}；Mul → {rax}；
+Cmpxchg → {rax}；Cdq → {rax}。Div/Idiv/Mul 的 Rdx 经 dst-tag 非
+pure-def 读路径覆盖。cl 族移位经 reg_b 声明覆盖；string-op 翻译期展开
+为显式 ops 覆盖；rsp/rip/flags 恒排除。
+
+**二次翻案实证**（CFG 活跃度 + 审计表完备后仍失败，wvmpTest seed
+12345）：① junk rcx @ b64 wrapper（注入点后紧跟 `mov ecx,eax` 重定义，
+再经 callgate 调原生 0xd540）→ 进程崩溃；② junk rax @ region[1] →
+b64 内核软失败；③ **nop-only 换落位同崩**——MIT-459 时代的"绿色"实为
+落位幸运。结论：消费面在 IR 不可见的 VM 级（callgate 邻域：Win64 参数
+marshal 面、影子空间、或嵌套 VM 的槽语义——三个候选未分辨）。IR 级
+liveness 对该面**原理性不可见**（消费发生在 VM 执行期，不在 IR 操作数
+图内）。
+
+**重启启用前置（T6.2）**：VM 级 dataflow 工具——消费 asmgen handler 表
++ translator 发射面，生成"VmOp × VM 槽"精确读写矩阵；mutate 直接消费
+矩阵做注入判定（替代 IR 级推断）。或等价：callgate 前强制**全槽活**
+（Kill 面 = callgate 参数槽之外的槽全部不可注入——粗但可能已足够，因
+失败样本全部位于含 callgate 的区域）。**快速通道候选：含 Call 的块内
+禁止注入**（本单未验证，T6.2 首试）。
+
+**方法论**：二分钩子（注入上限 env，rng 前缀确定性保持——先取全部
+rng 再决定发射）是确定性变换失败定位的通用工具；"nop-only 绿色"不能作
+为机制安全证据（落位幸运），必须以注入/不注入对照实验分离变量。

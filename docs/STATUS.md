@@ -730,3 +730,45 @@ disp 重指 .wvmp 镜像等价槽（mirror_rva + (target − iat_base)）。运�
 **验证**：build 0/0；ctest 23/23（import_protect 6 用例）；multiseed
 **335/335**；tls_e2e 2/2（含新静态断言）；fetch_crypt_e2e 2/2；x64
 dump 锚 67cfa727… 恒等（import_protect 不触解释器）。冻结契约零 diff。
+
+
+## MIT-478 (T6 · junk-Mov 二次翻案尝试——审计完备化 + CFG 活跃度，重启仍受阻) ✅ 2026-09-07
+
+**交付**：MIT-459 挂账的"槽隐式消费面系统性审计"完成，mutate 注入安全
+性基础设施全面升级；junk-Mov 重启用在 wvmpTest kern 面复现失败，新实证
+两条入册，**维持默认关闭**（宁挂账勿错）。
+
+- **隐式读审计补录**（IR 操作数未声明的槽消费面，lifter/translator 源
+  级核对）：Ret → Rax（返回值经 stub 写回原生）；Div/Idiv → Rax
+  （dividend 低半，IR 仅 dst=Rdx tag——MIT-404 协议）；Mul → Rax（隐式
+  乘数）；Cmpxchg → Rax（MIT-341 "read Rax 槽"）；Cdq → Rax（零操作
+  数符号扩展）；Call → rcx/rdx/r8/r9/rax（MIT-459 已入册，x64）。
+- **区域级 CFG 反向活跃度**：替换旧"块尾保守全活"块内近似——live_out(B)
+  = 后继 live_in 并集（间接跳/不可解析目标 = 全活；区域出口 = Rax 活），
+  反向不动点；块内 dead 集从 live_out 起步。跨块可见性洞（MIT-459 残余
+  发散的头号嫌疑）由此闭合。
+- **测试**：InsertionSurfaceInvariant 改为块内前向健全性口径（junk dst
+  到块尾不得先读后重定义；读集含隐式面）——旧口径（块尾全活反向）与
+  CFG 语义不相容。
+
+**二次翻案实录**（wvmpTest x64，mutate+crypt 8 passes，seed 12345）：
+junk 重启用 → 155 Mov 注入 → kern 面崩（所有非 kern 家族 100+ 内核全
+过）；二分（WVMP_JUNK_LIMIT/NOP_LIMIT 钩子，rng 前缀确定性保持）定位：
+- junk **rcx** @ region[0]（b64 wrapper，0xD56E/0xD573，注入点紧跟
+  `mov ecx,eax` 重定义、后经 callgate 调原生 0xd540）→ 进程崩溃；
+- junk **rax** @ region[1]（0xD5D7+）→ kern.b64 结果错（软失败）；
+- **nop-only 新落位同崩**（junk 分支额外 rng 抽样改变 Nop 落位）→ 历史
+  绿色纯靠落位幸运，非机制安全；
+- 对照：flag=false（历史 rng 流）rc=0 全绿。
+→ 消费面在 **IR 不可见的 VM 级**（callgate 邻域：参数 marshal/影子空
+间/嵌套 VM 的槽语义），IR 侧审计无法闭合。
+
+**裁定**：kEnableJunkMov 维持 false；全部强化设施保留（CFG 活跃度对
+Nop 注入位置选择同样生效——跨块可见性对未来的注入类变换是普适前提）。
+重启启用前置 = **T6.2：VM 级 dataflow 工具**（消费 asmgen handler 表 +
+translator 发射面生成"VmOp × 槽"精确读写矩阵，mutate 直接消费该矩阵替
+代 IR 级推断），已入 DEV_QUEUE。
+
+**验证**：build 0/0；ctest 23/23（mutate 5 用例含新口径）；multiseed
+**335/335**；x64 dump 锚 67cfa727… 恒等；tls/fetch E2E 2/2。冻结契约
+零 diff。
