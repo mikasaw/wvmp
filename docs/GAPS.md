@@ -1896,3 +1896,33 @@ begin ≠ marker 名静默失配，本单已修正并以此踩坑入册）。
 更名 WVMP_MUTATE_ALLOW_FN（fn.name 子串匹配，激活报 Note，消除 RVA 命
 名误导）；③ junk 分支 dead[i] 空集 uniform 下溢 UB 守卫（T6.5 重启用前
 置守卫项，验收建议采纳）。
+
+## MIT-483（T6.5 调查一阶段，2026-09-07）——blob 跨 seed 恒等（translator 免罪）+ 缺陷收敛到解释器/桩面
+
+**决定性实验**（base 包 seed 12345 vs seed 3，无 mutate）：
+- `.wvmp`（全部 blob 词流）SHA256 **恒等** → translator 词流与 seed 零关
+  联，MIT-480 续的"blob 词流 diff"方法论对基线缺陷**失效**（当年对比的
+  两包内容本就不同——junk 与非 junk——divergence 是内容差的平移，非病）。
+- `.wvmpc` 尺寸 0x84b3 vs 0x8653（**+0x1A0**）且哈希不同 → seed 进入解
+  释器生成（asmgen x64 roll 的寄存器角色/编码差异）。**T6.5 缺陷面收敛
+  = 解释器/桩生成，非 translator、非 mutate。**
+
+**崩溃链静态解码**（base seed 3，cdb ctx+0=流指针/ctx+8=入口词序号 +
+blob 词流静态解码，词流与绿 seed 逐位同源）：
+- 崩 handler = Load 家族 S32 分支（`mov esi,[r14]`，地址槽 ctx[18]=0）；
+- 崩词 [435] `Load s20,[s18]`，前置链 [431] `Mov s18,v2` ← [430]
+  `Load v2,[s18']` ← [428-429] `Mov s18,v4; Add s18,0x48`——即
+  `v2 = *(v4 + 0x48)`：**经 VM rsp 镜像槽（v4）寻址原生栈帧的槽加载返
+  回 0** → 后续 `v2 + v1<<2` 解引用崩。
+- 嫌疑收敛：v4（rsp 镜像槽）在 seed-3 roll 构建下的初始化/维护——stub
+  entry 的 push 序与 rsp 捕获、callgate step 4-8 的 rsp 切换与 v4 槽同
+  步、或 roll 改变 push 序后某处硬编码偏移失配（asmgen:348 有同类前
+  科：宿主 RBP 槽错开 0x88 → ctx_=0）。
+
+**下轮首步**：① 对比 seed 12345/3 两构建的 stub entry（vm_entry push 序
++ rsp 捕获点）与 callgate step 4/7 的 rsp 常量链（kPushCtxDepth/
+kCallgateSpRollback 派生）；② 用 WVMP_X64_ASM_DUMP 式钩子给真实 pack 的
+解释器生成落盘 diff roll 表（ctx_/base_/pc_/flags_/t_[0..9] 的物理映射
++ size_perm_/cond_perm_）；③ 修复判据 = seeds 0..41 基线全绿（含挂死
+面）+ junk-Mov 重启用后全 seed 扫描绿。junk-Mov（kEnableJunkMov）维持
+false 至此判据达成。
