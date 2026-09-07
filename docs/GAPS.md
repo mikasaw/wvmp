@@ -1981,3 +1981,26 @@ stub_link 打补丁的地址 → 语义 = VM 自重入执行 fn A 词 0..98）�
 **方法论补丁（复现工具链）**：cdb 追踪必须 `sxd av; sxd c0000094` 双
 flag（缺 c0000094 会被 exc 用例中断）；printf 换行四层转义；全 suite
 逐词断点好构建超时 → 只追目标流（ctx+0 == 流 VA）。
+
+## MIT-483 续三（T6.5 四阶段，2026-09-08）——callgate 空返回确认 + native_sp 合成栈列首要嫌疑
+
+**新实证**：① RVA 0xd290 在两个 base 包中**均未被 E9 打补丁**（原始字
+节 40 53 48 83 ec 完好）——callgate 调的是**真原生函数**（非 stub 重
+入）；② 词级追踪确认 V0 在词[99] CallGate 后即变 0（此前 V0=0x10），
+V1=0xf/V2=0x15f7f0 参数完好——**原生 callee 以相同参数在坏构建返回 0、
+好构建返回非 0**。
+
+**首要嫌疑 = callgate 给 callee 的合成栈**：native_sp（ctx+0x120）由
+stub 捕获（stub_gen.cpp:311-315 `lea rax,[rsp+0x208]`，v4 与 native_sp
+同源）；callgate step 4 切 rsp 到 native_sp - 0x28垫 - callee 窗口。
+若 seed 相关因素（roll → 解释器代码尺寸 → 无关；但 stub 布局/entry
+_rsp 深度随调用链变）使 [v4+0x48] 落进 stub 自身保存区/ctx 区而非
+caller 帧，native callee 的栈帧读写即错。**实测 [v4+0x48]=0x15f758 已
+越出 ctx 界（0x15f508+0x1C8=0x15f6D0）**，落在 stub 保存区/caller 帧
+交界——该地址归属两构建是否一致待验。
+
+**下轮首步**：① 干净重试 bp 0x1400d290（callee 入口）log rcx/rdx/rsp
+——callee 是否被执行、栈深多少；② 对比双构建同地址 [v4+0x48]=0x15f758
+的内存归属（GCCTEX？caller 帧？stub 保存区？）与生命周期；③ 审
+build_callgate step 9-11 + stub_gen 的 kStubPushBytes/kCtxSize/kPushCtx
+Depth 常量链在多深调用链下的一致性。
