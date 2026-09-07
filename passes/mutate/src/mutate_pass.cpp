@@ -139,12 +139,6 @@ static void insn_transfer(const ir::Insn& in, std::vector<char>& live, ir::Arch 
     // `movzx ecx, byte ptr [rdx + rcx]`，rcx 既是 dst 又是变址——kern.md5
     // 野指针崩溃）会把同指令正要读的槽误杀成"边界死"，junk 注入到紧邻
     // 读者指令之前即产野地址。
-    // MIT-482 (T6.4) 纯定义杀必须先于 use 标记：活性语义 =
-    // live_in(i) = (live_out(i) \ def(i)) ∪ use(i)。若先 use 后 kill，则
-    // 目的与自身 mem 基址/变址重叠的纯写指令（实录：md5 区域
-    // `movzx ecx, byte ptr [rdx + rcx]`，rcx 既是 dst 又是变址——kern.md5
-    // 野指针崩溃）会把同指令正要读的槽误杀成"边界死"，junk 注入到紧邻
-    // 读者指令之前即产野地址。
     if (is_pure_def(in) && in.dst.kind == ir::Operand::Kind::Reg)
         live[static_cast<size_t>(in.dst.reg)] = 0;
     if (!is_pure_def(in)) read_reg(in.dst);
@@ -214,16 +208,20 @@ void MutatePass::run(ProtectionContext& ctx) {
     for (size_t fn_index = 0; fn_index < ctx.functions.size(); ++fn_index) {
         ir::FunctionRegion& fn = ctx.functions[fn_index];
         if (fn.blocks.empty()) continue;
-        // MIT-482 (T6.4 诊断钩子，实验分支专用)：WVMP_MUTATE_ALLOW_RVA=<hex>
+        // MIT-482 (T6.4 诊断钩子，实验分支专用)：WVMP_MUTATE_ALLOW_FN=<name 子串>
         // 只对 begin_rva 匹配的区域发射注入物。rng 抽取序保持全量语义
         //（发射级丢弃，非函数级 continue——否则 rng 状态耦合破坏二分）。
         {
             char* av = nullptr;
             size_t av_len = 0;
-            if (_dupenv_s(&av, &av_len, "WVMP_MUTATE_ALLOW_RVA") == 0 && av &&
+            if (_dupenv_s(&av, &av_len, "WVMP_MUTATE_ALLOW_FN") == 0 && av &&
                 av_len > 1) {
                 region_allowed =
                     fn.name.find(av) != std::string::npos;  // 子串匹配 marker 名
+                if (fn_index == 0)
+                    ctx.diag.report(Severity::Note, name(),
+                                    std::string("诊断白名单激活: WVMP_MUTATE_ALLOW_FN=") +
+                                        av);
                 std::free(av);
             } else {
                 std::free(av);
@@ -345,7 +343,8 @@ void MutatePass::run(ProtectionContext& ctx) {
                             inserted = true;
                             site_log += site_note(fn, blk_i, i, host, -1, false, 0);
                         }
-                    } else if (kEnableJunkMov && rng.chance(kJunkMovProbability)) {
+                    } else if (kEnableJunkMov && !dead[i].empty() &&
+                               rng.chance(kJunkMovProbability)) {
                         // MIT-478 (T6)：dead[i] 已由区域级 CFG 反向活跃度背书
                         //（live_out(B) 折入后继可见性 + 隐式读补录），直接注入。
                         const size_t pick =

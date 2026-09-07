@@ -1890,3 +1890,9 @@ T6.5 修复 + 全 seed 扫描转绿。**
 host，VM 级消费面对账主键）；② WVMP_MUTATE_ALLOW_RVA 诊断钩子（fn.name
 子串匹配、发射级丢弃、rng 抽取序保持——注意 begin_rva 匹配会因 region
 begin ≠ marker 名静默失配，本单已修正并以此踩坑入册）。
+
+**验收补强（2026-09-07）**：① read_mem(in.src2) Mem 形补录是行为变更
+（use 面扩大 → 注入面收紧，seed 12345 默认布局 239→240 站点）；② 钩子
+更名 WVMP_MUTATE_ALLOW_FN（fn.name 子串匹配，激活报 Note，消除 RVA 命
+名误导）；③ junk 分支 dead[i] 空集 uniform 下溢 UB 守卫（T6.5 重启用前
+置守卫项，验收建议采纳）。
