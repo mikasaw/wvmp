@@ -1926,3 +1926,32 @@ kCallgateSpRollback 派生）；② 用 WVMP_X64_ASM_DUMP 式钩子给真实 pac
 + size_perm_/cond_perm_）；③ 修复判据 = seeds 0..41 基线全绿（含挂死
 面）+ junk-Mov 重启用后全 seed 扫描绿。junk-Mov（kEnableJunkMov）维持
 false 至此判据达成。
+
+## MIT-483 续（T6.5 二阶段，2026-09-08）——崩构建控制流断裂实证：后向 Jmp 直落
+
+**追踪方法**（入册复现）：cdb 条件断点钉在分派取指指令（崩构建
+0x14011e032），过滤目标 blob 流 VA（ctx+0），log 词序号 r15 + ctx 槽
+（CTX2=ctx+0x20、CTX18=ctx+0xA0、CTX4=ctx+0x30）；`--filter=kern` 缩短
+到达路径；⚠️ cdb 命令 printf 换行需四层转义（`\\n`），且全量 suite 的
+逐词断点开销巨大——坏构建因中途崩停可 500s 内跑完，**好构建全 suite 追
+踪超时**（808s 仅到 ~test25），需 --filter 直达或更廉价断点。
+
+**关键实证**（base seed 3 崩构建，md5 blob 流 0x1179f0，1657 次分派全
+序列）：词 [102] = `Jmp`（op23，aux=0xffffffa0 = 有符号 -96，语义应回
+跳至词 6/7 = fn A 循环头）**未跳转、直落 [103]**——控制流断裂。前链：
+区域双入口（词 0 = fn A：~1500 次分派的循环体；词 99 = fn B 入口，
+首词 [99] `CallGate 0xd290` 回调 fn A），fn B 顺序直落执行 [100..435]
+→ [430] `Load v2,[v4+0x48]` 读到 0（fn A 未按控制流写回）→ [435]
+`Load [v2+v1<<2]` 地址 0 → segfault。与绿构建的逐词序列对比因追踪开销
+未完成（好构建 trace 五次尝试均 0 命中或超时——断点地址 0x11e02e 与
+命中行为待复查，建议下轮改用 --filter=kern + 两构建对称探针）。
+
+**嫌疑收敛（asmgen 审计输入）**：Jmp/Jcc handler 的 pc 更新在特定 roll
+分配下失效——候选：① Jmp aux 的符号扩展/加法用了某个被 roll 分配为
+caller-saved 且被 decode_prelude 前序指令影响的寄存器；② Jcc/Jmp 的
+advance 与 aux 加法路径在某 t_[n] == 物理rax/rdx 时被 spill 防护误伤
+（spill_pcflags_raxrdx 只护 pc_/flags_）；③ 条件码/尺寸 perm（cond_
+perm_/size_perm_）在 Jmp（无条件）路径的 unused-field 校验位翻转。
+下轮首步 = 读 build_jmp/build_jcc 模板 + 在 seed 3 构建的反汇编中对照
+Jmp handler 机器码与 12345 构建逐条 diff（地址：分派表 entry[23] →
+handler 起始）。
