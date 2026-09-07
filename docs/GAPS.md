@@ -1831,8 +1831,11 @@ nop-only 新落位可崩——**生产建议：mutate 密度 ≥1 时对含 call
 误诊**：adce88f 的函数级二分在 `kEnableJunkMov=true` 下运行（175e2f6 翻
 案时刻的遗留值，且该次"翻案成功"结论本身是乐观误判——kern.md5 全量回归
 未跑；adce88f 入册时又漏翻转本位，main 一度处于"代码开着已证伪的
-junk-Mov"的自相矛盾状态）。二分观察到的 fn=1/2/4/6/7 崩溃**全部来自
-junk Mov**，与 Nop/插入本身无关。
+junk-Mov"的自相矛盾状态）。二分观察到的 fn=1/2/4/6/7 崩溃**需 junk
+Mov 参与方能解释**（E2 为 Mov+Nop 复合实验：新增变量 = 144 Mov，其
+Nop 数 101 低于 E1 已证全绿的 113，Nop 密度不是区分变量；未隔离
+"Mov 单独"vs"Mov×Nop 交互"——junk 精确归因归 T6.4），与 Nop 注入
+本身无关（E1 独立证明）。
 
 **决定性对照实验**（wvmpTest x64，seed 12345，7-pass 无 crypt，当前
 share-prev 地址纪律 + 跳表候选门控，mutate 密度默认 10%）：
@@ -1840,7 +1843,8 @@ share-prev 地址纪律 + 跳表候选门控，mutate 密度默认 10%）：
   packed rc=0，**103/103 全绿**（含 kern.md5 / kern.b64 历史必崩面）；
 - E2 `kEnableJunkMov=true`：全量注入 144 Mov + 101 Nop →
   **segfault 于 kern.md5_block_vectors 入口**（历史崩点签名逐字节一致，
-  末条 [RUN] = kern.md5）。
+  末条 [RUN] = kern.md5）。可比性：E2 的 Nop 数（101）**低于** E1 全绿
+  的 113——两实验的差异变量恰是 144 个 Mov，注入数不同不破坏对拍。
 
 **结论链**：
 1. **Nop 注入面已被 share-prev 纪律修复**（MIT-480 一阶段的地址纪律修复
