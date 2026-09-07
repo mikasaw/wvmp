@@ -1955,3 +1955,29 @@ perm_/size_perm_）在 Jmp（无条件）路径的 unused-field 校验位翻转�
 下轮首步 = 读 build_jmp/build_jcc 模板 + 在 seed 3 构建的反汇编中对照
 Jmp handler 机器码与 12345 构建逐条 diff（地址：分派表 entry[23] →
 handler 起始）。
+
+## MIT-483 续二（T6.5 三阶段，2026-09-08）——自区域 CallGate 重入失效实锤
+
+**词级状态追踪**（崩构建，IDX+V0/V1/V2 槽值，1657 分派全序列）：
+词 [99] `CallGate 0xd290`（目标 = 本区域 fn A 的原生入口 0xd290 = 已被
+stub_link 打补丁的地址 → 语义 = VM 自重入执行 fn A 词 0..98）执行后
+**IDX 直落 100、V0=0**——fn A 的分派（应再现 IDX 0..98）**一次都没发
+生**，callgate 返回 0。对照：同 blob 在绿构建（seed 12345）下该调用重
+入 fn A 并返回正确值（.wvmp 恒等 → 词流与数据全同）。
+
+**缺陷定性**：特定 roll 分配下，**自区域 CallGate 重入路径失效**——
+候选面：① stub 的 vm-active 嵌套检查（stub 侧全局/ctx 标志在重入时
+误判）；② callgate handler step 0 目标解析（t_[3] 判别位读到了错误
+槽 → 走了 reg 形分支拿 0 目标？）；③ callgate 的 arg 桥（step 1 预
+留槽 0xD0..0xE8）在重入场景被第一个 stub 覆写。**注意 V1=0xf/V2=
+0x15f7f0（参数槽）在 callgate 前后完好** → 参数桥无罪，嫌疑集中
+②③（目标解析/重入机制）。
+
+**下轮首步**：① 反汇编双构建 CallGate handler（分派表 entry[35]）
+全量 diff——重点 step 0 的 `cmp t3,1/jne` 判别与 step 9-11 恢复序；
+② 查 stub_gen 对"已打补丁区域入口"的重入语义（vm-active 标志位）；
+③ 修复判据不变（seeds 0..41 基线全绿 + junk 全 seed 扫描绿）。
+
+**方法论补丁（复现工具链）**：cdb 追踪必须 `sxd av; sxd c0000094` 双
+flag（缺 c0000094 会被 exc 用例中断）；printf 换行四层转义；全 suite
+逐词断点好构建超时 → 只追目标流（ctx+0 == 流 VA）。
