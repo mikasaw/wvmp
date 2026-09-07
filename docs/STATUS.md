@@ -831,3 +831,19 @@ kern.md5 仍崩 → 消费面不止跳表类；VM blob 解码 diff 已锁定 div
 
 **验证**：build 0/0；ctest 23/23；multiseed 335/335；x64 dump 锚
 67cfa727… 恒等。冻结契约零 diff。
+
+
+## MIT-482 (T6.4 · junk 首恶 def-kill 次序修复 + T6.5 基线 seed/布局脆弱立案) ✅ 2026-09-07
+
+**交付**：① insn_transfer 纯定义杀/use 次序修复（kill 先于 use；实录
+`movzx ecx,[rdx+rcx]` 变址自读被误杀 → junk 紧邻读者注入 → kern.md5 野
+指针，blob 词流 word[89] 全链实证）；② 回归专测
+MutateLiveness.PureDefKillMustNotEraseMemOperandUse；③ 诊断资产：mutate
+逐注入点 site_log note + WVMP_MUTATE_ALLOW_RVA 发射级白名单钩子（name
+子串匹配，rng 抽取序保持）；④ T6.5 立案：基线 seed 3/9/11 崩 + 部分
+seed 挂死 + seed 12345 不同注入布局绿崩不一 → 基线 blob 布局敏感缺陷，
+junk-Mov 重启用被阻塞维持 false。
+
+**验证**：build 0/0；ctest 23/23；multiseed 335/335；x64 dump 锚
+67cfa727… 恒等；seed 12345 wvmpTest 全量注入 165 Mov 修复后 103/103。
+冻结契约零 diff（mutate 侧 + 测试面）。

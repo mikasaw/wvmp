@@ -1862,3 +1862,31 @@ share-prev 地址纪律 + 跳表候选门控，mutate 密度默认 10%）：
 
 **状态修复**：`kEnableJunkMov = false`（恢复 + 注释改写为最终裁定）；
 mutate Nop 注入面恢复生产可用（默认 10% 密度，无需双跑对拍）。
+
+## MIT-482（T6.4 定案 + T6.5 立案，2026-09-07）——def-kill 次序缺陷修复 + 基线 seed/布局脆弱性
+
+**junk 首恶根因修复**：MIT-478/479/481 时代全部 junk 崩溃的首个实锤根因
+= mutate `insn_transfer` 的**纯定义杀/use 标记次序缺陷**。活性语义应为
+live_in(i) = (live_out(i) \ def(i)) ∪ use(i)，原实现先 use 后 kill → 目的
+与自身 mem 基址/变址重叠的纯写指令把同指令正要读的槽误杀成"边界死"。
+实录：md5 区域 `movzx ecx, byte ptr [rdx + rcx]`（host 0xDF21，region
+marker@0xd298 b3/i23）→ junk `Mov v1, 0x496E4B90` 注入紧邻读者指令之前
+→ VM 词流 word[89] 写 ctx[1]、word[91-93] 读作变址 → Load 野指针
+segfault（cdb + blob 词流解码 + 单区域 ALLOW 钩子三重实证）。修复 =
+kill 先于 use；回归专测 MutateLiveness.PureDefKillMustNotEraseMemOperandUse。
+修复后 seed 12345 全量 165 junk Mov → 103/103 绿。
+
+**T6.5 立案（阻塞 junk 重启用）**：宽 seed 扫描暴露**基线 seed/布局脆弱
+缺陷**——无 mutate 基线包 seed 3/9/11 崩于 kern.md5、seed ≥12 有挂死
+（VM 循环）；wvmpTest 基线历史只验过 seed 12345。且 seed 12345 下不同
+注入布局（96 Nop / 165 Mov / 239 混合）绿崩不一 → 缺陷对 blob 布局敏
+感（asmgen roll/jump-table/handler 布局随 seed 变化），注入内容只是布
+局随机化器。MIT-480 续的"word[94] Callgate aux 36→30"疑云与此同源待
+验。调查入口 = 基线包 seed 3 的 kern.md5 blob 词流静态解码 + asmgen
+x64 roll 分配审计。**junk-Mov 重启用（kEnableJunkMov）保持 false，待
+T6.5 修复 + 全 seed 扫描转绿。**
+
+**诊断资产**（本单落地）：① mutate 逐注入点 site_log note（含 slot/imm/
+host，VM 级消费面对账主键）；② WVMP_MUTATE_ALLOW_RVA 诊断钩子（fn.name
+子串匹配、发射级丢弃、rng 抽取序保持——注意 begin_rva 匹配会因 region
+begin ≠ marker 名静默失配，本单已修正并以此踩坑入册）。

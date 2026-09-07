@@ -5,6 +5,8 @@
 #include "wvmp/framework/protect_levels.hpp"
 #include "wvmp/framework/registry.hpp"
 
+#include <cstdlib>
+#include <cstring>
 #include <unordered_map>
 #include <vector>
 
@@ -33,28 +35,21 @@ constexpr double kJunkMovProbability = 0.15;
 // wvmpTest 全栈 E2E 仍未绿（callgate 参数寄存器 rcx/rdx/r8/r9/rax 隐式读
 // 已修，仍有未定位的槽消费面——同地址原生代码执行发散实录见 GAPS
 // mutate 节）。按"宁 gate 勿错"纪律 v1 只发 Nop 注入（E2E byte-exact 已证）；
-// junk-Mov 需系统性审计槽隐式消费面（callgate/ExitNative/xmm 同步/参数窗）
-// 后另行翻案。
-// ⚠️ MIT-478 (T6) 二次翻案尝试（2026-09-07）：隐式读审计完备化（Ret/
-// Div/Idiv/Mul/Cmpxchg/Cdq → Rax 入册）+ 区域级 CFG 反向活跃度（跨块可
-// 见性洞闭合）后，junk-Mov 仍在 wvmpTest kern 面复现失败——两条新实证：
-// junk rcx（b64 wrapper region[0]，0xD56E/0xD573，重定义后经 callgate
-// 调原生）→ 进程崩溃；junk rax（region[1] 0xD5D7+）→ b64 内核结果错。
-// 消费面在 IR 不可见的 VM 级（callgate 邻域），IR 侧审计无法闭合 →
-// **维持默认关闭**（宁挂账勿错）；全部强化设施保留（CFG 活跃度对 Nop
-// 注入面同样生效），重启启用需 VM 级 dataflow 工具（T6.2，见 GAPS）。
-// ✅ MIT-481 (T6.3 定案，2026-09-07)：adce88f"系统性 translator 插入敏感
-// 缺陷"系**混杂变量误诊**——函数级二分（fn=1/2/4/6/7 崩）在
-// kEnableJunkMov=true 下运行，崩溃全部来自 junk Mov 而非插入本身。对照实
-// 验（wvmpTest x64，seed 12345，7-pass 无 crypt，share-prev + 跳表门控）：
-//   E1 junk=false 全量注入 113 Nop / 40 块 → 103/103 绿；
-//   E2 junk=true 全量注入 144 Mov + 101 Nop → segfault 于 kern.md5 入口
-//      （历史崩点签名逐字节一致）。
-// 结论：① Nop 注入面已被 share-prev 地址纪律修复（MIT-480 一阶段），无
-// 系统性 translator 插入敏感缺陷；② junk Mov 在 share-prev 下**仍崩**
-// （MIT-478 的 VM 级消费面缺陷独立存在，非地址纪律可解释），维持关闭。
-// 本位 175e2f6 曾误翻 true（"翻案成功"注释为乐观误判，kern.md5 全量回归
-// 未跑），adce88f 入册时漏翻转——本行一并修正一致性。
+// junk-Mov 挂账史（MIT-459 关闭 → 478 二次翻案失败 → 481 混杂揭示）与
+// 终局裁定见 GAPS；此处只留最新结论：
+// ⚠️ MIT-482 (T6.4 定案，2026-09-07)：junk-Mov **维持关闭，但缺陷已定位修
+// 复**。MIT-478/479/481 时代全部 junk 崩溃的首恶 = insn_transfer 纯定义杀
+// /use 标记次序缺陷——目的与自身 mem 基址/变址重叠的纯写指令（实录
+// `movzx ecx, byte ptr [rdx + rcx]`，md5 区域 host 0xDF21）会把同指令正要
+// 读的槽误杀成"边界死"，junk 注入紧邻读者指令之前 → VM 词流 Load 读 junk
+// 槽作变址 → 野指针 segfault（junk imm 0x496E4B90 全链实证）。修复 = kill
+// 先于 use（live_in = (live_out\def) ∪ use）；回归专测
+// MutateLiveness.PureDefKillMustNotEraseMemOperandUse 钉死次序。修复后
+// seed 12345 全量 165 junk Mov / 54 块 → wvmpTest 103/103 绿。
+// **重启用被 T6.5 阻塞**：宽 seed 扫描暴露无 mutate 的基线包在 seed
+// 3/9/11 崩于 kern.md5、部分 seed 挂死（VM 循环）——基线 seed 脆弱缺陷
+//（wvmpTest 历史只验过 seed 12345），与 mutate 无关。基线修复 + 全 seed
+// 扫描转绿后 junk-Mov 方可重启用。
 constexpr bool kEnableJunkMov = false;
 
 // 垃圾目的的候选 GP 集（按 arch；rsp 排除——栈写语义由栈深 walk 专管，
@@ -68,6 +63,21 @@ std::vector<ir::Reg> gp_candidates(ir::Arch arch) {
         for (int r = static_cast<int>(ir::Reg::R8); r <= static_cast<int>(ir::Reg::R15); ++r)
             regs.push_back(static_cast<ir::Reg>(r));
     return regs;
+}
+
+// MIT-482 (T6.4)：单注入点诊断行（聚合进 site_log，pass 末尾一次性披露）。
+std::string site_note(const ir::FunctionRegion& fn, size_t bidx, size_t iidx,
+                      u64 host, int slot, bool is_mov, u32 imm) {
+    char buf[160];
+    if (is_mov)
+        std::snprintf(buf, sizeof(buf), "Mov v%d,0x%X", slot, imm);
+    else
+        std::snprintf(buf, sizeof(buf), "Nop");
+    char out[224];
+    std::snprintf(out, sizeof(out), "%s(fn=%s b%zu/i%zu @0x%llX) ",
+                  buf, fn.name.c_str(), bidx, iidx,
+                  static_cast<unsigned long long>(host));
+    return out;
 }
 
 bool is_pure_def(const ir::Insn& in) {
@@ -123,6 +133,20 @@ static void insn_transfer(const ir::Insn& in, std::vector<char>& live, ir::Arch 
         in.op == ir::Op::Mul || in.op == ir::Op::Cmpxchg || in.op == ir::Op::Cdq) {
         live[static_cast<size_t>(ir::Reg::Rax)] = 1;
     }
+    // MIT-482 (T6.4) 纯定义杀必须先于 use 标记：活性语义 =
+    // live_in(i) = (live_out(i) \ def(i)) ∪ use(i)。若先 use 后 kill，则
+    // 目的与自身 mem 基址/变址重叠的纯写指令（实录：md5 区域
+    // `movzx ecx, byte ptr [rdx + rcx]`，rcx 既是 dst 又是变址——kern.md5
+    // 野指针崩溃）会把同指令正要读的槽误杀成"边界死"，junk 注入到紧邻
+    // 读者指令之前即产野地址。
+    // MIT-482 (T6.4) 纯定义杀必须先于 use 标记：活性语义 =
+    // live_in(i) = (live_out(i) \ def(i)) ∪ use(i)。若先 use 后 kill，则
+    // 目的与自身 mem 基址/变址重叠的纯写指令（实录：md5 区域
+    // `movzx ecx, byte ptr [rdx + rcx]`，rcx 既是 dst 又是变址——kern.md5
+    // 野指针崩溃）会把同指令正要读的槽误杀成"边界死"，junk 注入到紧邻
+    // 读者指令之前即产野地址。
+    if (is_pure_def(in) && in.dst.kind == ir::Operand::Kind::Reg)
+        live[static_cast<size_t>(in.dst.reg)] = 0;
     if (!is_pure_def(in)) read_reg(in.dst);
     read_reg(in.src);
     if (in.src2.kind == ir::Operand::Kind::Reg) read_reg(in.src2);
@@ -134,9 +158,8 @@ static void insn_transfer(const ir::Insn& in, std::vector<char>& live, ir::Arch 
     };
     read_mem(in.dst);
     read_mem(in.src);
-    // 纯定义杀：目的在更早边界（含本插入点）不再活。
-    if (is_pure_def(in) && in.dst.kind == ir::Operand::Kind::Reg)
-        live[static_cast<size_t>(in.dst.reg)] = 0;
+    // MIT-482：src2 的 Mem 形补录（此前只覆盖 Reg 形——完整性对账）。
+    read_mem(in.src2);
 }
 
 std::vector<std::vector<ir::Reg>> dead_at_boundaries(const ir::BasicBlock& block,
@@ -165,6 +188,12 @@ std::vector<std::vector<ir::Reg>> dead_at_boundaries(const ir::BasicBlock& block
 
 } // namespace
 
+std::vector<std::vector<ir::Reg>> dead_at_boundaries_for_test(
+    const ir::BasicBlock& block, const std::vector<ir::Reg>& candidates,
+    ir::Arch arch, const std::vector<char>& live_out) {
+    return dead_at_boundaries(block, candidates, arch, live_out);
+}
+
 void MutatePass::run(ProtectionContext& ctx) {
     // MIT-457 档位对齐：level=none 的函数不会被 virtualize 消费，跳过变异
     //（变异产物无人消费，省时且日志口径与虚拟化面一致）。
@@ -177,10 +206,30 @@ void MutatePass::run(ProtectionContext& ctx) {
 
     Rng rng(ctx.seed ^ kMutateSeedSalt);
     size_t junk_movs = 0, nops = 0, blocks_touched = 0;
+    // MIT-482 (T6.4)：逐注入点日志（fn/block/idx/host/槽号）——junk 精确
+    // 归因面。槽号 = ir::Reg 枚举值 = VM GP 槽号（VM 级消费面对账主键）。
+    std::string site_log;
+    bool region_allowed = true;  // MIT-482：诊断白名单（发射级丢弃）。
 
     for (size_t fn_index = 0; fn_index < ctx.functions.size(); ++fn_index) {
         ir::FunctionRegion& fn = ctx.functions[fn_index];
         if (fn.blocks.empty()) continue;
+        // MIT-482 (T6.4 诊断钩子，实验分支专用)：WVMP_MUTATE_ALLOW_RVA=<hex>
+        // 只对 begin_rva 匹配的区域发射注入物。rng 抽取序保持全量语义
+        //（发射级丢弃，非函数级 continue——否则 rng 状态耦合破坏二分）。
+        {
+            char* av = nullptr;
+            size_t av_len = 0;
+            if (_dupenv_s(&av, &av_len, "WVMP_MUTATE_ALLOW_RVA") == 0 && av &&
+                av_len > 1) {
+                region_allowed =
+                    fn.name.find(av) != std::string::npos;  // 子串匹配 marker 名
+                std::free(av);
+            } else {
+                std::free(av);
+                region_allowed = true;
+            }
+        }
         if (rules != nullptr &&
             rules->level_for(fn.begin_rva, fn_index) == ProtectLevel::None)
             continue;
@@ -263,7 +312,8 @@ void MutatePass::run(ProtectionContext& ctx) {
             continue;
         }
 
-        for (ir::BasicBlock& block : fn.blocks) {
+        for (size_t blk_i = 0; blk_i < fn.blocks.size(); ++blk_i) {
+            ir::BasicBlock& block = fn.blocks[blk_i];
             if (block.insns.empty()) continue;
             const auto dead = dead_at_boundaries(block, candidates, fn.arch,
                                                  live_out_v[&block - fn.blocks.data()]);
@@ -285,28 +335,36 @@ void MutatePass::run(ProtectionContext& ctx) {
                     const u64 host =
                         block.insns[i == 0 ? 0 : i - 1].addr;
                     if (rng.chance(nop_probability)) {
-                        ir::Insn nop;
-                        nop.op = ir::Op::Nop;
-                        nop.size = junk_size;
-                        nop.addr = host;
-                        mutated.push_back(nop);
-                        ++nops;
-                        inserted = true;
+                        ++nops;  // rng 语义计数（发射受白名单门控）
+                        if (region_allowed) {
+                            ir::Insn nop;
+                            nop.op = ir::Op::Nop;
+                            nop.size = junk_size;
+                            nop.addr = host;
+                            mutated.push_back(nop);
+                            inserted = true;
+                            site_log += site_note(fn, blk_i, i, host, -1, false, 0);
+                        }
                     } else if (kEnableJunkMov && rng.chance(kJunkMovProbability)) {
                         // MIT-478 (T6)：dead[i] 已由区域级 CFG 反向活跃度背书
                         //（live_out(B) 折入后继可见性 + 隐式读补录），直接注入。
                         const size_t pick =
                             static_cast<size_t>(rng.uniform(0, dead[i].size() - 1));
                         const u32 junk_imm = static_cast<u32>(rng.next());
-                        ir::Insn junk;
-                        junk.op = ir::Op::Mov;
-                        junk.size = junk_size;
-                        junk.dst = ir::Operand::reg_(dead[i][pick]);
-                        junk.src = ir::Operand::imm_(static_cast<i64>(junk_imm));
-                        junk.addr = host;
-                        mutated.push_back(junk);
                         ++junk_movs;
-                        inserted = true;
+                        if (region_allowed) {
+                            ir::Insn junk;
+                            junk.op = ir::Op::Mov;
+                            junk.size = junk_size;
+                            junk.dst = ir::Operand::reg_(dead[i][pick]);
+                            junk.src = ir::Operand::imm_(static_cast<i64>(junk_imm));
+                            junk.addr = host;
+                            mutated.push_back(junk);
+                            inserted = true;
+                            site_log += site_note(fn, blk_i, i, host,
+                                                  static_cast<int>(dead[i][pick]), true,
+                                                  junk_imm);
+                        }
                     }
                 }
                 if (i < block.insns.size()) mutated.push_back(block.insns[i]);
@@ -318,12 +376,14 @@ void MutatePass::run(ProtectionContext& ctx) {
         }
     }
 
-    if (junk_movs + nops > 0)
+    if (junk_movs + nops > 0) {
         ctx.diag.report(Severity::Note, name(),
                         "已注入 " + std::to_string(junk_movs + nops) + " 个垃圾指令（Mov " +
                             std::to_string(junk_movs) + " / Nop " + std::to_string(nops) +
                             "，" + std::to_string(blocks_touched) + " 个基本块，seed 派生确定性）");
-    else
+        // MIT-482：逐注入点披露（单行聚合，诊断面；不影响产物字节）。
+        ctx.diag.report(Severity::Note, name(), "注入点清单: " + site_log);
+    } else
         ctx.diag.report(Severity::Note, name(), "本次未注入垃圾指令（密度抽样为空）");
 }
 

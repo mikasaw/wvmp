@@ -221,6 +221,54 @@ TEST(MutatePass, InsertionSurfaceInvariant) {
     }
 }
 
+// MIT-482 (T6.4)：纯定义杀/use 序回归专测——目的与自身 mem 变址重叠的
+// 纯写指令（`movzx ecx, [rdx+rcx]` 实录），边界 i（该指令之前）绝不能把
+// 变址槽判死。buggy 序（先 use 后 kill）曾把 rcx 误杀 → junk 注入紧邻
+// 读者指令前 → VM 词流 Load 读 junk 槽作变址 → kern.md5 野指针 segfault。
+TEST(MutateLiveness, PureDefKillMustNotEraseMemOperandUse) {
+    Insn mov_rdx;
+    mov_rdx.op = wvmp::ir::Op::Mov;
+    mov_rdx.size = Size::S64;
+    mov_rdx.dst = Operand::reg_(Reg::Rdx);
+    mov_rdx.src = Operand::imm_(0x40);
+
+    Insn mov_rcx;
+    mov_rcx.op = wvmp::ir::Op::Mov;
+    mov_rcx.size = Size::S64;
+    mov_rcx.dst = Operand::reg_(Reg::Rcx);
+    mov_rcx.src = Operand::imm_(3);
+
+    // movzx ecx, byte ptr [rdx + rcx]：dst=Cx（纯写）+ 变址=Cx（读）。
+    Insn load;
+    load.op = wvmp::ir::Op::Load;
+    load.size = Size::S8;
+    load.dst = Operand::reg_(Reg::Rcx);
+    wvmp::ir::MemOperand m;
+    m.base = Reg::Rdx;
+    m.index = Reg::Rcx;
+    load.src = Operand::mem_(m);
+
+    auto fn = make_fn("kill_order", {mov_rdx, mov_rcx, load}, 0x1000);
+    const auto& block = fn.blocks[0];
+    const std::vector<char> live_out(static_cast<size_t>(Reg::Count), 0);
+    const std::vector<wvmp::ir::Reg> candidates = {Reg::Rcx, Reg::Rdx};
+    const auto dead = wvmp::passes::dead_at_boundaries_for_test(
+        block, candidates, wvmp::ir::Arch::X64, live_out);
+
+    const auto has = [&](size_t boundary, Reg r) {
+        for (wvmp::ir::Reg x : dead[boundary])
+            if (x == r) return true;
+        return false;
+    };
+    // 边界 2（Load 之前）：变址槽 Cx 与基址槽 Rdx 均被本指令读取 → 恒活。
+    EXPECT_FALSE(has(2, Reg::Rcx)) << "变址槽被同指令 def-kill 误杀（MIT-482）";
+    EXPECT_FALSE(has(2, Reg::Rdx));
+    // 边界 1（mov rcx 之前）：rcx 由 insn1 紧邻重定义、Load 读的是新值
+    // → 判死合法（junk 写入会被 insn1 覆盖，读者看到的是 insn1 的结果）。
+    EXPECT_TRUE(has(1, Reg::Rcx));
+    EXPECT_FALSE(has(1, Reg::Rdx));
+}
+
 TEST(MutatePass, LevelNoneSkipped) {
     // 档位 none 的函数不变异；默认档函数正常变异（30 边界 × 0.10 ≈ 确定性
     // 至少 1 插入；若密度调整后偶发为零，增大程序规模）。
