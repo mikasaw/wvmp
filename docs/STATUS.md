@@ -809,3 +809,25 @@ kern.md5 仍崩 → 消费面不止跳表类；VM blob 解码 diff 已锁定 div
 
 **验证**：build 0/0；ctest 23/23；multiseed 335/335；x64 dump 锚
 67cfa727… 恒等。冻结契约零 diff。
+
+
+## MIT-481 (T6.3 定案 · 二分混杂揭示 + Nop 面修复确认) ✅ 2026-09-07
+
+**裁定反转**：MIT-480 续的"系统性 translator 插入敏感缺陷"为**混杂变量
+误诊**——adce88f 函数级二分在 `kEnableJunkMov=true` 下运行，崩溃全部来
+自 junk Mov。175e2f6 的 `kEnableJunkMov=true` 误翻（"翻案成功"为乐观误
+判）+ adce88f 漏翻转，本单一并修复状态一致性。
+
+**决定性对照**（wvmpTest x64 seed 12345，7-pass，share-prev + 跳表门控）：
+- E1 junk=false：113 Nop / 40 块全量注入 → **103/103 全绿**；
+- E2 junk=true：144 Mov + 101 Nop → segfault 于 kern.md5 入口（历史签名
+  一致）。
+
+**结论**：① Nop 注入面已被 share-prev 地址纪律修复，无系统性 translator
+插入敏感缺陷（MIT-480 续三根因候选全部作废），mutate Nop 面恢复生产可
+用；② junk Mov 在 share-prev 下仍崩——MIT-478 缺陷独立存在，但 MIT-478/
+479 时代全部 junk 实验同样被 share-NEXT 混杂，junk 调查需在干净基线重启
+（T6.4 候选）；③ 生产建议"双跑对拍"作废（Nop 面已证全绿）。
+
+**验证**：build 0/0；ctest 23/23；multiseed 335/335；x64 dump 锚
+67cfa727… 恒等。冻结契约零 diff。

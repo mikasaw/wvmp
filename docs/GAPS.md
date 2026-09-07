@@ -1824,3 +1824,37 @@ pending-jump 回填在插入后的序数漂移。修复需 VM 级 trace（per-wo
 **现状裁定**：junk-Mov 关闭（维持）；Nop 注入也受同一缺陷影响（ mutate
 nop-only 新落位可崩——**生产建议：mutate 密度 ≥1 时对含 callgate/复杂
 区域的产物跑双跑对拍**；历史绿色包属落位幸运）。
+
+## MIT-481（T6.3 定案，2026-09-07）——二分混杂变量揭示：Nop 面 share-prev 已修复，无系统性 translator 缺陷
+
+**推翻 MIT-480 续的裁定**。"系统性 translator 插入敏感缺陷"系**混杂变量
+误诊**：adce88f 的函数级二分在 `kEnableJunkMov=true` 下运行（175e2f6 翻
+案时刻的遗留值，且该次"翻案成功"结论本身是乐观误判——kern.md5 全量回归
+未跑；adce88f 入册时又漏翻转本位，main 一度处于"代码开着已证伪的
+junk-Mov"的自相矛盾状态）。二分观察到的 fn=1/2/4/6/7 崩溃**全部来自
+junk Mov**，与 Nop/插入本身无关。
+
+**决定性对照实验**（wvmpTest x64，seed 12345，7-pass 无 crypt，当前
+share-prev 地址纪律 + 跳表候选门控，mutate 密度默认 10%）：
+- E1 `kEnableJunkMov=false`：全量注入 **113 Nop / 40 块** →
+  packed rc=0，**103/103 全绿**（含 kern.md5 / kern.b64 历史必崩面）；
+- E2 `kEnableJunkMov=true`：全量注入 144 Mov + 101 Nop →
+  **segfault 于 kern.md5_block_vectors 入口**（历史崩点签名逐字节一致，
+  末条 [RUN] = kern.md5）。
+
+**结论链**：
+1. **Nop 注入面已被 share-prev 纪律修复**（MIT-480 一阶段的地址纪律修复
+   本来就是充分修复）；全密度（113 落位）全绿，"落位幸运"论作废。
+2. **junk Mov 在 share-prev 下仍崩**（E2）——MIT-478 的缺陷独立于地址纪
+   律存在。注意 MIT-478/479 时代的全部 junk 实验（含"含 Call 块禁注入仍
+   崩"、"junk rcx/rax 定点复现"）都跑在 share-NEXT 纪律下，其"callgate
+   邻域假设被否"等中间结论同样被 share-NEXT 混杂，**junk-Mov 调查需在
+   share-prev 基线上重启**（T6.4 候选）。
+3. MIT-480 续列的三个根因候选（Scratch 分配 / 地址键同址序 / pending
+   回填序漂移）全部不成立——blob 词流平移自洽性审计（静态）+ E1 实证
+   （动态）双确认。
+4. 历史单 Nop 复现（MIT-479 share-NEXT 时代 + MIT-480 续时代）与二分崩
+   溃，均为 share-NEXT 自指缺陷或 junk Mov 缺陷的复合表现，无第三缺陷。
+
+**状态修复**：`kEnableJunkMov = false`（恢复 + 注释改写为最终裁定）；
+mutate Nop 注入面恢复生产可用（默认 10% 密度，无需双跑对拍）。

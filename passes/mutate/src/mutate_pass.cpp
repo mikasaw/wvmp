@@ -43,14 +43,19 @@ constexpr double kJunkMovProbability = 0.15;
 // 消费面在 IR 不可见的 VM 级（callgate 邻域），IR 侧审计无法闭合 →
 // **维持默认关闭**（宁挂账勿错）；全部强化设施保留（CFG 活跃度对 Nop
 // 注入面同样生效），重启启用需 VM 级 dataflow 工具（T6.2，见 GAPS）。
-// ✅ MIT-480 (T6.3) 翻案成功：根因 = 插入物 addr 纪律。旧实现共享**后一
-// 条** insn 的地址 → 同址对 (NOP, I) 中 NOP 先写 next_ip_of[I.addr] =
-// I.addr（自指值），I 的 rip-relative 寻址/地址键消费面读到自指窗口即
-// 断（单 Nop 复现 kern.b64 软失败）。修复 = 插入物共享**前一条**真实
-// insn 的地址（语义 = 插入在 P 之后；同址对 (P, NOP) 两写同值 = P 的语
-// 义后继，且与 MIT-426 同址先例同向）。share-prev 下全量插入点实测绿色
-//（含历史必崩落位），junk-Mov **重启用**（MIT-459 挂账清偿，T6 完结）。
-constexpr bool kEnableJunkMov = true;
+// ✅ MIT-481 (T6.3 定案，2026-09-07)：adce88f"系统性 translator 插入敏感
+// 缺陷"系**混杂变量误诊**——函数级二分（fn=1/2/4/6/7 崩）在
+// kEnableJunkMov=true 下运行，崩溃全部来自 junk Mov 而非插入本身。对照实
+// 验（wvmpTest x64，seed 12345，7-pass 无 crypt，share-prev + 跳表门控）：
+//   E1 junk=false 全量注入 113 Nop / 40 块 → 103/103 绿；
+//   E2 junk=true 全量注入 144 Mov + 101 Nop → segfault 于 kern.md5 入口
+//      （历史崩点签名逐字节一致）。
+// 结论：① Nop 注入面已被 share-prev 地址纪律修复（MIT-480 一阶段），无
+// 系统性 translator 插入敏感缺陷；② junk Mov 在 share-prev 下**仍崩**
+// （MIT-478 的 VM 级消费面缺陷独立存在，非地址纪律可解释），维持关闭。
+// 本位 175e2f6 曾误翻 true（"翻案成功"注释为乐观误判，kern.md5 全量回归
+// 未跑），adce88f 入册时漏翻转——本行一并修正一致性。
+constexpr bool kEnableJunkMov = false;
 
 // 垃圾目的的候选 GP 集（按 arch；rsp 排除——栈写语义由栈深 walk 专管，
 // 任何额外 rsp 写都改变 walk 建模）。
