@@ -92,6 +92,7 @@ def main():
                      capstone.CS_MODE_64 if plus else capstone.CS_MODE_32)
     md.detail = True
     exec_hits = 0
+    imm_hits = 0
     for (_n, va, vs, rp, rs, chars) in secs:
         if not (chars & 0x20000000) or rs == 0:
             continue
@@ -110,6 +111,18 @@ def main():
                     t = op.mem.disp - ib  # abs32 disp 承载全 VA → RVA
                 if lo <= t < lo + size:
                     exec_hits += 1
+            # MIT-487 (T9.3a)：模型外形态负扫——imm32 直接载荷（B8+r
+            # mov r32, imm32 / C7 /0 mov [x], imm32 不经 MEM 操作数）与
+            # moffs64（A0-A3，long 模式 MSVC 不生成）。命中即残面证据。
+            b = ins.bytes
+            if 0xB8 <= b[0] <= 0xBF and len(b) == 5:
+                v = struct.unpack_from("<I", b, 1)[0]
+                if v >= ib and lo <= v - ib < lo + size:
+                    imm_hits += 1
+            if plus and b[0] in (0xA0, 0xA1, 0xA2, 0xA3) and len(b) == 10:
+                v = struct.unpack_from("<Q", b, 2)[0]
+                if v >= ib and lo <= v - ib < lo + size:
+                    imm_hits += 1
     # 数据指针残留：packed dd[5] 全扫，非 EXECUTE 节 DIR64/HIGHLOW 站点值
     # 落原 IAT 区（VA 空间）→ 命中。
     data_hits = 0
@@ -150,8 +163,8 @@ def main():
                         data_hits += 1
                 pos += bsz
     print(f"orig_iat=[{lo:#x},{lo + size:#x}) plus={plus} "
-          f"exec-hits={exec_hits} data-hits={data_hits}")
-    return 1 if (exec_hits or data_hits) else 0
+          f"exec-hits={exec_hits} data-hits={data_hits} imm-hits={imm_hits}")
+    return 1 if (exec_hits or data_hits or imm_hits) else 0
 
 
 if __name__ == "__main__":

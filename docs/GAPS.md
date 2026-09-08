@@ -2142,3 +2142,37 @@ opcode，线性兜底）；③ `B8+r imm32`（立即数直接载荷 IAT VA，非
 capstone 符号扩展）双盲——保守安全，回填兜底。
 **判据对齐**：校验器数据站点判据改为与 rewriter 全含式一致
 （site + w ≤ va + vs，消除节尾假阳面）。
+
+## MIT-487（T9.3a，2026-09-08）——跳回填完备性证据基座：锚点加固 + 模型外负扫 + 全池零残留
+
+**完备性论证结构**（跳回填决策的证据链第一层）：
+① **引用形态全域普查**（native 70 样本 = multiseed 双架构池 + tls 双架构
++ wvmpTest 靶标）：残面四族——FF 35（push [abs/rip]）、A1/A3（x64 为
+moffs64，x86 为 abs32 mov eax 形）、B8+r imm32 直接载荷、moffs64——
+**70/70 全零**。即池内 IAT 引用形态全集 = {x64 rip 相对 MEM /
+x86 abs32 MEM}，恰为两 rewriter 的建模面。
+② **重写面语义完备**：线性 capstone 路径按指令语义（MEM 操作数）
+覆盖全部形态，锚点仅为 drift 防线（本单加固：x64 锚加 FF 35 + 0F 前
+缀 mem 系（movups/movaps/movzx/movsx 白名单）、x86 锚加 0F movzx/
+movsx 系；FF 35 x86 面已由泛 modrm(00/101) 分支覆盖（0x35 & 0xC7 ==
+0x05）；x86 锚点循环上界 i+2→i+3 修正（0F 锚读 b[2] 越界））。
+③ **迁移样本零残留**（校验器，本单加 imm 负扫 B8-r/moffs64）：
+tls 双架构 + test_target 迁移 3/3，exec/data/imm-hits 全 0；其余 67
+样本未导入 kernel32!VirtualProtect → v1 硬依赖保守回退（无迁移面，
+原 IAT 引用本就正当，不在残面前提内）。
+**工具**：scripts/verify_pool_imports.sh（全池打包 + 逐样本校验，70/70
+PASS；注意"放弃 IAT 迁移"含"IAT 迁移"子串，回退分流必须先行）。
+
+**限制披露**：迁移面覆盖 3/70（v1 VP 硬依赖——回填需经既有 VP IAT 槽
+调 VirtualProtect；无 VP 导入样本不支持迁移，属能力边界非完备性缺陷，
+census 论证覆盖全部 70）；x64 PE32+ 低基址（<2GB）abs32 编址在
+long 模式不存在（modrm(00/101) = rip 相对），moffs64 MSVC 不生成 +
+校验器负扫兜底。
+
+**结论**：在池域内"重写完备"证据链闭合（形态全域普查 + 语义面覆盖 +
+迁移零残留）。跳回填行为票（T9.3b）剩余前置 = FailFast 红线桩（漏引
+从野指针变受控崩溃）+ 漏引风险最后一环（drift 假阴双保险论证）。
+
+**工程坑**：x64 INT 槽 8 字节步进——4 字节步进普查脚本 IAT span 全算
+小（slot0 高半字 0 提前终止），"零存在"结论曾建立于错误分母；修正后
+重扫方为有效证据。

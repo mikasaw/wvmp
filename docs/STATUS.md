@@ -898,3 +898,19 @@ wvmpTest 双跑各 103/103；multiseed 335/335 零回踩。生效实证：seed 3
 重写计数 + 校验器零残留）；真靶 x64 39 处 / x86 40 处重写、
 exec/data-hits 全 0；multiseed 335/335；wvmpTest 双跑 103/103×2。
 校验器 check_import_rewrite.py 扩展 PE32 abs32 + 数据残留双面。
+
+
+## MIT-487 (T9.3a · 跳回填完备性证据基座) ✅ 2026-09-08
+
+**交付**：① asmgen 无关的锚点加固（x64 锚 + FF 35 / 0F 前缀 mem 白
+名单系；x86 锚 + 0F movzx/movsx 系 + 循环上界 i+3 修正）；② 校验器
+模型外负扫（B8-r imm32 / moffs64，imm-hits 计入退出码）；③ 全池完备
+性扫描脚本 scripts/verify_pool_imports.sh。
+
+**证据**：native 70 样本残面四族普查全零（引用形态全集 = 两 rewriter
+建模面）；池打包扫描 70/70 PASS（迁移 3 = tls×2 + test_target，零残
+留；67 保守回退 = VP 硬依赖能力边界）；ctest 23/23；tls_e2e 2/2。
+asmgen 零触碰 → dump 锚不受影响（无换代）。
+
+**跳回填行为票 = T9.3b**（FailFast 红线桩 + drift 假阴论证），证据链
+门槛见 GAPS MIT-487 节。

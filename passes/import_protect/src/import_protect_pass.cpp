@@ -234,11 +234,18 @@ static size_t rewrite_iat_code_refs(ProtectionContext& ctx, const PeImage& pe,
         for (size_t i = 0; i + 3 <= len; ++i) {
             const u8* b = cur + i;
             size_t clen = 0;
-            if (b[0] == 0xFF && (b[1] == 0x15 || b[1] == 0x25)) {
-                clen = 6;              // FF /2 /4：call/jmp [rip+disp32]
+            if (b[0] == 0xFF && (b[1] == 0x15 || b[1] == 0x25 || b[1] == 0x35)) {
+                clen = 6;  // FF /2 /4 /6：call/jmp/push [rip+disp32]（MIT-487 加 FF 35）
             } else if ((b[0] == 0x8B || (b[0] >= 0x40 && b[0] <= 0x4F)) &&
                        b[1] == 0x8B && (b[2] & 0xC7) == 0x05) {
                 clen = (b[0] >= 0x40 && b[0] <= 0x4F) ? 7 : 6;  // (REX) 8B /r mov r32/r64
+            } else if (b[0] == 0x0F && (b[2] & 0xC7) == 0x05 &&
+                       (b[1] == 0x10 || b[1] == 0x11 || b[1] == 0x28 ||
+                        b[1] == 0x29 || b[1] == 0x2E || b[1] == 0x2F ||
+                        b[1] == 0xB6 || b[1] == 0xB7 || b[1] == 0xBE ||
+                        b[1] == 0xBF)) {
+                clen = 7;  // MIT-487：0F 前缀 mem 形（movups/movaps/movzx/movsx
+                           // [rip+disp32]）——drift 防线扩展（线性路径本已覆盖）
             } else {
                 continue;
             }
@@ -378,13 +385,18 @@ static size_t rewrite_iat_code_refs_x86(ProtectionContext& ctx, const PeImage& p
         // —— 锚点补漏扫描（对齐 MIT-477 范式）：数据混排区失步时线性
         // 漏过的真实引用由锚点独立解码补齐；对已重写位点幂等（新值不落
         // 原 span）。
-        for (size_t i = 0; i + 2 <= len; ++i) {
+        for (size_t i = 0; i + 3 <= len; ++i) {  // 上界 3：0F 前缀锚点读 b[2]
             const u8* b = cur + i;
             size_t clen = 0;
             if (b[0] == 0xFF && (b[1] == 0x15 || b[1] == 0x25)) {
                 clen = 6;  // FF /2 /4：call/jmp [disp32]
             } else if (b[0] == 0xA1 || b[0] == 0xA3) {
                 clen = 5;  // A1/A3：mov eax,[disp32] / mov [disp32],eax
+            } else if (b[0] == 0x0F && (b[2] & 0xC7) == 0x05 &&
+                       (b[1] == 0xB6 || b[1] == 0xB7 || b[1] == 0xBE ||
+                        b[1] == 0xBF)) {
+                clen = 7;  // MIT-487：0F movzx/movsx [disp32]（FF 35 已被泛
+                           // modrm 分支覆盖：0x35 & 0xC7 == 0x05）
             } else if ((b[1] & 0xC7) == 0x05) {
                 clen = 6;  // 泛单字节 opcode + modrm(00/101) + disp32
             } else {
