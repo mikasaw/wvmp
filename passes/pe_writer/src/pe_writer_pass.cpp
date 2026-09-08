@@ -98,7 +98,10 @@ void PeWriterPass::run(ProtectionContext& ctx) {
                 const u64 reserve_start = s.data.size() - kEmitReserveBytes;
                 if (*r <= reserve_start) continue;
                 const u64 used = *r - reserve_start;
-                if (used * 4 > u64{kEmitReserveBytes} * 3) {
+                // 除法形态恒无乘法回绕（MIT-491 验收建议 1：游标被外部
+                // 腐化 ≥2^62 时 used*4 理论回绕；当前威胁模型不可达，
+                // 形态防御仍取）。
+                if (used > kEmitReserveBytes / 4 * 3) {
                     char hw[128];
                     std::snprintf(hw, sizeof(hw),
                                   "Emit 预留区高水位：%llu / %u 字节（%.0f%%）"
