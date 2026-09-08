@@ -2322,10 +2322,11 @@ MIT-340 时代 .reloc 扩展在 snake 样本 segfault，"Windows 加载器对保
 后 .reloc 扩展存在未排查的行为差异"挂账至今。
 
 **绝对 VA 全域普查**（x64 tls 样本 seed 1 skip 模式，字节粒度）：92 处
-= native 面 79（原 .reloc 已覆盖，含 42 个 skip 桩值 IAT 槽）+ packer
-面 13（.wvmpc 7 代码 imm：TLS 回调 adb/drx/rdtsc/backfill 即时数 +
-**stub scratch_mem 写入 `movabs rax, ImageBase`**；.wvmp 6：TLS 目录/
-回调数组 VA）+ 头部 2。**packer 面在原 .reloc 中零覆盖**。
+= native 面 79（.rdata 77 + 头部 2；其中原 .reloc 实际覆盖 34 处，42
+个 skip 桩值 IAT 槽由 loader 导入机制原生处理）+ packer 面 13（.wvmpc
+7 代码 imm：TLS 回调 adb/drx/rdtsc/backfill 即时数 + **stub
+scratch_mem 写入 `movabs rax, ImageBase`**；.wvmp 6：TLS 目录/回调数
+组 VA）。**packer 面在原 .reloc 中零覆盖**。
 
 **决定性对照实验**（脚本化：scripts/experiments/aslr_poc.py）：
 - PoC：.reloc 节 slack 内追加 3 页 DIR64 块（55 站点，+144B）+ 置

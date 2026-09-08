@@ -64,7 +64,11 @@ def main():
         nxt = min(s["rp"] for s in secs if s["rp"] > rel["rp"])
         reloc_sz = struct.unpack_from("<I", d, dd + 5 * 8 + 4)[0]
         cur_end = rel["rp"] + reloc_sz
-        need = (8 + 2 * len(sites) + 7) // 8 * 8
+        # 每页一块：头 8B + 每条目 2B（len(ents) 已是字节数，MIT-493 验收
+        # 修正——原 8+2*len(ents) 把 SizeOfBlock 虚标 2 倍）。垫对齐后逐页
+        # 累计，need 估算与实际写入一致。
+        n_pages = len({rva & ~0xFFF for rva in sites})
+        need = (8 + 2 * len(sites)) // 8 * 8 + n_pages * 8
         if cur_end + need > nxt:
             print(f"slack insufficient: need {need}, avail {nxt - cur_end}")
             return 1
@@ -79,7 +83,7 @@ def main():
                 ents += struct.pack("<H", 10 << 12 | off)
             while len(ents) % 8:
                 ents += struct.pack("<H", 0)
-            blob += struct.pack("<II", page, 8 + 2 * len(ents)) + ents
+            blob += struct.pack("<II", page, 8 + len(ents)) + ents
         d[cur_end:cur_end + len(blob)] = blob
         struct.pack_into("<I", d, dd + 5 * 8 + 4, reloc_sz + len(blob))
         print(f"reloc extended: {len(sites)} DIR64 sites, +{len(blob)} bytes")
