@@ -1575,14 +1575,20 @@ public:
         // 先搬到 reserved 槽位，防 callgate 自己的 prelude/pre-call 路径
         // 在 push ctx 之后又读 VmContext 时被外部指令序串改坏——保留独立
         // 通道供后续 load 物理寄存器用。
-        o += std::string("    mov rax, qword ptr [") + r64(ctx_) + " + 0x18]\n";   // regs[1] (Rcx)
-        o += std::string("    mov qword ptr [") + r64(ctx_) + " + 0xD0], rax\n";
-        o += std::string("    mov rax, qword ptr [") + r64(ctx_) + " + 0x20]\n";   // regs[2] (Rdx)
-        o += std::string("    mov qword ptr [") + r64(ctx_) + " + 0xD8], rax\n";
-        o += std::string("    mov rax, qword ptr [") + r64(ctx_) + " + 0x48]\n";   // regs[8] (R8)
-        o += std::string("    mov qword ptr [") + r64(ctx_) + " + 0xE0], rax\n";
-        o += std::string("    mov rax, qword ptr [") + r64(ctx_) + " + 0x50]\n";   // regs[9] (R9)
-        o += std::string("    mov qword ptr [") + r64(ctx_) + " + 0xE8], rax\n";
+        // ⚠️ MIT-484 (T6.5)：搬运 scratch 禁用物理 rax——roll 可能把
+        // flags_ 或 pc_ 分到 rax（pool 恒含 rax），step 2 随即把被 snapshot
+        // 覆写的 rax 当 flags/pc 存进 ctx（实录：seed 3 构建生成的
+        // `mov [ctx+0x98], rax` 存的是 v9 残值）。改用 t_[1]：角色互斥保证
+        // ≠ ctx_/base_/pc_/flags_，其原值到 step 4 才消费、此处已死。
+        const std::string snap = r64(t_[1]);
+        o += std::string("    mov ") + snap + ", qword ptr [" + r64(ctx_) + " + 0x18]\n";   // regs[1] (Rcx)
+        o += std::string("    mov qword ptr [") + r64(ctx_) + " + 0xD0], " + snap + "\n";
+        o += std::string("    mov ") + snap + ", qword ptr [" + r64(ctx_) + " + 0x20]\n";   // regs[2] (Rdx)
+        o += std::string("    mov qword ptr [") + r64(ctx_) + " + 0xD8], " + snap + "\n";
+        o += std::string("    mov ") + snap + ", qword ptr [" + r64(ctx_) + " + 0x48]\n";   // regs[8] (R8)
+        o += std::string("    mov qword ptr [") + r64(ctx_) + " + 0xE0], " + snap + "\n";
+        o += std::string("    mov ") + snap + ", qword ptr [" + r64(ctx_) + " + 0x50]\n";   // regs[9] (R9)
+        o += std::string("    mov qword ptr [") + r64(ctx_) + " + 0xE8], " + snap + "\n";
         // 2) 保存 pc/flags/base 到 VmContext 槽
         o += std::string("    mov qword ptr [") + r64(ctx_) + " + 0x8], " + r64(pc_) + "\n";
         o += std::string("    mov qword ptr [") + r64(ctx_) + " + 0x98], " + r64(flags_) + "\n";
@@ -1648,12 +1654,17 @@ public:
         o += "    sub rsp, " + imm(kPushCtxDepth) + "\n";
         // 8) pop 回 ctx_
         o += std::string("    pop ") + r64(ctx_) + "\n";
+        // 10) RAX (callee 返回值) 写回 regs[v0]
+        // ⚠️ MIT-484 (T6.5)：必须先于下方 pc/flags/base 恢复——roll 可能把
+        // flags_ 或 pc_ 分到物理 rax，恢复指令会把 rax 里的 callee 返回值
+        // 冲掉，v0 随即写入污染值（实录：seed 3 构建
+        // `mov rax,[ctx+0x98]; mov [ctx+0x10],rax` → v0 恒 0，kern.md5
+        // 野指针）。v0 先写（此时 rax 仍持 native 返回），后恢复三角色。
+        o += std::string("    mov qword ptr [") + r64(ctx_) + " + 0x10], rax\n";
         // 9) 从 VmContext 恢复 pc/flags/base
         o += std::string("    mov ") + r64(pc_) + ", qword ptr [" + r64(ctx_) + " + 0x8]\n";
         o += std::string("    mov ") + r64(flags_) + ", qword ptr [" + r64(ctx_) + " + 0x98]\n";
         o += std::string("    mov ") + r64(base_) + ", qword ptr [" + r64(ctx_) + " + 0x130]\n";
-        // 10) RAX (callee 返回值) 写回 regs[v0]
-        o += std::string("    mov qword ptr [") + r64(ctx_) + " + 0x10], rax\n";
         // 10.5) MIT-417 (P0): callee 标量 FP 返回值 xmm0 → ctx.xmm[0]。
         // Win64 标量 FP 返回恒 xmm0 单槽, 无需 xmm1 (__vectorcall 多槽
         // 返回不在 v1 面, GAPS C3 登记)。全 16B movups 捕获 callee 实际

@@ -847,3 +847,23 @@ junk-Mov 重启用被阻塞维持 false。
 **验证**：build 0/0；ctest 23/23；multiseed 335/335；x64 dump 锚
 67cfa727… 恒等；seed 12345 wvmpTest 全量注入 165 Mov 修复后 103/103。
 冻结契约零 diff（mutate 侧 + 测试面）。
+
+
+## MIT-484 (T6.5 定案 · callgate 双缺陷修复 + 基线全 seed 转绿) ✅ 2026-09-08
+
+**交付**：① build_callgate step 1 参数快照 scratch 物理 rax → t_[1]
+（roll 把 flags_/pc_ 分到 rax 时快照覆写角色寄存器，`mov [ctx+0x98]`
+存入 v9 残值）；② epilogue v0 写回提前到 pc/flags/base 恢复之前
+（原次序 flags_==rax 时 `mov rax,[ctx+0x98]` 冲掉 native 返回值，
+V0 恒 0 → kern.md5 野指针）。基线 seed/布局脆弱立案（MIT-482）就此
+定案关闭。
+
+**验证**：build 0/0；ctest 23/23；seeds 0..41 基线全扫 ALL GREEN（含
+挂死面 timeout 90/跑）；seed 3 基线 103/103；wvmpTest 双跑（base
+seed 12345 / mut seed 3）各 103/103；multiseed 335/335。
+
+**锚换代**：asmgen 模板变更 → dump 锚 67cfa727…/164,329B 作废，新锚
+fb8c65cb…c2bac / 164,321B 入册（table=+0x6BB8 布局头不变）。
+
+**后续**：T6.6 = kEnableJunkMov=true 全 seed 扫描 → junk-Mov 重启用
+裁定（MIT-482 阻塞解除的前置基线缺陷已修）。

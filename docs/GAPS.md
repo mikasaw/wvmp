@@ -2004,3 +2004,40 @@ caller 帧，native callee 的栈帧读写即错。**实测 [v4+0x48]=0x15f758 �
 的内存归属（GCCTEX？caller 帧？stub 保存区？）与生命周期；③ 审
 build_callgate step 9-11 + stub_gen 的 kStubPushBytes/kCtxSize/kPushCtx
 Depth 常量链在多深调用链下的一致性。
+
+## MIT-484（T6.5 定案，2026-09-08）——callgate 双缺陷根因实锤与修复：step1 rax scratch 覆写 + epilogue 恢复冲掉返回值
+
+**根因（asmgen.cpp build_callgate 两处，均为 roll 洗牌敏感）**：
+
+**缺陷① step 1 参数快照 scratch = 物理 rax**。四对"regs 槽 → reserved
+槽"搬运（0x18/0x20/0x48/0x50 → 0xD0/0xD8/0xE0/0xE8）用 `mov rax,…;
+mov [ctx+…],rax` 走物理 rax。roll() 的 10 寄存器 pool 恒含 rax/rdx，
+flags_/pc_ 可被分到 rax（实录 seeds 3/9/11/23/29 等）——快照一覆写
+rax，step 2 的 `mov [ctx+0x98], flags_` 存进去的就是快照残值（v9 残
+值），native callee 收到的 flags/pc 已坏。
+
+**缺陷② epilogue 恢复次序颠倒**。恢复 pc/flags/base 的
+`mov rax,[ctx+0x98]`（flags_==rax 时）先于 v0 写回
+`mov [ctx+0x10],rax` 执行——rax 里的 native 返回值先被 flags 槽值冲
+掉，v0 写入污染值。实录 seed 3 构建：`mov rax,[ctx+0x98];
+mov [ctx+0x10],rax` → V0 恒 0 → kern.md5 野指针 av（四阶段词级追踪
+V0 在词[99] CallGate 后即变 0 与此完全吻合）。
+
+**修复**（vm/regvm/runtime/src/asmgen.cpp）：
+① 快照 scratch 改 `t_[1]`（角色互斥保证 ≠ ctx_/base_/pc_/flags_，
+原值 step 4 才消费、快照处已死）；② v0 写回提前到 pc/flags/base 恢
+复之前（rax 仍持 native 返回时先落槽）。
+
+**验证全绿**：seed 3 基线 103/103（原 kern.md5 野指针 av 面）；seeds
+0..41 全扫（基线，含挂死面 timeout 90/跑）ALL GREEN；ctest 23/23；
+wvmpTest 双跑（kern_base seed 12345 / kern_mutate seed 3）各 103/103。
+
+**dump 锚换代**：asmgen 模板变更 → 旧锚 67cfa727…/164,329B 作废，
+新锚 **fb8c65cb47d129fadd04ac960f1981341fb899f4eb3423e9ba05069ab16c2
+bac / 164,321B**（WVMP_X64_ASM_DUMP + gtest_filter=Interpreter.MovdB
+ridgeSemantic 重新生成入册，布局头 entry=+0x0/dispatch=+0x2B/table=+
+0x6BB8 不变）。multiseed 335 回归结果随附（见提交）。
+
+**方法论沉淀**：cdb `bu module+off` + ctx+0 流 VA 过滤 + `poi(ctx+0x
+10+N*8)` 槽值日志是好/坏构建同构比对的有效路径；"哪个构建先坏"不如
+"同一词流两构建槽值差异"定位快。
