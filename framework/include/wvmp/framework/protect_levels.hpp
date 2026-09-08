@@ -57,6 +57,8 @@ struct ProtectRules {
     // 生效（has_* 哨兵），直连 API 未装配配置的镜像行为不变。
     bool has_mutate_density = false;
     u32  mutate_density = 10;            // nop 填充密度百分比（0-100）
+    bool has_mutate_junk_density = false;
+    u32  mutate_junk_density = 15;       // MIT-489: junk-Mov 密度百分比（0-100）
     bool has_anti_debug_techniques = false;
     u32  anti_debug_techniques = 0x3;    // 位域（见上注）
     bool has_anti_debug_init = false;

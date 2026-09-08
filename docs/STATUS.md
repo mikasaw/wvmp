@@ -923,3 +923,10 @@ asmgen 零触碰 → dump 锚不受影响（无换代）。
   skip 模式 byte-exact = 零漏引运行期实证）；multiseed 335/335。
 - 至此 MIT-477 立案的 IAT 引用面全部闭环：x64 rip（477）+ x86 abs32
   （486）+ 数据指针（486）+ 完备性证据（487）+ 跳回填（488）。
+
+
+## MIT-489 (T21 · [mutate] junk_density 配置化) ✅ 2026-09-09
+- [mutate] junk_density（0-100，缺省 15）严格 schema 扩展；mutate 消
+  费 rules 哨兵；rng 抽取序不变（缺省注入与 MIT-485 基线逐字一致）。
+- 验证：ctest 23/23（+4 config 用例）；junk_density 0/100 两端 wvmpTest
+  103/103 绿；multiseed 335/335。MIT-485 披露遗留清偿。

@@ -201,6 +201,13 @@ void MutatePass::run(ProtectionContext& ctx) {
         (rules != nullptr && rules->has_mutate_density)
             ? static_cast<double>(rules->mutate_density) / 100.0
             : kNopProbability;
+    // MIT-489 (T21)：[mutate] junk_density 覆写 junk-Mov 概率（缺省 =
+    // kJunkMovProbability）。T6.6 生产重启用后，密度跟随配置化披露落地；
+    // rng 抽取序不受影响（chance() 消费序不变，仅阈值变）。
+    const double junk_probability =
+        (rules != nullptr && rules->has_mutate_junk_density)
+            ? static_cast<double>(rules->mutate_junk_density) / 100.0
+            : kJunkMovProbability;
 
     Rng rng(ctx.seed ^ kMutateSeedSalt);
     size_t junk_movs = 0, nops = 0, blocks_touched = 0;
@@ -348,7 +355,7 @@ void MutatePass::run(ProtectionContext& ctx) {
                             site_log += site_note(fn, blk_i, i, host, -1, false, 0);
                         }
                     } else if (kEnableJunkMov && !dead[i].empty() &&
-                               rng.chance(kJunkMovProbability)) {
+                               rng.chance(junk_probability)) {
                         // MIT-478 (T6)：dead[i] 已由区域级 CFG 反向活跃度背书
                         //（live_out(B) 折入后继可见性 + 隐式读补录），直接注入。
                         const size_t pick =

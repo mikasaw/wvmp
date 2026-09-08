@@ -2261,3 +2261,22 @@ span 从 native 侧取；极性改正；增补回调区 rep movs 扫描（x86 F3
 槽静默 continue 取消）；无 .wvmpc 回退单测补齐。修复后全链复跑：重建
 0 错、ctest 23/23、tls_e2e 4/4、红线负例（x86）rc=0xC0000005、池扫
 70/70。
+
+## MIT-489（T21，2026-09-09）——[mutate] junk_density 配置化（MIT-485 披露遗留清偿）
+
+**语义**：`[mutate] junk_density = 0..100`（百分比，在场时覆写缺省
+15%；0 = 关闭 junk 面保留 Nop 面；严格 schema 同 density：未知子键/
+非整数/超界拒绝）。ProtectRules 携 has_mutate_junk_density/
+mutate_junk_density（缺省哨兵 15）；mutate pass 以
+junk_probability = rules / 100.0 替代 kJunkMovProbability 直读。
+**rng 抽取序不变**（chance() 消费序恒定，仅阈值变）——同 seed 产物在
+"配置缺省"与"代码常量缺省"下逐字节一致（实测：缺省注入 239 = Mov 128
+/ Nop 111，与 MIT-485 基线逐字相同）。
+
+**行为验证**（wvmpTest seed 3）：junk_density=0 → Mov 0 / Nop 103
+（junk 关断面）103/103 绿；junk_density=100 → Mov 912 / Nop 101（每
+eligible 位全注入）103/103 绿——两端密度 + 缺省零漂移三面取证。
+
+**验证**：ctest 23/23（+4 config 用例：junk_density 解析/0 值/超界/
+非整数）；wvmpTest 双端密度运行绿；multiseed 335/335（管道无 mutate，
+零回踩门）。asmgen 零触碰。

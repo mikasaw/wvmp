@@ -313,14 +313,16 @@ ConfigResult parse_config(const std::filesystem::path& file) {
     // —— MIT-468 (T11)：保护参数三表（均可省略 = 现状缺省；子键严格
     // schema，未知子键显式拒绝——同顶层键的静默吞防线）。——
 
-    // [mutate] density = 0..100（nop 填充密度百分比；0 = 关闭填充）。
+    // [mutate] density = 0..100（nop 填充密度百分比；0 = 关闭填充）；
+    // junk_density = 0..100（MIT-489：junk-Mov 密度百分比，缺省 15，在场
+    // 时覆写；0 = 关闭 junk 面）。
     if (const toml::node* mutate_node = tbl.get("mutate")) {
         const toml::table* mt = mutate_node->as_table();
         if (!mt) return fail("config 字段 'mutate' 必须是表（[mutate]）");
         for (const auto& [key, value] : *mt)
-            if (key.str() != "density")
+            if (key.str() != "density" && key.str() != "junk_density")
                 return fail("config [mutate] 未知子键 '" + std::string(key.str()) +
-                            "'（允许: density）");
+                            "'（允许: density, junk_density）");
         const toml::node* dn = mt->get("density");
         if (dn == nullptr) return fail("config [mutate] 缺少子键 'density'");
         auto density = dn->value<std::int64_t>();
@@ -331,6 +333,16 @@ ConfigResult parse_config(const std::filesystem::path& file) {
                         + std::to_string(*density));
         result.value.rules.has_mutate_density = true;
         result.value.rules.mutate_density = static_cast<u32>(*density);
+        if (const toml::node* jd = mt->get("junk_density")) {
+            auto junk = jd->value<std::int64_t>();
+            if (!junk)
+                return fail("config [mutate] 'junk_density' 必须是整数（0-100）");
+            if (*junk < 0 || *junk > 100)
+                return fail("config [mutate] 'junk_density' 超界（0-100）："
+                            + std::to_string(*junk));
+            result.value.rules.has_mutate_junk_density = true;
+            result.value.rules.mutate_junk_density = static_cast<u32>(*junk);
+        }
     }
 
     // [anti_debug] being_debugged / nt_global_flag / init（默认全开）。

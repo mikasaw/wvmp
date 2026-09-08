@@ -601,6 +601,55 @@ TEST(ConfigParse, CryptNonBoolFails) {
     EXPECT_TRUE(contains(result.error, "crypt"));
 }
 
+TEST(ConfigParse, MutateJunkDensityParses) {
+    const TempToml toml(
+        "input  = \"target.exe\"\n"
+        "output = \"out.exe\"\n"
+        "[mutate]\n"
+        "density = 20\n"
+        "junk_density = 40\n");
+    const auto result = wvmp::cli::parse_config(toml.path());
+    ASSERT_TRUE(result.ok) << result.error;
+    EXPECT_TRUE(result.value.rules.has_mutate_junk_density);
+    EXPECT_EQ(result.value.rules.mutate_junk_density, 40u);
+}
+
+TEST(ConfigParse, MutateJunkDensityZeroOk) {
+    const TempToml toml(
+        "input  = \"target.exe\"\n"
+        "output = \"out.exe\"\n"
+        "[mutate]\n"
+        "density = 10\n"
+        "junk_density = 0\n");
+    const auto result = wvmp::cli::parse_config(toml.path());
+    ASSERT_TRUE(result.ok) << result.error;
+    EXPECT_EQ(result.value.rules.mutate_junk_density, 0u);
+}
+
+TEST(ConfigParse, MutateJunkDensityOutOfRangeFails) {
+    const TempToml toml(
+        "input  = \"target.exe\"\n"
+        "output = \"out.exe\"\n"
+        "[mutate]\n"
+        "density = 10\n"
+        "junk_density = 101\n");
+    const auto result = wvmp::cli::parse_config(toml.path());
+    ASSERT_FALSE(result.ok);
+    EXPECT_TRUE(contains(result.error, "junk_density"));
+}
+
+TEST(ConfigParse, MutateJunkDensityNonIntFails) {
+    const TempToml toml(
+        "input  = \"target.exe\"\n"
+        "output = \"out.exe\"\n"
+        "[mutate]\n"
+        "density = 10\n"
+        "junk_density = \"lots\"\n");
+    const auto result = wvmp::cli::parse_config(toml.path());
+    ASSERT_FALSE(result.ok);
+    EXPECT_TRUE(contains(result.error, "junk_density"));
+}
+
 TEST(ConfigParse, ImportSkipBackfillParses) {
     const TempToml toml(
         "input  = \"target.exe\"\n"
