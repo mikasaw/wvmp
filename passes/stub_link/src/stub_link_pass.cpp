@@ -319,6 +319,35 @@ void StubLinkPass::run(ProtectionContext& ctx) {
     data_payload.resize(static_cast<size_t>(data_total), 0);
     ctx.slot<u64>(kEmitReserveBase) = blobs_total;
 
+    // MIT-494 (T26)：stub/buffer 内绝对 VA 站点登记（.reloc 扩展数据源）。
+    // 只扫自产 payload——buffer 内命中即真实 VA（全镜像扫描存在结构化数
+    // 据假阳：误登记 = loader 对非 VA 值加 delta = 静默损坏）。条目 = 载
+    // 荷内偏移 + 节 requested_rva。
+    {
+        const size_t w = is_x86 ? 4 : 8;
+        u64 span_end = 0;
+        for (const auto& s : pe->sections)
+            span_end = std::max<u64>(
+                span_end, u64(s.virtual_addr) +
+                              std::max(u64(s.virtual_size), u64(s.raw_size)));
+        span_end = std::max<u64>(
+            span_end, u64(data_section_rva) + data_total + kEmitReserveBytes);
+        span_end = std::max<u64>(span_end, u64(code_rva) + code_payload.size());
+        const u64 ib = pe->image_base;
+        auto& sites = ctx.slot<std::vector<u32>>(kRelocSites);
+        auto scan = [&](const std::vector<u8>& buf, u32 base_rva) {
+            for (size_t o = 0; o + w <= buf.size(); ++o) {
+                u64 v = 0;
+                for (size_t i = 0; i < w; ++i)
+                    v |= u64(buf[o + i]) << (8 * i);
+                if (v >= ib && v - ib < span_end)
+                    sites.push_back(base_rva + static_cast<u32>(o));
+            }
+        };
+        scan(data_payload, static_cast<u32>(data_section_rva));
+        scan(code_payload, static_cast<u32>(code_rva));
+    }
+
     // —— 新节请求交给 pe_writer（MIT-472 W^X 拆节：两节）——
     // .wvmp（RW，0xC0000040）：字节码 blob 等数据面（解密期被写）。
     // .wvmpc（RX，0x60000020）：解释器 + 入口 stub 代码面（只执行不写）。

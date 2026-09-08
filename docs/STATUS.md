@@ -966,3 +966,14 @@ asmgen 零触碰 → dump 锚不受影响（无换代）。
   区策略 + DYNAMIC_BASE 保留）。实现另立单。
 - PoC 脚本入库：scripts/experiments/aslr_poc.py（--no-reloc 对照模
   式）。
+
+
+## MIT-494 (T26 · ASLR 兼容实现) ✅ 2026-09-09
+- 发射点登记（kRelocSites：stub_link/tls_hook/import_protect）+
+  pe_writer reloc 目录 .wvmp 预留区扩展（原块拷贝 + 分页新块 + 去重）
+  + DllCharacteristics 条件化（DYNAMIC_BASE 保留/清除）+ [pe] aslr
+  配置（缺省 true）。
+- 验证：ctest 23/23（+6 用例）；wvmpTest 双跑 103/103（ASLR 路径）；
+  tls_e2e 4/4；multiseed 335/335；迁移真值对照（撤扩展即崩）。
+- 产品缺省行为变化披露：native 带 DYNAMIC_BASE 的目标，保护后**不再
+  清除**该位（ASLR 兼容）；[pe] aslr=false 回退 M2-8 行为。

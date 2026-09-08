@@ -6,6 +6,12 @@ inline constexpr std::string_view kImage="image", kFunctions="functions", kLifte
 // 末端；import_protect/tls_hook 读写推进）。类型 u64，槽未置 = 旧"尾部
 // 追加"语义（旧夹具/单测兼容）。
 inline constexpr std::string_view kEmitReserveBase="pe.emit_reserve_base";
+// MIT-494 ASLR 兼容：packer 发射的绝对 VA 站点 RVA 表（stub_link/tls_hook/
+// import_protect 发射点登记 → pe_writer 消费生成 .reloc 扩展块）。类型
+// std::vector<u32>（站点 RVA）。发射点登记优于全镜像事后扫描——扫描在
+// 全镜像粒度存在结构化数据假阳（误登记 = loader 对非 VA 值加 delta =
+// 静默数据损坏，MIT-494 开发实录）；生产方只扫自产小 buffer，命中即真。
+inline constexpr std::string_view kRelocSites="pe.reloc_sites";
 // pe_loader 产出的 PE 结构模型（PeImage）所在扩展槽——M1 起为 marker_scan/lifter
 // 等分析类 pass 的共享依赖（提供方：pe_loader）。
 inline constexpr std::string_view kPeImage="pe.image_meta";

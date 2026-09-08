@@ -11,6 +11,7 @@
 
 #include "wvmp/framework/context.hpp"
 #include "wvmp/framework/keys.hpp"
+#include "wvmp/framework/protect_levels.hpp"
 
 #include <gtest/gtest.h>
 
@@ -256,6 +257,132 @@ TEST(PeWriterPass, UnwritableOutputPathFails) {
     wvmp::passes::PeWriterPass writer;
     EXPECT_THROW(writer.run(ctx), std::runtime_error);
     EXPECT_TRUE(ctx.diag.has_errors());
+}
+
+// —— MIT-494 (T26)：ASLR reloc 扩展 ————————————————————————————
+
+// 夹具：最小 PE + native DYNAMIC_BASE/ reloc 块（覆盖 .text 内 1 个
+// native 站点 @0x1400）+ .wvmp/.wvmpc 载荷 + 发射点登记表。aslr_on=
+// false 时不置 native DYNAMIC_BASE（native 未 opt-in 分支）。
+static void make_aslr_fixture(ProtectionContext& ctx, bool aslr_on,
+                              const std::vector<u32>& sites) {
+    std::vector<u8> bytes = build_minimal_pe(true, kMachineX64);
+    const size_t opt = kNt + 24;  // OptionalHeader
+    if (aslr_on) {
+        const u16 ch = static_cast<u16>(rd32(bytes, opt + 0x46) & 0xFFFF);
+        put16(bytes, opt + 0x46, static_cast<u16>(ch | 0x0040));
+    }
+    // 原 reloc：单块 PageRva=0x1000，1 个 DIR64 站点 @0x400；块体放
+    // .text raw 内（0x380），dd[5] = (.text VA + 0x180, 16)。
+    const size_t blk_off = 0x380;
+    put32(bytes, blk_off, 0x1000);       // PageRva
+    put32(bytes, blk_off + 4, 16);       // SizeOfBlock（头 + 1 条目 + 垫）
+    put16(bytes, blk_off + 8, static_cast<u16>(10 << 12 | 0x400));
+    put16(bytes, blk_off + 10, 0);       // ABSOLUTE 垫
+    put32(bytes, opt + 112 + 5 * 8, 0x1180);
+    put32(bytes, opt + 112 + 5 * 8 + 4, 16);
+
+    ctx.image = bytes;
+    ctx.output_path = temp_dir() / "aslr_case.exe";
+    wvmp::passes::NewSection wvmp;
+    wvmp.name = ".wvmp";
+    wvmp.data.assign(0x100 + wvmp::passes::kEmitReserveBytes, 0);
+    wvmp.requested_rva = 0x2000u;
+    wvmp.characteristics = 0xC0000040u;
+    wvmp::passes::NewSection wvmpc;
+    wvmpc.name = ".wvmpc";
+    wvmpc.data.assign(0x40, 0);
+    // 连续性：.wvmp 虚拟末端 = align(0x2000 + 0x2100, 0x1000) = 0x5000。
+    wvmpc.requested_rva = 0x5000u;
+    wvmpc.characteristics = 0x60000020u;
+    auto& secs =
+        ctx.slot<std::vector<wvmp::passes::NewSection>>(wvmp::kNewSections);
+    secs.push_back(wvmp);
+    secs.push_back(wvmpc);
+    ctx.slot<std::vector<u32>>(wvmp::kRelocSites) = sites;
+}
+
+TEST(PeWriterPass, EmitRelocExtensionRepointsDirectory) {
+    ProtectionContext ctx;
+    make_aslr_fixture(ctx, /*aslr_on=*/true, {0x5008, 0x5010});
+    wvmp::passes::PeWriterPass writer;
+    writer.run(ctx);
+
+    // DYNAMIC_BASE 保留。
+    const u16 ch = static_cast<u16>(rd32(ctx.image, kNt + 24 + 0x46) & 0xFFFF);
+    EXPECT_NE(ch & 0x0040, 0u);
+
+    // dd[5] 重指 .wvmp（保持原值 0x1180 即失败形态）。
+    const u32 rva = rd32(ctx.image, kNt + 24 + 112 + 5 * 8);
+    const u32 sz = rd32(ctx.image, kNt + 24 + 112 + 5 * 8 + 4);
+    // 落点 = .wvmp blobs 末端（0x2000 + 0x2100 = 0x4100）。
+    EXPECT_GE(rva, 0x2000u);
+    EXPECT_LE(rva, 0x4100u);
+    EXPECT_NE(rva, 0x1180u);
+
+    // 经节表定位 .wvmp raw，遍历 reloc 块：闭合、含登记站点 0x5008、
+    // 原生站点 0x1400 恰好一次（双重 delta 防线）。
+    const u16 nsec = static_cast<u16>(rd32(ctx.image, kNt + 6) & 0xFFFF);
+    const u16 optsz = static_cast<u16>(rd32(ctx.image, kNt + 20) & 0xFFFF);
+    const size_t opt2 = kNt + 24;
+    u64 ro = 0;
+    for (u16 i = 0; i < nsec && ro == 0; ++i) {
+        const size_t sh = opt2 + optsz + size_t(i) * 40;
+        if (std::memcmp(&ctx.image[sh], ".wvmp\0", 6) == 0) {
+            const u32 va = rd32(ctx.image, sh + 12);
+            const u32 rp = rd32(ctx.image, sh + 20);
+            ro = u64(rp) + (rva - va);
+        }
+    }
+    ASSERT_NE(ro, 0u);
+    u32 pos = 0;
+    int blocks = 0;
+    bool has_5008 = false;
+    int native_1400_count = 0;
+    while (pos + 8 <= sz) {
+        const u32 page = rd32(ctx.image, size_t(ro) + pos);
+        const u32 bsz = rd32(ctx.image, size_t(ro) + pos + 4);
+        ASSERT_GE(bsz, 8u);
+        ASSERT_LE(pos + bsz, sz);
+        for (u32 k = 0; k < (bsz - 8) / 2; ++k) {
+            const u16 ent = static_cast<u16>(
+                rd32(ctx.image, size_t(ro) + pos + 8 + k * 2) & 0xFFFF);
+            if (ent >> 12 == 10) {
+                const u32 site = page + (ent & 0xFFF);
+                if (site == 0x5008) has_5008 = true;
+                // 原生站点恰好一次（原块拷贝保留；不得重复登记）。
+                if (site == 0x1400) ++native_1400_count;
+            }
+        }
+        pos += bsz;
+        ++blocks;
+    }
+    EXPECT_GE(blocks, 2);          // 原块 + 新块
+    EXPECT_TRUE(has_5008);
+    EXPECT_EQ(native_1400_count, 1);
+}
+
+TEST(PeWriterPass, EmitRelocAslrDisabledClearsFlag) {
+    ProtectionContext ctx;
+    make_aslr_fixture(ctx, /*aslr_on=*/true, {0x5008});
+    auto& rules = ctx.slot<wvmp::ProtectRules>(wvmp::kProtectRules);
+    rules.has_pe_aslr = true;
+    rules.pe_aslr = false;  // [pe] aslr=false
+    wvmp::passes::PeWriterPass writer;
+    writer.run(ctx);
+    const u16 ch = static_cast<u16>(rd32(ctx.image, kNt + 24 + 0x46) & 0xFFFF);
+    EXPECT_EQ(ch & 0x0040, 0u);  // 维持清除
+    EXPECT_EQ(rd32(ctx.image, kNt + 24 + 112 + 5 * 8), 0x1180u);  // dd[5] 未动
+}
+
+TEST(PeWriterPass, EmitRelocNativeNotAslrClearsFlag) {
+    // native 未声明 DYNAMIC_BASE → 保守清除（扩展跳过）。
+    ProtectionContext ctx;
+    make_aslr_fixture(ctx, /*aslr_on=*/false, {0x5008});
+    wvmp::passes::PeWriterPass writer;
+    writer.run(ctx);
+    const u16 ch = static_cast<u16>(rd32(ctx.image, kNt + 24 + 0x46) & 0xFFFF);
+    EXPECT_EQ(ch & 0x0040, 0u);
 }
 
 // —— MIT-491 (T23)：Emit 预留区高水位观测 ————————————————————————

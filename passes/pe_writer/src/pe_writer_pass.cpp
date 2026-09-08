@@ -6,11 +6,15 @@
 #include "wvmp/common/bytes.hpp"
 #include "wvmp/framework/context.hpp"
 #include "wvmp/framework/keys.hpp"
+#include "wvmp/framework/protect_levels.hpp"
 #include "wvmp/framework/registry.hpp"
 #include "wvmp/passes/pe_loader/pe_image.hpp"
 #include "wvmp/passes/tls_hook/tls_plan.hpp"
 
 #include <cstdio>
+#include <map>
+#include <optional>
+#include <set>
 #include <filesystem>
 #include <fstream>
 #include <stdexcept>
@@ -65,6 +69,14 @@ size_t opt_num_rva_sizes_off(bool plus) { return plus ? 108u : 92u; }
 size_t opt_data_dir_off(bool plus) { return plus ? 112u : 96u; }
 constexpr size_t kTlsDirIndex = 9;
 
+// MIT-494：小端读（reloc 扩展解析用；与 import_protect 同名 helper 独立
+// 声明——模块边界约定）。
+u64 rd_le(const u8* p, size_t n) {
+    u64 v = 0;
+    for (size_t i = 0; i < n; ++i) v |= u64(p[i]) << (8 * i);
+    return v;
+}
+
 } // namespace
 
 std::span<const std::string_view> PeWriterPass::requires_keys() const {
@@ -114,6 +126,161 @@ void PeWriterPass::run(ProtectionContext& ctx) {
                 }
                 break;
             }
+
+    // MIT-494 (T26，MIT-493 定案实现)：ASLR 兼容——native 声明了
+    // DYNAMIC_BASE 且带 .reloc 时，保留 DYNAMIC_BASE 并把 reloc 目录扩
+    // 展为「原块拷贝 + packer 面 DIR64/HIGHLOW 新块」，整体拷入 .wvmp
+    // 预留区（单连续区间，dd[5] 重指；预算 = 8KB 预留，远超典型 3KB
+    // reloc + 数百站点）。packer 站点 = 字节粒度扫描 [ImageBase,
+    // ImageBase+span) 内的全宽值（发射点登记的替代形态：keystone 装配
+    // 的 imm 偏移难以静态映射，扫描假阳率 ≈ span/2^64 ≈ 0，MIT-493
+    // PoC 实证）。原 reloc 已覆盖站点去重（双重 delta = 错位）。
+    // native 未声明 DYNAMIC_BASE / 无 .reloc / 配置 [pe] aslr=false →
+    // 跳过扩展（DllCharacteristics 面维持清除语义）。
+    bool aslr_extended = false;
+    const bool aslr_enabled =
+        [](ProtectionContext& c) {
+            const auto* rules = c.find_slot<ProtectRules>(kProtectRules);
+            return rules == nullptr || !rules->has_pe_aslr || rules->pe_aslr;
+        }(ctx);
+    NewSection* wvmp_sec = nullptr;
+    if (auto* sections = ctx.find_slot<std::vector<NewSection>>(kNewSections))
+        for (auto& s : *sections)
+            if (s.name == ".wvmp") { wvmp_sec = &s; break; }
+    if (aslr_enabled && wvmp_sec != nullptr && !ctx.image.empty()) {
+        const size_t e_off = static_cast<size_t>(
+            ctx.image[0x3C]) | (static_cast<size_t>(ctx.image[0x3D]) << 8) |
+            (static_cast<size_t>(ctx.image[0x3E]) << 16) |
+            (static_cast<size_t>(ctx.image[0x3F]) << 24);
+        if (e_off + 24 + 2 <= ctx.image.size() &&
+            ctx.image[e_off] == 'P' && ctx.image[e_off + 1] == 'E') {
+            const size_t opt_off = e_off + 24;
+            // Magic 高字节：0x020B(PE32+) → 0x02 / 0x010B(PE32) → 0x01。
+            const bool plus = ctx.image[opt_off + 1] == 0x02;
+            const u16 want_type = plus ? 10 : 3;  // DIR64 / HIGHLOW
+            const size_t dd5 = opt_off + opt_data_dir_off(plus) + 5 * 8;
+            const u32 old_rva =
+                u32(rd_le(ctx.image.data() + dd5, 4));
+            const u32 old_size =
+                u32(rd_le(ctx.image.data() + dd5 + 4, 4));
+            const u16 dllchars =
+                u16(rd_le(ctx.image.data() + opt_off + 0x46, 2));
+            const bool native_aslr =
+                (dllchars & kImageDllCharacteristicsDynamicBase) != 0;
+            if (native_aslr && old_size > 0 && old_rva != 0) {
+                // —— 原 reloc 块拷贝 + 已覆盖站点集 ——
+                const auto old_off = [&]() -> std::optional<size_t> {
+                    u16 num = u16(rd_le(ctx.image.data() + e_off + 6, 2));
+                    size_t sh = opt_off +
+                                u16(rd_le(ctx.image.data() + e_off + 20, 2));
+                    for (u16 i = 0; i < num; ++i) {
+                        const size_t o = sh + size_t(i) * 40;
+                        const u32 va =
+                            u32(rd_le(ctx.image.data() + o + 12, 4));
+                        const u32 rs =
+                            u32(rd_le(ctx.image.data() + o + 16, 4));
+                        const u32 rp =
+                            u32(rd_le(ctx.image.data() + o + 20, 4));
+                        const u32 vs =
+                            u32(rd_le(ctx.image.data() + o + 8, 4));
+                        const u32 ext = rs > vs ? rs : vs;
+                        if (va <= old_rva && old_rva + old_size <= va + ext)
+                            return size_t(rp) + (old_rva - va);
+                    }
+                    return std::nullopt;
+                }();
+                if (old_off.has_value() &&
+                    u64(*old_off) + old_size <= ctx.image.size()) {
+                    std::set<u32> covered;
+                    {
+                        size_t pos = 0;
+                        const u8* rp = ctx.image.data() + *old_off;
+                        while (pos + 8 <= old_size) {
+                            const u32 page = u32(rd_le(rp + pos, 4));
+                            const u32 bsz = u32(rd_le(rp + pos + 4, 4));
+                            if (bsz < 8 || pos + bsz > old_size) break;
+                            for (u32 i = 0; i < (bsz - 8) / 2; ++i) {
+                                const u16 ent =
+                                    u16(rd_le(rp + pos + 8 + i * 2, 2));
+                                if (u16(ent >> 12) == want_type)
+                                    covered.insert(
+                                        page + u32(ent & 0x0FFF));
+                            }
+                            pos += bsz;
+                        }
+                    }
+                    // —— packer 站点（发射点登记表；MIT-493 首选形态）——
+                    // 生产方只登记自产 buffer 中的真实 VA（全镜像扫描存在
+                    // 结构化数据假阳：误登记 = loader 对非 VA 值加 delta =
+                    // 静默数据损坏，MIT-494 开发实录）。
+                    std::set<u32> new_sites;
+                    if (auto* sites =
+                            ctx.find_slot<std::vector<u32>>(kRelocSites))
+                        for (const u32 rva : *sites) new_sites.insert(rva);
+                    if (!new_sites.empty()) {
+                        // —— 页分组 → 追加块 ——
+                        std::map<u32, std::set<u32>> pages;
+                        for (const u32 rva : new_sites)
+                            pages[rva & ~u32(0xFFF)].insert(rva & 0xFFF);
+                        std::vector<u8> blob(
+                            ctx.image.begin() + *old_off,
+                            ctx.image.begin() + *old_off + old_size);
+                        if (blob.size() % 8 != 0)
+                            blob.resize(
+                                (blob.size() + 7) / 8 * 8, 0);
+                        for (const auto& [page, offs] : pages) {
+                            std::vector<u8> ents;
+                            for (const u32 off : offs)
+                                for (int b = 0; b < 2; ++b)
+                                    ents.push_back(static_cast<u8>(
+                                        ((want_type << 12 | off) >> (8 * b)) &
+                                        0xFF));
+                            while (ents.size() % 8 != 0) ents.push_back(0);
+                            u32 bsz = static_cast<u32>(8 + ents.size());
+                            for (int b = 0; b < 4; ++b)
+                                blob.push_back(static_cast<u8>(
+                                    (page >> (8 * b)) & 0xFF));
+                            for (int b = 0; b < 4; ++b)
+                                blob.push_back(static_cast<u8>(
+                                    (bsz >> (8 * b)) & 0xFF));
+                            blob.insert(blob.end(), ents.begin(), ents.end());
+                        }
+                        // —— 拷入 .wvmp 预留区并重指 dd[5] ——
+                        u64 cur = wvmp_sec->data.size();
+                        bool grow_ok = true;
+                        if (auto* r = ctx.find_slot<u64>(kEmitReserveBase)) {
+                            cur = *r;
+                            grow_ok = false;
+                        }
+                        const u64 copy_off = emit_reserve_take(
+                            wvmp_sec->data, cur, 8, blob.size(), grow_ok);
+                        std::memcpy(wvmp_sec->data.data() + copy_off,
+                                    blob.data(), blob.size());
+                        if (auto* r = ctx.find_slot<u64>(kEmitReserveBase))
+                            *r = cur;
+                        const u64 new_rva =
+                            wvmp_sec->requested_rva + copy_off;
+                        ByteWriter wt(ctx.image);
+                        wt.patch_u32(dd5, static_cast<u32>(new_rva));
+                        wt.patch_u32(dd5 + 4,
+                                     static_cast<u32>(blob.size()));
+                        aslr_extended = true;
+                        char rb[160];
+                        std::snprintf(rb, sizeof(rb),
+                                      "ASLR 兼容：reloc 目录已扩展（+ %zu "
+                                      "站点 / %zu 字节）→ .wvmp @ RVA 0x%llX",
+                                      new_sites.size(), blob.size(),
+                                      static_cast<unsigned long long>(new_rva));
+                        ctx.diag.report(Severity::Note, name(), rb);
+                    } else {
+                        // 无 packer 新站点：原 reloc 已完整覆盖（native 面
+                        // 自足），保留 DYNAMIC_BASE 即可，无需扩展。
+                        aslr_extended = true;
+                    }
+                }
+            }
+        }
+    }
 
     // 1) 落位新节（kNewSections 槽；stub_link 等 Emit 阶段产出）——必须在
     //    checksum 之前，校验失败则整体失败（镜像不被部分修改）。
@@ -200,12 +367,21 @@ void PeWriterPass::run(ProtectionContext& ctx) {
     //   MVP P0 #3 替代方案 A 完整动机: 详见 kDllCharsClearMask 上方注释块。
     const auto* new_sections_check = ctx.find_slot<std::vector<NewSection>>(kNewSections);
     const bool has_stub = new_sections_check != nullptr && !new_sections_check->empty();
+    // MIT-494：DYNAMIC_BASE 仅在"ASLR 路径未成立"时清除——
+    //   配置关断（[pe] aslr=false）或扩展未成功（native 未 opt-in / 无
+    //   reloc / 无站点可扩展且原目录缺失）。扩展成功（aslr_extended，
+    //   含"无新站点、原目录自足"分支）→ 保留 DYNAMIC_BASE。
+    const bool keep_dynamic_base = aslr_enabled && aslr_extended;
+    const u16 dll_clear_mask =
+        keep_dynamic_base
+            ? static_cast<u16>(kImageDllCharacteristicsForceIntegrity)
+            : kDllCharsClearMask;
     if (has_stub &&
         nt_off + kDllCharsOffsetFromNt + 2 <= ctx.image.size()) {
         const u16 old_dll =
             static_cast<u16>(static_cast<u16>(ctx.image[nt_off + kDllCharsOffsetFromNt]) |
                             (static_cast<u16>(ctx.image[nt_off + kDllCharsOffsetFromNt + 1]) << 8));
-        const u16 new_dll = static_cast<u16>(old_dll & ~kDllCharsClearMask);
+        const u16 new_dll = static_cast<u16>(old_dll & ~dll_clear_mask);
         if (new_dll != old_dll) {
             ctx.image[nt_off + kDllCharsOffsetFromNt] = static_cast<u8>(new_dll & 0xFF);
             ctx.image[nt_off + kDllCharsOffsetFromNt + 1] = static_cast<u8>((new_dll >> 8) & 0xFF);

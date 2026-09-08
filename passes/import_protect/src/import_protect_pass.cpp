@@ -676,11 +676,15 @@ void ImportProtectPass::run(ProtectionContext& ctx) {
             const u8 ff_stub[8] = {0x31, 0xC0, 0xC7, 0x00, 0x00, 0x00, 0x00, 0x00};
             std::memcpy(wvmpc->data.data() + ff_off, ff_stub, 8);
             const u64 stub_va = pe->image_base + wvmpc->requested_rva + ff_off;
+            // MIT-494：skip 模式原 IAT 全槽 = 桩 VA → 全部为绝对 VA 站点，
+            // 登记（.reloc 扩展数据源；backfill 模式无此面）。
+            auto& sites = ctx.slot<std::vector<u32>>(kRelocSites);
             for (u64 off_in = 0; off_in + w <= span; off_in += w) {
                 const auto so = pe->rva_to_offset(u32(base + off_in));
                 for (size_t b = 0; b < w; ++b)
                     ctx.image[*so + b] =
                         static_cast<u8>((stub_va >> (8 * b)) & 0xFF);
+                sites.push_back(u32(base + off_in));
             }
             skip_backfill = true;
             failfast_rva = wvmpc->requested_rva + ff_off;

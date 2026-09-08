@@ -627,6 +627,33 @@ void TlsHookPass::run(ProtectionContext& ctx) {
     // 回调桩 → 代码节 .wvmpc（RX）；index/数组/目录 → 数据节 .wvmp（RW）。
     wvmpc->data.resize(static_cast<size_t>(cb_off), 0);
     wvmpc->data.insert(wvmpc->data.end(), stub.begin(), stub.end());
+    // MIT-494：绝对 VA 站点登记（.reloc 扩展数据源）——TLS 目录 4 个 VA
+    // 字段、回调数组（我们的 + 原回调拷贝；NULL 不登记）、回调桩 blob 内
+    // 的装配即时数（page/mirror/oldprot/vp/ctx/gtc/rdtsc 槽 VA；自产
+    // buffer 扫描，命中即真 VA）。ASLR 下 loader 对登记站点应用 delta。
+    {
+        auto& sites = ctx.slot<std::vector<u32>>(kRelocSites);
+        for (u64 off = dir_off; off < dir_off + 4 * ptr_w; off += ptr_w)
+            sites.push_back(static_cast<u32>(sec_rva + off));
+        sites.push_back(static_cast<u32>(array_rva));
+        for (size_t i = 0; i < orig.callbacks.size(); ++i)
+            sites.push_back(static_cast<u32>(array_rva + (i + 1) * ptr_w));
+        u64 span_end = 0;
+        for (const auto& s : pe->sections)
+            span_end = std::max<u64>(
+                span_end, u64(s.virtual_addr) +
+                              std::max(u64(s.virtual_size), u64(s.raw_size)));
+        span_end = std::max<u64>(
+            span_end, u64(wvmpc->requested_rva) + cb_off + stub.size());
+        const u64 ib = base;
+        for (size_t o = 0; o + ptr_w <= stub.size(); ++o) {
+            u64 v = 0;
+            for (size_t i = 0; i < ptr_w; ++i)
+                v |= u64(stub[o + i]) << (8 * i);
+            if (v >= ib && v - ib < span_end)
+                sites.push_back(static_cast<u32>(cb_rva + o));
+        }
+    }
     {
         // index 槽（加载器写 TLS slot index）+ 数组 + 目录字段：预留区内直写。
         u8* base_p = wvmp->data.data();

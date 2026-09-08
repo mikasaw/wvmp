@@ -2351,3 +2351,34 @@ reloc 块——.reloc slack 预算有限（tls 样本 436B≈208 站点、wvmpTe
 loader 锁内先于 TLS 回调（PoC 中 adb/rdtsc 面即依赖此序，byte-exact
 为证）；② 强签名/强制完整性镜像的 reloc 语义（FORCE_INTEGRITY 仍清
 除，无关）；③ 大样本池 ASLR 全量回归为实现单验收主体。
+
+## MIT-494（T26，2026-09-09）——ASLR 兼容实现：发射点登记 + reloc 目录 .wvmp 预留区扩展
+
+**架构（MIT-493 方案落地）**：
+① **发射点登记**（framework keys 新槽 kRelocSites = vector<u32>）——
+stub_link（stub/data payload 成品处自产 buffer 扫描）、tls_hook（TLS 目录
+4 VA 字段精确登记 + 回调数组 + 回调桩 blob 扫描）、import_protect
+（skip 模式原 IAT 全槽）。生产方只扫自产 buffer：命中即真 VA。
+② **pe_writer 消费**：原 reloc 块整体拷入 .wvmp 预留区（单连续区间，
+dd[5] 重指；预算 = 8KB 预留 ≫ 典型 3KB reloc + 数百站点），追加登记
+站点分页 DIR64/HIGHLOW 块；原覆盖站点去重（双重 delta 防线，单测断
+言 native 站点恰现一次）。
+③ **DllCharacteristics 条件化**：FORCE_INTEGRITY 恒清；DYNAMIC_BASE
+仅在「native 声明 + [pe] aslr≠false + 扩展成功（含无新站点的原目录自
+足分支）」时保留，否则清除（native 未 opt-in → 保守回退 M2-8 行为）。
+④ **配置**：[pe] aslr（缺省 true；false = 关断维持旧行为）。
+
+**开发实录三坑**：① plus 判定 `image[opt+1] == 0x20` 应为 `0x02`
+（0x020B 高字节）——错值使扩展静默跳过（gate 无 Note 掩盖）；② 全镜
+像扫描路线（初版）在 wvmpTest 登记出 2194 个 .rdata 假阳站点（结构化
+数据 (rva, 0x01000040) 对恰好别名 VA 区间）——误登记 = loader 对非
+VA 值加 delta = 静默损坏，本次运行侥幸全绿不可依赖；返工为发射点登
+记后 wvmpTest 站点数 1087→28（纯 stub 面）。③ 单测夹具 .wvmpc 落点
+须取 .wvmp 虚拟末端**向上**对齐（align(0x4100,0x1000)=0x5000，向下的
+0x4000 触发连续性硬拒）。
+
+**验证**：ctest 23/23（+6 用例：pe_writer 扩展三策略分支 + config 三
+态）；wvmpTest 双跑（base/mutate，ASLR 路径全走）各 103/103；tls_e2e
+4/4；multiseed 335/335（全部产物走 ASLR 路径）；**迁移真值对照**：撤
+销 dd[5] 扩展 + 保留 DYNAMIC_BASE → base 面崩（127）/ mutate 面
+0xC0000409，扩展产物 rc=0——delta≠0 下扩展为必要性证明。

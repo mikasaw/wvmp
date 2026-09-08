@@ -664,6 +664,41 @@ TEST(ConfigParse, MutateJunkDensityNonIntFails) {
     EXPECT_TRUE(contains(result.error, "junk_density"));
 }
 
+TEST(ConfigParse, PeAslrParses) {
+    const TempToml toml(
+        "input  = \"target.exe\"\n"
+        "output = \"out.exe\"\n"
+        "[pe]\n"
+        "aslr = true\n");
+    const auto result = wvmp::cli::parse_config(toml.path());
+    ASSERT_TRUE(result.ok) << result.error;
+    EXPECT_TRUE(result.value.rules.has_pe_aslr);
+    EXPECT_TRUE(result.value.rules.pe_aslr);
+}
+
+TEST(ConfigParse, PeAslrFalseParses) {
+    const TempToml toml(
+        "input  = \"target.exe\"\n"
+        "output = \"out.exe\"\n"
+        "[pe]\n"
+        "aslr = false\n");
+    const auto result = wvmp::cli::parse_config(toml.path());
+    ASSERT_TRUE(result.ok) << result.error;
+    EXPECT_TRUE(result.value.rules.has_pe_aslr);
+    EXPECT_FALSE(result.value.rules.pe_aslr);
+}
+
+TEST(ConfigParse, PeUnknownSubkeyFails) {
+    const TempToml toml(
+        "input  = \"target.exe\"\n"
+        "output = \"out.exe\"\n"
+        "[pe]\n"
+        "mode = \"x\"\n");
+    const auto result = wvmp::cli::parse_config(toml.path());
+    ASSERT_FALSE(result.ok);
+    EXPECT_TRUE(contains(result.error, "aslr"));
+}
+
 TEST(ConfigParse, ImportSkipBackfillParses) {
     const TempToml toml(
         "input  = \"target.exe\"\n"

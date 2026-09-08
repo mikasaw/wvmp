@@ -123,7 +123,7 @@ ConfigResult parse_config(const std::filesystem::path& file) {
     constexpr std::string_view kTopLevelKeys[] = {"input", "output", "seed", "arch",
                                                   "default_level", "functions", "passes",
                                                   "mutate", "anti_debug", "tls", "crypt",
-                                                  "import"};
+                                                  "import", "pe"};
     for (const auto& [key, value] : tbl) {
         bool known = false;
         for (auto k : kTopLevelKeys)
@@ -430,6 +430,24 @@ ConfigResult parse_config(const std::filesystem::path& file) {
             return fail("config [import] 'skip_backfill' 必须是布尔值");
         result.value.rules.has_import_skip_backfill = true;
         result.value.rules.import_skip_backfill = *skip;
+    }
+
+    // [pe] aslr（默认 true；true = 保留 native DYNAMIC_BASE + .reloc 扩展
+    // ——MIT-494 ASLR 兼容；false = 清 DYNAMIC_BASE 维持 M2-8 行为）。
+    if (const toml::node* pe_node = tbl.get("pe")) {
+        const toml::table* pt = pe_node->as_table();
+        if (!pt) return fail("config 字段 'pe' 必须是表（[pe]）");
+        for (const auto& [key, value] : *pt)
+            if (key.str() != "aslr")
+                return fail("config [pe] 未知子键 '" + std::string(key.str()) +
+                            "'（允许: aslr）");
+        const toml::node* ab = pt->get("aslr");
+        if (ab == nullptr) return fail("config [pe] 缺少子键 'aslr'");
+        auto aslr = ab->value<bool>();
+        if (!aslr)
+            return fail("config [pe] 'aslr' 必须是布尔值");
+        result.value.rules.has_pe_aslr = true;
+        result.value.rules.pe_aslr = *aslr;
     }
 
     result.ok = true;
