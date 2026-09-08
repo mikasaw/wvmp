@@ -2314,3 +2314,39 @@ oldprot + tls_hook CONTEXT/rdtsc/TLS 面）游标推进的最终汇点，单点�
 三用例。红例即正例本身（Note 出现即被断言捕获；篡改阈值两侧即翻转）。
 夹具坑：.wvmp requested_rva 必须紧接最小 PE 节尾 0x2000（连续性硬拒
 ≠ 水位逻辑问题）；游标语义 = reserve_start + used（勿从节尾倒推）。
+
+## MIT-493（T25 侦察单，2026-09-09）——ASLR 兼容性调查：MIT-340 误诊反转，可行性定案
+
+**背景**：M2-8 起保护后恒清 DYNAMIC_BASE 强制加载到声明 ImageBase；
+MIT-340 时代 .reloc 扩展在 snake 样本 segfault，"Windows 加载器对保护
+后 .reloc 扩展存在未排查的行为差异"挂账至今。
+
+**绝对 VA 全域普查**（x64 tls 样本 seed 1 skip 模式，字节粒度）：92 处
+= native 面 79（原 .reloc 已覆盖，含 42 个 skip 桩值 IAT 槽）+ packer
+面 13（.wvmpc 7 代码 imm：TLS 回调 adb/drx/rdtsc/backfill 即时数 +
+**stub scratch_mem 写入 `movabs rax, ImageBase`**；.wvmp 6：TLS 目录/
+回调数组 VA）+ 头部 2。**packer 面在原 .reloc 中零覆盖**。
+
+**决定性对照实验**（脚本化：scripts/experiments/aslr_poc.py）：
+- PoC：.reloc 节 slack 内追加 3 页 DIR64 块（55 站点，+144B）+ 置
+  DYNAMIC_BASE → ASLR 加载 **rc=0，stdout 与 native byte-exact**；
+- 对照：仅置 DYNAMIC_BASE 不扩展 reloc → **rc=139 segfault**
+  （MIT-340 崩溃形态复现）。
+
+**裁定反转**：MIT-340"加载器行为差异"系**误诊**——加载器对扩展 reloc
+块行为完全正常；当年崩因 = 覆盖不全（未登记站点 delta 未应用 → 错位
+访问）。**ASLR 兼容技术可行**。
+
+**实现方案（另立实现单）**：① 站点登记——import_protect/tls_hook 发
+射绝对 VA 时同步记录站点 RVA 至 ctx 槽（比事后扫描精确：skip 桩值站
+点、backfill 模式差异、未来新面均在发射点闭环）；② pe_writer 追加
+reloc 块——.reloc slack 预算有限（tls 样本 436B≈208 站点、wvmpTest
+仅 168B≈84 站点，**大镜像不足**），预算策略 = 将原 reloc 数据整体拷
+入 .wvmp 预留区（8KB，RW 节 reloc 合法）后追加新块，dd[5] 重指（单
+区间连续，预算永久充裕）；③ DYNAMIC_BASE 保留不清（pe_writer 清除
+逻辑改配置化或删除）；④ x86 面 HIGHLOW 同构。
+
+**风险与未决**：① ASLR 下 TLS 回调先于重定位？——否，reloc 处理在
+loader 锁内先于 TLS 回调（PoC 中 adb/rdtsc 面即依赖此序，byte-exact
+为证）；② 强签名/强制完整性镜像的 reloc 语义（FORCE_INTEGRITY 仍清
+除，无关）；③ 大样本池 ASLR 全量回归为实现单验收主体。

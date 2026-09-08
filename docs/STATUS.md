@@ -955,3 +955,14 @@ asmgen 零触碰 → dump 锚不受影响（无换代）。
   御理由重复合并（MIT-484 复审遗留）；③ rng.hpp 注释续行缩进对齐。
 - 验证：重建 0 错；dump 锚 fb8c65cb… 逐位恒等（asmgen 注释零 codegen
   触碰实证）；ctest 23/23。
+
+
+## MIT-493 (T25 · ASLR 兼容性侦察：MIT-340 误诊反转) ✅ 2026-09-09
+- 侦察单（零产品行为改动）：绝对 VA 全域普查（92 处，packer 面 13+42
+  无 reloc 覆盖）+ 决定性对照实验（.reloc 扩展 55 站点 + DYNAMIC_BASE
+  → rc=0 byte-exact；对照仅 DYNAMIC_BASE → rc=139 复现 MIT-340）。
+- **裁定**：MIT-340"加载器行为差异"系误诊（崩因覆盖不全）；ASLR 兼容
+  技术可行。实现方案入册 GAPS（站点发射点登记 + reloc 块 .wvmp 预留
+  区策略 + DYNAMIC_BASE 保留）。实现另立单。
+- PoC 脚本入库：scripts/experiments/aslr_poc.py（--no-reloc 对照模
+  式）。
