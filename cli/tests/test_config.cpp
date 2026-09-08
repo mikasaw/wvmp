@@ -601,6 +601,20 @@ TEST(ConfigParse, CryptNonBoolFails) {
     EXPECT_TRUE(contains(result.error, "crypt"));
 }
 
+// MIT-490 (T22 ①，MIT-489 验收建议 2)：junk_density 缺席时哨兵必须
+// 缺省（has_* = false），消费方走代码常量路径。
+TEST(ConfigParse, MutateJunkDensityAbsentKeepsSentinelDefault) {
+    const TempToml toml(
+        "input  = \"target.exe\"\n"
+        "output = \"out.exe\"\n"
+        "[mutate]\n"
+        "density = 10\n");
+    const auto result = wvmp::cli::parse_config(toml.path());
+    ASSERT_TRUE(result.ok) << result.error;
+    EXPECT_FALSE(result.value.rules.has_mutate_junk_density);
+    EXPECT_EQ(result.value.rules.mutate_junk_density, 15u);
+}
+
 TEST(ConfigParse, MutateJunkDensityParses) {
     const TempToml toml(
         "input  = \"target.exe\"\n"

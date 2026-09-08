@@ -390,7 +390,21 @@ cb0 = struct.unpack_from('<Q' if plus else '<I', packed, aoff)[0] - ib
 coff = r2o_p(cb0)
 if coff is None:
     sys.exit(1)
-body = packed[coff:coff + 0x200]
+# MIT-490 (T22 ③)：扫描窗随回调尺寸化——回调是 tls_hook 对 .wvmpc 的
+# 最后一次代码追加（其后无代码追加方），窗 = [cb0, .wvmpc 节 raw 末端)。
+end_off = None
+e2 = struct.unpack_from('<I', packed, 0x3c)[0]
+nsec2 = struct.unpack_from('<H', packed, e2 + 6)[0]
+table2 = e2 + 24 + struct.unpack_from('<H', packed, e2 + 20)[0]
+for i in range(nsec2):
+    sh2 = table2 + i * 40
+    nm2 = packed[sh2:sh2 + 8].split(b'\x00')[0].decode(errors='replace')
+    if nm2 == '.wvmpc':
+        _vs, _va, _rs, rp2 = struct.unpack_from('<IIII', packed, sh2 + 8)
+        end_off = rp2 + _rs
+if end_off is None or end_off <= coff:
+    sys.exit(1)
+body = packed[coff:end_off]
 for pat in (b'\xf3\x48\xa5', b'\xf3\xa5', b'\xf3\xa4'):
     if pat in body:
         print(f'rep movs pattern {pat.hex()} found in callback body', file=sys.stderr)

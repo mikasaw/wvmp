@@ -708,4 +708,43 @@ TEST(ImportProtectFallback, SkipBackfillWithoutCodeSectionFallsBack) {
     EXPECT_EQ(rd(ctx.image, rv2off(0x1200), 8), 0u);
 }
 
+// MIT-490 (T22 ②，MIT-488 验收建议 2)：skip_backfill=true 但原 IAT 槽
+// 落节间空洞（rva_to_offset 失败）→ 槽映射预检失败 → 整单保守回退回填
+// 模式（红线覆盖不全时跳回填语义不成立，MIT-488 R1 复审随落项）。
+TEST(ImportProtectFallback, SkipBackfillUnmappableSlotFallsBack) {
+    const u64 base = 0x140000000;
+    auto ms = make_multisection_image(true, base);
+    ProtectionContext ctx;
+    ctx.image = ms.image;
+    ctx.slot<PeImage>(kPeImage) = ms.meta;
+    ctx.slot<std::vector<NewSection>>(kNewSections).push_back(make_wvmp(0x4000));
+    ImportFixture2 fx = make_import_fixture2(std::move(ctx.image), true);
+    ctx.image = std::move(fx.image);
+    auto& rules = ctx.slot<ProtectRules>(kProtectRules);
+    rules.has_import_skip_backfill = true;
+    rules.import_skip_backfill = true;
+    // 把 desc0/desc1 的 FT 改指节间空洞（.data 止于 0x2400、.rdata 起于
+    // 0x3000——0x2800 无节覆盖 → rva_to_offset 失败），两段保持相邻连续
+    //（0x2800..0x2818 / 0x2818..0x2830）以免触发区间连续性回退、并让槽
+    // 映射预检（而非连续性校验）成为回退触发点。INT 原位可映射，描述符
+    // 解析 / VP 槽发现不受影响。
+    const auto rv2off = [](u32 rva) { return size_t(rva) - 0xC00; };
+    const u32 hole_ft0 = 0x2800;
+    const u32 hole_ft1 = 0x2800 + 3 * 8;
+    for (int b = 0; b < 4; ++b) {
+        ctx.image[rv2off(0x1000) + 16 + b] =
+            static_cast<u8>((hole_ft0 >> (8 * b)) & 0xFF);
+        ctx.image[rv2off(0x1000) + 20 + 16 + b] =
+            static_cast<u8>((hole_ft1 >> (8 * b)) & 0xFF);
+    }
+
+    ImportProtectPass pass;
+    pass.run(ctx);
+
+    const auto* plan = ctx.find_slot<ImportPlan>(kImportPlan);
+    ASSERT_NE(plan, nullptr);  // 迁移本体成立（base/span 计算 FT 仅取值）
+    EXPECT_FALSE(plan->skip_backfill);
+    EXPECT_EQ(plan->failfast_stub_rva, 0u);
+}
+
 } // namespace
