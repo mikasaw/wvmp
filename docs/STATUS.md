@@ -919,7 +919,7 @@ asmgen 零触碰 → dump 锚不受影响（无换代）。
 ## MIT-488 (T9.3b · 跳回填行为票：[import] skip_backfill + FailFast 红线桩) ✅ 2026-09-08
 - opt-in 配置（缺省 false）：跳过 TLS 回填循环（VP 翻转面消失）+ 原
   IAT 全槽 FailFast 桩 VA（漏引 → 确定性 AV，红线实证 rc=0xC0000005）。
-- 验证：ctest 23/23（+5 用例）；tls_e2e 4/4（双架构 backfill/skip 双模，
+- 验证：ctest 23/23（+6 用例）；tls_e2e 4/4（双架构 backfill/skip 双模，
   skip 模式 byte-exact = 零漏引运行期实证）；multiseed 335/335。
 - 至此 MIT-477 立案的 IAT 引用面全部闭环：x64 rip（477）+ x86 abs32
   （486）+ 数据指针（486）+ 完备性证据（487）+ 跳回填（488）。
