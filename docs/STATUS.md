@@ -977,3 +977,21 @@ asmgen 零触碰 → dump 锚不受影响（无换代）。
   tls_e2e 4/4；multiseed 335/335；迁移真值对照（撤扩展即崩）。
 - 产品缺省行为变化披露：native 带 DYNAMIC_BASE 的目标，保护后**不再
   清除**该位（ASLR 兼容）；[pe] aslr=false 回退 M2-8 行为。
+
+### MIT-494a (T26a · forkface x64 单点 cdb 定位) ✅ 2026-09-09
+- 纯诊断单（零代码改动，WIP 分支内入册）。**谜底**：野跳 = 虚拟化桩
+  跳板 `E9 rel32` @ .text 0x13DC 的 rel32 运行时被毒化（第 4 字节
+  0x00→0xAB）。
+- **根因**：native `mov rax, imm64`（DIR64 条目 @ 0x13DE）被 12B 跳板
+  patch（E9+rel32+CC 填充）覆写，扩展 reloc 目录原样保留孤儿条目 →
+  loader 把 delta 加进跳板尾字节+填充（delta 0x7FF651AB0000 第 3 字节
+  0xAB 恰落 0x13E0，逐字节算术吻合 cdb）。**T26c 修复 = pe_writer 剪
+  枝与 .text 覆写区相交的 native 拷贝条目**。
+- **"0x4a4d 站点复活"作废为假绿**：0x4a4d 是文件偏移（RVA 0x5C4D），
+  "裸 image_base qword" = [填充]+[LoadConfig.Size=0x140]+[TDS 首字节]
+  的 VA 扫描假阳窗口；补登记后 DIR64 腐化 LoadConfig.Size → loader 放
+  弃重定位整像按优先基址加载（fe 全程 0x14000xxxx，delta=0）→ 掩盖一
+  切基址缺陷。**0x5C4D 禁入 T26c；ASLR 判据必须加 delta≠0 断言**。
+- 证据链：2×2 隔离（checksum 排除）→ u/t cdb 追踪抓野跳指令 → 文件/
+  运行时字节对比 → delta 算术验证 → fe 基址直读。全程实录在
+  GAPS.md MIT-494 节③。

@@ -2401,11 +2401,29 @@ multiseed 290/335。
    "站点"（结构化数据 (rva, 0x01000040) 对别名 VA 区间），误登记 =
    loader 对非 VA 值加 delta = 静默损坏风险。发射点/已知 VA 集精确
    匹配（wvmpTest 仅 28 站点）为唯一可接受登记形态。
-③ **x64 forkface 单点之谜**：精确登记下 forkface x64 独崩（其余 x64
-   全绿）。差一个 .rdata 0x4a4d 站点（值 = 裸 image_base、奇对齐、
-   native reloc 未覆盖）——补登记后 10/10 复活，不补 0/10 崩。该站点
-   为何在 packed 形态下 load-bearing（native 下同值不 reloc 亦 rc=0）
-   未定位；提示存在"打包后新出现的基址指针消费路径"。
+③ **x64 forkface 单点之谜——T26a cdb 定位已破案（2026-09-09），原"补
+   登记复活"结论作废为假绿**：野跳指令 = `jmp <stub>` 桩跳板
+   `E9 rel32` @ .text 0x13DC（callreg 虚拟化入口），rel32 文件值
+   0x00013FAF（→ 桩 0x15390 合法），运行时被毒化为 0xAB013FAF（第 4
+   字节 0x00→0xAB）。**根因链**：native 原指令 `mov rax, 0x140001020`
+   （绝对 imm64，DIR64 条目 @ 0x13DE）→ 虚拟化跳板（E9+rel32+CC 填充
+   共 12B）覆写该 imm64 → 扩展 reloc 拷贝原样保留 0x13DE 孤儿条目 →
+   loader 对跳板尾字节+CC 填充的 qword 加 delta（实测 delta
+   0x7FF651AB0000 的第 3 字节 0xAB 恰落 0x13E0，算术逐字节吻合 cdb
+   实证）→ rel32 毒变 → 执行流进 .text 缝隙野跳。**"0x4a4d 站点"
+   真相**：0x4a4d 是文件偏移（= .rdata RVA 0x5C4D），其"裸 image_base
+   qword"是 [3B 节间填充]+[IMAGE_LOAD_CONFIG_DIRECTORY64.Size=0x140
+   LE 字节]+[TimeDateStamp 首字节] 的 8 字节假窗口——VA 扫描假阳，非
+   真指针。补登记 0x5C4D 后 10/10 "复活"机制 = DIR64 对该假窗口加
+   delta 腐化 LoadConfig.Size（0x140→~8MB）→ **Windows loader 判配置
+   无效放弃重定位整像，按优先基址 0x140000000 加载（delta=0，cdb 实
+   证 fe 全程 0x14000xxxx）** → 一切基址相关缺陷被 delta=0 掩盖 =
+   ASLR 被腐化关掉的假绿，非兼容修复。0x5C4D 条目禁止进入 T26c。
+   **真修复（T26c）**：pe_writer 生成扩展目录时，剪枝与 .text 覆写
+   区（桩跳板 patch [resume_rva, resume_rva+patch_len)）相交的 native
+   拷贝条目（孤儿条目 = 原指针已不存在于内存）；同族排查：IAT 槽/
+   TLS 面/其它覆写点同规则套用。**测试铁律**：ASLR 判据必须断言
+   运行时基址 ≠ 优先基址（delta≠0），否则 0x5C4D 类假绿无法区分。
 ④ **ASLR 测试方法论**：基址随机化使单次运行可能 delta=0 假绿——判据
    必须 = 每产物 ≥10 次重复运行统计 + 撤销扩展对照组（对照崩 = 证明
    delta≠0 且扩展必要）。
@@ -2414,6 +2432,9 @@ multiseed 290/335。
 本）；精确登记 290/335（45 红，under-registration 更差）。两形态均未
 达 335 全绿，合并阻断正确。
 
-**T26 v2 入场条件**：① x86 词流 RVA 化方案（独立大单）；② forkface
-0x4a4d 消费路径定位（cdb）；③ ASLR 重复运行统计框架（multiseed 扩
-展 ×N 次判据）。全部实证已入本节与分支提交历史。
+**T26 v2 入场条件**（2026-09-09 更新：② 已完成，①③ 待做）：① x86
+词流 RVA 化方案（独立大单）；② ~~forkface 0x4a4d 消费路径定位~~
+**已完成 = T26a cdb 定位**（谜底见③，真根因 = 跳板覆写区孤儿 reloc
+条目未剪枝，0x5C4D 复活 = LoadConfig 腐化 delta=0 假绿）；③ ASLR 重
+复运行统计框架（multiseed 扩展 ×N 次判据）+ **delta≠0 断言**（本次
+新增，防假绿）。全部实证已入本节与分支提交历史。
