@@ -306,55 +306,101 @@ EOF
         echo "[tls-e2e] FAIL $arch skip: stdout/rc mismatch (native=$rc packed=$rc2)" >&2
         fail=$((fail + 1)); rm -rf "$tmp"; return
     fi
-    # 静态断言：原 IAT 全槽（INT w 步进计数）= 同一 VA（FailFast 红线桩）。
-    if ! python - "$out_win" "$plus" <<'PYEOF2'
+    # 静态断言（MIT-488 复审 R2 修复版）：① 原 IAT 全槽 = 同一 VA——
+    # span 必须从 **native** 侧 dd[1] 描述符链取（packed 的 FirstThunk 已
+    # 被迁移重指 .wvmp 镜像，直接走 packed dd[1] 拿到的是镜像区间）；
+    # ② 回调区无 rep movs（F3 48 A5 / F3 A5 / F3 A4）——x64/x86 面都有
+    # 自动化（此前仅 x64 单测覆盖）。断言失败 = FAIL（极性与 R2 前版
+    # 相反：前版 `if ! python` 把通过当失败、失败当通过，形同死代码）。
+    if python - "$out_win" "$(cygpath -m "$sample")" "$plus" <<'PYEOF2'
 import struct, sys
-d = open(sys.argv[1], 'rb').read()
-plus = sys.argv[2] == '1'
+packed = open(sys.argv[1], 'rb').read()
+native = open(sys.argv[2], 'rb').read()
+plus = sys.argv[3] == '1'
 w = 8 if plus else 4
-e = struct.unpack_from('<I', d, 0x3c)[0]
-nsec = struct.unpack_from('<H', d, e+6)[0]
-opt = e + 24
-dd = opt + (112 if plus else 96)
-table = opt + struct.unpack_from('<H', d, e+20)[0]
-secs = []
-for i in range(nsec):
-    sh = table + i*40
-    vs, va, rs, rp = struct.unpack_from('<IIII', d, sh+8)
-    secs.append((va, vs, rp, rs))
-def r2o(r):
-    for va, vs, rp, rs in secs:
-        if va and va <= r < va + max(vs, rs):
-            return rp + r - va
-    return None
-desc = struct.unpack_from('<I', d, dd + 8)[0]
-o = r2o(desc)
-lo, hi = None, 0
-while o and o + 20 <= len(d):
-    intl, ts, fc, nm, ft = struct.unpack_from('<IIIII', d, o)
-    if not intl and not ft:
-        break
-    io_ = r2o(intl)
-    if io_ is None:
-        sys.exit(1)
-    n = 0
-    while struct.unpack_from('<I', d, io_ + n*w)[0] != 0:
-        n += 1
-        if n > 4096:
+
+def header(d):
+    e = struct.unpack_from('<I', d, 0x3c)[0]
+    opt = e + 24
+    dd = opt + (112 if plus else 96)
+    table = opt + struct.unpack_from('<H', d, e + 20)[0]
+    nsec = struct.unpack_from('<H', d, e + 6)[0]
+    secs = []
+    for i in range(nsec):
+        sh = table + i * 40
+        vs, va, rs, rp = struct.unpack_from('<IIII', d, sh + 8)
+        secs.append((va, vs, rp, rs))
+    def r2o(r):
+        for va, vs, rp, rs in secs:
+            if va and va <= r < va + max(vs, rs):
+                return rp + r - va
+        return None
+    return dd, r2o
+
+def iat_span(d):
+    dd, r2o = header(d)
+    desc = struct.unpack_from('<I', d, dd + 8)[0]
+    o = r2o(desc)
+    lo, hi = None, 0
+    while o and o + 20 <= len(d):
+        intl, ts, fc, nm, ft = struct.unpack_from('<IIIII', d, o)
+        if not intl and not ft:
+            break
+        io_ = r2o(intl)
+        if io_ is None:
             sys.exit(1)
-    lo = ft if lo is None else min(lo, ft)
-    hi = max(hi, ft + (n+1)*w)
-    o += 20
+        n = 0
+        while struct.unpack_from('<I', d, io_ + n * w)[0] != 0:
+            n += 1
+            if n > 4096:
+                sys.exit(1)
+        lo = ft if lo is None else min(lo, ft)
+        hi = max(hi, ft + (n + 1) * w)
+        o += 20
+    return lo, hi
+
+lo, hi = iat_span(native)  # native 侧 span（packed dd[1] 已重指镜像）
+_, r2o_p = header(packed)
 vals = set()
 for r in range(lo, hi, w):
-    off = r2o(r)
-    vals.add(struct.unpack_from('<Q' if plus else '<I', d, off)[0])
-sys.exit(0 if len(vals) == 1 else 1)
+    off = r2o_p(r)
+    if off is None:
+        sys.exit(1)
+    vals.add(struct.unpack_from('<Q' if plus else '<I', packed, off)[0])
+if len(vals) != 1:
+    print(f'slot values not uniform: {sorted(hex(v) for v in vals)[:4]}', file=sys.stderr)
+    sys.exit(1)
+
+# 回调区 rep movs 扫描：dd[9] TLS 目录 -> 回调数组 -> 我们的回调（第 0 项）。
+dd, r2o_p = header(packed)
+e = struct.unpack_from('<I', packed, 0x3c)[0]
+opt = e + 24
+ib = struct.unpack_from('<Q' if plus else '<I', packed, opt + (24 if plus else 28))[0]
+tls_rva = struct.unpack_from('<I', packed, dd + 9 * 8)[0]
+to = r2o_p(tls_rva)
+if to is None:
+    sys.exit(1)
+# IMAGE_TLS_DIRECTORY 的 AddressOfCallBacks：x64 偏移 24 / x86 偏移 12。
+cb_arr = struct.unpack_from('<Q' if plus else '<I', packed, to + (24 if plus else 12))[0]
+arr_rva = cb_arr - ib
+aoff = r2o_p(arr_rva)
+if aoff is None:
+    sys.exit(1)
+cb0 = struct.unpack_from('<Q' if plus else '<I', packed, aoff)[0] - ib
+coff = r2o_p(cb0)
+if coff is None:
+    sys.exit(1)
+body = packed[coff:coff + 0x200]
+for pat in (b'\xf3\x48\xa5', b'\xf3\xa5', b'\xf3\xa4'):
+    if pat in body:
+        print(f'rep movs pattern {pat.hex()} found in callback body', file=sys.stderr)
+        sys.exit(1)
+sys.exit(0)
 PYEOF2
     then
         :
     else
-        echo "[tls-e2e] FAIL $arch skip: orig IAT slots not uniformly stub VA" >&2
+        echo "[tls-e2e] FAIL $arch skip: static assert failed (slots uniform / callback rep-movs)" >&2
         fail=$((fail + 1)); rm -rf "$tmp"; return
     fi
 

@@ -2217,8 +2217,9 @@ tls_hook 回调体据此**整段省略回填循环**（无 VP 调用、无 rep m
 （0xC0000005）确定性 AV**——红线桩按设计工作。x64 同构面结构性不可
 编码（基址 0x140000000 > 4GB，imm32 装不下全 VA），恰为完备性论证的
 一部分（MIT-487）；
-③ **静态断言**：packed .wvmpc 回调区无 rep movsq/movsd；原 IAT 42 槽
-全 = 桩 VA（tls_e2e skip 分支自动化）。
+③ **静态断言**：packed .wvmpc 回调区无 rep movsq/movsd（x64/x86 面
+tls_e2e skip 分支自动化）；原 IAT 全槽（x64 42 / x86 43）唯一值 = 桩
+VA（同上自动化）。
 
 **工程坑实录**：① x86 样本侦察连踩三坑——描述符在 .rdata 而非 .text
 （r2o 硬编码单节映射全读飞）、x86 abs32 目标是全 VA 须减 ib 再对
@@ -2226,11 +2227,37 @@ RVA span、span 上界误减 ib 变负数——三次"零命中"全是扫描器�
 真零；② x64 B8 负例注入测试在 pack 前即不可行（imm32 溢出），属论证
 性面非测试面。
 
-**验证**：ctest 23/23（+4 用例：config [import] 三态 +
+**验证**：ctest 23/23（**+6 用例**：config [import] 三态 +
 SkipBackfillSlotsFilledWithFailFastStub + SkipBackfillTlsCallbackOmits
-BackfillLoop）；tls_e2e 4/4；multiseed 335/335（默认关断零回踩）；
-x86 电池不受影响（runtime 零触碰）。
+BackfillLoop + SkipBackfillWithoutCodeSectionFallsBack）；tls_e2e 4/4
+（skip 分支静态断言复活后全绿）；multiseed 335/335（默认关断零回踩）；
+池扫 70/70。
 
 **披露**：skip_backfill 仅在"目标进程无第三方注入补丁"前提下安全——
 外部工具若依赖原 IAT 布局（罕见且本就破坏者视角），跳回填语义为显式
 opt-in，缺省关闭。
+
+## MIT-488 补（验收 REJECT 落地，2026-09-08）——R1 阻塞缺陷与 R2 测试缺陷修复
+
+**R1（阻塞，验收代理有效否决）**：FailFast 桩发射误用 kEmitReserveBase
+游标（.wvmp 数据节专属预算，stub_link 仅给 .wvmp 预扩 8KB）作为
+.wvmpc 落点——游标值 ≪ .wvmpc 代码节尺寸，桩被写进**解释器代码正中
+间**（实录：x64 tls 样本 .wvmpc+0x1B0 覆写 `add r12,1; jmp` 推进尾，
+≥5 个 handler 臂直达该地址；x86 同构覆写 handler 解码中段）→ 每个
+skip 产物被挖 8 字节解释器，踩中即 VM 内确定性 AV。tls 两样本恰未踩
+中，e2e 全绿假象——C2 级静默损坏。**修复**：桩改 .wvmpc **尾部追加**
+（16 对齐 grow 语义，与 tls_hook 回调桩同款；.wvmpc 为末节，追加不破
+坏任何后续节 RVA；本 pass 先行无冲突）。**教训**：kEmitReserveBase 是
+节专属预算不是全局偏移——跨节复用游标值 = 把数据节坐标当代码节坐标；
+单测夹具 .wvmpc 仅 16B 恰好让错误落点 == 尾部，假绿（夹具尺寸应足以
+区分"游标落点"与"尾部落点"两种语义）。
+**R2（测试缺陷）**：tls_e2e skip 静态断言两处叠加失效——① span 走
+packed dd[1]，FirstThunk 已重指镜像 → 扫的是镜像随机字节；② `if !
+python; then : else FAIL` 极性反转 → 断言永不生效（死代码）。**修复**：
+span 从 native 侧取；极性改正；增补回调区 rep movs 扫描（x86 F3 A5
+面首次自动化）。红例自证：篡改 skip 产物单槽 → 断言判 2 值非一值
+转红。
+**随落**：槽映射预检（任一原 IAT 槽不可映射 → 保守回退回填模式，漏填
+槽静默 continue 取消）；无 .wvmpc 回退单测补齐。修复后全链复跑：重建
+0 错、ctest 23/23、tls_e2e 4/4、红线负例（x86）rc=0xC0000005、池扫
+70/70。

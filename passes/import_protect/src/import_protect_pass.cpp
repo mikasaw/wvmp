@@ -636,7 +636,8 @@ void ImportProtectPass::run(ProtectionContext& ctx) {
     // 回填，去掉 .rdata 页 VirtualProtect 翻转面（检测敏感）；红线 =
     // 原 IAT 全槽（含 NULL 终止槽）写入 FailFast 桩 VA——完备性论证域
     // 内无引用落原 IAT，域外形态一旦漏引，调用侧确定性 AV（受控崩溃）
-    // 而非野指针静默错行为。.wvmpc 缺席（旧夹具）→ 保守回退回填模式。
+    // 而非野指针静默错行为。.wvmpc 缺席 / 任一槽不可映射 → 保守回退
+    // 回填模式（红线覆盖不全时跳回填语义不成立）。
     bool skip_backfill = false;
     u64 failfast_rva = 0;
     if (auto* rules = ctx.find_slot<ProtectRules>(kProtectRules);
@@ -646,27 +647,37 @@ void ImportProtectPass::run(ProtectionContext& ctx) {
         if (auto* sections = ctx.find_slot<std::vector<NewSection>>(kNewSections))
             for (auto& s : *sections)
                 if (s.name == ".wvmpc") { wvmpc = &s; break; }
-        if (wvmpc == nullptr) {
+        // 槽映射预检（MIT-488 验收建议 4）：任一槽不可映射 = 红线覆盖
+        // 不全（漏填槽残留文件残值 → 漏引时非确定性 AV）→ 整单保守回退。
+        bool all_mappable = true;
+        for (u64 off_in = 0; off_in + w <= span; off_in += w) {
+            const auto so = pe->rva_to_offset(u32(base + off_in));
+            if (!so.has_value() || u64(*so) + w > ctx.image.size()) {
+                all_mappable = false;
+                break;
+            }
+        }
+        if (wvmpc == nullptr || !all_mappable) {
             ctx.diag.report(Severity::Note, name(),
-                            "[import] skip_backfill=true 但无 .wvmpc 节，保守回退回填模式");
+                            wvmpc == nullptr
+                                ? "[import] skip_backfill=true 但无 .wvmpc 节，保守回退回填模式"
+                                : "[import] skip_backfill=true 但原 IAT 存在不可映射槽，保守回退回填模式");
         } else {
             // FailFast 桩：8 字节 `xor eax,eax; mov dword ptr [eax],0`
             //（31 C0 C7 00 00 00 00 00，双架构同字节）→ 写 0 地址确定性
-            // AV。16 对齐预留（emit_reserve 协议，与 tls_hook 共用游标）。
+            // AV。⚠️ 落点 = .wvmpc **尾部追加**（16 对齐，grow 语义）——
+            // kEmitReserveBase 游标是 .wvmp（数据节）专属预算，其值远小
+            // 于 .wvmpc 代码节尺寸，误用作落点会静默覆写解释器代码
+            //（MIT-488 验收 REJECT 实录）。.wvmpc 为末节，尾部追加不破坏
+            // 任何后续节 RVA（与 tls_hook 回调桩同款语义，本 pass 先行
+            // 无冲突）。
             u64 cur_ff = wvmpc->data.size();
-            bool grow_ok_ff = true;
-            if (auto* r = ctx.find_slot<u64>(kEmitReserveBase)) {
-                cur_ff = *r;
-                grow_ok_ff = false;
-            }
-            const u64 ff_off = emit_reserve_take(wvmpc->data, cur_ff, 16, 8, grow_ok_ff);
+            const u64 ff_off = emit_reserve_take(wvmpc->data, cur_ff, 16, 8, true);
             const u8 ff_stub[8] = {0x31, 0xC0, 0xC7, 0x00, 0x00, 0x00, 0x00, 0x00};
             std::memcpy(wvmpc->data.data() + ff_off, ff_stub, 8);
-            if (auto* r = ctx.find_slot<u64>(kEmitReserveBase)) *r = cur_ff;
             const u64 stub_va = pe->image_base + wvmpc->requested_rva + ff_off;
             for (u64 off_in = 0; off_in + w <= span; off_in += w) {
                 const auto so = pe->rva_to_offset(u32(base + off_in));
-                if (!so.has_value() || u64(*so) + w > ctx.image.size()) continue;
                 for (size_t b = 0; b < w; ++b)
                     ctx.image[*so + b] =
                         static_cast<u8>((stub_va >> (8 * b)) & 0xFF);

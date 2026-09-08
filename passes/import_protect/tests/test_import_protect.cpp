@@ -683,4 +683,29 @@ TEST(ImportProtectMigrate, SkipBackfillTlsCallbackOmitsBackfillLoop) {
     EXPECT_FALSE(found);
 }
 
+// MIT-488 验收建议 5：skip_backfill=true 但无 .wvmpc（旧夹具）→ 保守
+// 回退回填模式（plan.skip_backfill=false，镜像零改动）。
+TEST(ImportProtectFallback, SkipBackfillWithoutCodeSectionFallsBack) {
+    const u64 base = 0x140000000;
+    ProtectionContext ctx;
+    ctx.image = make_image(true, 0x8664, base);
+    ctx.slot<PeImage>(kPeImage) = make_meta(true, 0x8664, base);
+    ctx.slot<std::vector<NewSection>>(kNewSections).push_back(make_wvmp(0x3000));
+    ctx.image = make_import_fixture(base).image;
+    auto& rules = ctx.slot<ProtectRules>(kProtectRules);
+    rules.has_import_skip_backfill = true;
+    rules.import_skip_backfill = true;
+
+    ImportProtectPass pass;
+    pass.run(ctx);
+
+    const auto* plan = ctx.find_slot<ImportPlan>(kImportPlan);
+    ASSERT_NE(plan, nullptr);  // 迁移本体成立
+    EXPECT_FALSE(plan->skip_backfill);
+    EXPECT_EQ(plan->failfast_stub_rva, 0u);
+    // 原 IAT 槽未被填桩（保持文件态 0）。
+    const auto rv2off = [](u32 rva) { return size_t(rva) - 0x1000 + 0x400; };
+    EXPECT_EQ(rd(ctx.image, rv2off(0x1200), 8), 0u);
+}
+
 } // namespace
