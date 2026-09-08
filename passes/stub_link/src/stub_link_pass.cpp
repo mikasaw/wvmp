@@ -240,6 +240,7 @@ void StubLinkPass::run(ProtectionContext& ctx) {
         code_payload.resize(static_cast<size_t>(stub_off), 0);
         const u64 stub_rva = code_rva + stub_off;
         std::vector<u8> stub;
+        std::vector<u64> stub_abs_vas;
         try {
             // MIT-458: 加密函数的 stub 携带 one-shot 解密块参数（流/旗标 VA
             // = image_base + RVA，PE32+ imm64 经寄存器中转由 asm 模板处理；
@@ -273,13 +274,27 @@ void StubLinkPass::run(ProtectionContext& ctx) {
             stub = generate_entry_stub(stub_rva, blob_stream_rva, rt_entry, vf.end_rva,
                                        pe->image_base,
                                        is_x86 ? StubArch::X86 : StubArch::X64,
-                                       crypt_ptr, adb_ptr);
+                                       crypt_ptr, adb_ptr, &stub_abs_vas);
         } catch (const std::exception& e) {
             ctx.diag.report(Severity::Error, name(),
                             "函数 " + vf.name + " stub 生成失败（保持原生）: " + e.what());
             continue;
         }
         code_payload.insert(code_payload.end(), stub.begin(), stub.end());
+        // MIT-494：精确站点登记——已知 VA 集在 stub 内的字节精确匹配
+        //（零假阳；payload 级泛扫描在 wvmpTest 假阳 2194 处，开发实录）。
+        {
+            const size_t w = is_x86 ? 4 : 8;
+            auto& sites = ctx.slot<std::vector<u32>>(kRelocSites);
+            for (const u64 va : stub_abs_vas) {
+                u8 pat[8];
+                for (size_t i = 0; i < w; ++i)
+                    pat[i] = static_cast<u8>((va >> (8 * i)) & 0xFF);
+                for (size_t o = 0; o + w <= stub.size(); ++o)
+                    if (std::memcmp(stub.data() + o, pat, w) == 0)
+                        sites.push_back(static_cast<u32>(stub_rva + o));
+            }
+        }
         patches.push_back({vf.begin_rva, vf.end_rva, stub_rva});
     }
 
@@ -318,35 +333,6 @@ void StubLinkPass::run(ProtectionContext& ctx) {
 
     data_payload.resize(static_cast<size_t>(data_total), 0);
     ctx.slot<u64>(kEmitReserveBase) = blobs_total;
-
-    // MIT-494 (T26)：stub/buffer 内绝对 VA 站点登记（.reloc 扩展数据源）。
-    // 只扫自产 payload——buffer 内命中即真实 VA（全镜像扫描存在结构化数
-    // 据假阳：误登记 = loader 对非 VA 值加 delta = 静默损坏）。条目 = 载
-    // 荷内偏移 + 节 requested_rva。
-    {
-        const size_t w = is_x86 ? 4 : 8;
-        u64 span_end = 0;
-        for (const auto& s : pe->sections)
-            span_end = std::max<u64>(
-                span_end, u64(s.virtual_addr) +
-                              std::max(u64(s.virtual_size), u64(s.raw_size)));
-        span_end = std::max<u64>(
-            span_end, u64(data_section_rva) + data_total + kEmitReserveBytes);
-        span_end = std::max<u64>(span_end, u64(code_rva) + code_payload.size());
-        const u64 ib = pe->image_base;
-        auto& sites = ctx.slot<std::vector<u32>>(kRelocSites);
-        auto scan = [&](const std::vector<u8>& buf, u32 base_rva) {
-            for (size_t o = 0; o + w <= buf.size(); ++o) {
-                u64 v = 0;
-                for (size_t i = 0; i < w; ++i)
-                    v |= u64(buf[o + i]) << (8 * i);
-                if (v >= ib && v - ib < span_end)
-                    sites.push_back(base_rva + static_cast<u32>(o));
-            }
-        };
-        scan(data_payload, static_cast<u32>(data_section_rva));
-        scan(code_payload, static_cast<u32>(code_rva));
-    }
 
     // —— 新节请求交给 pe_writer（MIT-472 W^X 拆节：两节）——
     // .wvmp（RW，0xC0000040）：字节码 blob 等数据面（解密期被写）。

@@ -250,12 +250,33 @@ std::vector<u8> assemble_callback_stub(bool is_x86,
                                        u32 adb_init,
                                        const DrxInfo* drx,
                                        bool rdtsc_on,
-                                       u64 rdtsc_scratch_va) {
+                                       u64 rdtsc_scratch_va,
+                                       std::vector<u64>* abs_vas = nullptr) {
     ks_engine* ks = nullptr;
     if (ks_open(KS_ARCH_X86, is_x86 ? KS_MODE_32 : KS_MODE_64, &ks) != KS_ERR_OK)
         throw std::runtime_error("tls_hook: ks_open failed");
     ks_option(ks, KS_OPT_SYNTAX, KS_OPT_SYNTAX_INTEL);
     std::string body;
+    // MIT-494：本回调体内嵌的全部绝对 VA（ASLR reloc 站点登记源）——
+    // rdtsc 暂存槽、DRx CONTEXT/GetThreadContext 槽、回填面 page/mirror/
+    // orig/oldprot/vp 槽。与 build_*_asm 的 snprintf 发射点一一对应。
+    if (abs_vas != nullptr) {
+        abs_vas->clear();
+        if (rdtsc_on && rdtsc_scratch_va != 0)
+            abs_vas->push_back(rdtsc_scratch_va);
+        if (drx != nullptr && drx->gtc_slot_va != 0) {
+            abs_vas->push_back(drx->ctx_va);
+            abs_vas->push_back(drx->gtc_slot_va);
+        }
+        if (imp != nullptr && imp->active && !imp->skip_backfill) {
+            abs_vas->push_back(image_base + imp->page_rva);
+            abs_vas->push_back(image_base + imp->oldprot_rva);
+            abs_vas->push_back(image_base + imp->mirror_rva);
+            abs_vas->push_back(image_base + imp->iat_base_rva);
+            abs_vas->push_back(image_base + imp->mirror_rva +
+                               (imp->vp_slot_rva - imp->iat_base_rva));
+        }
+    }
     if (rdtsc_on) body += build_rdtsc_open_asm(is_x86, rdtsc_scratch_va);
     if (adb_init != 0) body += build_adb_init_asm(is_x86, adb_init);
     // MIT-471 窗口口径：rdtsc close 紧跟 PEB 块（测量窗 = 确定性指令序列）。
@@ -578,12 +599,13 @@ void TlsHookPass::run(ProtectionContext& ctx) {
         const u64 sc_off = emit_reserve_take(wvmp->data, cur, 8, 8, grow_ok);
         rdtsc_scratch_va = base + wvmp->requested_rva + sc_off;
     }
+    std::vector<u64> cb_abs_vas;
     const std::vector<u8> stub =
         assemble_callback_stub(is_x86, (imp != nullptr && imp->active) ? imp : nullptr,
                                pe->image_base, adb_init,
                                (drx_requested && drx.gtc_slot_va != 0) ? &drx : nullptr,
                                rdtsc_requested,
-                               rdtsc_requested ? rdtsc_scratch_va : 0);
+                               rdtsc_requested ? rdtsc_scratch_va : 0, &cb_abs_vas);
     // 代码节偏移（.wvmpc 尾部 16 对齐；代码节后无节，保持尾部追加）。
     const u64 cb_off = align_up(wvmpc->data.size(), 16);
     // 数据节（MIT-476 预留区）：index 槽 8B → 回调数组 → TLS 目录。
@@ -638,20 +660,18 @@ void TlsHookPass::run(ProtectionContext& ctx) {
         sites.push_back(static_cast<u32>(array_rva));
         for (size_t i = 0; i < orig.callbacks.size(); ++i)
             sites.push_back(static_cast<u32>(array_rva + (i + 1) * ptr_w));
-        u64 span_end = 0;
-        for (const auto& s : pe->sections)
-            span_end = std::max<u64>(
-                span_end, u64(s.virtual_addr) +
-                              std::max(u64(s.virtual_size), u64(s.raw_size)));
-        span_end = std::max<u64>(
-            span_end, u64(wvmpc->requested_rva) + cb_off + stub.size());
-        const u64 ib = base;
-        for (size_t o = 0; o + ptr_w <= stub.size(); ++o) {
-            u64 v = 0;
-            for (size_t i = 0; i < ptr_w; ++i)
-                v |= u64(stub[o + i]) << (8 * i);
-            if (v >= ib && v - ib < span_end)
-                sites.push_back(static_cast<u32>(cb_rva + o));
+        // 回调桩 blob：已知 VA 集（cb_abs_vas）的字节精确匹配（零假阳；
+        // 泛扫描在结构化代码上有别名误登记风险，MIT-494 开发实录）。
+        {
+            const size_t w = ptr_w;
+            for (const u64 va : cb_abs_vas) {
+                u8 pat[8];
+                for (size_t i = 0; i < w; ++i)
+                    pat[i] = static_cast<u8>((va >> (8 * i)) & 0xFF);
+                for (size_t o = 0; o + w <= stub.size(); ++o)
+                    if (std::memcmp(stub.data() + o, pat, w) == 0)
+                        sites.push_back(static_cast<u32>(cb_rva + o));
+            }
         }
     }
     {

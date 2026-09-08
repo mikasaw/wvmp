@@ -2382,3 +2382,38 @@ VA 值加 delta = 静默损坏，本次运行侥幸全绿不可依赖；返工�
 4/4；multiseed 335/335（全部产物走 ASLR 路径）；**迁移真值对照**：撤
 销 dd[5] 扩展 + 保留 DYNAMIC_BASE → base 面崩（127）/ mutate 面
 0xC0000409，扩展产物 rc=0——delta≠0 下扩展为必要性证明。
+
+## MIT-494 开发实录（T26 ASLR 实现分支挂起，2026-09-09）——三处实证发现与未决破缺
+
+**实现现状**（分支 mit-494-t26-aslr-impl 挂起，未合入）：发射点登记
+架构（kRelocSites：stub_link 已知 VA 集精确匹配 / tls_hook TLS 面 + 回
+调 blob / import_protect skip 槽）+ pe_writer 消费生成扩展块 +
+DllCharacteristics 条件化 + [pe] aslr 配置。wvmpTest/tls_e2e 全绿，
+multiseed 290/335。
+
+**实证发现**（对 ASLR 兼容实现单极具价值，勿重新推导）：
+① **x86 blob 词内嵌首选基址 VA**：x86 翻译器无 rip-relative，IAT 槽
+   引用等以完整 VA 烙进 VM 词流（实录：x86 looplea blob 内 22 处
+   0x403000 = ib+IAT 槽 RVA）。ASLR 下全数错位 → x86 样本崩溃。
+   修复方向 = x86 词流 RVA 化（对齐 x64 M2-8 模型，翻译器大改）或
+   blob 词 VA 站点全量登记（假阳风险需评估）。
+② **全镜像扫描假阳实锤**：wvmpTest 上泛扫描登记 2194 个 .rdata
+   "站点"（结构化数据 (rva, 0x01000040) 对别名 VA 区间），误登记 =
+   loader 对非 VA 值加 delta = 静默损坏风险。发射点/已知 VA 集精确
+   匹配（wvmpTest 仅 28 站点）为唯一可接受登记形态。
+③ **x64 forkface 单点之谜**：精确登记下 forkface x64 独崩（其余 x64
+   全绿）。差一个 .rdata 0x4a4d 站点（值 = 裸 image_base、奇对齐、
+   native reloc 未覆盖）——补登记后 10/10 复活，不补 0/10 崩。该站点
+   为何在 packed 形态下 load-bearing（native 下同值不 reloc 亦 rc=0）
+   未定位；提示存在"打包后新出现的基址指针消费路径"。
+④ **ASLR 测试方法论**：基址随机化使单次运行可能 delta=0 假绿——判据
+   必须 = 每产物 ≥10 次重复运行统计 + 撤销扩展对照组（对照崩 = 证明
+   delta≠0 且扩展必要）。
+
+**multiseed 数据**：全镜像扫描 304/335（31 红 = forkface + 9 x86 样
+本）；精确登记 290/335（45 红，under-registration 更差）。两形态均未
+达 335 全绿，合并阻断正确。
+
+**T26 v2 入场条件**：① x86 词流 RVA 化方案（独立大单）；② forkface
+0x4a4d 消费路径定位（cdb）；③ ASLR 重复运行统计框架（multiseed 扩
+展 ×N 次判据）。全部实证已入本节与分支提交历史。

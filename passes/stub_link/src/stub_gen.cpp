@@ -534,12 +534,29 @@ std::string build_stub_asm_x86(u64 rt_entry_rva, u64 blob_stream_rva,
 
 std::vector<u8> generate_entry_stub(u64 stub_rva, u64 blob_stream_rva, u64 rt_entry_rva,
                                     u64 resume_rva, u64 image_base, StubArch arch,
-                                    const StubCrypt* crypt, const StubAntiDebug* adb) {
+                                    const StubCrypt* crypt, const StubAntiDebug* adb,
+                                    std::vector<u64>* abs_vas) {
     ks_engine* ks = nullptr;
     if (ks_open(KS_ARCH_X86, arch == StubArch::X86 ? KS_MODE_32 : KS_MODE_64, &ks) !=
         KS_ERR_OK)
         throw std::runtime_error("stub_link: ks_open failed");
     ks_option(ks, KS_OPT_SYNTAX, KS_OPT_SYNTAX_INTEL);
+    // MIT-494：本 stub 内嵌的全部绝对 VA（ASLR reloc 站点登记源）。集合
+    // 与 build_stub_asm_* 的发射点一一对应：scratch_mem = image_base、
+    // EXIT_SLOT 预写 = image_base + resume_rva、x86 blob 指针 =
+    // image_base + blob_stream_rva（x64 走 rip-relative 免登记）、crypt
+    // 流/旗标 VA。
+    if (abs_vas != nullptr) {
+        abs_vas->clear();
+        abs_vas->push_back(image_base);
+        abs_vas->push_back(image_base + resume_rva);
+        if (arch == StubArch::X86)
+            abs_vas->push_back(image_base + blob_stream_rva);
+        if (crypt != nullptr) {
+            abs_vas->push_back(crypt->stream_va);
+            abs_vas->push_back(crypt->flag_va);
+        }
+    }
 
     const std::string src =
         arch == StubArch::X86

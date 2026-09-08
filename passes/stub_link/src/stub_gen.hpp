@@ -68,6 +68,10 @@ struct StubCrypt {
                                                   u64 image_base,
                                                   StubArch arch = StubArch::X64,
                                                   const StubCrypt* crypt = nullptr,
-                                                  const StubAntiDebug* adb = nullptr);
+                                                  const StubAntiDebug* adb = nullptr,
+                                                  // MIT-494：非空时回填本 stub
+                                                  // 内嵌的全部绝对 VA（.reloc
+                                                  // 扩展站点登记源，精确零假阳）。
+                                                  std::vector<u64>* abs_vas = nullptr);
 
 } // namespace wvmp::passes
