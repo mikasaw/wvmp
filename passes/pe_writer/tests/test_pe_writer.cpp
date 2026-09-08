@@ -258,6 +258,68 @@ TEST(PeWriterPass, UnwritableOutputPathFails) {
     EXPECT_TRUE(ctx.diag.has_errors());
 }
 
+// —— MIT-491 (T23)：Emit 预留区高水位观测 ————————————————————————
+
+// 高水位夹具：合法最小 PE + .wvmp 数据节（blobs + 8KB 预留）+ 游标。
+// used_high = 游标越过 75% 预算线 → 期望高水位 Note；used_low → 无。
+static void run_high_water_case(u64 cursor, bool& hit) {
+    std::vector<u8> bytes = build_minimal_pe(true, kMachineX64);
+    const fs::path out = temp_dir() / "hw_case.exe";
+    ProtectionContext ctx;
+    ctx.image = bytes;
+    ctx.output_path = out;
+    wvmp::passes::NewSection wvmp;
+    wvmp.name = ".wvmp";
+    wvmp.data.assign(0x200 + wvmp::passes::kEmitReserveBytes, 0);
+    wvmp.requested_rva = 0x2000u;  // 紧接最小 PE .text 节尾（连续性校验）
+    ctx.slot<std::vector<wvmp::passes::NewSection>>(wvmp::kNewSections)
+        .push_back(wvmp);
+    ctx.slot<u64>(wvmp::kEmitReserveBase) = cursor;
+    wvmp::passes::PeWriterPass writer;
+    writer.run(ctx);
+    hit = false;
+    for (const auto& item : ctx.diag.items())
+        if (item.message.find("Emit 预留区高水位") != std::string::npos)
+            hit = true;
+}
+
+TEST(PeWriterPass, EmitReserveHighWaterEmitsNote) {
+    // blobs 0x200 + 预留 0x2000：used = 0x2000 - 0x1800 = 0x800... 取
+    // 7000/8192 ≈ 85% > 75% → 必出 Note。
+    bool hit = false;
+    run_high_water_case(0x200 + 7000, hit);  // used = cursor - reserve_start(0x200) = 7000 ≈ 85%
+    EXPECT_TRUE(hit);
+}
+
+TEST(PeWriterPass, EmitReserveLowWaterStaysSilent) {
+    // used = 1000/8192 ≈ 12% < 75% → 无高水位 Note。
+    bool hit = true;
+    run_high_water_case(0x200 + 1000, hit);  // used = 1000 ≈ 12% < 75%
+    EXPECT_FALSE(hit);
+}
+
+TEST(PeWriterPass, EmitReserveNoCursorSlotStaysSilent) {
+    // 旧夹具（无游标槽）→ 观测面静默跳过，行为零改动。
+    std::vector<u8> bytes = build_minimal_pe(true, kMachineX64);
+    const fs::path out = temp_dir() / "hw_nocursor.exe";
+    ProtectionContext ctx;
+    ctx.image = bytes;
+    ctx.output_path = out;
+    wvmp::passes::NewSection wvmp;
+    wvmp.name = ".wvmp";
+    wvmp.data.assign(0x200 + wvmp::passes::kEmitReserveBytes, 0);
+    wvmp.requested_rva = 0x2000u;  // 紧接最小 PE .text 节尾（连续性校验）
+    ctx.slot<std::vector<wvmp::passes::NewSection>>(wvmp::kNewSections)
+        .push_back(wvmp);
+    wvmp::passes::PeWriterPass writer;
+    writer.run(ctx);
+    bool hit = false;
+    for (const auto& item : ctx.diag.items())
+        if (item.message.find("Emit 预留区高水位") != std::string::npos)
+            hit = true;
+    EXPECT_FALSE(hit);
+}
+
 // —— 系统 PE 往返（Windows 签名的 checksum 即正确性判据）———————————
 
 TEST(PeWriterRoundtrip, NotepadX64) {

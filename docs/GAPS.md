@@ -2298,3 +2298,19 @@ skip_backfill=true 断言失败"的红例推理链不成立（短路下删预检
 使分支可观测 + iat_base_rva==0x2800 钉死 FT 篡改生效。方法论：死测试
 鉴别 = "该断言在其目标分支被移除时是否转红"必须逐字推演，分支短路条
 件是首查项。
+
+## MIT-491（T23，2026-09-09）——Emit 预留区高水位观测（MIT-476 验收建议落地）
+
+**语义**：pe_writer run() 前置观测——.wvmp 数据节预留区
+（[size - kEmitReserveBytes, size)，游标为节专属预算，MIT-488 R1 教
+训）使用超过 75% 预算 → Note「Emit 预留区高水位：N / 8192 字节
+（P%）——逼近预算上限，请评估 kEmitReserveBytes 扩容」。无游标槽
+（旧夹具）/ .wvmp 缺席 → 静默跳过（零改动面）。观测点在 pe_writer
+（流水线末端）= 三消费方（stub_link 初始 + import_protect 镜像/
+oldprot + tls_hook CONTEXT/rdtsc/TLS 面）游标推进的最终汇点，单点覆
+盖全部预算消耗。
+
+**测试**：高水位（85%）出 Note / 低水位（12%）静默 / 无游标槽静默，
+三用例。红例即正例本身（Note 出现即被断言捕获；篡改阈值两侧即翻转）。
+夹具坑：.wvmp requested_rva 必须紧接最小 PE 节尾 0x2000（连续性硬拒
+≠ 水位逻辑问题）；游标语义 = reserve_start + used（勿从节尾倒推）。

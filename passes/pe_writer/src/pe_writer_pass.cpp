@@ -82,6 +82,36 @@ void PeWriterPass::run(ProtectionContext& ctx) {
     if (ctx.image.empty()) fail(ctx, "镜像为空，没有可写出的内容");
     if (ctx.output_path.empty()) fail(ctx, "输出路径为空");
 
+    // MIT-491 (T23，MIT-476 观察项落地)：Emit 预留区高水位观测——使用
+    // 超过 75% 预算打 Note（协议超限本身是 emit_reserve_take 硬失败，
+    // 此处为提前预警面）。游标是 .wvmp 数据节专属预算（MIT-488 R1 教
+    // 训），预留区 = [size - kEmitReserveBytes, size)；无游标槽（旧夹
+    // 具）或 .wvmp 缺席 → 静默跳过。
+    if (auto* sections = ctx.find_slot<std::vector<NewSection>>(kNewSections);
+        sections != nullptr)
+        if (auto* r = ctx.find_slot<u64>(kEmitReserveBase); r != nullptr &&
+            *r != 0)
+            for (const auto& s : *sections) {
+                if (s.name != ".wvmp" ||
+                    s.data.size() <= kEmitReserveBytes)
+                    continue;
+                const u64 reserve_start = s.data.size() - kEmitReserveBytes;
+                if (*r <= reserve_start) continue;
+                const u64 used = *r - reserve_start;
+                if (used * 4 > u64{kEmitReserveBytes} * 3) {
+                    char hw[128];
+                    std::snprintf(hw, sizeof(hw),
+                                  "Emit 预留区高水位：%llu / %u 字节（%.0f%%）"
+                                  "——逼近预算上限，请评估 kEmitReserveBytes 扩容",
+                                  static_cast<unsigned long long>(used),
+                                  static_cast<unsigned>(kEmitReserveBytes),
+                                  100.0 * static_cast<double>(used) /
+                                      static_cast<double>(kEmitReserveBytes));
+                    ctx.diag.report(Severity::Note, name(), hw);
+                }
+                break;
+            }
+
     // 1) 落位新节（kNewSections 槽；stub_link 等 Emit 阶段产出）——必须在
     //    checksum 之前，校验失败则整体失败（镜像不被部分修改）。
     if (auto* new_sections = ctx.find_slot<std::vector<NewSection>>(kNewSections);
