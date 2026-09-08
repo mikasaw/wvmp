@@ -50,7 +50,10 @@ constexpr double kJunkMovProbability = 0.15;
 // 双缺陷（step 1 快照 rax scratch 覆写 flags_/pc_ + epilogue 恢复冲掉
 // 返回值），修复后 seeds 0..41 基线全扫 ALL GREEN + wvmpTest 双跑 +
 // multiseed 335/335。T6.6 全 seed junk 双跑扫描转绿后生产重启用
-//（kEnableJunkMov = true）。
+//（kEnableJunkMov = true）。⚠️ 翻动本开关经 else-if 短路改变 mutate
+// 局部 rng 抽取序——同 seed 产物相对关闭态构建必然不同（单方向差异，
+// 属启用的固有后果）；下游 ctx.rng 流不受扰（Rng 独立 salt，MIT-485
+// 验收核实）。
 constexpr bool kEnableJunkMov = true;
 
 // 垃圾目的的候选 GP 集（按 arch；rsp 排除——栈写语义由栈深 walk 专管，
@@ -351,6 +354,10 @@ void MutatePass::run(ProtectionContext& ctx) {
                         const size_t pick =
                             static_cast<size_t>(rng.uniform(0, dead[i].size() - 1));
                         const u32 junk_imm = static_cast<u32>(rng.next());
+                        // 注意：junk_movs 在 region_allowed 判定之前自增
+                        //（与 Nop 侧 :337 同口径）——注入统计 note 的 Mov
+                        // 计数是"rng 语义计数"，白名单丢弃也计入，与产物
+                        // 字节对账时需知悉（MIT-485 验收建议 2）。
                         ++junk_movs;
                         if (region_allowed) {
                             ir::Insn junk;

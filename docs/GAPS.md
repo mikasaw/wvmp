@@ -2076,3 +2076,13 @@ jmp-face 教训入方法论：锚对角色寄存器落 rax 类缺陷不敏感，
 **遗留**：junk 密度/概率常量（kJunkMovProbability 等）未配置化（T11
 [mutate] 表仅 Nop 密度），需要时另立单；x86 面 junk 候选集与 x64 同
 代码路径，x86 电池不受本单影响。
+
+## MIT-485 补（验收建议落地，2026-09-08）——rng 抽取序单向差异与计数口径披露
+
+① 翻动 kEnableJunkMov 经 else-if 短路改变 mutate 局部 rng 抽取序
+（关闭态不抽 chance(kJunkMovProbability)）——**同 seed 产物相对关闭
+态构建必然不同**（单方向差异，启用固有后果）；下游 ctx.rng 流不受扰
+（mutate Rng 独立 salt：`ctx.seed ^ kMutateSeedSalt`，验收核实）。
+② 注入统计 note 的 Mov 计数为"rng 语义计数"（junk_movs 在
+region_allowed 判定前自增，白名单丢弃也计入），与产物字节对账需知悉
+口径（Nop 侧同口径，:337 原注已言明）。
