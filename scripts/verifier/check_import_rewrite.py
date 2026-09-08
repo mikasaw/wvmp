@@ -135,8 +135,11 @@ def main():
                     if e >> 12 != want_type:
                         continue
                     site = page + (e & 0x0FFF)
+                    # 站点判据与 rewriter 全含式一致（site+w 全落节内），
+                    # 避免节尾 w-1 字节站点的校验假阳（MIT-486 复审建议 3）。
                     sec = next((s for s in secs
-                                if s[1] and s[1] <= site < s[1] + s[2]), None)
+                                if s[1] and s[1] <= site
+                                and site + w <= s[1] + s[2]), None)
                     if sec is None or (sec[5] & 0x20000000):
                         continue
                     so = sec[3] + site - sec[1]
