@@ -2086,3 +2086,47 @@ jmp-face 教训入方法论：锚对角色寄存器落 rax 类缺陷不敏感，
 ② 注入统计 note 的 Mov 计数为"rng 语义计数"（junk_movs 在
 region_allowed 判定前自增，白名单丢弃也计入），与产物字节对账需知悉
 口径（Nop 侧同口径，:337 原注已言明）。
+
+## MIT-486（T9.2，2026-09-08）——MIT-477 砍面清偿：x86 abs32 代码引用重写 + 数据段指针重写（.reloc 扫描）
+
+**砍面① 复盘定案（reloc 联动不必复杂）**：abs32 站点（PE32 代码节内
+HIGHLOW reloc 项）的 delta 修正作用于站点值本身——改写前后站点值均为
+preferred-base 同镜像 VA，delta 线性作用于两者等价成立（镜像槽重定向
+不改变"值随基址平移"的性质），**无需增删 reloc 项**；且 pe_writer 恒
+清 DYNAMIC_BASE（delta=0，M2-8 起），stale reloc 项惰性，双保险。
+MIT-477 时代"绝对寻址 + .reloc 联动复杂"的评估就此推翻。
+
+**实现**（passes/import_protect/src/import_protect_pass.cpp）：
+① `rewrite_iat_code_refs_x86`：CS_MODE_32 两级扫描（线性 + 锚点），
+锚点集 = FF 15/25（call/jmp [abs]）、A1/A3（mov eax,[abs] /
+mov [abs],eax）、泛 modrm mod=00/rm=101。守卫差异 vs x64 rip 范式：
+abs32 disp 承载**全 VA**（须减 image_base 转 RVA 再对 span，实测踩坑）
++ 槽对齐 %4（PE32 槽宽 4B）+ raw32==abs 位置回读校验。改写 =
+镜像槽全 VA（ib + mirror_rva + Δ），无 disp32 界。
+② `rewrite_iat_data_refs`：dd[5] BASERELOC 全扫，非 EXECUTE 节内
+DIR64 (PE32+) / HIGHLOW (PE32) 站点值（preferred-base VA）落原 IAT
+span 的重写为镜像槽 VA；EXECUTE 节站点归代码面（x86 abs32 站点的
+HIGHLOW 项分流，避免双路径重复处理）。reloc 项保留：站点位置不变、
+新值同镜像 VA，delta 线性等价照旧。
+
+**真靶实证**（wvmp_tls_sample 11-pass 全栈）：x64 代码引用重写 39 处 /
+x86 abs32 重写 40 处 / 数据指针 0 处（样本无静态数据指针形态；
+wvmpTest .fptable 亦运行期填充）。静态校验
+scripts/verifier/check_import_rewrite.py（本单扩展：PE32 abs32 面 +
+数据指针残留面）双架构 **exec-hits=0 data-hits=0**。
+
+**验证**：单测 +2（X86Abs32CodeRefRewrite 三形改写 + 非对齐/span 外
+负例；DataRefRewriteRelocScan 双架构参数化 DIR64/HIGHLOW + span 外 +
+EXECUTE 分流负例）；ctest 23/23；x86 电池绿；tls_e2e 2/2（断言升级：
+双架构重写计数 >0 + 校验器零残留——旧"梅 x86 不重写"断言随砍面清偿
+作废）；multiseed 335/335；wvmpTest 双跑 103/103×2。
+
+**跳回填未动**（MIT-477 裁定维持）：完备性证明（"重写完备"→ 可移除
+TLS 回填 + .rdata 页 VirtualProtect 翻转）另立票——需证明无其他引用
+形态（含 drift 假阳面），收益 = 去检测敏感面；风险 = 漏引从"兜底可用"
+变"必崩"。证据链门槛：锚点集穷举论证 + 全样本池零残留 + 漏引红线
+（FailFast 探针）三件套。
+
+**工程坑实录**：① abs32 disp = 全 VA 不是 RVA（x64 rip 相对思维定势，
+单测抓获）；② 合成夹具 .reloc blob 落节终点（rva_to_offset 排他界
+返回空 → 整体静默返回 0，负例变假绿需以断言值判真伪）。

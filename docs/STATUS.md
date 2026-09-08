@@ -882,3 +882,19 @@ wvmpTest 双跑各 103/103；multiseed 335/335 零回踩。生效实证：seed 3
 注入 239 垃圾指令（Mov 128 / Nop 111 / 60 块）。
 
 **披露**：junk 概率/密度未配置化（维持代码常量），需要时另立单。
+
+
+## MIT-486 (T9.2 · MIT-477 砍面清偿：x86 abs32 引用重写 + 数据指针重写) ✅ 2026-09-08
+
+**交付**：import_protect 引用重写从 x64-only 扩为双架构全覆盖——
+① x86 abs32 直接编址代码引用重写（两级扫描，锚点 FF 15/25 + A1/A3 +
+泛 modrm(00/101)；abs32 disp 全 VA→RVA 转换）；② 数据段指针重写
+（.reloc DIR64/HIGHLOW 全扫非 EXECUTE 节）。砍面①的 reloc 联动复杂度
+评估推翻（同镜像 VA 重定向 delta 线性等价，无需增删 reloc 项）。
+③ 跳回填（完备性证明）另立票，证据链门槛入册 GAPS。
+
+**验证**：ctest 23/23（单测 +2：x86 三形 + 负例 / 双架构 reloc 数据
+指针 + EXECUTE 分流负例）；x86 电池绿；tls_e2e 2/2（断言升级至双架构
+重写计数 + 校验器零残留）；真靶 x64 39 处 / x86 40 处重写、
+exec/data-hits 全 0；multiseed 335/335；wvmpTest 双跑 103/103×2。
+校验器 check_import_rewrite.py 扩展 PE32 abs32 + 数据残留双面。

@@ -174,23 +174,23 @@ EOF
         echo "[tls-e2e] FAIL $arch tls_hook note missing" >&2
         fail=$((fail + 1)); rm -rf "$tmp"; return
     fi
-    # MIT-477 (T9.1)：引用重写断言——x64 期望 note 计数 > 0 且打包镜像
-    # EXECUTE 节内不存在 rip 引用落原 IAT（全部已重指镜像）；x86 期望
-    # 明示不重写（回填兜底）。
+    # MIT-477 (T9.1) / MIT-486 (T9.2)：引用重写断言——双架构期望 note 计
+    # 数 > 0（x64 rip 相对 / x86 abs32 直接编址），且打包镜像静态校验零
+    # 残留（代码引用 + 数据指针，check_import_rewrite.py 双面）。
     if [[ $arch == x64 ]]; then
         if ! echo "$out" | grep -E "代码引用重写 [1-9][0-9]* 处" > /dev/null; then
             echo "[tls-e2e] FAIL $arch 引用重写计数缺失或为 0" >&2
             fail=$((fail + 1)); rm -rf "$tmp"; return
         fi
-        if ! python "$PWD/scripts/verifier/check_import_rewrite.py"                 "$(cygpath -m "$sample")" "$out_win" > /dev/null 2>&1; then
-            echo "[tls-e2e] FAIL $arch 打包镜像仍存在 rip 引用原 IAT" >&2
-            fail=$((fail + 1)); rm -rf "$tmp"; return
-        fi
     else
-        if ! echo "$out" | grep -q "x86 不做引用重写"; then
-            echo "[tls-e2e] FAIL $arch x86 不重写 note missing" >&2
+        if ! echo "$out" | grep -E "abs32 代码引用重写 [1-9][0-9]* 处" > /dev/null; then
+            echo "[tls-e2e] FAIL $arch x86 abs32 引用重写计数缺失或为 0" >&2
             fail=$((fail + 1)); rm -rf "$tmp"; return
         fi
+    fi
+    if ! python "$PWD/scripts/verifier/check_import_rewrite.py"                 "$(cygpath -m "$sample")" "$out_win" > /dev/null 2>&1; then
+        echo "[tls-e2e] FAIL $arch 打包镜像仍存在引用原 IAT（代码或数据）" >&2
+        fail=$((fail + 1)); rm -rf "$tmp"; return
     fi
     if ! echo "$out" | grep -q "并入原回调 1 个"; then
         echo "[tls-e2e] FAIL $arch merge note missing (期望并入原回调 1 个)" >&2

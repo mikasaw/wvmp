@@ -121,8 +121,8 @@ std::span<const std::string_view> ImportProtectPass::provides_keys() const {
 // 槽的指令，disp 重指 .wvmp 镜像等价槽（mirror_rva + (target - iat_base)）。
 // 扫描 = 线性 capstone 反汇编（解码失败步进 1 字节，抗数据混排）；disp
 // 位置 = encoding.modrm_offset + 2（mod=00/rm=101 无 SIB），并以"指令地址
-// + 长度 + disp == 目标"回读校验兜底（不符即跳过，保守）。x86 目标不重写
-// （绝对寻址 + .reloc 联动复杂，v1 砍面；TLS 回填兜底仍覆盖未重写引用）。
+// + 长度 + disp == 目标"回读校验兜底（不符即跳过，保守）。（x86 abs32
+// 面见下方 rewrite_iat_code_refs_x86，MIT-486 起不再砍面。）
 // 返回重写条数。
 static size_t rewrite_iat_code_refs(ProtectionContext& ctx, const PeImage& pe,
                                     u64 iat_base, u64 iat_span, u64 mirror_rva) {
@@ -287,6 +287,187 @@ static size_t rewrite_iat_code_refs(ProtectionContext& ctx, const PeImage& pe,
     return rewritten;
 }
 
+// ---------------------------------------------------------------------------
+// MIT-486 (T9.2 砍面①)：x86 绝对寻址代码引用重写——PE32 EXECUTE 节内
+// abs32 直接编址（ea = disp32，无 rip 基）引用原 IAT 槽的指令，imm32
+// 重写为镜像等价槽全 VA（image_base + mirror_rva + (target - iat_base)）。
+// 与 x64 rip 范式同构的两级扫描（线性 + 锚点），守卫差异：
+//   - 绝对编址 ea = disp（无"insn 尾 + disp"项）→ target == disp 本身；
+//   - PE32 IAT 槽宽 4B → 槽对齐判据 (target - iat_base) % 4 == 0；
+//   - 新 imm32 = 镜像槽全 VA，RVA 空间 < 4GB 恒可表示（无 disp32 界）。
+// reloc 语义定案（MIT-477 砍面①复盘）：abs32 站点的 HIGHLOW reloc 项按
+// delta 修正站点值——改写前后站点值均为 preferred-base 同镜像 VA，delta
+// 线性作用于两者等价成立（新旧都随基址平移），无需增删 reloc 项；且
+// pe_writer 恒清 DYNAMIC_BASE（delta=0），双重自洽。
+// 锚点集 = FF 15/25（call/jmp [abs]）、A1/A3（mov eax,[abs] /
+// mov [abs],eax）、泛 modrm mod=00/rm=101（8B/89/03/2B 等单字节 opcode
+// 尾随 disp32 形；带尾随立即数的编码如 C7 05 disp32 imm32 由线性路径
+// 覆盖——锚点缓冲截短会解码失败，按设计跳过）。
+static size_t rewrite_iat_code_refs_x86(ProtectionContext& ctx, const PeImage& pe,
+                                        u64 iat_base, u64 iat_span, u64 mirror_rva) {
+    csh h = 0;
+    if (cs_open(CS_ARCH_X86, CS_MODE_32, &h) != CS_ERR_OK)
+        throw std::runtime_error("import_protect: cs_open(x86) failed");
+    cs_option(h, CS_OPT_DETAIL, CS_OPT_ON);
+    cs_insn* insn = cs_malloc(h);
+    if (insn == nullptr) {
+        cs_close(&h);
+        throw std::runtime_error("import_protect: cs_malloc failed");
+    }
+    const u64 ib = pe.image_base;
+    // 站点改写核心（线性与锚点共享）：绝对编址命中判据 + imm32 位置
+    // 回读校验 + 原位改写。raw32 == disp 校验的是"补丁位置正确"（disp
+    // 再生自同一字段，语义载荷由 span + 槽对齐守卫承担）。
+    const auto try_rewrite = [&](u8* raw, const cs_insn& c) -> bool {
+        const cs_x86& x = c.detail->x86;
+        bool hit = false;
+        i64 disp = 0;
+        for (size_t k = 0; k < x.op_count && !hit; ++k) {
+            const cs_x86_op& op = x.operands[k];
+            if (op.type != X86_OP_MEM) continue;
+            if (op.mem.base != X86_REG_INVALID) continue;  // 仅 abs32 直接编址
+            hit = true;
+            disp = op.mem.disp;
+        }
+        if (!hit) return false;
+        // abs32 disp 字段承载全 VA（real PE 链接器形态）——先减 image_base
+        // 转 RVA 空间再对 span（iat_base 为 RVA）；< ib 即非镜像引用。
+        const u64 abs = static_cast<u64>(disp);
+        if (abs < ib) return false;
+        const u64 target = abs - ib;
+        if (target < iat_base || target + 4 > iat_base + iat_span) return false;
+        if ((target - iat_base) % 4 != 0) return false;
+        // disp32 定位：FF 15/25 与 A1/A3 无 modrm（disp 在 size-4）；
+        // modrm 形（mod=00/rm=101 无 SIB）disp32 紧跟 modrm → offset + 1。
+        const size_t disp_off =
+            x.encoding.modrm_offset != 0 ? x.encoding.modrm_offset + 1 : c.size - 4;
+        if (disp_off + 4 > c.size) return false;
+        u32 raw32 = 0;
+        std::memcpy(&raw32, c.bytes + disp_off, 4);
+        if (raw32 != abs) return false;
+        const u64 new_target = ib + mirror_rva + (target - iat_base);
+        for (int b = 0; b < 4; ++b)
+            raw[disp_off + b] = static_cast<u8>((new_target >> (8 * b)) & 0xFF);
+        return true;
+    };
+    size_t rewritten = 0;
+    for (const auto& sec : pe.sections) {
+        if ((sec.characteristics & 0x2000'0000u) == 0) continue;  // EXECUTE
+        const auto sec_off = pe.rva_to_offset(sec.virtual_addr);
+        if (!sec_off.has_value()) continue;
+        size_t len = sec.raw_size;
+        if (static_cast<u64>(*sec_off) >= ctx.image.size()) continue;
+        len = static_cast<size_t>(std::min<u64>(len, ctx.image.size() - *sec_off));
+        if (len == 0) continue;
+        const u8* cur = ctx.image.data() + *sec_off;
+        size_t pos = 0;
+        u64 va = sec.virtual_addr;
+        while (pos < len) {
+            size_t remain = len - pos;
+            const u8* p = cur + pos;
+            u64 at = va;
+            if (!cs_disasm_iter(h, &p, &remain, &at, insn)) {
+                ++pos;
+                ++va;
+                continue;
+            }
+            if (try_rewrite(ctx.image.data() + *sec_off + pos, *insn)) ++rewritten;
+            pos += insn->size;
+            va += insn->size;
+        }
+        // —— 锚点补漏扫描（对齐 MIT-477 范式）：数据混排区失步时线性
+        // 漏过的真实引用由锚点独立解码补齐；对已重写位点幂等（新值不落
+        // 原 span）。
+        for (size_t i = 0; i + 2 <= len; ++i) {
+            const u8* b = cur + i;
+            size_t clen = 0;
+            if (b[0] == 0xFF && (b[1] == 0x15 || b[1] == 0x25)) {
+                clen = 6;  // FF /2 /4：call/jmp [disp32]
+            } else if (b[0] == 0xA1 || b[0] == 0xA3) {
+                clen = 5;  // A1/A3：mov eax,[disp32] / mov [disp32],eax
+            } else if ((b[1] & 0xC7) == 0x05) {
+                clen = 6;  // 泛单字节 opcode + modrm(00/101) + disp32
+            } else {
+                continue;
+            }
+            if (i + clen > len) continue;
+            size_t remain = clen;
+            const u8* p = b;
+            u64 at = sec.virtual_addr + i;
+            if (!cs_disasm_iter(h, &p, &remain, &at, insn)) continue;
+            if (insn->size != clen) continue;
+            if (try_rewrite(ctx.image.data() + *sec_off + i, *insn)) ++rewritten;
+        }
+    }
+    cs_free(insn, 1);
+    cs_close(&h);
+    return rewritten;
+}
+
+// ---------------------------------------------------------------------------
+// MIT-486 (T9.2 砍面②)：数据段指针重写——.reloc 目录全扫，非 EXECUTE
+// 节内 DIR64 (PE32+) / HIGHLOW (PE32) 站点值（preferred-base 同镜像 VA）
+// 落原 IAT span 的，重写为镜像等价槽全 VA。reloc 项保留不动：站点位置
+// 不变、新值仍为 preferred-base 同镜像 VA，delta（若启 ASLR）线性作用
+// 于新旧值等价成立。EXECUTE 节站点归代码重写面（x86 abs32 站点的
+// HIGHLOW 项在此被分流，避免与数据路径重复处理）。返回改写条数。
+static size_t rewrite_iat_data_refs(ProtectionContext& ctx, const PeImage& pe,
+                                    u64 iat_base, u64 iat_span, u64 mirror_rva) {
+    const bool plus = pe.is_pe32_plus;
+    const size_t w = plus ? 8 : 4;
+    const u16 want_type = plus ? 10 : 3;  // IMAGE_REL_BASED_DIR64 / HIGHLOW
+    const size_t dd5 = size_t(pe.nt_headers_offset) + 24 + opt_data_dir_off(plus) +
+                       5 * 8;  // DataDirectory[5] = BASERELOC
+    if (dd5 + 8 > ctx.image.size()) return 0;
+    const u32 reloc_rva = u32(rd_le(ctx.image.data() + dd5, 4));
+    const u32 reloc_size = u32(rd_le(ctx.image.data() + dd5 + 4, 4));
+    if (reloc_rva == 0 || reloc_size < 8) return 0;
+    const auto reloc_off = pe.rva_to_offset(reloc_rva);
+    if (!reloc_off.has_value() ||
+        u64(*reloc_off) + reloc_size > ctx.image.size())
+        return 0;
+    const u64 ib = pe.image_base;
+    size_t rewritten = 0;
+    size_t pos = 0;
+    const u8* rp = ctx.image.data() + *reloc_off;
+    while (pos + 8 <= reloc_size) {
+        const u32 page_rva = u32(rd_le(rp + pos, 4));
+        const u32 block_size = u32(rd_le(rp + pos + 4, 4));
+        if (block_size < 8 || pos + block_size > reloc_size) break;  // 损坏防御
+        const size_t n_entries = (block_size - 8) / 2;
+        for (size_t i = 0; i < n_entries; ++i) {
+            const u16 e = u16(rd_le(rp + pos + 8 + i * 2, 2));
+            if (u16(e >> 12) != want_type) continue;  // ABSOLUTE(0) 垫等跳过
+            const u32 site_rva = page_rva + u32(e & 0x0FFF);
+            const SectionInfo* sec = nullptr;
+            for (const auto& s : pe.sections) {
+                if (site_rva >= s.virtual_addr &&
+                    u64(site_rva) + w <=
+                        u64(s.virtual_addr) + s.virtual_size) {
+                    sec = &s;
+                    break;
+                }
+            }
+            if (sec == nullptr || (sec->characteristics & 0x2000'0000u) != 0)
+                continue;
+            const auto so = pe.rva_to_offset(site_rva);
+            if (!so.has_value() || u64(*so) + w > ctx.image.size()) continue;
+            u64 v = 0;
+            std::memcpy(&v, ctx.image.data() + *so, w);  // LE
+            if (v < ib) continue;
+            const u64 rva = v - ib;
+            if (rva < iat_base || rva + 4 > iat_base + iat_span) continue;
+            if ((rva - iat_base) % w != 0) continue;
+            const u64 new_v = ib + mirror_rva + (rva - iat_base);
+            for (size_t b = 0; b < w; ++b)
+                ctx.image[*so + b] = static_cast<u8>((new_v >> (8 * b)) & 0xFF);
+            ++rewritten;
+        }
+        pos += block_size;
+    }
+    return rewritten;
+}
+
 void ImportProtectPass::run(ProtectionContext& ctx) {
     // .wvmp 节（stub_link 产出）缺席 = 无可挂靠镜像 → 空转（镜像零改动）。
     NewSection* wvmp = nullptr;
@@ -418,13 +599,17 @@ void ImportProtectPass::run(ProtectionContext& ctx) {
             ctx.image[ft_offsets[i] + b] = static_cast<u8>((new_ft >> (8 * b)) & 0xFF);
     }
 
-    // MIT-477 (T9.1)：x64 代码引用重写——.text 内 rip 相对引用原 IAT 的指
-    // 令重指镜像等价槽。回填（TLS 回调）保留为兜底（未重写的引用——数据指
-    // 针、x86 绝对寻址——仍可用），运行期调用面则提前到 loader 填镜像时刻。
+    // MIT-477/486 (T9.1/T9.2)：代码引用重写——x64 rip 相对（MIT-477）/
+    // x86 abs32 直接编址（MIT-486 砍面①）；随后数据段指针重写（砍面②，
+    // 双架构）。回填（TLS 回调）保留为兜底（未识别的引用形态仍可用），
+    // 运行期调用面则提前到 loader 填镜像时刻。
     size_t refs_rewritten = 0;
     if (pe->machine != kMachineX86) {
         refs_rewritten = rewrite_iat_code_refs(ctx, *pe, base, span, mirror_rva);
+    } else {
+        refs_rewritten = rewrite_iat_code_refs_x86(ctx, *pe, base, span, mirror_rva);
     }
+    const size_t data_rewritten = rewrite_iat_data_refs(ctx, *pe, base, span, mirror_rva);
 
     import_protect::ImportPlan plan;
     plan.active = true;
@@ -439,21 +624,23 @@ void ImportProtectPass::run(ProtectionContext& ctx) {
     plan.oldprot_rva = oldprot_rva;
     ctx.slot<import_protect::ImportPlan>(kImportPlan) = plan;
 
-    char buf[192];
+    char buf[224];
     if (pe->machine != kMachineX86) {
         std::snprintf(buf, sizeof(buf),
                       "IAT 迁移：%u 描述符 / %u 槽（0x%llX 字节）→ .wvmp 镜像 @ RVA 0x%llX"
-                      "（INT 原位；回填由 TLS 回调执行；代码引用重写 %zu 处）",
+                      "（INT 原位；回填由 TLS 回调执行；代码引用重写 %zu 处 / 数据指针重写 %zu 处）",
                       plan.descriptor_count, plan.slot_count,
                       static_cast<unsigned long long>(span),
-                      static_cast<unsigned long long>(mirror_rva), refs_rewritten);
+                      static_cast<unsigned long long>(mirror_rva), refs_rewritten,
+                      data_rewritten);
     } else {
         std::snprintf(buf, sizeof(buf),
                       "IAT 迁移：%u 描述符 / %u 槽（0x%llX 字节）→ .wvmp 镜像 @ RVA 0x%llX"
-                      "（INT 原位；回填由 TLS 回调执行；x86 不做引用重写，回填兜底）",
+                      "（INT 原位；回填由 TLS 回调执行；x86 abs32 代码引用重写 %zu 处 / 数据指针重写 %zu 处）",
                       plan.descriptor_count, plan.slot_count,
                       static_cast<unsigned long long>(span),
-                      static_cast<unsigned long long>(mirror_rva));
+                      static_cast<unsigned long long>(mirror_rva), refs_rewritten,
+                      data_rewritten);
     }
     ctx.diag.report(Severity::Note, name(), buf);
 }

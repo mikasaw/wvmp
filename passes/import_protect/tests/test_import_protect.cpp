@@ -352,4 +352,246 @@ TEST(ImportProtectFallback, NoImportDirectoryIsNoop) {
     EXPECT_EQ(ctx.find_slot<std::vector<NewSection>>(kNewSections)->at(0).data.size(), 64u);
 }
 
+// ---------------------------------------------------------------------------
+// MIT-486 (T9.2)：x86 abs32 代码引用重写 + 数据段指针重写（.reloc 扫描）。
+// 通用三节夹具：.text @0x1000（EXECUTE，容纳导入面/代码引用站点）、
+// .data @0x2000（RW，数据指针站点）、.rdata @0x3000（RO，承载 .reloc
+// 目录 blob）；节 raw 步进与 .text 一致（raw_ptr = 0x400 + (rva-0x1000)）
+// → rv2off 全节通用。.wvmp 挂 @0x4000（避开 .rdata）。
+struct MultiSectionImage {
+    std::vector<u8> image;
+    PeImage meta;
+};
+
+MultiSectionImage make_multisection_image(bool plus, u64 base) {
+    const u16 machine = plus ? 0x8664 : 0x14C;
+    const size_t opt_size = plus ? 240 : 224;
+    const size_t table = kOpt + opt_size;
+    const size_t sh = table;  // 3 节头
+    const size_t end = sh + 3 * 40;
+    // 节布局（raw 步进与 .text 一致：raw_ptr = 0x400 + (rva-0x1000)）：
+    // .text vs/rs 0x1000 @ raw 0x400；.data 0x400 @ 0x1400；
+    // .rdata 0x400 @ 0x2400（.reloc blob @0x3400 → raw 0x2800）。文件总长
+    // 0x2900（含 blob 24B）。
+    std::vector<u8> img(end + 0x2900, 0);
+    img[0] = 'M';
+    img[1] = 'Z';
+    for (int i = 0; i < 4; ++i) img[0x3C + i] = u8((kNt >> (8 * i)) & 0xFF);
+    img[kNt] = 'P';
+    img[kNt + 1] = 'E';
+    auto wr16 = [&](size_t off, u16 v) {
+        img[off] = u8(v & 0xFF);
+        img[off + 1] = u8((v >> 8) & 0xFF);
+    };
+    auto wr32 = [&](size_t off, u32 v) {
+        for (int i = 0; i < 4; ++i) img[off + i] = u8((v >> (8 * i)) & 0xFF);
+    };
+    wr16(kNt + 4, machine);
+    wr16(kNt + 6, 3);
+    wr16(kNt + 20, u16(opt_size));
+    wr16(kNt + 22, 0x0022);
+    wr32(kOpt, plus ? 0x020B : 0x010B);
+    wr32(kOpt + 16, 0x1000);
+    wr32(kOpt + 20, 0x200);
+    wr32(kOpt + (plus ? 24 : 28), u32(base));
+    wr32(kOpt + 56, 0x5000);
+    wr32(kOpt + 60, 0x200);
+    wr32(kOpt + (plus ? 108 : 92), 16);
+    // dd[1] → 描述符链 @0x1000；dd[5] → .reloc blob @0x3380（.rdata 界内
+    // ——节终点 0x3400 为排他界，rva_to_offset 对端点返回空）。
+    const size_t dd = kOpt + (plus ? 112 : 96);
+    wr32(dd + 1 * 8, 0x1000);
+    wr32(dd + 1 * 8 + 4, 60);
+    wr32(dd + 5 * 8, 0x3380);
+    wr32(dd + 5 * 8 + 4, 8 + 2 * 8);
+
+    struct Sec {
+        const char* name;
+        u32 va;
+        u32 size;
+        u32 raw;
+        u32 ch;
+    };
+    const Sec secs[3] = {
+        {".text", 0x1000, 0x1000, 0x400, 0x60000020},
+        {".data", 0x2000, 0x400, 0x1400, 0xC0000040},
+        {".rdata", 0x3000, 0x400, 0x2400, 0x40000040},
+    };
+    for (int i = 0; i < 3; ++i) {
+        const size_t o = sh + size_t(i) * 40;
+        std::memcpy(&img[o], secs[i].name, std::strlen(secs[i].name));
+        wr32(o + 8, secs[i].size);
+        wr32(o + 12, secs[i].va);
+        wr32(o + 16, secs[i].size);
+        wr32(o + 20, secs[i].raw);
+        wr32(o + 36, secs[i].ch);
+    }
+
+    PeImage m;
+    m.is_pe32_plus = plus;
+    m.machine = machine;
+    m.image_base = base;
+    m.section_alignment = 0x1000;
+    m.file_alignment = 0x200;
+    m.num_sections = 3;
+    m.nt_headers_offset = u32(kNt);
+    for (const auto& s : secs) {
+        SectionInfo si;
+        si.name = s.name;
+        si.virtual_size = s.size;
+        si.virtual_addr = s.va;
+        si.raw_size = s.size;
+        si.raw_ptr = s.raw;
+        si.characteristics = s.ch;
+        m.sections.push_back(si);
+    }
+    return {std::move(img), std::move(m)};
+}
+
+// 在三节镜像内布置导入面（x64 槽宽 8B / x86 4B，rv2off = rva - 0xC00）：
+// desc0（INT@0x1100、FT@0x1200、2 槽）、desc1（INT@0x1300、FT@0x1200+3w
+// 连续、1 槽）、全零终止；VirtualProtect 名字面 @0x1500（v1 硬依赖）。
+struct ImportFixture2 {
+    std::vector<u8> image;
+    u64 iat_base = 0x1200;
+    u64 iat_span = 0;
+};
+
+ImportFixture2 make_import_fixture2(std::vector<u8> img, bool plus) {
+    const size_t w = plus ? 8 : 4;
+    auto wr32 = [&](size_t off, u32 v) {
+        for (int i = 0; i < 4; ++i) img[off + i] = u8((v >> (8 * i)) & 0xFF);
+    };
+    const auto rv2off = [](u32 rva) { return size_t(rva) - 0xC00; };
+    const u32 ft1 = 0x1200 + u32(3 * w);
+    // desc0 / desc1 / 终止。
+    wr32(rv2off(0x1000) + 0, 0x1100);
+    wr32(rv2off(0x1000) + 16, 0x1200);
+    wr32(rv2off(0x1000) + 20 + 0, 0x1300);
+    wr32(rv2off(0x1000) + 20 + 16, ft1);
+    // INT0 @0x1100：slot0 → VirtualProtect 名字 @0x1500、slot1 → 杂散、NULL。
+    wr32(rv2off(0x1100), 0x1500);
+    wr32(rv2off(u32(0x1100 + w)), 0x2222);
+    // IMAGE_IMPORT_BY_NAME @0x1500。
+    std::memcpy(&img[rv2off(0x1500) + 2], "VirtualProtect", 14);
+    // INT1 @0x1300：1 槽 + NULL。
+    wr32(rv2off(0x1300), 0x3333);
+    return {std::move(img), 0x1200, 4 * w};
+}
+
+// .reloc blob 布置：单块 PageRva=0x2000（.data），entries 由调用方给定
+//（type<<12|off）。blob 位于 @0x3400（.rdata 内），大小 8 + 2*n（须与
+// 夹具 dd[5] 尺寸一致：8 entry 槽位已按上限预留）。
+static void put_reloc_block(std::vector<u8>& img, const std::vector<u16>& entries) {
+    const size_t off = 0x3380 - 0xC00;
+    auto wr32 = [&](size_t o, u32 v) {
+        for (int i = 0; i < 4; ++i) img[o + i] = u8((v >> (8 * i)) & 0xFF);
+    };
+    wr32(off, 0x2000);
+    wr32(off + 4, u32(8 + 2 * entries.size()));
+    for (size_t i = 0; i < entries.size(); ++i) {
+        img[off + 8 + i * 2] = u8(entries[i] & 0xFF);
+        img[off + 8 + i * 2 + 1] = u8(entries[i] >> 8);
+    }
+}
+
+TEST(ImportProtectMigrate, X86Abs32CodeRefRewrite) {
+    const u64 base = 0x400000;
+    auto ms = make_multisection_image(false, base);
+    ProtectionContext ctx;
+    ctx.image = ms.image;
+    ctx.slot<PeImage>(kPeImage) = ms.meta;
+    ctx.slot<std::vector<NewSection>>(kNewSections).push_back(make_wvmp(0x4000));
+    ImportFixture2 fx = make_import_fixture2(std::move(ctx.image), false);
+    ctx.image = std::move(fx.image);
+    const auto rv2off = [](u32 rva) { return size_t(rva) - 0xC00; };
+    const u64 ib = base;
+    auto put_abs = [&](u32 at, u8 op0, u8 op1, u32 target) {
+        ctx.image[rv2off(at)] = op0;
+        if (op1 != 0) ctx.image[rv2off(at) + 1] = op1;
+        const u32 a = u32(ib + target);
+        const size_t doff = op1 != 0 ? 2 : 1;
+        for (int b = 0; b < 4; ++b)
+            ctx.image[rv2off(at) + doff + b] = u8((a >> (8 * b)) & 0xFF);
+    };
+    //   @0x1600: FF 15 abs → call [0x1200]（槽 0 → 改写）
+    //   @0x1610: 8B 05 abs → mov eax,[0x1204]（槽 1 → 改写）
+    //   @0x1620: A1 abs    → mov eax,[0x1200]（槽 0 → 改写）
+    //   @0x1630: FF 15 abs → call [0x1202]（非对齐 → 保留）
+    //   @0x1640: FF 15 abs → call [0x1300]（span 外 → 保留）
+    put_abs(0x1600, 0xFF, 0x15, 0x1200);
+    put_abs(0x1610, 0x8B, 0x05, 0x1204);
+    put_abs(0x1620, 0xA1, 0x00, 0x1200);
+    put_abs(0x1630, 0xFF, 0x15, 0x1202);
+    put_abs(0x1640, 0xFF, 0x15, 0x1300);
+    const std::vector<u8> raw_backup(ctx.image);
+
+    ImportProtectPass pass;
+    pass.run(ctx);
+
+    const auto* plan = ctx.find_slot<ImportPlan>(kImportPlan);
+    ASSERT_NE(plan, nullptr);
+    const u64 mirror = plan->mirror_rva;
+    const auto rd_abs = [&](u32 at, size_t disp_off) {
+        u32 raw32 = 0;
+        std::memcpy(&raw32, &ctx.image[rv2off(at) + disp_off], 4);
+        return raw32;
+    };
+    EXPECT_EQ(rd_abs(0x1600, 2), u32(ib + mirror + 0));
+    EXPECT_EQ(rd_abs(0x1610, 2), u32(ib + mirror + 4));
+    EXPECT_EQ(rd_abs(0x1620, 1), u32(ib + mirror + 0));
+    EXPECT_EQ(std::memcmp(&ctx.image[rv2off(0x1630)], &raw_backup[rv2off(0x1630)], 6), 0);
+    EXPECT_EQ(std::memcmp(&ctx.image[rv2off(0x1640)], &raw_backup[rv2off(0x1640)], 6), 0);
+}
+
+TEST(ImportProtectMigrate, DataRefRewriteRelocScan) {
+    // 双架构参数化：PE32+ DIR64 / PE32 HIGHLOW。
+    for (const bool plus : {true, false}) {
+        const u64 base = plus ? 0x140000000 : 0x400000;
+        const size_t w = plus ? 8 : 4;
+        const u16 rtype = plus ? 10 : 3;
+        auto ms = make_multisection_image(plus, base);
+        ProtectionContext ctx;
+        ctx.image = ms.image;
+        ctx.slot<PeImage>(kPeImage) = ms.meta;
+        ctx.slot<std::vector<NewSection>>(kNewSections).push_back(make_wvmp(0x4000));
+        ImportFixture2 fx = make_import_fixture2(std::move(ctx.image), plus);
+        ctx.image = std::move(fx.image);
+        const auto rv2off = [](u32 rva) { return size_t(rva) - 0xC00; };
+        const u64 ib = base;
+        // .data 站点：@0x2000 → IAT 槽 0（改写）；@0x2000+w → span 外
+        // 0x1300（保留）。
+        auto put_ptr = [&](u32 at, u64 rva) {
+            const u64 v = ib + rva;
+            for (size_t b = 0; b < w; ++b)
+                ctx.image[rv2off(at) + b] = u8((v >> (8 * b)) & 0xFF);
+        };
+        put_ptr(0x2000, 0x1200);
+        put_ptr(u32(0x2000 + w), 0x1300);
+        // EXECUTE 节站点（.text @0x1700 持 IAT 槽 VA 但无指令语义）：
+        // 数据路径必须按节属性分流跳过。
+        put_ptr(0x1700, 0x1200);
+        put_reloc_block(ctx.image,
+                        {u16(rtype << 12 | 0x000), u16(0 << 12 | 0x004),
+                         u16(rtype << 12 | u16(0x000 + w)), u16(rtype << 12 | 0x700)});
+        const std::vector<u8> raw_backup(ctx.image);
+
+        ImportProtectPass pass;
+        pass.run(ctx);
+
+        const auto* plan = ctx.find_slot<ImportPlan>(kImportPlan);
+        ASSERT_NE(plan, nullptr);
+        const u64 mirror = plan->mirror_rva;
+        const auto rd_val = [&](u32 at) {
+            u64 v = 0;
+            std::memcpy(&v, &ctx.image[rv2off(at)], w);
+            return v;
+        };
+        EXPECT_EQ(rd_val(0x2000), ib + mirror + 0);
+        EXPECT_EQ(rd_val(u32(0x2000 + w)), ib + 0x1300);
+        EXPECT_EQ(rd_val(0x1700), ib + 0x1200);
+        (void)raw_backup;
+    }
+}
+
 } // namespace
