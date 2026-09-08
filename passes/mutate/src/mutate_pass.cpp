@@ -46,11 +46,12 @@ constexpr double kJunkMovProbability = 0.15;
 // 先于 use（live_in = (live_out\def) ∪ use）；回归专测
 // MutateLiveness.PureDefKillMustNotEraseMemOperandUse 钉死次序。修复后
 // seed 12345 全量 165 junk Mov / 54 块 → wvmpTest 103/103 绿。
-// **重启用被 T6.5 阻塞**：宽 seed 扫描暴露无 mutate 的基线包在 seed
-// 3/9/11 崩于 kern.md5、部分 seed 挂死（VM 循环）——基线 seed 脆弱缺陷
-//（wvmpTest 历史只验过 seed 12345），与 mutate 无关。基线修复 + 全 seed
-// 扫描转绿后 junk-Mov 方可重启用。
-constexpr bool kEnableJunkMov = false;
+// **重启用阻塞已解除（MIT-484，T6.6）**：T6.5 根因 = asmgen build_callgate
+// 双缺陷（step 1 快照 rax scratch 覆写 flags_/pc_ + epilogue 恢复冲掉
+// 返回值），修复后 seeds 0..41 基线全扫 ALL GREEN + wvmpTest 双跑 +
+// multiseed 335/335。T6.6 全 seed junk 双跑扫描转绿后生产重启用
+//（kEnableJunkMov = true）。
+constexpr bool kEnableJunkMov = true;
 
 // 垃圾目的的候选 GP 集（按 arch；rsp 排除——栈写语义由栈深 walk 专管，
 // 任何额外 rsp 写都改变 walk 建模）。

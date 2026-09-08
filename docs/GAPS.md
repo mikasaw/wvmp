@@ -2046,3 +2046,33 @@ rax 非角色寄存器），**对该缺陷类不敏感**——单拿锚做回归
 **方法论沉淀**：cdb `bu module+off` + ctx+0 流 VA 过滤 + `poi(ctx+0x
 10+N*8)` 槽值日志是好/坏构建同构比对的有效路径；"哪个构建先坏"不如
 "同一词流两构建槽值差异"定位快。
+
+## MIT-485（T6.6 裁定，2026-09-08）——junk-Mov 生产重启用：全 seed 扫描转绿，MIT-478/T1 挂账正式关闭
+
+**裁定**：kEnableJunkMov **true**（passes/mutate/src/mutate_pass.cpp），
+junk-Mov 自 T1（MIT-459）挂账以来首次进入生产缺省面（Nop 面保持）。
+
+**门槛证据**（MIT-482 立案时定判据"基线修复 + 全 seed 扫描绿"）：
+① 前置基线缺陷已修（MIT-482 def-kill 次序 + MIT-484 callgate 双缺陷），
+seeds 0..41 基线全扫 ALL GREEN；② 本单 junk 面全 seed 扫描：seeds
+0..41 逐 seed 以 kern_mutate.toml 派生 TOML（mutate 7-pass，junk=true）
+打包 wvmpTest + timeout 90 运行，**42/42 PASS**（判据 SUMMARY
+passed=103 failed=0）；③ ctest 23/23；④ wvmpTest 双跑（base seed
+12345 / mut seed 3）各 103/103；⑤ multiseed 335/335（mutate 面不在
+multiseed 管道内，作零回踩门）。
+
+**生效实证**：seed 3 注入统计 note「已注入 239 个垃圾指令（Mov 128 /
+Nop 111，60 个基本块）」——junk 面真实发射非静默 no-op；注入点清单
+note（MIT-482 site_log 资产）逐点可审计。
+
+**安全背书链回顾**（junk-Mov 曾两次炸出真实缺陷，均已修复并有专测）：
+MIT-478 审计（callgate 隐式读盲区 + liveness 区域级 CFG 反向不动点）→
+MIT-482（insn_transfer kill-before-use 次序 + PureDefKillMustNotErase
+MemOperandUse 专测）→ MIT-484（callgate step1 scratch + epilogue 次序
+——**该缺陷在 junk 面同样会触发**，快照/恢复路径与注入内容无关）。
+jmp-face 教训入方法论：锚对角色寄存器落 rax 类缺陷不敏感，回归门必须
+含多 seed E2E（本单 42 seed 扫描即为该纪律的执行样板）。
+
+**遗留**：junk 密度/概率常量（kJunkMovProbability 等）未配置化（T11
+[mutate] 表仅 Nop 密度），需要时另立单；x86 面 junk 候选集与 x64 同
+代码路径，x86 电池不受本单影响。

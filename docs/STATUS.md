@@ -867,3 +867,18 @@ fb8c65cb…c2bac / 164,321B 入册（table=+0x6BB8 布局头不变）。
 
 **后续**：T6.6 = kEnableJunkMov=true 全 seed 扫描 → junk-Mov 重启用
 裁定（MIT-482 阻塞解除的前置基线缺陷已修）。
+
+
+## MIT-485 (T6.6 裁定 · junk-Mov 生产重启用) ✅ 2026-09-08
+
+**裁定（D 级，按 DEV_QUEUE T6.6 判据默认值拍板）**：kEnableJunkMov
+false → **true**（生产缺省面含 junk-Mov；Nop 面保持）。MIT-459 T1
+挂账 + MIT-478 二次翻案维持关闭的历史账清偿。
+
+**门槛**：MIT-482（def-kill 次序）+ MIT-484（callgate 双缺陷）修复后
+基线全 seed 绿为前置；本单 junk 面 seeds 0..41 逐 seed 打包运行
+**42/42 PASS**（SUMMARY 103/103 判据，timeout 90/跑）；ctest 23/23；
+wvmpTest 双跑各 103/103；multiseed 335/335 零回踩。生效实证：seed 3
+注入 239 垃圾指令（Mov 128 / Nop 111 / 60 块）。
+
+**披露**：junk 概率/密度未配置化（维持代码常量），需要时另立单。
