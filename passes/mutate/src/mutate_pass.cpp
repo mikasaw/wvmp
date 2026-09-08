@@ -362,7 +362,7 @@ void MutatePass::run(ProtectionContext& ctx) {
                             static_cast<size_t>(rng.uniform(0, dead[i].size() - 1));
                         const u32 junk_imm = static_cast<u32>(rng.next());
                         // 注意：junk_movs 在 region_allowed 判定之前自增
-                        //（与 Nop 侧 :337 同口径）——注入统计 note 的 Mov
+                        //（与 Nop 侧 "rng 语义计数" 注释同口径）——注入统计 note 的 Mov
                         // 计数是"rng 语义计数"，白名单丢弃也计入，与产物
                         // 字节对账时需知悉（MIT-485 验收建议 2）。
                         ++junk_movs;

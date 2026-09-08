@@ -947,3 +947,11 @@ asmgen 零触碰 → dump 锚不受影响（无换代）。
   静默跳过。MIT-476 观察项落地。
 - 验证：ctest 23/23（+3 用例：高水位出 Note / 低水位静默 / 无游标静
   默）；tls_e2e 4/4。
+
+
+## MIT-492 (T24 · 外观级注释清理三处) ✅ 2026-09-09
+- ① mutate_pass.cpp 行号引用改文字锚（"与 Nop 侧 rng 语义计数注释同
+  口径"，消除 off-by-3 漂移源）；② asmgen step 0 注释 reserved 槽防
+  御理由重复合并（MIT-484 复审遗留）；③ rng.hpp 注释续行缩进对齐。
+- 验证：重建 0 错；dump 锚 fb8c65cb… 逐位恒等（asmgen 注释零 codegen
+  触碰实证）；ctest 23/23。
