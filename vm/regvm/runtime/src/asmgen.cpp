@@ -1547,10 +1547,10 @@ public:
         //    image_base([ctx+0x110])（既有 RVA 形，行为逐位不变）。T3/T4 已
         //    由 decode_prelude 解出；t_[0] 恒 callee-saved（roll() 约束），
         //    跨 step 5 物理参数装载存活到 step 6 call。
-        //    ⚠️ 本块必须在参数快照（下一 step）之前：快照用 rax 搬运，而
-        //    T3/T4 (=t_[3]/t_[4]) 是池洗牌寄存器、可能=rax——先读后快照，
-        //    否则 reg 形槽索引/判别位读到快照残渣（E2E 实证：forkface 区2
-        //    cdb 崩点 [rsi+rax*8+0x10]，rax=0x475cc0=快照后 rax 残值）。
+        //    ⚠️ 本块必须在参数快照（下一 step）之前：快照覆写 reserved
+        //    24..27 槽，先读保 reg_a∈24..27 病态形的语义（translator 恒
+        //    emit ≤23，双保险）。（MIT-484 后快照 scratch = t_[1]，与
+        //    t_[3]/t_[4] 互斥、不再覆写 T3/T4，但先读次序仍保双保险。）
         //    先读还附带防御 reg_a∈24..27 的病态形：快照会覆写 reserved
         //    24..27 槽，先读保语义（ translator 恒 emit ≤23，双保险）。
         {
@@ -1579,7 +1579,9 @@ public:
         // flags_ 或 pc_ 分到 rax（pool 恒含 rax），step 2 随即把被 snapshot
         // 覆写的 rax 当 flags/pc 存进 ctx（实录：seed 3 构建生成的
         // `mov [ctx+0x98], rax` 存的是 v9 残值）。改用 t_[1]：角色互斥保证
-        // ≠ ctx_/base_/pc_/flags_，其原值到 step 4 才消费、此处已死。
+        // ≠ ctx_/base_/pc_/flags_，其原值在本块前无任何读者、step 4 首条
+        // 指令即纯写覆盖（decode_prelude 只用 t_[2..8]，step 0 只用
+        // t_[0]/t_[3]/t_[4]/t_[5]）。
         const std::string snap = r64(t_[1]);
         o += std::string("    mov ") + snap + ", qword ptr [" + r64(ctx_) + " + 0x18]\n";   // regs[1] (Rcx)
         o += std::string("    mov qword ptr [") + r64(ctx_) + " + 0xD0], " + snap + "\n";

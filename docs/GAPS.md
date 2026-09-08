@@ -2038,6 +2038,11 @@ bac / 164,321B**（WVMP_X64_ASM_DUMP + gtest_filter=Interpreter.MovdB
 ridgeSemantic 重新生成入册，布局头 entry=+0x0/dispatch=+0x2B/table=+
 0x6BB8 不变）。multiseed 335 回归结果随附（见提交）。
 
+**锚盲区警示**：dump 锚生成于 seed 12345（roll 后 flags_=r10/pc_=r14，
+rax 非角色寄存器），**对该缺陷类不敏感**——单拿锚做回归门测不出本单
+缺陷；缺陷面只在 flags_/pc_ 落 rax 的 seed（3/9/11/23/29 等）显形。
+回归门必须含多 seed E2E（multiseed/全 seed 扫描），锚仅守模板漂移。
+
 **方法论沉淀**：cdb `bu module+off` + ctx+0 流 VA 过滤 + `poi(ctx+0x
 10+N*8)` 槽值日志是好/坏构建同构比对的有效路径；"哪个构建先坏"不如
 "同一词流两构建槽值差异"定位快。
