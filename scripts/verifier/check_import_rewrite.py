@@ -65,7 +65,10 @@ def iat_span(data):
         io_ = r2o(intl)
         if io_ is None:
             return None
-        while u32(data, io_ + n * 4) != 0:
+        # INT 槽宽 = w（PE32+ 8B / PE32 4B）：4 字节步进会在首个 8B 槽的
+        # 高半字 0 处提前终止 → span 少算（MIT-487 验收 MUST-FIX，同
+        # census 脚本坑）。
+        while u32(data, io_ + n * w) != 0:
             n += 1
         if base is None or ft < base:
             base = ft
@@ -112,8 +115,11 @@ def main():
                 if lo <= t < lo + size:
                     exec_hits += 1
             # MIT-487 (T9.3a)：模型外形态负扫——imm32 直接载荷（B8+r
-            # mov r32, imm32 / C7 /0 mov [x], imm32 不经 MEM 操作数）与
-            # moffs64（A0-A3，long 模式 MSVC 不生成）。命中即残面证据。
+            # mov r32, imm32；x64 基址 >4GB 时 imm32 结构上装不下全 VA，
+            # 该族结构性缺席——负扫兜底仍留）。C7 /0 mov [x], imm32 的
+            # imm 载荷不经本扫：其 mem 操作数已由 MEM 面覆盖、imm 语义
+            # 是"写入槽的值"而非"槽地址引用"。moffs64（A0-A3，long 模式
+            # MSVC 不生成）。命中即残面证据。
             b = ins.bytes
             if 0xB8 <= b[0] <= 0xBF and len(b) == 5:
                 v = struct.unpack_from("<I", b, 1)[0]
@@ -164,6 +170,14 @@ def main():
                 pos += bsz
     print(f"orig_iat=[{lo:#x},{lo + size:#x}) plus={plus} "
           f"exec-hits={exec_hits} data-hits={data_hits} imm-hits={imm_hits}")
+    # span 自检（MIT-487 验收建议 2）：native dd[12]（IAT 目录 Size）非零
+    # 时必须与 INT 步进计数一致——自动捕获 span 分母错误类缺陷。
+    _secs, dd_native, _p2 = sections(native)
+    dd12_size = u32(native, dd_native + 12 * 8 + 4)
+    if dd12_size not in (0, size):
+        print(f"span self-check FAILED: dd[12].Size={dd12_size:#x} "
+              f"!= INT-counted {size:#x}")
+        return 1
     return 1 if (exec_hits or data_hits or imm_hits) else 0
 
 

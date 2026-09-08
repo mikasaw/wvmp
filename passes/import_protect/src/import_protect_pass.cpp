@@ -245,7 +245,11 @@ static size_t rewrite_iat_code_refs(ProtectionContext& ctx, const PeImage& pe,
                         b[1] == 0xB6 || b[1] == 0xB7 || b[1] == 0xBE ||
                         b[1] == 0xBF)) {
                 clen = 7;  // MIT-487：0F 前缀 mem 形（movups/movaps/movzx/movsx
-                           // [rip+disp32]）——drift 防线扩展（线性路径本已覆盖）
+                           // [rip+disp32]）——drift 防线扩展（线性路径本已覆盖）。
+                           // 注：带 legacy prefix/REX 的变体不是被 size 判据
+                           // "排除"——锚点落在 0F 字节位时尾解码 7 字节恰好
+                           // size==clen 通过，且子解码与真指令的 disp 落点
+                           // 一致（i+1+7 == 真指令尾），守卫照常生效。
             } else {
                 continue;
             }
@@ -393,10 +397,13 @@ static size_t rewrite_iat_code_refs_x86(ProtectionContext& ctx, const PeImage& p
             } else if (b[0] == 0xA1 || b[0] == 0xA3) {
                 clen = 5;  // A1/A3：mov eax,[disp32] / mov [disp32],eax
             } else if (b[0] == 0x0F && (b[2] & 0xC7) == 0x05 &&
-                       (b[1] == 0xB6 || b[1] == 0xB7 || b[1] == 0xBE ||
+                       (b[1] == 0x10 || b[1] == 0x11 || b[1] == 0x28 ||
+                        b[1] == 0x29 || b[1] == 0x2E || b[1] == 0x2F ||
+                        b[1] == 0xB6 || b[1] == 0xB7 || b[1] == 0xBE ||
                         b[1] == 0xBF)) {
-                clen = 7;  // MIT-487：0F movzx/movsx [disp32]（FF 35 已被泛
-                           // modrm 分支覆盖：0x35 & 0xC7 == 0x05）
+                clen = 7;  // MIT-487：0F movzx/movsx + SSE mem 形（与 x64 锚
+                           // 点集对称；FF 35 已被泛 modrm 分支覆盖：
+                           // 0x35 & 0xC7 == 0x05）
             } else if ((b[1] & 0xC7) == 0x05) {
                 clen = 6;  // 泛单字节 opcode + modrm(00/101) + disp32
             } else {
