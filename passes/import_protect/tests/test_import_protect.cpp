@@ -707,6 +707,11 @@ TEST(ImportProtectFallback, SkipBackfillWithoutCodeSectionFallsBack) {
     // 原 IAT 槽未被填桩（保持文件态 0）。
     const auto rv2off = [](u32 rva) { return size_t(rva) - 0x1000 + 0x400; };
     EXPECT_EQ(rd(ctx.image, rv2off(0x1200), 8), 0u);
+    // diag 分支断言（MIT-490 复审建议 2，与不可映射槽用例形成显式对照）。
+    bool diag_hit = false;
+    for (const auto& item : ctx.diag.items())
+        if (item.message.find("无 .wvmpc 节") != std::string::npos) diag_hit = true;
+    EXPECT_TRUE(diag_hit);
 }
 
 // MIT-490 (T22 ②，MIT-488 验收建议 2)：skip_backfill=true 但原 IAT 槽
@@ -760,10 +765,15 @@ TEST(ImportProtectFallback, SkipBackfillUnmappableSlotFallsBack) {
     EXPECT_EQ(plan->iat_base_rva, 0x2800u);
     // 分支可观测性：回退诊断必须点名"不可映射槽"——与"缺 .wvmpc"回退
     // 路径区分（MIT-490 验收 REJECT：死测试教训）。
-    bool diag_hit = false;
-    for (const auto& item : ctx.diag.items())
+    // 双向钉分支（MIT-490 复审建议 1）：含"不可映射槽"且不含"缺 .wvmpc"
+    // ——消息改写导致单向匹配静默失效时仍能被负向断言捕获。
+    bool diag_hit = false, diag_wrong_branch = false;
+    for (const auto& item : ctx.diag.items()) {
         if (item.message.find("不可映射槽") != std::string::npos) diag_hit = true;
+        if (item.message.find("无 .wvmpc 节") != std::string::npos) diag_wrong_branch = true;
+    }
     EXPECT_TRUE(diag_hit);
+    EXPECT_FALSE(diag_wrong_branch);
 }
 
 } // namespace
