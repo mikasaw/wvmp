@@ -16,6 +16,7 @@
 #include <gtest/gtest.h>
 
 #include <cstring>
+#include <string>
 #include <vector>
 
 namespace {
@@ -711,6 +712,10 @@ TEST(ImportProtectFallback, SkipBackfillWithoutCodeSectionFallsBack) {
 // MIT-490 (T22 ②，MIT-488 验收建议 2)：skip_backfill=true 但原 IAT 槽
 // 落节间空洞（rva_to_offset 失败）→ 槽映射预检失败 → 整单保守回退回填
 // 模式（红线覆盖不全时跳回填语义不成立，MIT-488 R1 复审随落项）。
+// MIT-490 验收 REJECT 修正：夹具必须含 .wvmpc——回退条件
+// `wvmpc == nullptr || !all_mappable` 短路，缺节时预检根本不参与判定
+// （死测试）；并以 diag 消息断言钉死"预检分支"可观测性 + iat_base_rva
+// 钉死 FT 篡改生效。
 TEST(ImportProtectFallback, SkipBackfillUnmappableSlotFallsBack) {
     const u64 base = 0x140000000;
     auto ms = make_multisection_image(true, base);
@@ -718,6 +723,12 @@ TEST(ImportProtectFallback, SkipBackfillUnmappableSlotFallsBack) {
     ctx.image = ms.image;
     ctx.slot<PeImage>(kPeImage) = ms.meta;
     ctx.slot<std::vector<NewSection>>(kNewSections).push_back(make_wvmp(0x4000));
+    NewSection csec;
+    csec.name = ".wvmpc";
+    csec.data.assign(16, 0);
+    csec.characteristics = 0x60000020u;
+    csec.requested_rva = 0x5000u;
+    ctx.slot<std::vector<NewSection>>(kNewSections).push_back(csec);
     ImportFixture2 fx = make_import_fixture2(std::move(ctx.image), true);
     ctx.image = std::move(fx.image);
     auto& rules = ctx.slot<ProtectRules>(kProtectRules);
@@ -725,7 +736,7 @@ TEST(ImportProtectFallback, SkipBackfillUnmappableSlotFallsBack) {
     rules.import_skip_backfill = true;
     // 把 desc0/desc1 的 FT 改指节间空洞（.data 止于 0x2400、.rdata 起于
     // 0x3000——0x2800 无节覆盖 → rva_to_offset 失败），两段保持相邻连续
-    //（0x2800..0x2818 / 0x2818..0x2830）以免触发区间连续性回退、并让槽
+    //（0x2800..0x2818 / 0x2818..0x2828）以免触发区间连续性回退、并让槽
     // 映射预检（而非连续性校验）成为回退触发点。INT 原位可映射，描述符
     // 解析 / VP 槽发现不受影响。
     const auto rv2off = [](u32 rva) { return size_t(rva) - 0xC00; };
@@ -745,6 +756,14 @@ TEST(ImportProtectFallback, SkipBackfillUnmappableSlotFallsBack) {
     ASSERT_NE(plan, nullptr);  // 迁移本体成立（base/span 计算 FT 仅取值）
     EXPECT_FALSE(plan->skip_backfill);
     EXPECT_EQ(plan->failfast_stub_rva, 0u);
+    // FT 篡改确实生效（否则用例会经其他回退路径假绿）。
+    EXPECT_EQ(plan->iat_base_rva, 0x2800u);
+    // 分支可观测性：回退诊断必须点名"不可映射槽"——与"缺 .wvmpc"回退
+    // 路径区分（MIT-490 验收 REJECT：死测试教训）。
+    bool diag_hit = false;
+    for (const auto& item : ctx.diag.items())
+        if (item.message.find("不可映射槽") != std::string::npos) diag_hit = true;
+    EXPECT_TRUE(diag_hit);
 }
 
 } // namespace

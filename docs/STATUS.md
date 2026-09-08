@@ -930,3 +930,12 @@ asmgen 零触碰 → dump 锚不受影响（无换代）。
   费 rules 哨兵；rng 抽取序不变（缺省注入与 MIT-485 基线逐字一致）。
 - 验证：ctest 23/23（+4 config 用例）；junk_density 0/100 两端 wvmpTest
   103/103 绿；multiseed 335/335。MIT-485 披露遗留清偿。
+
+
+## MIT-490 (T22 · 测试卫生单：三项验收遗留小测试打包) ✅ 2026-09-09
+- ① config 哨兵缺省守卫用例（junk_density 缺席 → has_*=false/15）；
+  ② 不可映射槽预检单测（skip_backfill + FT 落节间空洞 → 保守回退，
+  diag 消息断言钉分支 + iat_base_rva 钉篡改生效）；③ tls_e2e
+  rep-movs 扫描窗随回调尺寸化（[cb0, .wvmpc raw 末端)）。
+- 验证：ctest 23/23；tls_e2e 4/4。零产品代码改动。
+- ② 首版验收 REJECT（夹具缺 .wvmpc 短路进缺节分支 = 死测试）随修。
