@@ -122,7 +122,8 @@ ConfigResult parse_config(const std::filesystem::path& file) {
     // 必须响，不能静默吞。
     constexpr std::string_view kTopLevelKeys[] = {"input", "output", "seed", "arch",
                                                   "default_level", "functions", "passes",
-                                                  "mutate", "anti_debug", "tls", "crypt"};
+                                                  "mutate", "anti_debug", "tls", "crypt",
+                                                  "import"};
     for (const auto& [key, value] : tbl) {
         bool known = false;
         for (auto k : kTopLevelKeys)
@@ -130,7 +131,7 @@ ConfigResult parse_config(const std::filesystem::path& file) {
         if (!known)
             return fail("config 未知顶层字段 '" + std::string(key.str()) +
                         "'（允许: input/output/seed/arch/default_level/functions/"
-                        "passes/mutate/anti_debug/tls/crypt——⚠️ 顶层键必须写在任何 "
+                        "passes/mutate/anti_debug/tls/crypt/import——⚠️ 顶层键必须写在任何 "
                         "[[表头]] 之前，否则会被 TOML 作用域规则吸进表内）");
     }
 
@@ -399,6 +400,24 @@ ConfigResult parse_config(const std::filesystem::path& file) {
             return fail("config [tls] 'enabled' 必须是布尔值");
         result.value.rules.has_tls_enabled = true;
         result.value.rules.tls_enabled = *enabled;
+    }
+
+    // [import] skip_backfill（默认 false；true = MIT-488 跳过 TLS 回填 +
+    // 原 IAT 全槽 FailFast 红线桩——依据 MIT-487 完备性证据链，opt-in）。
+    if (const toml::node* imp_node = tbl.get("import")) {
+        const toml::table* it = imp_node->as_table();
+        if (!it) return fail("config 字段 'import' 必须是表（[import]）");
+        for (const auto& [key, value] : *it)
+            if (key.str() != "skip_backfill")
+                return fail("config [import] 未知子键 '" + std::string(key.str()) +
+                            "'（允许: skip_backfill）");
+        const toml::node* sb = it->get("skip_backfill");
+        if (sb == nullptr) return fail("config [import] 缺少子键 'skip_backfill'");
+        auto skip = sb->value<bool>();
+        if (!skip)
+            return fail("config [import] 'skip_backfill' 必须是布尔值");
+        result.value.rules.has_import_skip_backfill = true;
+        result.value.rules.import_skip_backfill = *skip;
     }
 
     result.ok = true;

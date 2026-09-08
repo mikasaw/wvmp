@@ -2191,3 +2191,46 @@ w 步进；② 新增 span 自检（native dd[12].Size 非零时必须与 INT �
 B8 >4GB 结构性缺席；x64 0F 锚"prefix 变体被 size 排除"注释更正为
 "尾解码落点与真指令一致，守卫照常生效"。修复后全链复跑：ctest、
 tls_e2e、池扫（见提交数字）。
+
+## MIT-488（T9.3b，2026-09-08）——跳回填行为票落地：[import] skip_backfill + FailFast 红线桩
+
+**语义**（opt-in，缺省 false = 回填模式零变化）：配置 `[import]
+skip_backfill = true` → import_protect 迁移后把**原 IAT 全槽（含 NULL
+终止槽）**写入 FailFast 桩 VA（.wvmpc 内 16 对齐 8 字节
+`31 C0 C7 00 00 00 00 00` = `xor eax,eax; mov [eax],0`，双架构同字节，
+写 0 地址确定性 AV）；ImportPlan 携带 skip_backfill/failfast_stub_rva；
+tls_hook 回调体据此**整段省略回填循环**（无 VP 调用、无 rep movs——
+.rdata 页翻转面消失；adb/rdtsc/drx 前缀照常）。.wvmpc 缺席（旧夹具）
+→ 保守回退回填模式（Note）。
+
+**依据与红线**：MIT-487 完备性证据链（形态全域普查四族零 + 迁移零残
+留 + 锚点加固）成立 → 域内无引用落原 IAT，回填兜底成为纯冗余面；域
+外形态一旦漏引，槽中桩 VA 使调用侧**确定性受控崩溃**（而非野指针静
+默错行为）——漏引从"静默"变"响亮"，这正是跳回填的安全前提。
+
+**运行期验证**（本单新增的最强实证）：
+① **零漏引正面**：tls 双架构 skip 模式打包 → native vs packed stdout/rc
+**byte-exact**（tls_e2e 4/4：backfill 2 + skip 2）；
+② **红线负例**（x86，B8 imm32 结构可编码面）：把执行路径上的
+`call [IAT 槽]`（FF 15）等长替换为 `mov eax,<槽VA>; call rax`
+（B8+FF D0，重写器模型外）→ skip 模式打包运行 **rc=3221225477
+（0xC0000005）确定性 AV**——红线桩按设计工作。x64 同构面结构性不可
+编码（基址 0x140000000 > 4GB，imm32 装不下全 VA），恰为完备性论证的
+一部分（MIT-487）；
+③ **静态断言**：packed .wvmpc 回调区无 rep movsq/movsd；原 IAT 42 槽
+全 = 桩 VA（tls_e2e skip 分支自动化）。
+
+**工程坑实录**：① x86 样本侦察连踩三坑——描述符在 .rdata 而非 .text
+（r2o 硬编码单节映射全读飞）、x86 abs32 目标是全 VA 须减 ib 再对
+RVA span、span 上界误减 ib 变负数——三次"零命中"全是扫描器错而非靶
+真零；② x64 B8 负例注入测试在 pack 前即不可行（imm32 溢出），属论证
+性面非测试面。
+
+**验证**：ctest 23/23（+4 用例：config [import] 三态 +
+SkipBackfillSlotsFilledWithFailFastStub + SkipBackfillTlsCallbackOmits
+BackfillLoop）；tls_e2e 4/4；multiseed 335/335（默认关断零回踩）；
+x86 电池不受影响（runtime 零触碰）。
+
+**披露**：skip_backfill 仅在"目标进程无第三方注入补丁"前提下安全——
+外部工具若依赖原 IAT 布局（罕见且本就破坏者视角），跳回填语义为显式
+opt-in，缺省关闭。

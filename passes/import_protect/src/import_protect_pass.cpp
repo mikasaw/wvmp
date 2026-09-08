@@ -4,6 +4,7 @@
 
 #include "wvmp/framework/context.hpp"
 #include "wvmp/framework/keys.hpp"
+#include "wvmp/framework/protect_levels.hpp"
 #include "wvmp/framework/registry.hpp"
 #include "wvmp/passes/pe_loader/pe_image.hpp"
 
@@ -630,6 +631,51 @@ void ImportProtectPass::run(ProtectionContext& ctx) {
     }
     const size_t data_rewritten = rewrite_iat_data_refs(ctx, *pe, base, span, mirror_rva);
 
+    // MIT-488 (T9.3b)：[import] skip_backfill=true → 跳回填模式。依据
+    // MIT-487 完备性证据链（形态全域普查 + 迁移零残留），整段跳过 TLS
+    // 回填，去掉 .rdata 页 VirtualProtect 翻转面（检测敏感）；红线 =
+    // 原 IAT 全槽（含 NULL 终止槽）写入 FailFast 桩 VA——完备性论证域
+    // 内无引用落原 IAT，域外形态一旦漏引，调用侧确定性 AV（受控崩溃）
+    // 而非野指针静默错行为。.wvmpc 缺席（旧夹具）→ 保守回退回填模式。
+    bool skip_backfill = false;
+    u64 failfast_rva = 0;
+    if (auto* rules = ctx.find_slot<ProtectRules>(kProtectRules);
+        rules != nullptr && rules->has_import_skip_backfill &&
+        rules->import_skip_backfill) {
+        NewSection* wvmpc = nullptr;
+        if (auto* sections = ctx.find_slot<std::vector<NewSection>>(kNewSections))
+            for (auto& s : *sections)
+                if (s.name == ".wvmpc") { wvmpc = &s; break; }
+        if (wvmpc == nullptr) {
+            ctx.diag.report(Severity::Note, name(),
+                            "[import] skip_backfill=true 但无 .wvmpc 节，保守回退回填模式");
+        } else {
+            // FailFast 桩：8 字节 `xor eax,eax; mov dword ptr [eax],0`
+            //（31 C0 C7 00 00 00 00 00，双架构同字节）→ 写 0 地址确定性
+            // AV。16 对齐预留（emit_reserve 协议，与 tls_hook 共用游标）。
+            u64 cur_ff = wvmpc->data.size();
+            bool grow_ok_ff = true;
+            if (auto* r = ctx.find_slot<u64>(kEmitReserveBase)) {
+                cur_ff = *r;
+                grow_ok_ff = false;
+            }
+            const u64 ff_off = emit_reserve_take(wvmpc->data, cur_ff, 16, 8, grow_ok_ff);
+            const u8 ff_stub[8] = {0x31, 0xC0, 0xC7, 0x00, 0x00, 0x00, 0x00, 0x00};
+            std::memcpy(wvmpc->data.data() + ff_off, ff_stub, 8);
+            if (auto* r = ctx.find_slot<u64>(kEmitReserveBase)) *r = cur_ff;
+            const u64 stub_va = pe->image_base + wvmpc->requested_rva + ff_off;
+            for (u64 off_in = 0; off_in + w <= span; off_in += w) {
+                const auto so = pe->rva_to_offset(u32(base + off_in));
+                if (!so.has_value() || u64(*so) + w > ctx.image.size()) continue;
+                for (size_t b = 0; b < w; ++b)
+                    ctx.image[*so + b] =
+                        static_cast<u8>((stub_va >> (8 * b)) & 0xFF);
+            }
+            skip_backfill = true;
+            failfast_rva = wvmpc->requested_rva + ff_off;
+        }
+    }
+
     import_protect::ImportPlan plan;
     plan.active = true;
     plan.iat_base_rva = base;
@@ -641,9 +687,11 @@ void ImportProtectPass::run(ProtectionContext& ctx) {
     plan.page_rva = page_rva;
     plan.page_bytes = page_bytes;
     plan.oldprot_rva = oldprot_rva;
+    plan.skip_backfill = skip_backfill;
+    plan.failfast_stub_rva = failfast_rva;
     ctx.slot<import_protect::ImportPlan>(kImportPlan) = plan;
 
-    char buf[224];
+    char buf[288];
     if (pe->machine != kMachineX86) {
         std::snprintf(buf, sizeof(buf),
                       "IAT 迁移：%u 描述符 / %u 槽（0x%llX 字节）→ .wvmp 镜像 @ RVA 0x%llX"
@@ -660,6 +708,13 @@ void ImportProtectPass::run(ProtectionContext& ctx) {
                       static_cast<unsigned long long>(span),
                       static_cast<unsigned long long>(mirror_rva), refs_rewritten,
                       data_rewritten);
+    }
+    if (skip_backfill) {
+        char buf2[128];
+        std::snprintf(buf2, sizeof(buf2),
+                      "[import] skip_backfill=true：TLS 回填已跳过，原 IAT 全槽 = FailFast 红线桩 @ RVA 0x%llX",
+                      static_cast<unsigned long long>(failfast_rva));
+        ctx.diag.report(Severity::Note, name(), buf2);
     }
     ctx.diag.report(Severity::Note, name(), buf);
 }

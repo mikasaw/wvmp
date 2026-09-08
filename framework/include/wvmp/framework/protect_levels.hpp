@@ -65,6 +65,8 @@ struct ProtectRules {
     bool tls_enabled = true;             // TLS 回调基建面开关
     bool has_crypt_fetch = false;
     bool crypt_fetch = false;            // MIT-473: 取指级加密（替代 blob 级）
+    bool has_import_skip_backfill = false;
+    bool import_skip_backfill = false;   // MIT-488: 跳过 TLS 回填 + FailFast 红线桩
 
     // 解析某函数的档位：显式规则覆盖缺省；index 规则先评、rva 规则后评
     // （rva 是跨重编译唯一较稳的选择器，后评 = 与 index 规则同时命中时

@@ -11,6 +11,7 @@
 
 #include "wvmp/framework/context.hpp"
 #include "wvmp/framework/keys.hpp"
+#include "wvmp/framework/protect_levels.hpp"
 
 #include <gtest/gtest.h>
 
@@ -592,6 +593,94 @@ TEST(ImportProtectMigrate, DataRefRewriteRelocScan) {
         EXPECT_EQ(rd_val(0x1700), ib + 0x1200);
         (void)raw_backup;
     }
+}
+
+// ---------------------------------------------------------------------------
+// MIT-488 (T9.3b)：[import] skip_backfill=true——跳回填模式。原 IAT 全槽
+// 写入 FailFast 红线桩 VA；tls_hook 回调体不再携带回填循环。
+TEST(ImportProtectMigrate, SkipBackfillSlotsFilledWithFailFastStub) {
+    const u64 base = 0x140000000;
+    ProtectionContext ctx;
+    ctx.image = make_image(true, 0x8664, base);
+    ctx.slot<PeImage>(kPeImage) = make_meta(true, 0x8664, base);
+    ctx.slot<std::vector<NewSection>>(kNewSections).push_back(make_wvmp(0x3000));
+    NewSection csec;
+    csec.name = ".wvmpc";
+    csec.data.assign(16, 0);
+    csec.characteristics = 0x60000020u;
+    csec.requested_rva = 0x4000u;
+    ctx.slot<std::vector<NewSection>>(kNewSections).push_back(csec);
+    ctx.image = make_import_fixture(base).image;
+    auto& rules = ctx.slot<ProtectRules>(kProtectRules);
+    rules.has_import_skip_backfill = true;
+    rules.import_skip_backfill = true;
+
+    ImportProtectPass pass;
+    pass.run(ctx);
+
+    const auto* plan = ctx.find_slot<ImportPlan>(kImportPlan);
+    ASSERT_NE(plan, nullptr);
+    EXPECT_TRUE(plan->skip_backfill);
+    ASSERT_NE(plan->failfast_stub_rva, 0u);
+
+    // 桩字节（31 C0 C7 00 00 00 00 00）落 .wvmpc @ failfast_stub_rva。
+    const std::vector<NewSection>* sections =
+        ctx.find_slot<std::vector<NewSection>>(kNewSections);
+    const std::vector<u8>* code = nullptr;
+    for (const auto& sc : *sections)
+        if (sc.name == ".wvmpc") code = &sc.data;
+    ASSERT_NE(code, nullptr);
+    const size_t stub_off = size_t(plan->failfast_stub_rva - 0x4000);
+    ASSERT_LE(stub_off + 8, code->size());
+    static const u8 kStub[8] = {0x31, 0xC0, 0xC7, 0x00, 0x00, 0x00, 0x00, 0x00};
+    EXPECT_EQ(std::memcmp(code->data() + stub_off, kStub, 8), 0);
+
+    // 原 IAT 全槽（3 槽 + NULL 终止，8B 宽）= 桩全 VA。
+    const u64 stub_va = base + plan->failfast_stub_rva;
+    const auto rv2off = [](u32 rva) { return size_t(rva) - 0x1000 + 0x400; };
+    for (u32 slot = 0x1200; slot < 0x1228; slot += 8) {
+        const u64 v = rd(ctx.image, rv2off(slot), 8);
+        EXPECT_EQ(v, stub_va);
+    }
+}
+
+TEST(ImportProtectMigrate, SkipBackfillTlsCallbackOmitsBackfillLoop) {
+    const u64 base = 0x140000000;
+    ProtectionContext ctx;
+    ctx.image = make_image(true, 0x8664, base);
+    ctx.slot<PeImage>(kPeImage) = make_meta(true, 0x8664, base);
+    ctx.slot<std::vector<NewSection>>(kNewSections).push_back(make_wvmp(0x3000));
+    NewSection csec;
+    csec.name = ".wvmpc";
+    csec.data.assign(16, 0);
+    csec.characteristics = 0x60000020u;
+    csec.requested_rva = 0x4000u;
+    ctx.slot<std::vector<NewSection>>(kNewSections).push_back(csec);
+    ctx.image = make_import_fixture(base).image;
+    auto& rules = ctx.slot<ProtectRules>(kProtectRules);
+    rules.has_import_skip_backfill = true;
+    rules.import_skip_backfill = true;
+
+    ImportProtectPass imp;
+    imp.run(ctx);
+    ASSERT_NE(ctx.find_slot<ImportPlan>(kImportPlan), nullptr);
+
+    TlsHookPass tls;
+    tls.run(ctx);
+
+    const auto* plan = ctx.find_slot<tls_hook::TlsPlan>(kTlsPlan);
+    ASSERT_NE(plan, nullptr);
+    std::vector<u8> const* code = nullptr;
+    for (const auto& sc : *ctx.find_slot<std::vector<NewSection>>(kNewSections))
+        if (sc.name == ".wvmpc") code = &sc.data;
+    ASSERT_NE(code, nullptr);
+    const auto& d = *code;
+    const size_t cb_off = size_t(plan->callback_rva - 0x4000);
+    // 回调体不含 rep movsq（F3 48 A5）——回填循环已随 skip_backfill 消失。
+    bool found = false;
+    for (size_t i = cb_off; i + 3 <= d.size(); ++i)
+        if (d[i] == 0xF3 && d[i + 1] == 0x48 && d[i + 2] == 0xA5) { found = true; break; }
+    EXPECT_FALSE(found);
 }
 
 } // namespace

@@ -601,6 +601,40 @@ TEST(ConfigParse, CryptNonBoolFails) {
     EXPECT_TRUE(contains(result.error, "crypt"));
 }
 
+TEST(ConfigParse, ImportSkipBackfillParses) {
+    const TempToml toml(
+        "input  = \"target.exe\"\n"
+        "output = \"out.exe\"\n"
+        "[import]\n"
+        "skip_backfill = true\n");
+    const auto result = wvmp::cli::parse_config(toml.path());
+    ASSERT_TRUE(result.ok) << result.error;
+    EXPECT_TRUE(result.value.rules.has_import_skip_backfill);
+    EXPECT_TRUE(result.value.rules.import_skip_backfill);
+}
+
+TEST(ConfigParse, ImportUnknownSubkeyFails) {
+    const TempToml toml(
+        "input  = \"target.exe\"\n"
+        "output = \"out.exe\"\n"
+        "[import]\n"
+        "skip = true\n");
+    const auto result = wvmp::cli::parse_config(toml.path());
+    ASSERT_FALSE(result.ok);
+    EXPECT_TRUE(contains(result.error, "skip_backfill"));
+}
+
+TEST(ConfigParse, ImportNonBoolFails) {
+    const TempToml toml(
+        "input  = \"target.exe\"\n"
+        "output = \"out.exe\"\n"
+        "[import]\n"
+        "skip_backfill = \"yes\"\n");
+    const auto result = wvmp::cli::parse_config(toml.path());
+    ASSERT_FALSE(result.ok);
+    EXPECT_TRUE(contains(result.error, "skip_backfill"));
+}
+
 TEST(ConfigParse, MixedSelectorPairStillRejected) {
     const TempToml toml(
         "input  = \"target.exe\"\n"

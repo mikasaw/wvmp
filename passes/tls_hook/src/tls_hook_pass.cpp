@@ -360,6 +360,12 @@ std::vector<u8> assemble_callback_stub(bool is_x86,
     }
     if (imp == nullptr) {
         body += is_x86 ? "xor eax, eax\nret 0Ch" : "xor eax, eax\nret";
+    } else if (imp->skip_backfill) {
+        // MIT-488 (T9.3b)：[import] skip_backfill=true → 回调体不带回填
+        // 循环（无 VP 调用、无 rep movs——.rdata 页翻转面整段消失）。
+        // 原 IAT 已由 import_protect 全槽写入 FailFast 红线桩（域外漏引
+        // → 受控 AV），此处只保留占位收尾；adb/rdtsc/drx 前缀照常。
+        body += is_x86 ? "xor eax, eax\nret 0Ch" : "xor eax, eax\nret";
     } else {
         const u64 mirror_va = image_base + imp->mirror_rva;
         const u64 orig_va = image_base + imp->iat_base_rva;

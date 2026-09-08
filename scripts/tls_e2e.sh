@@ -239,11 +239,137 @@ EOF
     rm -rf "$tmp"
 }
 
+# MIT-488 (T9.3b)：skip_backfill 模式——[import] skip_backfill=true 打包，
+# 判据：① note 报告 skip_backfill=true；② 校验器零残留；③ native vs
+# packed byte-exact（完备性证据的运行期形态：零漏引）；④ 静态断言原 IAT
+# 全槽 = 同一 VA（FailFast 红线桩）。
+run_one_skip() { # $1 = sample, $2 = plus(1|0), $3 = arch
+    local sample="$1" plus="$2" arch="$3"
+    local tmp cfg out_win rc rc2
+    tmp="$(mktemp -d)"
+    cfg="$tmp/e2e.toml"
+    out_win="$(cygpath -m "$tmp")/wvmp_tls_skip.exe"
+
+    cat > "$cfg" <<EOF
+input  = "$(cygpath -m "$sample")"
+output = "$out_win"
+seed   = 1
+
+[import]
+skip_backfill = true
+
+[anti_debug]
+drx = true
+rdtsc = true
+
+[[passes]]
+name = "pe_loader"
+[[passes]]
+name = "marker_scan"
+[[passes]]
+name = "lifter"
+[[passes]]
+name = "mutate"
+[[passes]]
+name = "virtualize"
+[[passes]]
+name = "crypt"
+[[passes]]
+name = "anti_debug"
+[[passes]]
+name = "stub_link"
+[[passes]]
+name = "import_protect"
+[[passes]]
+name = "tls_hook"
+[[passes]]
+name = "pe_writer"
+EOF
+
+    rc=0
+    out="$("$CLI" protect --config "$(cygpath -w "$cfg")" 2>&1)" || rc=$?
+    if [[ $rc -ne 0 ]]; then
+        echo "[tls-e2e] FAIL $arch skip: protect rc=$rc" >&2; echo "$out" | tail -3 >&2
+        fail=$((fail + 1)); rm -rf "$tmp"; return
+    fi
+    if ! echo "$out" | grep -q "skip_backfill=true"; then
+        echo "[tls-e2e] FAIL $arch skip note missing" >&2
+        fail=$((fail + 1)); rm -rf "$tmp"; return
+    fi
+    if ! python "$PWD/scripts/verifier/check_import_rewrite.py"                    "$(cygpath -m "$sample")" "$out_win" > /dev/null 2>&1; then
+        echo "[tls-e2e] FAIL $arch skip: static verify residual nonzero" >&2
+        fail=$((fail + 1)); rm -rf "$tmp"; return
+    fi
+    "$sample" > "$tmp/exp" 2>/dev/null; rc=$?
+    "$tmp/wvmp_tls_skip.exe" > "$tmp/act" 2>/dev/null; rc2=$?
+    if [[ $rc -ne $rc2 ]] || ! cmp -s "$tmp/exp" "$tmp/act"; then
+        echo "[tls-e2e] FAIL $arch skip: stdout/rc mismatch (native=$rc packed=$rc2)" >&2
+        fail=$((fail + 1)); rm -rf "$tmp"; return
+    fi
+    # 静态断言：原 IAT 全槽（INT w 步进计数）= 同一 VA（FailFast 红线桩）。
+    if ! python - "$out_win" "$plus" <<'PYEOF2'
+import struct, sys
+d = open(sys.argv[1], 'rb').read()
+plus = sys.argv[2] == '1'
+w = 8 if plus else 4
+e = struct.unpack_from('<I', d, 0x3c)[0]
+nsec = struct.unpack_from('<H', d, e+6)[0]
+opt = e + 24
+dd = opt + (112 if plus else 96)
+table = opt + struct.unpack_from('<H', d, e+20)[0]
+secs = []
+for i in range(nsec):
+    sh = table + i*40
+    vs, va, rs, rp = struct.unpack_from('<IIII', d, sh+8)
+    secs.append((va, vs, rp, rs))
+def r2o(r):
+    for va, vs, rp, rs in secs:
+        if va and va <= r < va + max(vs, rs):
+            return rp + r - va
+    return None
+desc = struct.unpack_from('<I', d, dd + 8)[0]
+o = r2o(desc)
+lo, hi = None, 0
+while o and o + 20 <= len(d):
+    intl, ts, fc, nm, ft = struct.unpack_from('<IIIII', d, o)
+    if not intl and not ft:
+        break
+    io_ = r2o(intl)
+    if io_ is None:
+        sys.exit(1)
+    n = 0
+    while struct.unpack_from('<I', d, io_ + n*w)[0] != 0:
+        n += 1
+        if n > 4096:
+            sys.exit(1)
+    lo = ft if lo is None else min(lo, ft)
+    hi = max(hi, ft + (n+1)*w)
+    o += 20
+vals = set()
+for r in range(lo, hi, w):
+    off = r2o(r)
+    vals.add(struct.unpack_from('<Q' if plus else '<I', d, off)[0])
+sys.exit(0 if len(vals) == 1 else 1)
+PYEOF2
+    then
+        :
+    else
+        echo "[tls-e2e] FAIL $arch skip: orig IAT slots not uniformly stub VA" >&2
+        fail=$((fail + 1)); rm -rf "$tmp"; return
+    fi
+
+    echo "[tls-e2e] PASS $arch skip-backfill"
+    pass=$((pass + 1))
+    rm -rf "$tmp"
+}
+
 [[ -f "$x64_sample" ]] || { echo "[tls-e2e] FAIL: $x64_sample missing (build target wvmp_tls_samples)" >&2; exit 1; }
 [[ -f "$x86_sample" ]] || { echo "[tls-e2e] FAIL: $x86_sample missing (build target wvmp_tls_samples)" >&2; exit 1; }
 
 run_one "$x64_sample" 1 x64
 run_one "$x86_sample" 0 x86
+run_one_skip "$x64_sample" 1 x64
+run_one_skip "$x86_sample" 0 x86
 
 echo "[tls-e2e] === $pass PASS / $fail FAIL ==="
 [[ $fail -eq 0 ]]

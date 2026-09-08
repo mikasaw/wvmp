@@ -31,6 +31,16 @@ struct ImportPlan {
     u64 page_rva = 0;         // 原 IAT 区所在首页 RVA（页对齐）
     u64 page_bytes = 0;       // 覆盖整个 IAT 区的页跨度
     u64 oldprot_rva = 0;      // .wvmp 内旧保护值暂存（u32，8B 对齐）
+
+    // —— MIT-488 (T9.3b)：跳回填模式（[import] skip_backfill，opt-in）——
+    // 依据 MIT-487 完备性证据链（形态全域普查 + 迁移零残留），可整段
+    // 跳过 TLS 回填：去掉 .rdata 页 VirtualProtect 翻转面（检测敏感）。
+    // 红线 = 原 IAT 全槽写入 FailFast 桩 VA（.wvmpc 内 8 字节
+    // `xor eax,eax; mov [eax],0`）：完备性论证域内无引用落原 IAT；域外
+    // 形态一旦漏引，调用侧确定性 AV（受控崩溃）而非野指针静默错行为。
+    // tls_hook 据此跳过回填循环体。
+    bool skip_backfill = false;
+    u64 failfast_stub_rva = 0; // FailFast 桩 RVA（.wvmpc 内，16 对齐）
 };
 
 } // namespace wvmp::passes::import_protect
