@@ -2541,3 +2541,17 @@ scratch_va+4（仅 x86，x64 用 r11 无槽写）。**验证**：tls_e2e 4/4；
 字段所在 RVA），用"目标值 ∈ 站点集"核对会双重视为命中/未命中而误
 判；③ 撤声明回退 = 首次真执行该架构全部初始化路径——回归面（如
 tls 回调双 dword 槽）在低熵时代不可见，E2E 必须覆盖全 pass 组合。
+
+## MIT-494f（T29 · undefined-flags 夹具依赖普查，2026-09-09）——零新增发现
+- 普查面：div_flags 勘误（MIT-494d）同款依赖 = "探测 SDM undefined
+  flags 位并逐位对拍 native"的夹具。结论：**唯一命中 = div_flags
+  （已修）**。
+- 逐族核查：① imul——无 MASM flags 探针夹具（imul_sample 为 C++ 面，
+  CF/OF 本身 defined；build_imul 的 D4.1 处置是 handler 内部设计非夹
+  具依赖）；② x87——永久 gate 双侧原生，VM 不执行不产 flags；③
+  flags_rol——rol/ror 的 ZF/SF/PF 语义 = unaffected（保留读合法）；
+  ④ sse bwcmp——ucomis 的 ZF/PF/CF defined；⑤ setcc/jcc 主面——
+  cmp/add/test 后的读全部 defined。
+- T28 同批：X86* 折条三单测切换真 x86 夹具 fn86_of（arch=X86，S32
+  tag）——T27 验收建议落地。Park "MIT-476 多 .wvmp continue" 条目维
+  持挂起（W^X 拆节后语义待重估，非当前阻塞）。
