@@ -2469,19 +2469,34 @@ multiseed_e2e.sh 零漂移。**本框架首个战果 = 立即抓出 T26d（下�
 - 验证：ctest 23/23；forkface ONLY 池 ×10 = **10/10 PASS**（x64 探针
   delta≠0 + 真基址 ×10 byte-exact；x86 声明回退 NOTE + ×10）。
 
-**T26d（新登记缺陷，T26c 合并的前置阻断）**：div_flags_readback x64
-在**真 delta≠0** 下 stdout PF 位非确定性翻转（q/r/哨兵恒正确，仅
-PF=0/1 漂移；首探针即现）。特征：seed 相关（1/12345/0xDEADBEEF 红，
-99999/0xCAFEBABE 绿）= roll/布局相关；同二进制同基址（per-boot 恒定
-0x7ff6a36c0000）逐次漂移 = 栈/内存态相关；delta=0 产物 20/20 恒定。
-**证据链**：折叠触发 0 次（TEMP note 实证，translator 折条排除）；
-pe_writer 剪枝为内容等价重组（站点集不变）嫌疑排除方向；旧代码产物
-pinned preferred 基址 20/20 稳定 + 新产物 pinned 重定位基址即现 flake
-= **历史绿全部是 delta=0 下的测量**（基址 per-boot 按镜像哈希选择，
-产物字节变 → 基址命运变，二分实验曾被此混淆）。候选方向：MIT-474
-dead-bit 误标 + 未初始化 ctx flags 槽读（首探针即毒化指向更早的写
-缺失）；MIT-484 同族（flags_/pc_ 落 rax/rdx）div handler 变体。修复
-归 T26d 专单，T26c 不跨 Scope。
+**T26d（两层根因，2026-09-09 定案——初版"真 delta≠0 缺陷"定性反转）**：
+div_flags_readback x64 stdout PF 位逐次漂移。**根因分解**：
+- **层 1（已修，translator）**：合成（非 guest 语义）flag-writing 指令
+  污染 guest flags 视界——`mov [rbx+disp], rax` 降低为 Mov/Add(合成)/
+  Store，合成 Add 的 flags_tail 把**指针低位奇偶**写进 [ctx+0x98]，后
+  续 setcc 整排读到合成值（实测 PF 全排 111111/000000 随堆栈熵翻转）。
+  修复 = Emitter::mark_last_dead 五类合成发射点（寻址拼装 Add/Sub/Shl、
+  imm64 拆条 Shl/Or、x64 栈调整 Sub/Add、跳表表项物化、锚定 Add）+
+  mark_dead_flag_writes 对预标记**写族**指令按透明（kNone）处理（⚠️
+  仅写族——Jcc/Setcc/Cmovcc/ExitNative 的 cond 域是 4 位条件码，bit2 =
+  条件数据非标记，首版透明化误伤 Jcc 读链被 FlagsLiveness 单测当场拦
+  下）。修复后前 5 条输出行 flags 恒正确（合成污染清除，读到真 div 后
+  test 前的值），仅第 6 输出行（idiv32_neg）PF 残留漂移 → 暴露层 2。
+  验收补充：plain 形串指令尾随步进 Add 同族残留一并打标（movs/stos/
+  lods/scas/cmps 五路径 7 处，scas/cmps 防步进覆写比较 flags）。
+- **层 2（已修，夹具重设计）**：MIT-404 的 "div/idiv flags undefined
+  但同 CPU 同输入逐位一致" 前提在高熵堆栈随机化下不成立——undefined
+  值随微架构状态漂移，VM 捕获值永远无法可靠对拍 native 捕获值。修复
+  = 夹具（div_flags_readback_sample_asm.asm 三函数）除法后插
+  `test rax/eax, rax/eax` 探测**有定义** flags（ZF/SF/PF 由商决定，
+  CF=OF=0），槽位路由 + flags 管线验证价值不变，双侧确定。
+- **验证**：ctest 23/23（+3 合成透明化用例）；div_flags 重打包 ×20 =
+  20/20；基线 multiseed **335/335**；tls_e2e 4/4；全池 multiseed_aslr
+  门见 STATUS MIT-494d 节。
+- **口径更正（重要）**：本缺陷与 delta 数值**无关**——高熵栈随机化挂
+  DYNAMIC_BASE 位，低熵栈下 pointer parity 恒定故历史绿；MIT-474
+  liveness 算法本身无罪（python 逐指令复刻与 C++ 行为一致），它忠实建
+  模了被合成指令污染的降低层。
 
 **方法论新增**：① 产物字节→pinned 基址→delta 命运的混淆链：任何
 "A 构建稳/B 构建飘"的对比必须先 probe 双方基址，否则二分结论无效；

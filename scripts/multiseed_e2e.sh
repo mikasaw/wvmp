@@ -154,6 +154,9 @@ samples=(
     "build/passes/marker_scan/tests/wvmp_sse_bwcmpss_flags_readback_sample.exe"
     # MIT-404: 整数除法族主样本 + 影子样本 + 既有 rip_relative 2 样本注册.
     "build/passes/marker_scan/tests/wvmp_div_sample.exe"
+    # MIT-494d: div_flags_readback 夹具勘误——除法后插 test 探测确定
+    # flags（原"undefined flags 同 CPU 逐位一致"前提在高熵随机化下不
+    # 成立，见 GAPS MIT-494d）。
     "build/passes/marker_scan/tests/wvmp_div_flags_readback_sample.exe"
     "build/passes/marker_scan/tests/wvmp_rip_relative_sample.exe"
     "build/passes/marker_scan/tests/wvmp_rip_relative_simple_sample.exe"

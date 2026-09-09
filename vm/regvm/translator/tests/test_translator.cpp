@@ -464,6 +464,64 @@ TEST(Translate, FlagsLivenessAdcSbbRegDepKeepsPredecessor) {
     EXPECT_TRUE(dead(d.insns[1]));    // adc 自身 flags 写：后无读者
 }
 
+// ---------------- MIT-494d：合成指令 flags 透明化 ----------------
+
+TEST(Translate, SyntheticAddressAddMarkedDeadGuestFlagsSurvive) {
+    // add rax,1（guest flags 写）→ mov [rbx+8],rax（寻址合成 Add acc,8）→
+    // Jcc（读者）。合成 Add 打 dead 标且**不再杀前驱 guest 写**——native
+    // 等价（mov [rbx+8],rax）不写 flags，合成指令的宿主 flags 副作用
+    // （指针低位奇偶）不得泄漏进 setcc/jcc 读数（MIT-494d div_flags PF
+    // 漂移根因）。
+    ir::Insn st = I(ir::Op::Store, ir::Size::S64);
+    st.dst = ir::Operand::mem_(m(ir::Reg::Rbx, ir::Reg::Flags, 0, 8));
+    st.src = ir::Operand::reg_(ir::Reg::Rax);
+    const auto r = wvmp::regvm::translator::translate_function(fn_of({
+        blk(0x1000, {alu(ir::Op::Add, ir::Operand::reg_(ir::Reg::Rax),
+                         ir::Operand::imm_(1), ir::Size::S32),
+                     st,
+                     jump(ir::Op::Jcc, 0x2000)}),
+        blk(0x2000, {mov_imm(ir::Reg::Rcx, 7, ir::Size::S32)}),
+    }));
+    const Decoded d = decode_program(r.program);
+    ASSERT_GE(d.insns.size(), static_cast<size_t>(5));
+    EXPECT_EQ(d.insns[0].op, VmOp::Add);
+    EXPECT_FALSE(dead(d.insns[0]));   // guest Add：Jcc 跨合成指令仍是读者
+    EXPECT_EQ(d.insns[1].op, VmOp::Mov);  // acc = rbx
+    EXPECT_EQ(d.insns[2].op, VmOp::Add);  // acc += 8（合成）
+    EXPECT_TRUE(dead(d.insns[2]));        // 合成 disp Add：dead 标
+    EXPECT_EQ(d.insns[3].op, VmOp::Store);
+}
+
+TEST(Translate, Imm64SplitSyntheticsMarkedDead) {
+    // imm64 拆条的 Shl/Or 为合成拼装：dead 标（native movabs 不写 flags）。
+    const Decoded d = one_insn(mov_imm(ir::Reg::Rax, 0x1122334455667788ll, ir::Size::S64));
+    ASSERT_EQ(d.insns.size(), static_cast<size_t>(6));
+    EXPECT_EQ(d.insns[1].op, VmOp::Shl);
+    EXPECT_TRUE(dead(d.insns[1]));
+    EXPECT_EQ(d.insns[3].op, VmOp::Or);
+    EXPECT_TRUE(dead(d.insns[3]));
+    EXPECT_EQ(d.insns[0].op, VmOp::Mov);  // Mov 非 flags 写，不带标
+    EXPECT_FALSE(dead(d.insns[0]));
+}
+
+TEST(Translate, PushStackAdjustSubMarkedDead) {
+    // x64 push 的栈步进 Sub rsp 为合成（native push 不写 flags）。
+    const auto r = wvmp::regvm::translator::translate_function(fn_of({
+        blk(0x1000, {alu(ir::Op::Add, ir::Operand::reg_(ir::Reg::Rax),
+                         ir::Operand::imm_(1), ir::Size::S32),
+                     [] {
+                         ir::Insn p = I(ir::Op::Push, ir::Size::S64);
+                         p.dst = ir::Operand::reg_(ir::Reg::Rbx);
+                         return p;
+                     }()}),
+    }));
+    const Decoded d = decode_program(r.program);
+    ASSERT_GE(d.insns.size(), static_cast<size_t>(4));
+    EXPECT_EQ(d.insns[1].op, VmOp::Sub);  // 栈步进
+    EXPECT_TRUE(dead(d.insns[1]));
+    EXPECT_TRUE(dead(d.insns[0]));        // guest Add：后无读者 → liveness 死写标记
+}
+
 TEST(Translate, RetTerminatorNeedsNoFallthrough) {
     // b0: jne 0x2000  b1: ret —— Jcc 之后补 Jmp+1，Ret 之后不补，末尾 Halt。
     const auto r = wvmp::regvm::translator::translate_function(fn_of({

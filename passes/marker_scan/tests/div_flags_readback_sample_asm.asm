@@ -9,8 +9,11 @@
 ;   1. out[0]/out[1] = 商/余 (区域内存 store, 槽写错即不一致 → FAIL);
 ;   2. out[2..6] = setz/setc/seto/sets/setp 五探针 — Setcc handler 读
 ;      Div/Idiv handler flags_tail 写的 VM flags 槽。flags 按 Intel
-;      undefined, 但 VM 与 native 在同一 CPU 执行同一条 div/idiv →
-;      真值逐位一致 (D4.1: 处置照抄 build_imul 的可观测推论)。
+;      undefined —— MIT-494d 勘误: 原设计依赖 "VM 与 native 在同一 CPU
+;      执行同一条 div/idiv → 真值逐位一致" 的前提, 在高熵堆栈随机化下
+;      不成立（undefined 值随微架构状态漂移, PF 整排翻转）。现除法后
+;      插 test rax/eax, rax/eax 探测**有定义**的 flags（ZF/SF/PF 由商
+;      决定, CF=OF=0）—— 槽位路由 + flags 管线验证价值不变, 双侧确定。
 ;
 ; Win64 ABI / 栈对齐 / rax clobber 约定同 div_sample_asm.asm。
 
@@ -34,6 +37,11 @@ dfr_idiv64 PROC
     mov  rdi, [rsp+28h]                 ; rdi = b
     cqo                                 ; 48 99
     idiv rdi                            ; 48 F7 FF (REG)
+    test rax, rax                       ; MIT-494d: div/idiv flags = SDM undefined,
+                                        ; 逐位对拍 native 依赖同值前提在高熵随机化
+                                        ; 下不成立（PF 随堆栈布局漂移）。改探
+                                        ; test（ZF/SF/PF 由商决定，CF=OF=0）=
+                                        ; 双侧确定值，flags 管线验证价值不变。
     mov  [rbx], rax                     ; out[0] = 商
     mov  [rbx+8], rdx                   ; out[1] = 余
     setz al                             ; 五探针: Setcc handler 读 VM flags 槽
@@ -73,6 +81,7 @@ dfr_div32 PROC
     mov  ecx, dword ptr [rsp+24h]       ; ecx = b
     cdq                                 ; 99
     div  ecx                            ; F7 F1 (REG)
+    test eax, eax                       ; MIT-494d: 同 dfr_idiv64 注（探测确定 flags）
     mov  [rbx], rax                     ; out[0] = 商 (高 32 位由 32 位写语义定)
     mov  [rbx+8], rdx                   ; out[1] = 余
     setz al
@@ -110,6 +119,7 @@ dfr_idiv32 PROC
     mov  eax, dword ptr [rsp+20h]       ; eax = a
     cdq                                 ; 99
     idiv dword ptr [rsp+24h]            ; F7 /7 MEM
+    test eax, eax                       ; MIT-494d: 同 dfr_idiv64 注（探测确定 flags）
     mov  [rbx], rax
     mov  [rbx+8], rdx
     setz al

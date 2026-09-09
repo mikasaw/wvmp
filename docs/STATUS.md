@@ -1015,9 +1015,18 @@ asmgen 零触碰 → dump 锚不受影响（无换代）。
 - 基线 multiseed 332/335：3 红 = div_flags PF 漂移 → **T26d**（真
   delta≠0 首个暴露缺陷，非本单回归，证据链入 GAPS MIT-494d）。
 
-### MIT-494d (T26d · 真 delta≠0 VM flags 非确定性) ⏳ 2026-09-09 立案
-- div_flags_readback x64：真 delta≠0 下 PF 位逐次漂移（q/r 恒正确）。
-  seed 相关（roll）+ delta=0 恒定 + 折叠 0 触发 + 剪枝内容等价。
-- 历史口径更正：基址按镜像哈希 per-boot 选择，历史"ASLR 路径绿"未
-  经 delta≠0 断言，不可引用为真 ASLR 证据。修复另立单，T26c 合并的
-  后置收敛条件。
+### MIT-494d (T26d · 合成指令 flags 污染 + undefined-flags 夹具依赖) ✅ 2026-09-09
+- div_flags PF 漂移两层根因定案并修复（初版"真 delta≠0 缺陷"定性反
+  转——与 delta 数值无关，高熵栈随机化挂 DYNAMIC_BASE 位而已）：
+  ① 层 1 = 合成（寻址/拆条/栈调整/表项物化）flag-writing 指令污染
+  guest flags 视界 → Emitter::mark_last_dead 五类发射点 + liveness 写
+  族透明化（cond 域双语义坑：Jcc/Setcc/Cmovcc/ExitNative 的 bit2 =
+  条件码非标记，首版误伤被 FlagsLiveness 单测当场拦截）；② 层 2 =
+  MIT-404 "undefined flags 同 CPU 逐位一致"前提在高熵随机化下不成立
+  → 夹具三函数除法后插 test 探测确定 flags（槽位路由/管线验证价值不
+  变）。
+- 验证：ctest 23/23（+3 用例）；div_flags ×20 = 20/20；基线
+  multiseed 335/335（修复前 332/335）；tls_e2e 4/4；全池
+  multiseed_aslr REPEATS=10 = **335/335 全绿**（250 x64 真基址
+  delta≠0 ×10 byte-exact + 85 x86 声明回退 NOTE ×10）→ T26 v2 收敛
+  门通过，分支具备合入条件。

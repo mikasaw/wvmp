@@ -47,6 +47,17 @@ struct Emitter {
     void emit_ri(VmOp op, u8 ra, u32 aux, u8 cs) { // a=Reg, b=Imm
         emit(op, OpKind::Reg, ra, OpKind::Imm, 0, aux, cs);
     }
+    // MIT-494d：合成（非 guest 语义）的 flag-writing 指令打 flags-dead 标。
+    // 地址拼装 Add/Sub/Shl、imm64 拆条 Shl/Or、栈调整 Sub/Add、跳表表项物
+    // 化的宿主 flags 副作用不得进入 guest 视界——native 等价序列（lea/mov/
+    // 栈步进）不写 flags，合成指令的 flags_tail 会把指针低位奇偶等宿主状
+    // 态写进 [ctx+0x98] 供后续 setcc/jcc 误读（MIT-494d div_flags PF 漂移
+    // 根因）。mark_dead_flag_writes 对预标记指令按透明（kNone）处理。
+    void mark_last_dead() {
+        if (!out.empty())
+            out.back().cond_or_size =
+                isa::set_flags_dead(out.back().cond_or_size);
+    }
 };
 
 // scratch 轮转分配（v18..v23，预算 6）。单条 IR 指令的任何展开路径至多用 5：
@@ -698,8 +709,10 @@ void emit_imm64_split(Emitter& em, Scratch& sc, u8 d, u64 v, u8 sz_step) {
     const u8 s = sc.take();
     em.emit_ri(VmOp::Mov, s, static_cast<u32>(v >> 32), sz_step);
     em.emit_ri(VmOp::Shl, s, 32, sz_step);
+    em.mark_last_dead();  // MIT-494d: 合成 Shl 的 flags 副作用不进 guest 视界
     em.emit_ri(VmOp::Mov, d, static_cast<u32>(v), sz_step);
     em.emit_rr(VmOp::Or, d, s, sz_step);
+    em.mark_last_dead();  // 同上（Or 拼装）
 }
 
 // 地址计算：base(+index*scale)(+disp) -> acc。RIP 相对：base=Rip 时用
@@ -747,9 +760,12 @@ void emit_imm64_split(Emitter& em, Scratch& sc, u8 d, u64 v, u8 sz_step) {
             }
             const u8 ix = sc.take();
             em.emit_rr(VmOp::Mov, ix, isa::vm_reg_of(m.index), sz_step);
-            if (shift_bits > 0)
+            if (shift_bits > 0) {
                 em.emit_ri(VmOp::Shl, ix, shift_bits, sz_step);
+                em.mark_last_dead();  // MIT-494d
+            }
             em.emit_rr(VmOp::Add, acc, ix, sz_step);
+            em.mark_last_dead();      // MIT-494d
         }
         (void)current_rva;
         acc_out = acc;
@@ -772,23 +788,29 @@ void emit_imm64_split(Emitter& em, Scratch& sc, u8 d, u64 v, u8 sz_step) {
         }
         const u8 ix = sc.take();
         em.emit_rr(VmOp::Mov, ix, isa::vm_reg_of(m.index), sz_step);
-        if (shift_bits > 0)
+        if (shift_bits > 0) {
             em.emit_ri(VmOp::Shl, ix, shift_bits, sz_step);
+            em.mark_last_dead();  // MIT-494d
+        }
         em.emit_rr(VmOp::Add, acc, ix, sz_step);
+        em.mark_last_dead();      // MIT-494d
     }
     if (m.disp != 0) {
         if (fits_aux(m.disp)) {
             em.emit_ri(VmOp::Add, acc, static_cast<u32>(m.disp), sz_step);
+            em.mark_last_dead();  // MIT-494d: disp 拼装（native lea 不写 flags）
         } else if (m.disp < 0) {
             // 负 disp：Sub |disp|（aux 零扩展放不下负数，减法等价，见头文件约定）。
             const u64 mag = static_cast<u64>(-(m.disp + 1)) + 1; // 避开 INT64_MIN 的 UB
             if (mag > 0xFFFF'FFFFull)
                 return false; // 超大负 disp：x86 不可编码，防御拒绝
             em.emit_ri(VmOp::Sub, acc, static_cast<u32>(mag), sz_step);
+            em.mark_last_dead();  // MIT-494d
         } else {
             const u8 t = sc.take();
             emit_imm64_split(em, sc, t, static_cast<u64>(m.disp), sz_step);
             em.emit_rr(VmOp::Add, acc, t, sz_step);
+            em.mark_last_dead();  // MIT-494d
         }
     }
     (void)current_rva;
@@ -1159,27 +1181,34 @@ struct Translator {
 
         // ---- MIT-442 (X2a) ②: plain 单发形 — "循环一次" 展开 (X0 §A.2 预判
         // 实测成立: 415 微程序框架现成)。无 rcx 预检/无循环回边/无早退;
-        // movs/stos/lods 原生不写 flags → 无 GetFlags/SetFlags 包裹 (体内
-        // Load/Store/Add 全 flags-free); scas/cmps 单发 = 体内 Cmp 后直落,
-        // flags = 末次比较 (原生语义, 不恢复)。DF=0 假定沿用 G3 D1 口径。
+        // movs/stos/lods 原生不写 flags → 体内 Load/Store flags-free、尾随
+        // 指针步进 Add 为合成（MIT-494d mark_last_dead，宿主 flags 副作用
+        // 不进 guest 视界）; scas/cmps 单发 = 体内 Cmp 后直落, flags = 末次
+        // 比较（原生语义）——尾随步进 Add 同为合成打标，防覆写比较 flags。
+        // DF=0 假定沿用 G3 D1 口径。
         if (plain) {
             if (family == 0) {            // movsd/movsb/movsq 单发: [rdi]←[rsi]
                 const u8 t1 = sc.take();
                 em.emit_rr(VmOp::Load, t1, rsi, sz);
                 em.emit_rr(VmOp::Store, rdi, t1, sz);
                 em.emit_ri(VmOp::Add, rsi, inc, sz64);
+                em.mark_last_dead();      // MIT-494d
                 em.emit_ri(VmOp::Add, rdi, inc, sz64);
+                em.mark_last_dead();      // MIT-494d
             } else if (family == 1) {     // stos: [rdi] ← AL/EAX/RAX
                 em.emit_rr(VmOp::Store, rdi, rax, sz);
                 em.emit_ri(VmOp::Add, rdi, inc, sz64);
+                em.mark_last_dead();      // MIT-494d
             } else if (family == 4) {     // lods: AL/EAX/RAX ← [rsi]
                 em.emit_rr(VmOp::Load, rax, rsi, sz);
                 em.emit_ri(VmOp::Add, rsi, inc, sz64);
+                em.mark_last_dead();      // MIT-494d
             } else if (family == 2) {     // scas 单发: cmp acc, [rdi]
                 const u8 t1 = sc.take();
                 em.emit_rr(VmOp::Load, t1, rdi, sz);
                 em.emit_rr(VmOp::Cmp, rax, t1, sz);
                 em.emit_ri(VmOp::Add, rdi, inc, sz64);
+                em.mark_last_dead();      // MIT-494d: 防步进覆写比较 flags
             } else {                      // cmps 单发: cmp [rsi], [rdi]
                 const u8 t1 = sc.take();
                 const u8 t2 = sc.take();
@@ -1187,7 +1216,9 @@ struct Translator {
                 em.emit_rr(VmOp::Load, t2, rdi, sz);
                 em.emit_rr(VmOp::Cmp, t1, t2, sz);
                 em.emit_ri(VmOp::Add, rdi, inc, sz64);
+                em.mark_last_dead();      // MIT-494d
                 em.emit_ri(VmOp::Add, rsi, inc, sz64);
+                em.mark_last_dead();      // MIT-494d
             }
             const char* fam_name_p = family == 0 ? "movs" : family == 1 ? "stos"
                                    : family == 2 ? "scas" : family == 3 ? "cmps" : "lods";
@@ -1626,6 +1657,7 @@ struct Translator {
             const u8 sz64 = isa::size_field(ir::Size::S64);
             const u8 rsp = isa::vm_reg_of(ir::Reg::Rsp);
             em.emit_ri(VmOp::Sub, rsp, in.size == ir::Size::S64 ? 8u : 4u, sz64);
+            em.mark_last_dead();  // MIT-494d: 栈步进合成 Sub（native push 不写 flags）
             em.emit_rr(VmOp::Store, rsp, isa::vm_reg_of(in.dst.reg),
                        isa::size_field(in.size));
             return true;
@@ -1678,6 +1710,7 @@ struct Translator {
         em.emit_rr(VmOp::Load, isa::vm_reg_of(in.dst.reg), rsp,
                    isa::size_field(in.size));
         em.emit_ri(VmOp::Add, rsp, in.size == ir::Size::S64 ? 8u : 4u, sz64);
+        em.mark_last_dead();  // MIT-494d: 栈步进合成 Add（native pop 不写 flags）
         return true;
     }
 
@@ -1781,15 +1814,21 @@ struct Translator {
             s = sc.take();
             t = sc.take();
             em.emit_rr(VmOp::Mov, s, isa::vm_reg_of(h.idx_reg), sz64);
-            if (h.scale == 8)
+            if (h.scale == 8) {
                 em.emit_ri(VmOp::Shl, s, 3, sz64);
-            else if (h.scale == 4)
+                em.mark_last_dead();  // MIT-494d: 表项物化（native jmp [tbl] 不写 flags）
+            } else if (h.scale == 4) {
                 em.emit_ri(VmOp::Shl, s, 2, sz64);
-            else
+                em.mark_last_dead();  // MIT-494d
+            } else {
                 return skip(in, "跳转表 scale 非 4/8，保守 gate", nullptr);
+            }
             em.emit_rr(VmOp::Add, s, isa::vm_reg_of(h.base_reg), sz64);
-            if (h.disp > 0)
+            em.mark_last_dead();      // MIT-494d
+            if (h.disp > 0) {
                 em.emit_ri(VmOp::Add, s, static_cast<u32>(h.disp), sz64);
+                em.mark_last_dead();  // MIT-494d
+            }
             em.emit_rr(VmOp::Load, t, s,
                        h.width == 8 ? sz64 : isa::size_field(ir::Size::S32));
             if (h.sem != kJtSemAbsVa) {
@@ -1797,10 +1836,12 @@ struct Translator {
                 // 防御性超宽走 split 不丢语义）→ LeaRva 补 image_base
                 if (fits_aux(static_cast<i64>(h.anchor_rva))) {
                     em.emit_ri(VmOp::Add, t, static_cast<u32>(h.anchor_rva), sz64);
+                    em.mark_last_dead();  // MIT-494d
                 } else {
                     const u8 tmp = sc.take();
                     emit_imm64_split(em, sc, tmp, h.anchor_rva, sz_step_);
                     em.emit_rr(VmOp::Add, t, tmp, sz64);
+                    em.mark_last_dead();  // MIT-494d
                 }
                 em.emit_rr(VmOp::LeaRva, t, t, sz64);
             }
@@ -3469,7 +3510,22 @@ void mark_dead_flag_writes(std::vector<isa::VmInsn>& code) {
     for (bool changed = true; changed;) {
         changed = false;
         for (size_t i = n; i-- > 0;) {
-            const auto sem = isa::flag_sem_of(code[i].op);
+            // MIT-494d：emit 期预标记 flags-dead 的合成指令（地址拼装/
+            // imm64 拆条/栈调整/表项物化）按透明（kNone）处理——其宿主
+            // flags 副作用不进 guest 视界，既不杀前驱 guest 写，自身也
+            // 不再参与死写标记。⚠️ 仅写族 op 的 cond 位 2 是 dead 标
+            // （encoding 契约：位 2 仅算术类使用）；Jcc/Setcc/Cmovcc/
+            // ExitNative 的 cond 域是 4 位条件码，bit2 = 条件数据，不可
+            // 误读为标记。
+            auto base_sem = isa::flag_sem_of(code[i].op);
+            const bool write_family =
+                base_sem == isa::FlagSem::kWrite ||
+                base_sem == isa::FlagSem::kWriteReadMerge ||
+                base_sem == isa::FlagSem::kWriteReadReg;
+            const auto sem =
+                (write_family && isa::flags_dead_field(code[i].cond_or_size))
+                    ? isa::FlagSem::kNone
+                    : base_sem;
             u8 out = 0;
             for (size_t k = succ_begin[i]; k < succ_begin[i + 1]; ++k)
                 out = static_cast<u8>(out | live_in[succ[k]]);
