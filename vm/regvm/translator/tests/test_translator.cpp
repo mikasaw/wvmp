@@ -92,6 +92,10 @@ ir::FunctionRegion fn_of(std::vector<ir::BasicBlock> blocks) {
     return fn;
 }
 
+// 真 x86 夹具（arch=X86 → sz_step_=S32）；定义见 X5 测试区。
+ir::FunctionRegion fn86_of(std::vector<ir::BasicBlock> blocks);
+
+
 // 产出解码：bytecode -> read_blob -> 逐条 decode（隐含一轮 encode/decode 往返）。
 struct Decoded {
     isa::VmBlob blob;
@@ -333,7 +337,7 @@ TEST(Translate, X86MovImageVaFoldsToRvaPlusLeaRva) {
     // 化主面，MIT-494 实录① looplea 22 处同源）。
     const ir::Insn i = mov_imm(ir::Reg::Rax, 0x403000ll, ir::Size::S32);
     const auto r = wvmp::regvm::translator::translate_function(
-        fn_of({blk(0x1000, {i})}), {}, {}, 0x400000ull, 0xF000ull);
+        fn86_of({blk(0x1000, {i})}), {}, {}, 0x400000ull, 0xF000ull);
     EXPECT_TRUE(r.notes.empty());
     const Decoded d = decode_program(r.program);
     ASSERT_EQ(d.insns.size(), static_cast<size_t>(4)); // 2 + Jmp + Halt
@@ -347,7 +351,7 @@ TEST(Translate, X86MovOutOfWindowConstUnaffected) {
     // x86 窗口外常数（0x7FFFFFFF > base+extent）：照旧直放 aux，零变化。
     const ir::Insn i = mov_imm(ir::Reg::Rax, 0x7FFFFFFFll, ir::Size::S32);
     const auto r = wvmp::regvm::translator::translate_function(
-        fn_of({blk(0x1000, {i})}), {}, {}, 0x400000ull, 0xF000ull);
+        fn86_of({blk(0x1000, {i})}), {}, {}, 0x400000ull, 0xF000ull);
     EXPECT_TRUE(r.notes.empty());
     const Decoded d = decode_program(r.program);
     ASSERT_EQ(d.insns.size(), static_cast<size_t>(3));
@@ -363,16 +367,17 @@ TEST(Translate, X86AbsoluteAddressFoldsInEmitter) {
     lea.dst = ir::Operand::reg_(ir::Reg::Rax);
     lea.src = ir::Operand::mem_(m(ir::Reg::Flags, ir::Reg::Flags, 0, 0x403000));
     const auto r = wvmp::regvm::translator::translate_function(
-        fn_of({blk(0x1000, {lea})}), {}, {}, 0x400000ull, 0xF000ull);
+        fn86_of({blk(0x1000, {lea})}), {}, {}, 0x400000ull, 0xF000ull);
     EXPECT_TRUE(r.notes.empty());
     const Decoded d = decode_program(r.program);
-    // 3 = Mov acc,RVA + LeaRva + Mov dst,acc；+ Jmp + Halt
+    // 3 = Mov acc,RVA + LeaRva + Mov dst,acc；+ Jmp + Halt（x86 夹具 →
+    // 合成地址算术 S32 tag）
     ASSERT_EQ(d.insns.size(), static_cast<size_t>(5));
     const u8 acc = isa::kScratchFirst;
     expect_is(d.insns[0], VmOp::Mov, OpKind::Reg, acc, OpKind::Imm, 0, 0x3000,
-              kS64);
+              kS32);
     expect_is(d.insns[1], VmOp::LeaRva, OpKind::Reg, acc, OpKind::Reg, acc, 0,
-              kS64);
+              kS32);
     // 全词流 aux 零裸 VA 自检（0x403000 不得再现）。
     for (const auto& g : d.insns)
         EXPECT_NE(g.aux, 0x403000u);
