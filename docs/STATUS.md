@@ -1030,3 +1030,13 @@ asmgen 零触碰 → dump 锚不受影响（无换代）。
   multiseed_aslr REPEATS=10 = **335/335 全绿**（250 x64 真基址
   delta≠0 ×10 byte-exact + 85 x86 声明回退 NOTE ×10）→ T26 v2 收敛
   门通过，分支具备合入条件。
+
+### MIT-494e (T27 · x86 词流 RVA 化 + x86 真 ASLR 启用) ✅ 2026-09-09
+- T27a：emit_address 绝对形 + translate_mov 映像窗口折条（双 arch 统
+  一，extent=SizeOfImage 收窄窗口）；translate_function 五参重载 +
+  backend 布线；looplea 词流裸 VA 22 → 0。
+- T27b：pe_writer 撤 x86 声明回退，HIGHLOW 扩展启用（+1 单测）。
+- T27c：tls_hook x86 回调桩 rdtsc [scratch+4] 漏登记修复（delta≠0
+  下 edx 写落优先基址野地址——tls_e2e x86 回填腿 FAIL 根因）。
+- 验证：ctest 23/23（+3 用例）；tls_e2e 4/4；基线 multiseed 335/335；
+  全池 multiseed_aslr REPEATS=10 全绿（x86 85 产物升级真基址）。

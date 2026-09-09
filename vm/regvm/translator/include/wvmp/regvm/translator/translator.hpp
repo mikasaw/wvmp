@@ -161,4 +161,14 @@ using JumpTableReadFn = std::function<std::optional<u64>(u64 /*table_rva*/,
                                                  JumpTableReadFn table_read_fn,
                                                  u64 image_base);
 
+// 五参数版：MIT-494d/T27a 增加 image_extent（PE SizeOfImage）。映像窗
+// 口 [image_base, image_base+image_extent) 内的立即数/绝对 disp 折条为
+// Mov(RVA)+LeaRva（x86 词流 RVA 化主面 + x64 imm64 函数指针）。extent
+// = 0（未提供）→ 回退 2^32 宽窗口（T26c 语义，单测兼容）；生产调用方
+// 应传真实 SizeOfImage 以收窄窗口（降低非指针常量误转面）。
+[[nodiscard]] TranslateResult translate_function(const ir::FunctionRegion& fn,
+                                                 FunctionUpperBoundFn upper_bound_fn,
+                                                 JumpTableReadFn table_read_fn,
+                                                 u64 image_base, u64 image_extent);
+
 } // namespace wvmp::regvm::translator

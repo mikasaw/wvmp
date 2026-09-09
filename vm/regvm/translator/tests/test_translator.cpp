@@ -325,6 +325,59 @@ TEST(Translate, MovBelowImageBaseSmallConstUnaffected) {
     ASSERT_EQ(d.insns.size(), static_cast<size_t>(6)); // 4 拆条 + Jmp + Halt
 }
 
+// ---------------- MIT-494d/T27a：x86 词流 RVA 化（映像窗口折条） ----------------
+
+TEST(Translate, X86MovImageVaFoldsToRvaPlusLeaRva) {
+    // x86 mov eax, 0x403000（IAT 槽地址常量，image_base=0x400000 extent=
+    // 0xF000）：S32 立即数落映像窗口 → Mov eax, RVA + LeaRva（词流 RVA
+    // 化主面，MIT-494 实录① looplea 22 处同源）。
+    const ir::Insn i = mov_imm(ir::Reg::Rax, 0x403000ll, ir::Size::S32);
+    const auto r = wvmp::regvm::translator::translate_function(
+        fn_of({blk(0x1000, {i})}), {}, {}, 0x400000ull, 0xF000ull);
+    EXPECT_TRUE(r.notes.empty());
+    const Decoded d = decode_program(r.program);
+    ASSERT_EQ(d.insns.size(), static_cast<size_t>(4)); // 2 + Jmp + Halt
+    expect_is(d.insns[0], VmOp::Mov, OpKind::Reg, kRax, OpKind::Imm, 0, 0x3000,
+              kS32);
+    expect_is(d.insns[1], VmOp::LeaRva, OpKind::Reg, kRax, OpKind::Reg, kRax, 0,
+              kS32);
+}
+
+TEST(Translate, X86MovOutOfWindowConstUnaffected) {
+    // x86 窗口外常数（0x7FFFFFFF > base+extent）：照旧直放 aux，零变化。
+    const ir::Insn i = mov_imm(ir::Reg::Rax, 0x7FFFFFFFll, ir::Size::S32);
+    const auto r = wvmp::regvm::translator::translate_function(
+        fn_of({blk(0x1000, {i})}), {}, {}, 0x400000ull, 0xF000ull);
+    EXPECT_TRUE(r.notes.empty());
+    const Decoded d = decode_program(r.program);
+    ASSERT_EQ(d.insns.size(), static_cast<size_t>(3));
+    expect_is(d.insns[0], VmOp::Mov, OpKind::Reg, kRax, OpKind::Imm, 0,
+              0x7FFFFFFF, kS32);
+}
+
+TEST(Translate, X86AbsoluteAddressFoldsInEmitter) {
+    // x86 绝对寻址 lea eax, [0x403000]（base/index 均 Flags，disp=VA）：
+    // emit_address 折条 Mov acc,RVA + LeaRva，词流零裸 VA（looplea 22 处
+    // 同源）；随后 Mov dst,acc。
+    ir::Insn lea = I(ir::Op::Lea, ir::Size::S32);
+    lea.dst = ir::Operand::reg_(ir::Reg::Rax);
+    lea.src = ir::Operand::mem_(m(ir::Reg::Flags, ir::Reg::Flags, 0, 0x403000));
+    const auto r = wvmp::regvm::translator::translate_function(
+        fn_of({blk(0x1000, {lea})}), {}, {}, 0x400000ull, 0xF000ull);
+    EXPECT_TRUE(r.notes.empty());
+    const Decoded d = decode_program(r.program);
+    // 3 = Mov acc,RVA + LeaRva + Mov dst,acc；+ Jmp + Halt
+    ASSERT_EQ(d.insns.size(), static_cast<size_t>(5));
+    const u8 acc = isa::kScratchFirst;
+    expect_is(d.insns[0], VmOp::Mov, OpKind::Reg, acc, OpKind::Imm, 0, 0x3000,
+              kS64);
+    expect_is(d.insns[1], VmOp::LeaRva, OpKind::Reg, acc, OpKind::Reg, acc, 0,
+              kS64);
+    // 全词流 aux 零裸 VA 自检（0x403000 不得再现）。
+    for (const auto& g : d.insns)
+        EXPECT_NE(g.aux, 0x403000u);
+}
+
 // ---------------- 整函数：块布局 / fallthrough / 相对偏移 ----------------
 
 TEST(Translate, TwoBlockLayoutAndOffsets) {

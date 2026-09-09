@@ -262,8 +262,14 @@ std::vector<u8> assemble_callback_stub(bool is_x86,
     // orig/oldprot/vp 槽。与 build_*_asm 的 snprintf 发射点一一对应。
     if (abs_vas != nullptr) {
         abs_vas->clear();
-        if (rdtsc_on && rdtsc_scratch_va != 0)
+        if (rdtsc_on && rdtsc_scratch_va != 0) {
             abs_vas->push_back(rdtsc_scratch_va);
+            // MIT-494d/T27: x86 rdtsc 双 dword 槽（build_rdtsc_open/close
+            // 的 edx 半字 [scratch+4] 同为发射点，漏登记 = delta≠0 下
+            // edx 写落优先基址野地址）。
+            if (is_x86)
+                abs_vas->push_back(rdtsc_scratch_va + 4);
+        }
         if (drx != nullptr && drx->gtc_slot_va != 0) {
             abs_vas->push_back(drx->ctx_va);
             abs_vas->push_back(drx->gtc_slot_va);

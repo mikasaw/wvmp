@@ -183,9 +183,23 @@ public:
                        (static_cast<u64>(p[4]) << 32) | (static_cast<u64>(p[5]) << 40) |
                        (static_cast<u64>(p[6]) << 48) | (static_cast<u64>(p[7]) << 56);
             };
+            // MIT-494d/T27a: SizeOfImage 布线——映像窗口 [image_base,
+            // +SizeOfImage) 收窄立即数/绝对 disp 折条面（x86 词流 RVA 化）。
+            u64 size_of_image = 0;
+            if (pe != nullptr && ctx.image.size() >= 0x40) {
+                const size_t e_off = static_cast<size_t>(ctx.image[0x3C]) |
+                                     (static_cast<size_t>(ctx.image[0x3D]) << 8);
+                const size_t opt_h = e_off + 24;
+                if (opt_h + 64 <= ctx.image.size())
+                    size_of_image = static_cast<u64>(ctx.image[opt_h + 56]) |
+                                    (static_cast<u64>(ctx.image[opt_h + 57]) << 8) |
+                                    (static_cast<u64>(ctx.image[opt_h + 58]) << 16) |
+                                    (static_cast<u64>(ctx.image[opt_h + 59]) << 24);
+            }
             result = translator::translate_function(fn, std::move(upper_bound_of),
                                                     std::move(table_read),
-                                                    pe != nullptr ? pe->image_base : 0);
+                                                    pe != nullptr ? pe->image_base : 0,
+                                                    size_of_image);
             // MIT-407: exit-native 站点 diag note 不进 gate 通道——virtualize
             // 对 kLastTranslateNotes 的**任一** note 即放弃该函数虚拟化
             // （v1 把站点 note 塞进 notes 的隐患：启用后每个 ExitNative 函数

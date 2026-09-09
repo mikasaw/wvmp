@@ -731,7 +731,8 @@ void emit_imm64_split(Emitter& em, Scratch& sc, u8 d, u64 v, u8 sz_step) {
 // 地址算术的尺寸 tag 改由调用方按 arch 传 sz_step（x64 = S64 现形逐字节
 // 不动；x86 = S32，x86 运行时 3 路尺寸链不再折防御 no-op 静默空转）。
 [[nodiscard]] bool emit_address(Emitter& em, Scratch& sc, const ir::MemOperand& m,
-                                u64 current_rva, u64 next_ip, u8 sz_step, u8& acc_out) {
+                                u64 current_rva, u64 next_ip, u8 sz_step, u8& acc_out,
+                                u64 image_base = 0, u64 image_extent = 0) {
     if (m.base == ir::Reg::Rip) {
         // rip-relative: RVA = next_ip + disp (disp 是 i64, 可负).
         // PE RVA 字段为 u32, 正常范围 [0, end_rva); 越界（极负 disp 跌出 image 起点）
@@ -772,10 +773,29 @@ void emit_imm64_split(Emitter& em, Scratch& sc, u8 d, u64 v, u8 sz_step) {
         return true;
     }
     const u8 acc = sc.take();
-    if (m.base != ir::Reg::Flags) {
-        em.emit_rr(VmOp::Mov, acc, isa::vm_reg_of(m.base), sz_step);
+    // MIT-494d/T27a：绝对地址形（无 base）且 disp 落映像窗口 [ib, ib+extent)
+    // → 折条 Mov acc, RVA + LeaRva（运行时 + image_base 槽 = 真 VA）。
+    // x86 无 rip-relative，绝对 disp32 承载完整 VA（looplea blob 22 处
+    // 0x403000 类），ASLR 重定位下全数错位——词流 RVA 化的对偶收口。
+    // extent = SizeOfImage（生产布线）；0 = 未提供 → 回退 2^32 宽窗口
+    // （T26c x64 语义，单测兼容）。
+    const bool no_base = m.base == ir::Reg::Flags;
+    const u64 win_extent = image_extent != 0 ? image_extent : 0xFFFF'FFFFull;
+    const bool fold_abs =
+        no_base && image_base != 0 && m.disp >= 0 &&
+        static_cast<u64>(m.disp) >= image_base &&
+        static_cast<u64>(m.disp) - image_base < win_extent;
+    if (no_base) {
+        if (fold_abs) {
+            em.emit_ri(VmOp::Mov, acc,
+                       static_cast<u32>(static_cast<u64>(m.disp) - image_base),
+                       sz_step);
+            em.emit_rr(VmOp::LeaRva, acc, acc, sz_step);  // RVA→VA 原位
+        } else {
+            em.emit_ri(VmOp::Mov, acc, 0, sz_step); // 无 base：绝对 / 纯 index 形式，从 0 起算
+        }
     } else {
-        em.emit_ri(VmOp::Mov, acc, 0, sz_step); // 无 base：绝对 / 纯 index 形式，从 0 起算
+        em.emit_rr(VmOp::Mov, acc, isa::vm_reg_of(m.base), sz_step);
     }
     if (m.index != ir::Reg::Flags) {
         unsigned shift_bits = 0;
@@ -795,7 +815,7 @@ void emit_imm64_split(Emitter& em, Scratch& sc, u8 d, u64 v, u8 sz_step) {
         em.emit_rr(VmOp::Add, acc, ix, sz_step);
         em.mark_last_dead();      // MIT-494d
     }
-    if (m.disp != 0) {
+    if (m.disp != 0 && !fold_abs) {
         if (fits_aux(m.disp)) {
             em.emit_ri(VmOp::Add, acc, static_cast<u32>(m.disp), sz_step);
             em.mark_last_dead();  // MIT-494d: disp 拼装（native lea 不写 flags）
@@ -822,9 +842,11 @@ void emit_imm64_split(Emitter& em, Scratch& sc, u8 d, u64 v, u8 sz_step) {
 // 返回 false 的唯一原因（非法 scale / 越界 RVA）已由调用方先行检查。
 // sz_step：地址算术尺寸 tag（MIT-446 X4 B.2 点位②，调用方按 arch 传）。
 u8 emit_load(Emitter& em, Scratch& sc, const ir::MemOperand& m, ir::Size size,
-             u64 current_rva, u64 next_ip, u8 sz_step) {
+             u64 current_rva, u64 next_ip, u8 sz_step,
+             u64 image_base = 0, u64 image_extent = 0) {
     u8 acc = 0;
-    const bool ok = emit_address(em, sc, m, current_rva, next_ip, sz_step, acc);
+    const bool ok = emit_address(em, sc, m, current_rva, next_ip, sz_step, acc,
+                                 image_base, image_extent);
     (void)ok;
     const u8 val = sc.take();
     const isa::VmOp load_op =
@@ -902,6 +924,9 @@ struct Translator {
     // 重定位 blob；MIT-494a 第二层：forkface `mov rax, 0x140001020` 在
     // ASLR 基址下 callgate 野跳 rbx=rip=0x140001020）。
     u64 image_base_ = 0;
+    // MIT-494d/T27a：映像窗口边界（SizeOfImage；0 = 未提供 → translate_mov/
+    // emit_address 回退 2^32 宽窗口，T26c 单测语义）。
+    u64 image_extent_ = 0;
     // MIT-446 (X4) B.2：步进/地址算术尺寸 tag 的 arch 单一来源。x64 = S64
     // （VM 槽宽现形，逐字节不动）；x86 = S32（x86 运行时 3 路尺寸链走真
     // 块，不再折防御 no-op —— translate_push/pop 同批改 VmOp::Push/Pop 单
@@ -924,7 +949,7 @@ struct Translator {
                                          const ir::MemOperand& m,
                                          u64 current_rva, u64 next_ip, u8& acc_out) {
         u8 acc = 0;
-        if (!emit_address(em, sc, m, current_rva, next_ip, sz_step_, acc)) return false;
+        if (!emit_address(em, sc, m, current_rva, next_ip, sz_step_, acc, image_base_, image_extent_)) return false;
         if (m.base == ir::Reg::Rip) {
             em.emit_rr(VmOp::LeaRva, acc, acc, sz_step_);  // RVA→VA (in-place, 读先于写)
         }
@@ -1432,7 +1457,7 @@ struct Translator {
             in.src.kind != ir::Operand::Kind::Reg)
             return skip(in, "lock xadd 操作数形态未支持", nullptr);
         u8 acc = 0;
-        if (!emit_address(em, sc, in.dst.mem, current_rva, next_ip, sz_step_, acc))
+        if (!emit_address(em, sc, in.dst.mem, current_rva, next_ip, sz_step_, acc, image_base_, image_extent_))
             return skip(in, "lock xadd 地址形态未支持", &in.dst.mem);
         if (in.dst.mem.base == ir::Reg::Rip) {
             em.emit_rr(VmOp::LeaRva, acc, acc, sz_step_);  // RVA→VA (in-place)
@@ -1477,7 +1502,7 @@ struct Translator {
         if (in.dst.kind != ir::Operand::Kind::Mem)
             return skip(in, "lock bit 操作数形态未支持", nullptr);
         u8 acc = 0;
-        if (!emit_address(em, sc, in.dst.mem, current_rva, next_ip, sz_step_, acc))
+        if (!emit_address(em, sc, in.dst.mem, current_rva, next_ip, sz_step_, acc, image_base_, image_extent_))
             return skip(in, "lock bit 地址形态未支持", &in.dst.mem);
         if (in.dst.mem.base == ir::Reg::Rip) {
             em.emit_rr(VmOp::LeaRva, acc, acc, sz_step_);  // RVA→VA (in-place)
@@ -1513,27 +1538,26 @@ struct Translator {
         }
         if (in.src.kind != ir::Operand::Kind::Imm)
             return skip(in, "mov 操作数形态未支持", nullptr); // mem 源应已 lift 成 Load
-        if (in.size == ir::Size::S64 && !fits_aux(in.src.imm)) {
+        // MIT-494d/T27a：映像窗口立即数 → Mov(RVA)+LeaRva 折条（双 arch 统
+        // 一）。x64: mov r64,imm64 函数指针（T26c，MIT-494a 野跳实证）；
+        // x86: mov r32,imm32 地址常量（词流 RVA 化主面）。窗口
+        // [image_base_, +image_extent_)；extent 未提供（0）→ 回退 2^32 宽
+        // （T26c 单测语义）。窗口外常数（0x7FFFFFFF、0xDEADBEEF 等）零行
+        // 为变化；窗口内非指针常量误转 = 残余风险（与跳表 AbsoluteVa 同
+        // 档披露）。
+        if (image_base_ != 0 && in.src.imm >= 0) {
             const u64 v = static_cast<u64>(in.src.imm);
-            // MIT-494c (T26c)：映像范围绝对 VA → Mov(RVA)+LeaRva 折条。
-            // 原生 `mov r64, imm64(VA)`（函数指针/取址初始化）的值经拆条
-            // 原值入 blob，loader 无法重定位 → ASLR 基址下间接 call 野跳
-            // （MIT-494a cdb 实证）。折条 = imm32(RVA) + LeaRva 原位加
-            // ctx scratch 槽 image_base（运行时真基址），与 rip-relative
-            // / 跳表 AbsoluteVa 同地址模型，零新 VmOp。窗口 = [base,
-            // base+2^32)：RVA 可表示 imm32；命中拆条分支的前置条件已排除
-            // 小常量（< 2^32 原样拆条/直放，零行为变化）。残余风险 = 窗
-            // 口内非指针数值常量被误转（delta≠0 下偏移）——与跳表
-            // AbsoluteVa 语义同档，披露。
-            if (image_base_ != 0 && v >= image_base_ &&
-                v - image_base_ <= 0xFFFFFFFFu) {
+            const u64 extent = image_extent_ != 0 ? image_extent_ : 0xFFFF'FFFFull;
+            if (v >= image_base_ && v - image_base_ < extent) {
                 em.emit_ri(VmOp::Mov, d,
                            static_cast<u32>(v - image_base_), sz);
                 em.emit_rr(VmOp::LeaRva, d, d, sz);  // RVA→VA 原位（读先于写）
                 return true;
             }
+        }
+        if (in.size == ir::Size::S64 && !fits_aux(in.src.imm)) {
             // imm64 拆条（头文件约定）：Mov s,hi / Shl s,32 / Mov d,lo / Or d,s。
-            emit_imm64_split(em, sc, d, v, sz_step_);
+            emit_imm64_split(em, sc, d, static_cast<u64>(in.src.imm), sz_step_);
             return true;
         }
         // sub-64 或可直放：截断 aux，写回经 alias 折叠即正确。
@@ -1547,7 +1571,7 @@ struct Translator {
             in.src.kind != ir::Operand::Kind::Mem)
             return skip(in, "lea 操作数形态未支持", nullptr);
         u8 acc = 0;
-        if (!emit_address(em, sc, in.src.mem, current_rva, next_ip, sz_step_, acc))
+        if (!emit_address(em, sc, in.src.mem, current_rva, next_ip, sz_step_, acc, image_base_, image_extent_))
             return skip(in, "lea 地址形态未支持", &in.src.mem);
         // lea 不访存：地址值即结果；按原 size 写回（S32 lea 零扩展高位）。
         // MIT-322: rip-relative lea 的 emit_address 把 RVA 写进 acc, 但 lea
@@ -1571,7 +1595,7 @@ struct Translator {
             in.src.kind != ir::Operand::Kind::Mem)
             return skip(in, "load 操作数形态未支持", nullptr);
         u8 acc = 0;
-        if (!emit_address(em, sc, in.src.mem, current_rva, next_ip, sz_step_, acc))
+        if (!emit_address(em, sc, in.src.mem, current_rva, next_ip, sz_step_, acc, image_base_, image_extent_))
             return skip(in, "load 地址形态未支持", &in.src.mem);
         // rip-relative 翻译期算绝对 RVA, 运行时经 LoadRva 加 scratch_mem 还原 VA；
         // 非 rip 已为绝对 VA（来自 host 寄存器拷贝 / 算术）, 走普通 Load.
@@ -1589,7 +1613,7 @@ struct Translator {
             in.src.kind != ir::Operand::Kind::Imm)
             return skip(in, "store 操作数形态未支持", nullptr); // 双 mem 不合法
         u8 acc = 0;
-        if (!emit_address(em, sc, in.dst.mem, current_rva, next_ip, sz_step_, acc))
+        if (!emit_address(em, sc, in.dst.mem, current_rva, next_ip, sz_step_, acc, image_base_, image_extent_))
             return skip(in, "store 地址形态未支持", &in.dst.mem);
         u8 src_reg = 0;
         if (in.src.kind == ir::Operand::Kind::Reg) {
@@ -1678,7 +1702,7 @@ struct Translator {
         // 之前发射 = native 序（push [esp+X] 读减前 esp —— IAT 栈窗形锚）。
         if (in.dst.kind == ir::Operand::Kind::Mem && arch_ == ir::Arch::X86) {
             u8 acc = 0;
-            if (!emit_address(em, sc, in.dst.mem, current_rva, next_ip, sz_step_, acc))
+            if (!emit_address(em, sc, in.dst.mem, current_rva, next_ip, sz_step_, acc, image_base_, image_extent_))
                 return skip(in, "push 地址形态未支持", &in.dst.mem);
             const isa::VmOp load_op =
                 (in.dst.mem.base == ir::Reg::Rip) ? isa::VmOp::LoadRva : isa::VmOp::Load;
@@ -1889,7 +1913,7 @@ struct Translator {
         if (in.dst.kind == ir::Operand::Kind::Mem) {
             // mem 形折条: 目标值装入 fresh scratch（emit_load 内部自动选
             // LoadRva/Load 双通路）→ CallGate reg 形。
-            const u8 val = emit_load(em, sc, in.dst.mem, in.size, current_rva, next_ip, sz_step_);
+            const u8 val = emit_load(em, sc, in.dst.mem, in.size, current_rva, next_ip, sz_step_, image_base_, image_extent_);
             em.emit(VmOp::CallGate, OpKind::Reg, val, OpKind::None, 0, 0, 0);
             return true;
         }
@@ -1986,7 +2010,7 @@ struct Translator {
             if (v != d)
                 em.emit_rr(VmOp::Mov, d, v, sz);
         } else {
-            const u8 v = emit_load(em, sc, in.src.mem, in.size, current_rva, next_ip, sz_step_);
+            const u8 v = emit_load(em, sc, in.src.mem, in.size, current_rva, next_ip, sz_step_, image_base_, image_extent_);
             if (v != d)
                 em.emit_rr(VmOp::Mov, d, v, sz);
         }
@@ -2050,7 +2074,7 @@ struct Translator {
         if (dst_mem) {
             // [m] op src：地址一次计算、Load/Store 复用（scratch 预算内）。
             u8 acc = 0;
-            if (!emit_address(em, sc, in.dst.mem, current_rva, next_ip, sz_step_, acc))
+            if (!emit_address(em, sc, in.dst.mem, current_rva, next_ip, sz_step_, acc, image_base_, image_extent_))
                 return skip(in, "alu 内存目的地址形态未支持", &in.dst.mem);
             const u8 s = sc.take();
             const isa::VmOp load_op =
@@ -2069,7 +2093,7 @@ struct Translator {
             return skip(in, "alu 操作数形态未支持", nullptr);
         const u8 d = isa::vm_reg_of(in.dst.reg);
         if (src_mem) {
-            const u8 s = emit_load(em, sc, in.src.mem, in.size, current_rva, next_ip, sz_step_);
+            const u8 s = emit_load(em, sc, in.src.mem, in.size, current_rva, next_ip, sz_step_, image_base_, image_extent_);
             em.emit_rr(vop, d, s, isa::size_field(in.size));
             return true;
         }
@@ -2123,7 +2147,7 @@ struct Translator {
             return skip(in, "单目操作数形态未支持", nullptr);
         // [m]：Load s; op s; Store s（地址一次计算、复用）。
         u8 acc = 0;
-        if (!emit_address(em, sc, in.dst.mem, current_rva, next_ip, sz_step_, acc))
+        if (!emit_address(em, sc, in.dst.mem, current_rva, next_ip, sz_step_, acc, image_base_, image_extent_))
             return skip(in, "单目操作内存地址形态未支持", &in.dst.mem);
         const u8 s = sc.take();
         const isa::VmOp load_op =
@@ -2177,7 +2201,7 @@ struct Translator {
         if (in.src.kind == ir::Operand::Kind::Mem) {
             // emit_load: emit_address(1 scratch for acc) + sc.take() 1 scratch
             // for val (tmp 持有 [mem] 值)。
-            const u8 tmp = emit_load(em, sc, in.src.mem, in.size, current_rva, next_ip, sz_step_);
+            const u8 tmp = emit_load(em, sc, in.src.mem, in.size, current_rva, next_ip, sz_step_, image_base_, image_extent_);
             if (in.src2.kind == ir::Operand::Kind::Imm) {
                 // 3-op imm MEM (dst = [mem] * imm):
                 //   1. Mov dst, tmp        (dst := [mem])
@@ -2277,7 +2301,7 @@ struct Translator {
             // movsxd r, [m]：emit_address 算 acc + emit MovsxdMem。
             // scratch 预算: emit_address 用 1 scratch (acc)；本步不另取。
             u8 acc = 0;
-            if (!emit_address(em, sc, in.src.mem, current_rva, next_ip, sz_step_, acc))
+            if (!emit_address(em, sc, in.src.mem, current_rva, next_ip, sz_step_, acc, image_base_, image_extent_))
                 return skip(in, "movsxd 地址形态未支持", &in.src.mem);
             em.emit_rr(VmOp::MovsxdMem, d, acc, sz);
             return true;
@@ -2327,7 +2351,7 @@ struct Translator {
             // movzx r, [m]：emit_address 算 acc + emit MovzxMem。
             // scratch 预算: emit_address 用 1 scratch (acc)；本步不另取。
             u8 acc = 0;
-            if (!emit_address(em, sc, in.src.mem, current_rva, next_ip, sz_step_, acc))
+            if (!emit_address(em, sc, in.src.mem, current_rva, next_ip, sz_step_, acc, image_base_, image_extent_))
                 return skip(in, "movzx 地址形态未支持", &in.src.mem);
             em.emit(VmOp::MovzxMem, OpKind::Reg, d, OpKind::Reg, acc, src_size_aux, sz);
             return true;
@@ -2374,7 +2398,7 @@ struct Translator {
             // movsx r, [m]：emit_address 算 acc + emit MovsxMem。
             // scratch 预算: emit_address 用 1 scratch (acc)；本步不另取。
             u8 acc = 0;
-            if (!emit_address(em, sc, in.src.mem, current_rva, next_ip, sz_step_, acc))
+            if (!emit_address(em, sc, in.src.mem, current_rva, next_ip, sz_step_, acc, image_base_, image_extent_))
                 return skip(in, "movsx 地址形态未支持", &in.src.mem);
             em.emit(VmOp::MovsxMem, OpKind::Reg, d, OpKind::Reg, acc, src_size_aux, sz);
             return true;
@@ -2952,7 +2976,7 @@ struct Translator {
         if (in.src.kind == ir::Operand::Kind::Reg) {
             b = isa::vm_reg_of(in.src.reg);
         } else if (in.src.kind == ir::Operand::Kind::Mem) {
-            b = emit_load(em, sc, in.src.mem, in.size, current_rva, next_ip, sz_step_);
+            b = emit_load(em, sc, in.src.mem, in.size, current_rva, next_ip, sz_step_, image_base_, image_extent_);
         } else {
             return skip(in, "div/idiv 除数形态未支持", nullptr);
         }
@@ -3019,7 +3043,7 @@ struct Translator {
             return skip(in, "xchg 操作数形态未支持", nullptr);
         // MEM: xchg [m], r — Load tmp + Xchg(tmp, s) + Store 三条拆条。
         u8 acc = 0;
-        if (!emit_address(em, sc, in.dst.mem, current_rva, next_ip, sz_step_, acc))
+        if (!emit_address(em, sc, in.dst.mem, current_rva, next_ip, sz_step_, acc, image_base_, image_extent_))
             return skip(in, "xchg 地址形态未支持", &in.dst.mem);
         const u8 tmp = sc.take();
         const isa::VmOp load_op =
@@ -3060,7 +3084,7 @@ struct Translator {
         // REG-MEM: setcc [m] 走 Load+Setcc+Store 三条拆条。
         // 1) Load tmp, [m] (S8) — emit_address 用 1 scratch (acc) + 1 scratch (tmp)。
         u8 acc = 0;
-        if (!emit_address(em, sc, in.dst.mem, current_rva, next_ip, sz_step_, acc))
+        if (!emit_address(em, sc, in.dst.mem, current_rva, next_ip, sz_step_, acc, image_base_, image_extent_))
             return skip(in, "setcc 地址形态未支持", &in.dst.mem);
         const u8 tmp = sc.take();
         const isa::VmOp load_op =
@@ -3120,7 +3144,7 @@ struct Translator {
         // REG-MEM: cmovcc r, [m] — emit_address 算 acc + emit Load + emit Cmovcc。
         // scratch 预算: emit_address 用 1 scratch (acc) + 1 scratch (tmp) = 2, 在 6 预算内。
         u8 acc = 0;
-        if (!emit_address(em, sc, in.src.mem, current_rva, next_ip, sz_step_, acc))
+        if (!emit_address(em, sc, in.src.mem, current_rva, next_ip, sz_step_, acc, image_base_, image_extent_))
             return skip(in, "cmovcc 地址形态未支持", &in.src.mem);
         const u8 tmp = sc.take();
         const isa::VmOp load_op =
@@ -3179,7 +3203,7 @@ struct Translator {
         // MEM: cmpxchg [m], r — emit_address 算 acc + emit Load + Cmpxchg + Store。
         // scratch 预算: emit_address 用 1 scratch (acc) + 1 scratch (tmp) = 2, 在 6 预算内。
         u8 acc = 0;
-        if (!emit_address(em, sc, in.dst.mem, current_rva, next_ip, sz_step_, acc))
+        if (!emit_address(em, sc, in.dst.mem, current_rva, next_ip, sz_step_, acc, image_base_, image_extent_))
             return skip(in, "cmpxchg 地址形态未支持", &in.dst.mem);
         const u8 tmp = sc.take();
         const isa::VmOp load_op =
@@ -3586,6 +3610,15 @@ TranslateResult translate_function(const ir::FunctionRegion& fn,
                                  FunctionUpperBoundFn upper_bound_fn,
                                  JumpTableReadFn table_read_fn,
                                  u64 image_base) {
+    // MIT-494d/T27a：4 参版 = 5 参版 extent=0（窗口回退 2^32 宽，兼容）。
+    return translate_function(fn, std::move(upper_bound_fn),
+                              std::move(table_read_fn), image_base, 0);
+}
+
+TranslateResult translate_function(const ir::FunctionRegion& fn,
+                                 FunctionUpperBoundFn upper_bound_fn,
+                                 JumpTableReadFn table_read_fn,
+                                 u64 image_base, u64 image_extent) {
     TranslateResult result;
 
     // 地址 -> next_ip（每条 insn 的结束 RVA; rip-relative 翻译用 next_ip+disp 算 RVA）。
@@ -3693,6 +3726,8 @@ TranslateResult translate_function(const ir::FunctionRegion& fn,
         isa::size_field(fn.arch == ir::Arch::X86 ? ir::Size::S32 : ir::Size::S64);
     // MIT-494c：映像基址 → translate_mov 绝对 VA 折条判定（0 = 未提供）。
     tr.image_base_ = image_base;
+    // MIT-494d/T27a：映像窗口边界（5 参版传入；0 = 未提供）。
+    tr.image_extent_ = image_extent;
     // MIT-407: 把上界查询与区域端点写入 Translator, translate_jump 据此判定
     // 是否 emit ExitNative。upper_bound_fn 为空时 upper_bound_of_ 留空,
     // translate_jump 走原 gate 路径（与单参数版完全一致）。

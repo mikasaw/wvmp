@@ -158,20 +158,10 @@ void PeWriterPass::run(ProtectionContext& ctx) {
             const size_t opt_off = e_off + 24;
             // Magic 高字节：0x020B(PE32+) → 0x02 / 0x010B(PE32) → 0x01。
             const bool plus = ctx.image[opt_off + 1] == 0x02;
-            // MIT-494c：x86（PE32）自动回退——x86 翻译器无 rip-relative，
-            // IAT 槽引用等以完整 VA 烙进 VM 词流（MIT-494 实录①：looplea
-            // blob 22 处 ib+RVA），ASLR 重定位下全数错位。v1 收敛裁定 =
-            // x86 不走扩展、清 DYNAMIC_BASE（delta=0 成声明行为，M2-8
-            // 等价），词流 RVA 化（T27）后再启用。
-            if (!plus) {
-                const u16 dc =
-                    u16(rd_le(ctx.image.data() + opt_off + 0x46, 2));
-                if ((dc & kImageDllCharacteristicsDynamicBase) != 0)
-                    ctx.diag.report(
-                        Severity::Note, name(),
-                        "ASLR 兼容：x86（PE32）暂不启用——已清除 "
-                        "DYNAMIC_BASE（词流 RVA 化为后续单）");
-            } else {
+            // MIT-494d/T27b：x86（PE32）真 ASLR 启用——词流 RVA 化
+            // （T27a：emit_address 绝对形 + mov imm32 映像窗口折条 +
+            // SizeOfImage 布线）落地后撤 MIT-494c 的 x86 声明回退，
+            // HIGHLOW 扩展与 x64 同管道（want_type = plus ? 10 : 3）。
             const u16 want_type = plus ? 10 : 3;  // DIR64 / HIGHLOW
             const size_t dd5 = opt_off + opt_data_dir_off(plus) + 5 * 8;
             const u32 old_rva =
@@ -380,7 +370,6 @@ void PeWriterPass::run(ProtectionContext& ctx) {
                                         "区孤儿，放弃扩展（回退清 DYNAMIC_BASE）");
                     }
                 }
-            }
             }
         }
     }

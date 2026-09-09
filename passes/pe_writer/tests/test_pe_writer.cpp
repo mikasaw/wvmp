@@ -527,6 +527,53 @@ TEST(PeWriterPass, EmitRelocNoRangesKeepsOriginalEntries) {
     EXPECT_EQ(sites.count({0x5008, 10}), 1u);
 }
 
+TEST(PeWriterPass, EmitRelocX86ExtendsHighLow) {
+    // MIT-494d/T27b：x86（PE32）真 ASLR——词流 RVA 化（T27a）后撤声明回
+    // 退，HIGHLOW 扩展与 x64 同管道。PE32 dd 在 opt+96；native 站点
+    // HIGHLOW @0x1400 + packer 站点 @0x2008 → dd[5] 重指 + 类型 3 条目。
+    std::vector<u8> bytes = build_minimal_pe(false, kMachineX86);
+    const size_t opt = kNt + 24;
+    put16(bytes, opt + 0x46, 0x0040);  // native DYNAMIC_BASE
+    const size_t blk = 0x380;
+    put32(bytes, blk, 0x1000);
+    put32(bytes, blk + 4, 8 + 2 * 2);
+    put16(bytes, blk + 8, static_cast<u16>(3 << 12 | 0x400));
+    put16(bytes, blk + 10, 0);
+    put32(bytes, opt + 96 + 5 * 8, 0x1180);
+    put32(bytes, opt + 96 + 5 * 8 + 4, 12);
+
+    ProtectionContext ctx;
+    ctx.image = bytes;
+    ctx.output_path = temp_dir() / "aslr_x86.exe";
+    wvmp::passes::NewSection wvmp;
+    wvmp.name = ".wvmp";
+    wvmp.data.assign(0x100 + wvmp::passes::kEmitReserveBytes, 0);
+    wvmp.requested_rva = 0x2000u;
+    wvmp.characteristics = 0xC0000040u;
+    wvmp::passes::NewSection wvmpc;
+    wvmpc.name = ".wvmpc";
+    wvmpc.data.assign(0x40, 0);
+    wvmpc.requested_rva = 0x5000u;
+    wvmpc.characteristics = 0x60000020u;
+    auto& secs =
+        ctx.slot<std::vector<wvmp::passes::NewSection>>(wvmp::kNewSections);
+    secs.push_back(wvmp);
+    secs.push_back(wvmpc);
+    ctx.slot<std::vector<u32>>(wvmp::kRelocSites) = {0x2008};
+
+    wvmp::passes::PeWriterPass writer;
+    writer.run(ctx);
+
+    const u16 ch = static_cast<u16>(rd32(ctx.image, opt + 0x46) & 0xFFFF);
+    EXPECT_NE(ch & 0x0040, 0u);  // DYNAMIC_BASE 保留（x86 真 ASLR）
+    const u32 rva = rd32(ctx.image, opt + 96 + 5 * 8);
+    ASSERT_NE(rva, 0x1180u);     // 扩展发生（回退已撤）
+    std::set<std::pair<u32, u16>> sites;
+    collect_ext_sites(ctx, rva, rd32(ctx.image, opt + 96 + 5 * 8 + 4), sites);
+    EXPECT_EQ(sites.count({0x1400, 3}), 1u);   // native HIGHLOW 幸存
+    EXPECT_EQ(sites.count({0x2008, 3}), 1u);   // packer 站点 HIGHLOW
+}
+
 // —— MIT-491 (T23)：Emit 预留区高水位观测 ————————————————————————
 
 // 高水位夹具：合法最小 PE + .wvmp 数据节（blobs + 8KB 预留）+ 游标。

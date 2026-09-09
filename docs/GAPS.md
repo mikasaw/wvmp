@@ -2503,3 +2503,41 @@ div_flags_readback x64 stdout PF 位逐次漂移。**根因分解**：
 ② reloc 目录连续性 = loader pos+=bsz 遍历的硬约束，重排块必须 8 字
 节块对齐 + 零洞；③ "335/335 走 ASLR 路径"类历史口径在 delta≠0 断言
 缺失时一律视为 delta=0 测量，不可作为 ASLR 兼容证据引用。
+
+## MIT-494e（T27 · x86 词流 RVA 化 + x86 真 ASLR 启用，2026-09-09）
+
+**背景**：T26c 对 x86 采取声明回退（清 DYNAMIC_BASE）——x86 翻译器无
+rip-relative，绝对寻址与 mov r32,imm32 把映像窗口 VA 原值烙进词流
+（MIT-494 实录①：looplea blob 22 处 0x403000）。T27 收口后 x86 与
+x64 同享真 ASLR。
+
+**T27a（词流 RVA 化）**：
+- emit_address 绝对形（base==Flags && disp≥0 ∈ [ib, ib+extent)）→
+  `Mov acc, RVA + LeaRva acc,acc`（替代 Mov 0 + Add VA），index 链照
+  旧叠加；窗口外绝对地址（跨模块 VA 等）维持原语义（披露）。
+- translate_mov 统一窗口折叠（双 arch）：imm ∈ [ib, ib+extent) →
+  Mov(RVA)+LeaRva；x86 S32 面由此启用，x64 窗口从 T26c 的 2^32 宽收
+  紧为 SizeOfImage（降低非指针常量误转面；4 参版 extent=0 回退 2^32
+  宽保单测兼容）。
+- 布线：translate_function 五参重载（image_extent = PE SizeOfImage，
+  backend 直读 optional header +56）。
+- **验证**：looplea 词流裸 VA **22 → 0**（t27_va_scan.py 解包扫描）。
+
+**T27b（撤 x86 回退）**：pe_writer 的 `!plus` 声明回退分支删除，
+HIGHLOW 扩展与 x64 同管道（want_type=3 已布线；stub imm32 站点面
+is_x86?4:8 已布线）。单测 EmitRelocX86ExtendsHighLow（PE32 夹具
+dd@opt+96、类型 3 条目、DYNAMIC_BASE 保留）。
+
+**T27c（x86 TLS 回归 + 修复）**：撤回退后 tls_e2e x86 回填腿 FAIL
+（hit 全局读到 0）——**tls_hook 回调桩 rdtsc 双 dword 槽漏登记
+[scratch+4]（edx 半字发射点）**，delta≠0 下 edx 写落优先基址野地址
+（高熵栈时代不可达路径首次真执行）。修复 = abs_vas 补
+scratch_va+4（仅 x86，x64 用 r11 无槽写）。**验证**：tls_e2e 4/4；
+基线 multiseed 335/335；全池 multiseed_aslr REPEATS=10 全绿
+（x86 85 产物升级为真基址 delta≠0）。
+
+**方法论**：① 32 位产物调试 = WOW64（x64 cdb 需 .effmach x86，写断
+点走 32 位上下文）；② 站点登记核对必须用**位置口径**（登记值 =
+字段所在 RVA），用"目标值 ∈ 站点集"核对会双重视为命中/未命中而误
+判；③ 撤声明回退 = 首次真执行该架构全部初始化路径——回归面（如
+tls 回调双 dword 槽）在低熵时代不可见，E2E 必须覆盖全 pass 组合。
