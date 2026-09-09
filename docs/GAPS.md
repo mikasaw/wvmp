@@ -2555,3 +2555,16 @@ tls 回调双 dword 槽）在低熵时代不可见，E2E 必须覆盖全 pass �
 - T28 同批：X86* 折条三单测切换真 x86 夹具 fn86_of（arch=X86，S32
   tag）——T27 验收建议落地。Park "MIT-476 多 .wvmp continue" 条目维
   持挂起（W^X 拆节后语义待重估，非当前阻塞）。
+
+## MIT-494g（T30 · crypt×ASLR 全栈组合门首跑 + 首缺陷立案，2026-09-10）
+- 组合门首跑（multiseed_crypt 8-pass：+mutate+crypt，真 ASLR 姿态）：
+  **19/20**。红面 = wvmp_string_ops_sample × seed 99999，packed rc=2，
+  rep scasb 探针 idx=32/rem=0（全扫未命中）vs native idx=17/rem=14。
+- **判别刀**：① 6-pass ASLR（无 mutate/crypt）同 seed = 5/5 绿；②
+  8-pass delta=0（aslr=false）同 seed = 红复现 → **与 ASLR/delta 无
+  关**，是 crypt/mutate 栈 × roll(seed99999) 的既有缺陷（rep scasb
+  微程序 × 变异布局交互；该套件在当前池构成下未跑过，非本会话回
+  归）。
+- 立案 **T30-d**：rep 串微程序 × mutate×crypt × roll 交互修复。复现
+  资产 /tmp/t30/（so99999.exe / so0.exe + toml）。组合门维持红至修
+  复；多iseed_aslr（6-pass）335/335 不受影响。
