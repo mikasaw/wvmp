@@ -63,11 +63,12 @@ pass=0
 fail=0
 
 # 判据 (1): cdb 基址探针. $1 = packed exe (win 路径).
-# 返回 0 = delta≠0 (好); 1 = delta==0 (MIT-494a 假绿签名, FAIL);
-# 2 = 探针自身出错 (基址没解析到, FAIL 以防静默)。
+# 返回 0 = delta≠0 (好); 1 = DYNAMIC_BASE 置位但 delta=0 (MIT-494a 假绿
+# 签名, FAIL); 3 = DYNAMIC_BASE 已清除 (声明回退, delta=0 是声明行为,
+# 探针不适用); 2 = 探针自身出错 (基址没解析到, FAIL 以防静默)。
 probe_delta() {
     local exe_win="$1"
-    local tmp pref base log
+    local tmp pref base log dll
     tmp="$(mktemp -d)"
     log="$tmp/probe.log"
     pref="$(python - "$exe_win" <<'PYEOF'
@@ -78,9 +79,16 @@ opt = e + 24
 magic = struct.unpack_from('<H', img, opt)[0]
 v = (struct.unpack_from('<Q', img, opt + 24)[0] if magic == 0x20B
      else struct.unpack_from('<I', img, opt + 28)[0])
-print('0x%X' % v)
+dll = struct.unpack_from('<H', img, opt + 0x46)[0]
+print('0x%X' % v, 'NOASLR' if not (dll & 0x40) else 'ASLR')
 PYEOF
 )" || { rm -rf "$tmp"; return 2; }
+    dll="$(echo "$pref" | awk '{print $2}')"
+    pref="$(echo "$pref" | awk '{print $1}')"
+    if [[ "$dll" == "NOASLR" ]]; then
+        rm -rf "$tmp"
+        return 3
+    fi
     printf 'g\nq\n' | "$CDB" -G -logo "$log" "$exe_win" > /dev/null 2>&1
     # 主 exe 恒为首个 ModLoad 行 (loader 顺序), 去掉 cdb 地址里的反引号。
     base="$(grep -m1 '^ModLoad: ' "$log" | awk '{print $2}' | tr -d '`')"
@@ -96,7 +104,7 @@ PYEOF
 run_aslr_seed() {
     local sample="$1"
     local seed="$2"
-    local tmp cfg out_win out rc i rc_e rc_a crash_e crash_a
+    local tmp cfg out_win out rc i rc_e rc_a crash_e crash_a pd=0
     tmp="$(mktemp -d)"
     cfg="$tmp/e2e.toml"
     out_win="$(cygpath -m "$tmp")/wvmp_aslr_out.exe"
@@ -141,6 +149,8 @@ EOF
         if [[ $pd == 1 ]]; then
             echo "[aslr] FAIL seed=$seed sample=$sample ASLR probe: runtime base == preferred ImageBase (delta=0, MIT-494a 假绿签名)" >&2
             fail=$((fail + 1)); rm -rf "$tmp"; return
+        elif [[ $pd == 3 ]]; then
+            echo "[aslr] NOTE seed=$seed sample=$(basename "$sample") DYNAMIC_BASE 清除（声明回退，探针不适用）" >&2
         elif [[ $pd != 0 ]]; then
             echo "[aslr] FAIL seed=$seed sample=$sample ASLR probe error (rc=$pd, cdb/base 解析失败 — fail-closed)" >&2
             fail=$((fail + 1)); rm -rf "$tmp"; return
@@ -149,6 +159,8 @@ EOF
     # native 参考一次, packed 重复 REPEATS 次。
     "$sample" > "$tmp/ref.out" 2>/dev/null
     rc_e=$?
+    local probe_tag="probe ok"
+    [[ "$pd" == "3" ]] && probe_tag="probe n/a (declared fallback)"
     for ((i = 1; i <= REPEATS; i++)); do
         "$out_win" > "$tmp/act.out" 2>/dev/null
         rc_a=$?
@@ -180,7 +192,7 @@ EOF
             fail=$((fail + 1)); rm -rf "$tmp"; return
         fi
     done
-    echo "[aslr] PASS seed=$seed sample=$(basename "$sample") (probe ok, x$REPEATS byte-exact)"
+    echo "[aslr] PASS seed=$seed sample=$(basename "$sample") ($probe_tag, x$REPEATS byte-exact)"
     pass=$((pass + 1))
     rm -rf "$tmp"
 }

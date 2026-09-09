@@ -995,3 +995,29 @@ asmgen 零触碰 → dump 锚不受影响（无换代）。
 - 证据链：2×2 隔离（checksum 排除）→ u/t cdb 追踪抓野跳指令 → 文件/
   运行时字节对比 → delta 算术验证 → fe 基址直读。全程实录在
   GAPS.md MIT-494 节③。
+
+### MIT-494b (T26b · ASLR 统计框架) ✅ 2026-09-09
+- scripts/multiseed_aslr.sh：cdb delta≠0 基址探针（假绿防线）+
+  ×N 重复 byte-exact + REQUIRE_REAL；池运行时提取零漂移。
+- 验收 ACCEPT（独立复现：probe(p)=0 / probe(full_ext)=1 抓获假绿 /
+  forkface 定向 0/10 / snake 5/5）；should_fix 两项已修
+  （REPEATS 正整数校验、探针 rc 分诊）。
+
+### MIT-494c (T26c · ASLR 两层真修复 + x86 回退) ✅ 2026-09-09
+- 第一层：kPatchedRanges + stub_link 覆写区登记 + pe_writer 孤儿条目
+  剪枝（4 条目倍数块对齐 / type-0 垫 / 空块删除三铁律）。
+- 第二层：x64 映像窗口 imm64 → Mov(RVA)+LeaRva 折条（零新 VmOp，
+  asmgen 零 diff）；forkface 野跳 0x140001020 根治。
+- x86（PE32）自动回退：清 DYNAMIC_BASE + Note（词流 RVA 化归 T27）。
+- 验证：ctest 23/23（+7 用例：剪枝 3 + HIGHADJ 配对 1 + stub_link 登记
+  面 1 + 折条 3；covered 去重同步补齐——"双重 delta 防线"由声明变实
+  现）；forkface ONLY ×10 = 10/10 PASS。
+- 基线 multiseed 332/335：3 红 = div_flags PF 漂移 → **T26d**（真
+  delta≠0 首个暴露缺陷，非本单回归，证据链入 GAPS MIT-494d）。
+
+### MIT-494d (T26d · 真 delta≠0 VM flags 非确定性) ⏳ 2026-09-09 立案
+- div_flags_readback x64：真 delta≠0 下 PF 位逐次漂移（q/r 恒正确）。
+  seed 相关（roll）+ delta=0 恒定 + 折叠 0 触发 + 剪枝内容等价。
+- 历史口径更正：基址按镜像哈希 per-boot 选择，历史"ASLR 路径绿"未
+  经 delta≠0 断言，不可引用为真 ASLR 证据。修复另立单，T26c 合并的
+  后置收敛条件。

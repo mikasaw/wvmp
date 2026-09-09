@@ -874,6 +874,12 @@ struct Translator {
     // MIT-409: 跳转表处置表（锚点 jmp insn addr → 预扫描产物）。nullptr =
     // 未启用跳转表特化（维持原 gate）。translate_jump 命中时展开比较链。
     const std::unordered_map<u64, JumpTableHandle>* jump_tables_ = nullptr;
+    // MIT-494c：映像基址（四参版 translate_function 的 image_base；0 = 未
+    // 提供，单测旧路径）。translate_mov 用它识别"映像范围绝对 VA 立即数"
+    // → Mov(RVA)+LeaRva 折条——基址相关 VA 禁止烙进字节码（loader 无法
+    // 重定位 blob；MIT-494a 第二层：forkface `mov rax, 0x140001020` 在
+    // ASLR 基址下 callgate 野跳 rbx=rip=0x140001020）。
+    u64 image_base_ = 0;
     // MIT-446 (X4) B.2：步进/地址算术尺寸 tag 的 arch 单一来源。x64 = S64
     // （VM 槽宽现形，逐字节不动）；x86 = S32（x86 运行时 3 路尺寸链走真
     // 块，不再折防御 no-op —— translate_push/pop 同批改 VmOp::Push/Pop 单
@@ -1477,8 +1483,26 @@ struct Translator {
         if (in.src.kind != ir::Operand::Kind::Imm)
             return skip(in, "mov 操作数形态未支持", nullptr); // mem 源应已 lift 成 Load
         if (in.size == ir::Size::S64 && !fits_aux(in.src.imm)) {
+            const u64 v = static_cast<u64>(in.src.imm);
+            // MIT-494c (T26c)：映像范围绝对 VA → Mov(RVA)+LeaRva 折条。
+            // 原生 `mov r64, imm64(VA)`（函数指针/取址初始化）的值经拆条
+            // 原值入 blob，loader 无法重定位 → ASLR 基址下间接 call 野跳
+            // （MIT-494a cdb 实证）。折条 = imm32(RVA) + LeaRva 原位加
+            // ctx scratch 槽 image_base（运行时真基址），与 rip-relative
+            // / 跳表 AbsoluteVa 同地址模型，零新 VmOp。窗口 = [base,
+            // base+2^32)：RVA 可表示 imm32；命中拆条分支的前置条件已排除
+            // 小常量（< 2^32 原样拆条/直放，零行为变化）。残余风险 = 窗
+            // 口内非指针数值常量被误转（delta≠0 下偏移）——与跳表
+            // AbsoluteVa 语义同档，披露。
+            if (image_base_ != 0 && v >= image_base_ &&
+                v - image_base_ <= 0xFFFFFFFFu) {
+                em.emit_ri(VmOp::Mov, d,
+                           static_cast<u32>(v - image_base_), sz);
+                em.emit_rr(VmOp::LeaRva, d, d, sz);  // RVA→VA 原位（读先于写）
+                return true;
+            }
             // imm64 拆条（头文件约定）：Mov s,hi / Shl s,32 / Mov d,lo / Or d,s。
-            emit_imm64_split(em, sc, d, static_cast<u64>(in.src.imm), sz_step_);
+            emit_imm64_split(em, sc, d, v, sz_step_);
             return true;
         }
         // sub-64 或可直放：截断 aux，写回经 alias 折叠即正确。
@@ -3611,6 +3635,8 @@ TranslateResult translate_function(const ir::FunctionRegion& fn,
     tr.arch_ = fn.arch;
     tr.sz_step_ =
         isa::size_field(fn.arch == ir::Arch::X86 ? ir::Size::S32 : ir::Size::S64);
+    // MIT-494c：映像基址 → translate_mov 绝对 VA 折条判定（0 = 未提供）。
+    tr.image_base_ = image_base;
     // MIT-407: 把上界查询与区域端点写入 Translator, translate_jump 据此判定
     // 是否 emit ExitNative。upper_bound_fn 为空时 upper_bound_of_ 留空,
     // translate_jump 走原 gate 路径（与单参数版完全一致）。

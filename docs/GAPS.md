@@ -2438,3 +2438,53 @@ multiseed 290/335。
 条目未剪枝，0x5C4D 复活 = LoadConfig 腐化 delta=0 假绿）；③ ASLR 重
 复运行统计框架（multiseed 扩展 ×N 次判据）+ **delta≠0 断言**（本次
 新增，防假绿）。全部实证已入本节与分支提交历史。
+
+## MIT-494b/c/d（T26b/c/d，2026-09-09）——ASLR 统计框架 + 两层真修复 + 首个真 delta≠0 缺陷暴露
+
+**T26b（已提交，验收 ACCEPT）**：scripts/multiseed_aslr.sh = ASLR 模式
+multiseed。三道判据：① cdb 基址探针（运行时基址 ≠ 优先 ImageBase，
+delta=0 一票 FAIL——0x5C4D 类假绿的机械化防线；DYNAMIC_BASE 清除 =
+声明回退返回 3 不误伤）② ×REPEATS 重复 byte-exact（MIT-427 crash
+guard 口径移植）③ REQUIRE_REAL。池/seeds 运行时提取自
+multiseed_e2e.sh 零漂移。**本框架首个战果 = 立即抓出 T26d（下述）**。
+
+**T26c 两层真修复**（forkface x64 单点全链）：
+- 第一层（reloc 剪枝）：kPatchedRanges 槽（keys.hpp）+ stub_link 跳板
+  覆写成功即登记 {begin_rva, len} + pe_writer 扩展拷贝剪枝相交孤儿条
+  目。剪枝重组三铁律：幸存条目垫 **4 条目倍数**（块 8 字节对齐——
+  loader 以 pos+=bsz 顺序遍历，4 字节垫 + 尾部补零会产生零洞假头，
+  遍历提前终止）；type-0(ABSOLUTE) 哑条目补齐；只含 type-0 的块整体
+  删除（功能性空块发射会骗 loader 重定位无活站点的目录）。单测 3 +
+  stub_link 登记面 1。
+- 第二层（blob VA 折条）：x64 `mov r64, imm64` 落在映像窗口
+  [image_base, base+2^32) 时 → Mov(d, imm32(RVA)) + LeaRva(d,d)（RVA
+  + ctx scratch 槽运行时真基址），零新 VmOp（LeaRva 复用，读先于写原
+  位安全），asmgen 零 diff。**MIT-494a 第二层实证**：跳板修剪后
+  forkface 仍野跳 rbx=rip=0x140001020——native `mov rax, imm64`（绝
+  对函数指针）的值经 imm64 拆条原值烙进 blob，loader 无法重定位字节
+  码。这是 x86 词流 VA 嵌入（MIT-494 实录①）的 x64 孪生类，本折条即
+  其 x64 特化解；x86 全量 RVA 化仍归 T27。
+- x86（PE32）自动回退：pe_writer 遇 PE32 直接清 DYNAMIC_BASE + Note
+  （词流 RVA 化为 T27；delta=0 成声明行为）。
+- 验证：ctest 23/23；forkface ONLY 池 ×10 = **10/10 PASS**（x64 探针
+  delta≠0 + 真基址 ×10 byte-exact；x86 声明回退 NOTE + ×10）。
+
+**T26d（新登记缺陷，T26c 合并的前置阻断）**：div_flags_readback x64
+在**真 delta≠0** 下 stdout PF 位非确定性翻转（q/r/哨兵恒正确，仅
+PF=0/1 漂移；首探针即现）。特征：seed 相关（1/12345/0xDEADBEEF 红，
+99999/0xCAFEBABE 绿）= roll/布局相关；同二进制同基址（per-boot 恒定
+0x7ff6a36c0000）逐次漂移 = 栈/内存态相关；delta=0 产物 20/20 恒定。
+**证据链**：折叠触发 0 次（TEMP note 实证，translator 折条排除）；
+pe_writer 剪枝为内容等价重组（站点集不变）嫌疑排除方向；旧代码产物
+pinned preferred 基址 20/20 稳定 + 新产物 pinned 重定位基址即现 flake
+= **历史绿全部是 delta=0 下的测量**（基址 per-boot 按镜像哈希选择，
+产物字节变 → 基址命运变，二分实验曾被此混淆）。候选方向：MIT-474
+dead-bit 误标 + 未初始化 ctx flags 槽读（首探针即毒化指向更早的写
+缺失）；MIT-484 同族（flags_/pc_ 落 rax/rdx）div handler 变体。修复
+归 T26d 专单，T26c 不跨 Scope。
+
+**方法论新增**：① 产物字节→pinned 基址→delta 命运的混淆链：任何
+"A 构建稳/B 构建飘"的对比必须先 probe 双方基址，否则二分结论无效；
+② reloc 目录连续性 = loader pos+=bsz 遍历的硬约束，重排块必须 8 字
+节块对齐 + 零洞；③ "335/335 走 ASLR 路径"类历史口径在 delta≠0 断言
+缺失时一律视为 delta=0 测量，不可作为 ASLR 兼容证据引用。

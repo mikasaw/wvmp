@@ -22,6 +22,7 @@
 #include <cstdio>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace wvmp::passes {
@@ -326,6 +327,14 @@ void StubLinkPass::run(ProtectionContext& ctx) {
         for (int b = 0; b < 4; ++b)
             code[1 + b] = u8((rel_u >> (8 * b)) & 0xFF);
         for (i64 i = 5; i < region_len; ++i) code[i] = 0xCC;
+        // MIT-494c：登记覆写区。落在 [begin_rva, end_rva) 内的 native
+        // reloc 条目自本写入起成为孤儿——原指针（如函数头部 `mov rax,
+        // imm64`）已被跳板覆写消灭，pe_writer 扩展 reloc 目录时剪枝之
+        // （不剪 = loader 把 delta 写进跳板字节 → rel32 毒变野跳，
+        // MIT-494a forkface 0x13DE cdb 实证）。
+        ctx.slot<std::vector<std::pair<u32, u32>>>(kPatchedRanges)
+            .push_back({static_cast<u32>(p.begin_rva),
+                        static_cast<u32>(p.end_rva - p.begin_rva)});
     }
 
     // MIT-476：blob 末端起为 Emit 预留区（预扩零垫）；后续 pass 经

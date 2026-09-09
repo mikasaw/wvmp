@@ -12,6 +12,13 @@ inline constexpr std::string_view kEmitReserveBase="pe.emit_reserve_base";
 // 全镜像粒度存在结构化数据假阳（误登记 = loader 对非 VA 值加 delta =
 // 静默数据损坏，MIT-494 开发实录）；生产方只扫自产小 buffer，命中即真。
 inline constexpr std::string_view kRelocSites="pe.reloc_sites";
+// MIT-494c：覆写区登记表（stub_link 跳板覆写成功时写入 → pe_writer 消费）。
+// 类型 std::vector<std::pair<u32,u32>>（{rva, len}）。用途 = reloc 目录扩
+// 展拷贝时剪枝与覆写区相交的 native 孤儿条目——MIT-494a cdb 实证：虚拟
+// 化跳板（E9 rel32 + 填充）覆写原函数头部的 `mov rax, imm64` 绝对指针后，
+// 残留 DIR64 条目的 delta 会被 loader 写进跳板尾字节 → rel32 毒变野跳
+// （forkface 0x13DE：字节 0x00→0xAB，rel32 0x13FAF→0xAB013FAF）。
+inline constexpr std::string_view kPatchedRanges="pe.patched_ranges";
 // pe_loader 产出的 PE 结构模型（PeImage）所在扩展槽——M1 起为 marker_scan/lifter
 // 等分析类 pass 的共享依赖（提供方：pe_loader）。
 inline constexpr std::string_view kPeImage="pe.image_meta";

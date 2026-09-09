@@ -19,9 +19,11 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <set>
 #include <span>
 #include <string>
 #include <system_error>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -383,6 +385,146 @@ TEST(PeWriterPass, EmitRelocNativeNotAslrClearsFlag) {
     writer.run(ctx);
     const u16 ch = static_cast<u16>(rd32(ctx.image, kNt + 24 + 0x46) & 0xFFFF);
     EXPECT_EQ(ch & 0x0040, 0u);
+}
+
+// —— MIT-494c (T26c)：覆写区孤儿 reloc 条目剪枝 ————————————————————
+
+// 扩展目录通用遍历：按 loader 的 pos += bsz 语义走完整 blob（块间不允许
+// 间隙——零洞假头会提前终止遍历），收集 (site, type) 集。不闭合即失败。
+static void collect_ext_sites(const ProtectionContext& ctx, u32 dd_rva,
+                              u32 dd_sz, std::set<std::pair<u32, u16>>& out) {
+    const u16 nsec = static_cast<u16>(rd32(ctx.image, kNt + 6) & 0xFFFF);
+    const u16 optsz = static_cast<u16>(rd32(ctx.image, kNt + 20) & 0xFFFF);
+    const size_t opt2 = kNt + 24;
+    u64 ro = 0;
+    for (u16 i = 0; i < nsec && ro == 0; ++i) {
+        const size_t sh = opt2 + optsz + size_t(i) * 40;
+        if (std::memcmp(&ctx.image[sh], ".wvmp\0", 6) == 0) {
+            const u32 va = rd32(ctx.image, sh + 12);
+            const u32 rp = rd32(ctx.image, sh + 20);
+            ro = u64(rp) + (dd_rva - va);
+        }
+    }
+    ASSERT_NE(ro, 0u);
+    u32 pos = 0;
+    while (pos + 8 <= dd_sz) {
+        const u32 page = rd32(ctx.image, size_t(ro) + pos);
+        const u32 bsz = rd32(ctx.image, size_t(ro) + pos + 4);
+        ASSERT_GE(bsz, 8u);
+        ASSERT_EQ(bsz % 4, 0u);
+        ASSERT_LE(pos + bsz, dd_sz);
+        for (u32 k = 0; k < (bsz - 8) / 2; ++k) {
+            const u16 ent = static_cast<u16>(
+                rd32(ctx.image, size_t(ro) + pos + 8 + k * 2) & 0xFFFF);
+            if ((ent >> 12) != 0)
+                out.insert({page + u32(ent & 0xFFF),
+                            static_cast<u16>(ent >> 12)});
+        }
+        pos += bsz;
+    }
+    ASSERT_EQ(pos, dd_sz);  // 遍历恰好闭合（无尾部零洞）
+}
+
+TEST(PeWriterPass, EmitRelocPrunesOrphansInPatchedRanges) {    ProtectionContext ctx;
+    make_aslr_fixture(ctx, /*aslr_on=*/true, {0x5008});
+    // 原 reloc 块重组：DIR64@0x1400（落覆写区 [0x1400,0x140C)，孤儿）+
+    // HIGHLOW@0x1480（落覆写区 [0x1480,0x1484)，孤儿）+ DIR64@0x1500
+    // （覆写区外，幸存）+ ABSOLUTE 垫。
+    const size_t blk = 0x380;
+    put32(ctx.image, blk, 0x1000);
+    put32(ctx.image, blk + 4, 8 + 4 * 2);
+    put16(ctx.image, blk + 8, static_cast<u16>(10 << 12 | 0x400));
+    put16(ctx.image, blk + 10, static_cast<u16>(3 << 12 | 0x480));
+    put16(ctx.image, blk + 12, static_cast<u16>(10 << 12 | 0x500));
+    put16(ctx.image, blk + 14, 0);
+    put32(ctx.image, kNt + 24 + 112 + 5 * 8, 0x1180);
+    put32(ctx.image, kNt + 24 + 112 + 5 * 8 + 4, 16);
+    auto& ranges =
+        ctx.slot<std::vector<std::pair<u32, u32>>>(wvmp::kPatchedRanges);
+    ranges = {{0x1400, 12}, {0x1480, 4}};
+
+    wvmp::passes::PeWriterPass writer;
+    writer.run(ctx);
+
+    std::set<std::pair<u32, u16>> sites;
+    const u32 rva = rd32(ctx.image, kNt + 24 + 112 + 5 * 8);
+    const u32 sz = rd32(ctx.image, kNt + 24 + 112 + 5 * 8 + 4);
+    ASSERT_NE(rva, 0x1180u);  // 扩展发生
+    collect_ext_sites(ctx, rva, sz, sites);
+    EXPECT_EQ(sites.count({0x1400, 10}), 0u);  // 孤儿剪净
+    EXPECT_EQ(sites.count({0x1480, 3}), 0u);
+    EXPECT_EQ(sites.count({0x1500, 10}), 1u);  // 幸存者保留
+    EXPECT_EQ(sites.count({0x5008, 10}), 1u);  // 发射点登记站点在场
+    const u16 ch = static_cast<u16>(rd32(ctx.image, kNt + 24 + 0x46) & 0xFFFF);
+    EXPECT_NE(ch & 0x0040, 0u);  // 扩展成功 → DYNAMIC_BASE 保留
+}
+
+TEST(PeWriterPass, EmitRelocHighAdjFollowsPairedHighLow) {
+    // MIT-494c：HIGHADJ(1) 隶属其前导 HIGHLOW(3)——前导被剪则随剪，前导
+    // 幸存则随存（loader 格式安全敏感面，双向钉死）。
+    ProtectionContext ctx;
+    make_aslr_fixture(ctx, /*aslr_on=*/true, {0x5008});
+    const size_t blk = 0x380;
+    put32(ctx.image, blk, 0x1000);
+    put32(ctx.image, blk + 4, 8 + 4 * 2);
+    // 对 1：HIGHLOW@0x1400 落覆写区 [0x1400,0x140C) → 剪；HIGHADJ@0x1402 随剪。
+    // 对 2：HIGHLOW@0x1600 幸存；HIGHADJ@0x1602 随存。
+    put16(ctx.image, blk + 8, static_cast<u16>(3 << 12 | 0x400));
+    put16(ctx.image, blk + 10, static_cast<u16>(1 << 12 | 0x402));
+    put16(ctx.image, blk + 12, static_cast<u16>(3 << 12 | 0x600));
+    put16(ctx.image, blk + 14, static_cast<u16>(1 << 12 | 0x602));
+    put32(ctx.image, kNt + 24 + 112 + 5 * 8, 0x1180);
+    put32(ctx.image, kNt + 24 + 112 + 5 * 8 + 4, 16);
+    auto& ranges =
+        ctx.slot<std::vector<std::pair<u32, u32>>>(wvmp::kPatchedRanges);
+    ranges = {{0x1400, 12}};
+
+    wvmp::passes::PeWriterPass writer;
+    writer.run(ctx);
+
+    std::set<std::pair<u32, u16>> sites;
+    collect_ext_sites(ctx,
+                      rd32(ctx.image, kNt + 24 + 112 + 5 * 8),
+                      rd32(ctx.image, kNt + 24 + 112 + 5 * 8 + 4), sites);
+    EXPECT_EQ(sites.count({0x1400, 3}), 0u);
+    EXPECT_EQ(sites.count({0x1402, 1}), 0u);  // 配对 HIGHADJ 随剪
+    EXPECT_EQ(sites.count({0x1600, 3}), 1u);
+    EXPECT_EQ(sites.count({0x1602, 1}), 1u);  // 幸存 HIGHLOW 的 HIGHADJ 保留
+}
+
+TEST(PeWriterPass, EmitRelocAllOrphansFallsBackToClearDynamicBase) {
+    ProtectionContext ctx;
+    make_aslr_fixture(ctx, /*aslr_on=*/true, {});  // 无 packer 站点
+    // 原 reloc 唯一条目落覆写区内 = 全孤儿。
+    const size_t blk = 0x380;
+    put32(ctx.image, blk, 0x1000);
+    put32(ctx.image, blk + 4, 16);
+    put16(ctx.image, blk + 8, static_cast<u16>(10 << 12 | 0x400));
+    put16(ctx.image, blk + 10, 0);
+    auto& ranges =
+        ctx.slot<std::vector<std::pair<u32, u32>>>(wvmp::kPatchedRanges);
+    ranges = {{0x1400, 12}};
+    wvmp::passes::PeWriterPass writer;
+    writer.run(ctx);
+    // 回退：DYNAMIC_BASE 清除（delta=0 成为声明行为）且 dd[5] 未动。
+    const u16 ch = static_cast<u16>(rd32(ctx.image, kNt + 24 + 0x46) & 0xFFFF);
+    EXPECT_EQ(ch & 0x0040, 0u);
+    EXPECT_EQ(rd32(ctx.image, kNt + 24 + 112 + 5 * 8), 0x1180u);
+}
+
+TEST(PeWriterPass, EmitRelocNoRangesKeepsOriginalEntries) {
+    // 回归防线：无 kPatchedRanges（旧管道 / 直接 pe_writer 单测）时原条
+    // 目零剪枝——剪枝面必须由显式覆写区登记驱动，禁止隐式猜测。
+    ProtectionContext ctx;
+    make_aslr_fixture(ctx, /*aslr_on=*/true, {0x5008});
+    wvmp::passes::PeWriterPass writer;
+    writer.run(ctx);
+    std::set<std::pair<u32, u16>> sites;
+    collect_ext_sites(ctx,
+                      rd32(ctx.image, kNt + 24 + 112 + 5 * 8),
+                      rd32(ctx.image, kNt + 24 + 112 + 5 * 8 + 4), sites);
+    EXPECT_EQ(sites.count({0x1400, 10}), 1u);  // 原生站点仍在（现行为）
+    EXPECT_EQ(sites.count({0x5008, 10}), 1u);
 }
 
 // —— MIT-491 (T23)：Emit 预留区高水位观测 ————————————————————————

@@ -20,6 +20,7 @@
 #include <stdexcept>
 #include <string>
 #include <system_error>
+#include <utility>
 #include <vector>
 
 namespace wvmp::passes {
@@ -157,6 +158,20 @@ void PeWriterPass::run(ProtectionContext& ctx) {
             const size_t opt_off = e_off + 24;
             // Magic 高字节：0x020B(PE32+) → 0x02 / 0x010B(PE32) → 0x01。
             const bool plus = ctx.image[opt_off + 1] == 0x02;
+            // MIT-494c：x86（PE32）自动回退——x86 翻译器无 rip-relative，
+            // IAT 槽引用等以完整 VA 烙进 VM 词流（MIT-494 实录①：looplea
+            // blob 22 处 ib+RVA），ASLR 重定位下全数错位。v1 收敛裁定 =
+            // x86 不走扩展、清 DYNAMIC_BASE（delta=0 成声明行为，M2-8
+            // 等价），词流 RVA 化（T27）后再启用。
+            if (!plus) {
+                const u16 dc =
+                    u16(rd_le(ctx.image.data() + opt_off + 0x46, 2));
+                if ((dc & kImageDllCharacteristicsDynamicBase) != 0)
+                    ctx.diag.report(
+                        Severity::Note, name(),
+                        "ASLR 兼容：x86（PE32）暂不启用——已清除 "
+                        "DYNAMIC_BASE（词流 RVA 化为后续单）");
+            } else {
             const u16 want_type = plus ? 10 : 3;  // DIR64 / HIGHLOW
             const size_t dd5 = opt_off + opt_data_dir_off(plus) + 5 * 8;
             const u32 old_rva =
@@ -216,15 +231,97 @@ void PeWriterPass::run(ProtectionContext& ctx) {
                     std::set<u32> new_sites;
                     if (auto* sites =
                             ctx.find_slot<std::vector<u32>>(kRelocSites))
-                        for (const u32 rva : *sites) new_sites.insert(rva);
-                    if (!new_sites.empty()) {
+                        // 双重 delta 防线：原 reloc 已覆盖的站点不重复登
+                        // 记（同站点双重 delta = 错位，MIT-493 口径）。
+                        for (const u32 rva : *sites)
+                            if (covered.count(rva) == 0)
+                                new_sites.insert(rva);
+                    // —— 原 reloc 块拷贝（剪枝覆写区孤儿条目，MIT-494c）——
+                    // 覆写区（kPatchedRanges，stub_link 跳板 E9 rel32 +
+                    // 填充）内的原字节已非指针；指向其中的 native reloc
+                    // 条目自跳板写入起成为孤儿，拷贝时必须剪枝（不剪 =
+                    // loader 把 delta 写进跳板字节 → rel32 毒变野跳，
+                    // MIT-494a forkface 0x13DE cdb 实证）。幸存条目按原
+                    // 序重组；4 字节对齐以 type-0（ABSOLUTE，loader 忽
+                    // 略）哑条目补齐；剪空的块整体删除。
+                    size_t pruned_entries = 0;
+                    std::vector<u8> blob;
+                    {
+                        const auto* ranges =
+                            ctx.find_slot<std::vector<std::pair<u32, u32>>>(
+                                kPatchedRanges);
+                        const auto deadened = [&](u32 site, size_t width) {
+                            if (ranges == nullptr) return false;
+                            for (const auto& [rva, len] : *ranges)
+                                if (site < rva + len && rva < site + width)
+                                    return true;
+                            return false;
+                        };
+                        size_t pos = 0;
+                        const u8* rp = ctx.image.data() + *old_off;
+                        while (pos + 8 <= old_size) {
+                            const u32 page = u32(rd_le(rp + pos, 4));
+                            const u32 bsz = u32(rd_le(rp + pos + 4, 4));
+                            if (bsz < 8 || pos + bsz > old_size) break;
+                            std::vector<u16> keep;
+                            bool prev_hl_dropped = false;
+                            for (u32 i = 0; i < (bsz - 8) / 2; ++i) {
+                                const u16 ent =
+                                    u16(rd_le(rp + pos + 8 + i * 2, 2));
+                                const u16 type = u16(ent >> 12);
+                                const u32 site = page + u32(ent & 0x0FFF);
+                                bool drop = false;
+                                if (type == 1) {
+                                    drop = prev_hl_dropped;  // HIGHADJ 隶属前导 HIGHLOW
+                                } else if (type != 0) {
+                                    drop = deadened(site, type == 10 ? 8 : 4);
+                                }
+                                prev_hl_dropped = type == 3 && drop;
+                                if (drop) ++pruned_entries;
+                                else keep.push_back(ent);
+                            }
+                            if (!keep.empty()) {
+                                // 只剩 type-0 垫的块 = 功能性空块，整体
+                                // 删除（发射会骗 loader 重定位一个无活
+                                // 站点的目录 = 桩 VA 全部失配）。
+                                bool has_live = false;
+                                for (const u16 e2 : keep)
+                                    if ((e2 >> 12) != 0) has_live = true;
+                                if (has_live) {
+                                    // 垫到 4 条目倍数 = 块 8 字节对齐：
+                                    // loader 以 pos += bsz 顺序遍历，块间
+                                    // 不允许任何间隙（4 字节垫 + 尾部补零
+                                    // 会让下一个块头落在零洞上，遍历提前
+                                    // 终止）。type-0 哑条目 loader 忽略。
+                                    while (keep.size() % 4 != 0)
+                                        keep.push_back(0);
+                                    const u32 nbsz = static_cast<u32>(
+                                        8 + keep.size() * 2);
+                                    for (int b = 0; b < 4; ++b)
+                                        blob.push_back(static_cast<u8>(
+                                            (page >> (8 * b)) & 0xFF));
+                                    for (int b = 0; b < 4; ++b)
+                                        blob.push_back(static_cast<u8>(
+                                            (nbsz >> (8 * b)) & 0xFF));
+                                    for (const u16 e2 : keep)
+                                        for (int b = 0; b < 2; ++b)
+                                            blob.push_back(static_cast<u8>(
+                                                ((e2 >> (8 * b)) & 0xFF)));
+                                }
+                            }
+                            pos += bsz;
+                        }
+                    }
+                    if (new_sites.empty() && pruned_entries == 0) {
+                        // 无 packer 新站点且零孤儿：原 reloc 已完整覆盖
+                        // （native 面自足），保留 DYNAMIC_BASE 即可，无需
+                        // 扩展。
+                        aslr_extended = true;
+                    } else if (!blob.empty() || !new_sites.empty()) {
                         // —— 页分组 → 追加块 ——
                         std::map<u32, std::set<u32>> pages;
                         for (const u32 rva : new_sites)
                             pages[rva & ~u32(0xFFF)].insert(rva & 0xFFF);
-                        std::vector<u8> blob(
-                            ctx.image.begin() + *old_off,
-                            ctx.image.begin() + *old_off + old_size);
                         if (blob.size() % 8 != 0)
                             blob.resize(
                                 (blob.size() + 7) / 8 * 8, 0);
@@ -265,19 +362,25 @@ void PeWriterPass::run(ProtectionContext& ctx) {
                         wt.patch_u32(dd5 + 4,
                                      static_cast<u32>(blob.size()));
                         aslr_extended = true;
-                        char rb[160];
+                        char rb[192];
                         std::snprintf(rb, sizeof(rb),
                                       "ASLR 兼容：reloc 目录已扩展（+ %zu "
-                                      "站点 / %zu 字节）→ .wvmp @ RVA 0x%llX",
-                                      new_sites.size(), blob.size(),
+                                      "站点 / 剪枝覆写区孤儿 %zu / %zu 字节"
+                                      "）→ .wvmp @ RVA 0x%llX",
+                                      new_sites.size(), pruned_entries,
+                                      blob.size(),
                                       static_cast<unsigned long long>(new_rva));
                         ctx.diag.report(Severity::Note, name(), rb);
                     } else {
-                        // 无 packer 新站点：原 reloc 已完整覆盖（native 面
-                        // 自足），保留 DYNAMIC_BASE 即可，无需扩展。
-                        aslr_extended = true;
+                        // 原目录条目全部为覆写区孤儿且无 packer 站点：扩
+                        // 展无从谈起，aslr_extended 保持 false → 底部回退
+                        // 清 DYNAMIC_BASE 路径（delta=0 是声明行为）。
+                        ctx.diag.report(Severity::Note, name(),
+                                        "ASLR 兼容：原 reloc 条目全部为覆写"
+                                        "区孤儿，放弃扩展（回退清 DYNAMIC_BASE）");
                     }
                 }
+            }
             }
         }
     }

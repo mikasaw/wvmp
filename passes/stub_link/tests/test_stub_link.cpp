@@ -27,6 +27,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -164,6 +165,21 @@ TEST(StubLinkPass, OverwritesEntryAndRequestsSection) {
 
     // 区域余量 INT3 填充（0x40 字节区域，E9 后全 CC）。
     for (size_t i = 5; i < 0x40; ++i) EXPECT_EQ(code[i], 0xCC) << "byte " << i;
+}
+
+// MIT-494c (T26c)：覆写区登记——跳板写入成功即登记 {begin_rva, len}，
+// 供 pe_writer 扩展 reloc 目录剪枝孤儿条目（MIT-494a forkface 0x13DE）。
+TEST(StubLinkPass, RecordsPatchedRangeOnEntryOverwrite) {
+    ProtectionContext ctx = make_ctx_with_one_function();
+    wvmp::passes::StubLinkPass pass;
+    pass.run(ctx);
+    ASSERT_FALSE(ctx.diag.has_errors());
+    const auto* ranges = ctx.find_slot<std::vector<std::pair<u32, u32>>>(
+        wvmp::kPatchedRanges);
+    ASSERT_NE(ranges, nullptr);
+    ASSERT_EQ(ranges->size(), static_cast<size_t>(1));
+    EXPECT_EQ((*ranges)[0].first, 0x1100u);
+    EXPECT_EQ((*ranges)[0].second, 0x40u);
 }
 
 // MIT-476 (T20)：x86 全 gate —— 零 blob 时数据节恒非空（emit 预留区，

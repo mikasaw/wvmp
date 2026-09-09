@@ -283,6 +283,48 @@ TEST(Translate, MovImm32NegativeStaysSingleInsn) {
               kS32);
 }
 
+// ---------------- MIT-494c：映像范围绝对 VA → Mov(RVA)+LeaRva 折条 ----------------
+
+TEST(Translate, MovImageVaFoldsToRvaPlusLeaRva) {
+    // mov rax, 0x140001020（image_base=0x140000000，映像范围函数指针）：
+    // 禁止原值烙进 blob（loader 无法重定位，MIT-494a forkface 野跳实证）
+    // → Mov rax, imm32(0x1020) + LeaRva rax,rax（+ ctx scratch 真基址）。
+    const ir::Insn i = mov_imm(ir::Reg::Rax, 0x140001020ll, ir::Size::S64);
+    const auto r = wvmp::regvm::translator::translate_function(
+        fn_of({blk(0x1000, {i})}), {}, {}, 0x140000000ull);
+    EXPECT_TRUE(r.notes.empty());
+    const Decoded d = decode_program(r.program);
+    ASSERT_EQ(d.insns.size(), static_cast<size_t>(4)); // 2 + Jmp + Halt
+    expect_is(d.insns[0], VmOp::Mov, OpKind::Reg, kRax, OpKind::Imm, 0, 0x1020,
+              kS64);
+    expect_is(d.insns[1], VmOp::LeaRva, OpKind::Reg, kRax, OpKind::Reg, kRax, 0,
+              kS64);
+}
+
+TEST(Translate, MovOutOfImageVaKeepsImm64Split) {
+    // 非映像范围 imm64（常量 0x1122334455667788）：即使提供 image_base 也
+    // 走原拆条——转换只针对映像窗口 [base, base+2^32)。
+    const ir::Insn i = mov_imm(ir::Reg::Rax, 0x1122334455667788ll, ir::Size::S64);
+    const auto r = wvmp::regvm::translator::translate_function(
+        fn_of({blk(0x1000, {i})}), {}, {}, 0x140000000ull);
+    EXPECT_TRUE(r.notes.empty());
+    const Decoded d = decode_program(r.program);
+    ASSERT_EQ(d.insns.size(), static_cast<size_t>(6)); // 4 拆条 + Jmp + Halt
+    expect_is(d.insns[0], VmOp::Mov, OpKind::Reg, isa::kScratchFirst, OpKind::Imm, 0,
+              0x11223344, kS64);
+}
+
+TEST(Translate, MovBelowImageBaseSmallConstUnaffected) {
+    // < image_base 的 imm64（0x100000000，超 aux 界走拆条分支）：不转换
+    // ——窗口判定只认 [base, base+2^32)，界外照旧拆条。
+    const ir::Insn i = mov_imm(ir::Reg::Rax, 0x100000000ll, ir::Size::S64);
+    const auto r = wvmp::regvm::translator::translate_function(
+        fn_of({blk(0x1000, {i})}), {}, {}, 0x140000000ull);
+    EXPECT_TRUE(r.notes.empty());
+    const Decoded d = decode_program(r.program);
+    ASSERT_EQ(d.insns.size(), static_cast<size_t>(6)); // 4 拆条 + Jmp + Halt
+}
+
 // ---------------- 整函数：块布局 / fallthrough / 相对偏移 ----------------
 
 TEST(Translate, TwoBlockLayoutAndOffsets) {
