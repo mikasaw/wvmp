@@ -326,6 +326,35 @@ void MutatePass::run(ProtectionContext& ctx) {
             if (block.insns.empty()) continue;
             const auto dead = dead_at_boundaries(block, candidates, fn.arch,
                                                  live_out_v[&block - fn.blocks.data()]);
+            // TEMP-DIAG (T30-d, 收口前移除)：紧凑版——每个边界的 live(0..7)
+            // 位串 + 指令 op/dst/src，无截断风险。
+            if (region_allowed) {
+                std::string d = "TEMP2 b" + std::to_string(blk_i) +
+                                " n=" + std::to_string(block.insns.size()) + " lo={";
+                for (size_t r = 0; r < 8; ++r)
+                    if (live_out_v[blk_i][r]) d += std::to_string(r);
+                d += "}";
+                for (size_t i = 0; i <= block.insns.size() && i < 16; ++i) {
+                    d += " @" + std::to_string(i) + "d{";
+                    for (ir::Reg r : dead[i]) d += std::to_string(static_cast<int>(r));
+                    d += "}";
+                    if (i < block.insns.size()) {
+                        const auto& in2 = block.insns[i];
+                        d += "op" + std::to_string(static_cast<int>(in2.op)) +
+                             " d" + std::string(
+                                       in2.dst.kind == ir::Operand::Kind::Reg
+                                           ? std::to_string(static_cast<int>(in2.dst.reg))
+                                           : "x") +
+                             " s" + std::string(
+                                       in2.src.kind == ir::Operand::Kind::Reg
+                                           ? std::to_string(static_cast<int>(in2.src.reg))
+                                           : (in2.src.kind == ir::Operand::Kind::Imm
+                                                  ? "i"
+                                                  : "m"));
+                    }
+                }
+                ctx.diag.report(Severity::Note, name(), d);
+            }
             std::vector<ir::Insn> mutated;
             mutated.reserve(block.insns.size() + 8);
             bool inserted = false;

@@ -2565,12 +2565,17 @@ tls 回调双 dword 槽）在低熵时代不可见，E2E 必须覆盖全 pass �
   关**，是 crypt/mutate 栈 × roll(seed99999) 的既有缺陷（rep scasb
   微程序 × 变异布局交互；该套件在当前池构成下未跑过，非本会话回
   归）。
-- 立案 **T30-d**：rep 串微程序 × mutate 交互。**根因已锁定（blob 解
-  包 diff）**：mutate 的 junk-Mov（`Mov r0, 0x28112340`）插入在
-  `Mov r0, r2`（scas 比较子 AL 装载）与循环 `Cmp r0, r19` 之间——
-  **junk 注入的死寄存器判定误判 r0 为死**（实际横跨循环活），比较子
-  被毁 → 全扫不匹配（idx=32/rem=0）。MIT-484 「宁 gate 勿错挂账」家
-  族：mutate 死亡分析缺陷（跨指令 GPR liveness）。修复方向 = mutate
-  死寄存器选择接入真 liveness（或不确定即不注入该点）。复现资产
-  /tmp/t30/（so_mutate.exe / so_m0.exe + toml；blob3 双侧 dump 已存
-  本节）。crypt 无关（mutate-only 即红）；ASLR 无关（delta=0 同红）。
+- 立案 **T30-d（根因二次精化——IR↔翻译器发射契约缺口）**：blob3
+  双侧 dump + TEMP2 注入点活集转储（marker@0x11dc b0 n=10）实证——
+  junk `Mov r0, 0x28112340` 落在边界 i3，**IR liveness 判定合法**
+  （dead[3] ∋ 0：下游 i4 `Mov rax,[mem]` / i5 `mov eax,edi` 会重定义
+  rax）——**但翻译器从未发射 i4/i5 的 lowering**（translate_mov 对
+  mem-src Mov 走 "mem 源应已 lift 成 Load" 的 skip 路径——契约被上游
+  某环节违反，m0 无 mutate 同样缺发射但天然无害）→ junk 值在词流中
+  活到 `Cmp r0,r19`（scas 比较）→ 比较子污染 → 全扫不匹配。
+  **修复方向（二选一或并行）**：① translate_mov 对 `Mov dst=Reg,
+  src=Mem` 真发射（Load 到临时 + Mov），不再静默 skip；② mutate 注入
+  安全性改用"翻译后词流"口径的活性（或对含不可发射形态的块宁 gate
+  勿注入）。复现资产 /tmp/t30/（so_mutate.exe / so_m0.exe / so0.exe +
+  toml + TEMP2 转储）。crypt 无关（mutate-only 即红）；ASLR 无关
+  （delta=0 同红）。
