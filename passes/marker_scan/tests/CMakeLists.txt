@@ -281,6 +281,19 @@ target_link_options(wvmp_snake_sample PRIVATE
     $<$<CXX_COMPILER_ID:MSVC>:/INCREMENTAL:NO>
 )
 
+# MIT-494l (T34): 解释器密集微基准样本——5M 次 xorshift32 ALU 循环区域，
+# 量化解释器真实吞吐（T31 口径建议落地）。stdout 含非确定计时行，不进
+# multiseed byte-exact 池，仅作 measure 管道计时靶标（checksum 行可对拍）。
+add_executable(wvmp_hotloop_sample hotloop_sample_main.cpp)
+target_link_libraries(wvmp_hotloop_sample PRIVATE wvmp::sdk)
+target_compile_options(wvmp_hotloop_sample PRIVATE
+    $<$<CXX_COMPILER_ID:MSVC>:/Od;/Ob0;/utf-8>
+    $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-O0>
+)
+target_link_options(wvmp_hotloop_sample PRIVATE
+    $<$<CXX_COMPILER_ID:MSVC>:/INCREMENTAL:NO>
+)
+
 # MIT-301: 端到端正路径样本——区域内含 cl 变体 shift (D3 /5: shl/shr/sar/
 # rol/ror), 验证 cl 变体 shift 修复后翻译成功、运行时走真 ShlCl/ShrCl/
 # SarCl/RolCl/RorCl handler、行为与原生逐字节一致。用 volatile uint8_t

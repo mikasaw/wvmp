@@ -1094,3 +1094,9 @@ asmgen 零触碰 → dump 锚不受影响（无换代）。
   PASS → passthrough 字节保持 + 真 ASLR 加载运行正确（零 stub，非虚
   拟化行为实证）；
   Defender 4/4 不变。详见 GAPS MIT-494k。
+### MIT-494l (T34 · 解释器密集微基准) ✅ 2026-09-11
+- wvmp_hotloop_sample（5M 迭代 xorshift32 ALU 循环区域，do-while 规避
+  MIT-326 跨 END gate）+ scripts/measure_hotloop.sh（双侧中位 + checksum
+  哨兵）。native 6.73ms vs protected 410.8ms = **61.0x 减速比**（≈88M
+  词/秒吞吐），T31 口径建议落地，解释器优化后续以此为基线。不进 byte-
+  exact 池（stdout 含计时行）。ctest 23/23；证据链 GAPS MIT-494l 节。

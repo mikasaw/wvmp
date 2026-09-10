@@ -2747,3 +2747,28 @@ through 重写字节保持 → 行为与 native 副本一致）→ **passthrough
 到端字节保持 + 保留 DYNAMIC_BASE 的未改镜像在非系统路径真 ASLR 重定位
 下加载运行正确**的正面实证（零 stub，非虚拟化行为实证）。Defender 4/4
 未标记（不变）。
+
+## MIT-494l（T34 · 解释器密集微基准——wvmp_hotloop_sample，2026-09-11）
+
+**背景**：T31 结论建议"后续性能工作应采用解释器密集的微基准（长循环/
+大区域）而非进程级 wall clock"。本单落地该口径：新样本 wvmp_hotloop_
+sample（区域 = 5M 次迭代 xorshift32 ALU 循环，mov/add/xor/shl/shr/cmp/
+jb 全白名单，do-while 形态规避跨 END 前向跳（MIT-326）；区域外 QPC 计
+时），配套 scripts/measure_hotloop.sh（protect + 双侧 N 次中位 + check
+sum 一致性哨兵，REPEATS 正整数校验）。
+
+**测量结果**（6-pass 基础管道，seed 12345，5 次中位，1 入口 stub）：
+
+| 侧 | 循环中位 | 说明 |
+|---|---:|---|
+| native | 6.73 ms | 5M 迭代 xorshift+add |
+| protected x64 | 410.8 ms | checksum 一致 |
+| **减速比** | **61.0x** | ≈ 88M 词/秒解释器吞吐（~60M 词 / 410ms） |
+
+**结论**：① 解释器真实减速比首 quantified = **61x**（单区域纯 ALU 循
+环上限形态）；② checksum 行一致性哨兵绿（虚拟化语义无损）；③ 计时 3-5
+次波动 <1.5%（410-417ms 稳定带）——比 wall clock 口径噪声（0.98-1.07x
+漂移）可信度高一个量级；④ 后续解释器优化（dispatch/访存/词流密度）以
+此为基线。**x86 面留待扩展**（asm 区域编写独立小任务，x64 先行锚定方
+法论）；本样本 stdout 含非确定计时行，**不进 multiseed byte-exact 池**
+（checksum 行固定可作对拍锚）。
