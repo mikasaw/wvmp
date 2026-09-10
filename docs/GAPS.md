@@ -2585,5 +2585,21 @@ tls 回调双 dword 槽）在低熵时代不可见，E2E 必须覆盖全 pass �
   域 b0(n=10) 含 `Mov eax,[mem]`/`mov eax,edi` 双重定义、liveness 合
   法、junk 落点 sanction 成立，但修复后 i4 的 lowering 仍未出现在词
   流（blob 38 条不变）→ 该 IR 形态未走 translate_mov 的 mem 分支或
-  存在第二类静默丢弃点。**下一轮首步 = 在 run() 分派层 dump 逐 IR
-  insn 的翻译产物计数**（或 WVMP 级 IR→词流对账工具），锁定丢弃点。
+  存在第二类静默丢弃点。
+- **TEMP3 逐 insn 发射计数对账结论（2026-09-10）**：翻译器层**零丢
+  失**——目标区域全部 Mov/Load/Store/Lea 均 ok=1 且 emitted≥1（含
+  rep scasb 微程序 17 条）；junk 自身 emitted=1 正常入流。**丢弃点在
+  mutate→translate 的 IR 传递层之外的可能性排除，收敛于：scas 探针
+  区域的 b0（序言块，n=10 含 `Mov eax,[mem]`/`mov eax,edi` 双定义）
+  与 rep 循环块分属不同 block——junk 落在序言块 i3 边界按 IR liveness
+  合法（序言块内 i4/i5 重定义），但**序言块的 i4/i5 lowering 在词流
+  中缺席**（双侧 blob 均无）——而 m0 无 junk 时同缺席却正确 = 这两
+  条 IR 是死代码（其值从未被读，真 needle 在别处装载）→ **junk 注入
+  恰好命中了"IR 死代码边界之后、词流真活值链"的缝隙：IR 层判 rax 死
+  正确，但同边界的 junk 写与词流真活值（i2 装载的 needle 直传 Cmp）
+  在翻译后共存冲突——IR 活性与词流发射的活性口径不一致（中间形态
+  GetFlags/SetFlags 包裹 + 微程序路径的寄存器生命周期未被 mutate 的
+  IR 级分析覆盖）**。修复方向终版：mutate 注入点的死寄存器判定改用
+  "该寄存器在本块+后继块的**翻译后读写序**" 口径（或最保守：串指令
+  /微程序区域整体禁 junk——MIT-480 跳表禁注入同构先例）。TEMP 诊断
+  代码已撤（保持产品路径干净）；复跑资产与判定链完整保留本节。
