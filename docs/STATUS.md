@@ -1058,3 +1058,9 @@ asmgen 零触碰 → dump 锚不受影响（无换代）。
 - 验证：ctest 23/23；mutate-only 复现 byte-exact 转绿；crypt×ASLR 组
   合门 19/20 → **20/20**；tls 4/4；基线 335/335；全池 multiseed_aslr
   REPEATS=10 = 335/335。证据链 GAPS MIT-494g 节（TEMP2/TEMP3 对账）。
+### MIT-494i (T31 · 性能基线刷新) ✅ 2026-09-10
+- measure_perf.sh 10 次重复/侧 × 6 代表样本（deepcall/forkface/
+  jmp_table8/snake/sse_memop/string_ops），ASLR 扩展真姿态。
+- 运行时开销 0.98x–1.07x（进程启动主导，byte-exact 全过）；体积
+  2.37x–2.52x。T30 后首个正式基线入册 GAPS MIT-494i（含"后续应采用
+  解释器密集微基准"口径建议）。
