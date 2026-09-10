@@ -2574,8 +2574,16 @@ tls 回调双 dword 槽）在低熵时代不可见，E2E 必须覆盖全 pass �
   某环节违反，m0 无 mutate 同样缺发射但天然无害）→ junk 值在词流中
   活到 `Cmp r0,r19`（scas 比较）→ 比较子污染 → 全扫不匹配。
   **修复方向（二选一或并行）**：① translate_mov 对 `Mov dst=Reg,
-  src=Mem` 真发射（Load 到临时 + Mov），不再静默 skip；② mutate 注入
-  安全性改用"翻译后词流"口径的活性（或对含不可发射形态的块宁 gate
-  勿注入）。复现资产 /tmp/t30/（so_mutate.exe / so_m0.exe / so0.exe +
-  toml + TEMP2 转储）。crypt 无关（mutate-only 即红）；ASLR 无关
-  （delta=0 同红）。
+  src=Mem` 真发射（emit_address + Load/LoadRva 直入 dst），不再静默
+  skip；② mutate 注入安全性改用"翻译后词流"口径的活性。复现资产
+  /tmp/t30/。
+- **T30-d 阶段成果（本轮）**：① 已落地 = translate_mov mem 源真发射
+  （+MovMemSrcRealEmit 单测；translate_mov 签名扩展
+  current_rva/next_ip）——契约缺口闭合，ctest 23/23、基线 335/335、
+  tls 4/4、全池门 335/335 零回归。② **红面未消**（string_ops×99999
+  仍 rc=2 idx=32）→ 幽灵定义不止/不在此形态：TEMP2 转储显示目标区
+  域 b0(n=10) 含 `Mov eax,[mem]`/`mov eax,edi` 双重定义、liveness 合
+  法、junk 落点 sanction 成立，但修复后 i4 的 lowering 仍未出现在词
+  流（blob 38 条不变）→ 该 IR 形态未走 translate_mov 的 mem 分支或
+  存在第二类静默丢弃点。**下一轮首步 = 在 run() 分派层 dump 逐 IR
+  insn 的翻译产物计数**（或 WVMP 级 IR→词流对账工具），锁定丢弃点。

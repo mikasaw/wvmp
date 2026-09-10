@@ -359,6 +359,27 @@ TEST(Translate, X86MovOutOfWindowConstUnaffected) {
               0x7FFFFFFF, kS32);
 }
 
+TEST(Translate, MovMemSrcRealEmit) {
+    // MIT-494h：mem 源 Mov（此前静默 skip = IR liveness 幽灵定义，scas
+    // 比较子污染根因）→ emit_address + Load 真发射，值直入 dst。
+    ir::Insn i = I(ir::Op::Mov, ir::Size::S32);
+    i.dst = ir::Operand::reg_(ir::Reg::Rax);
+    i.src = ir::Operand::mem_(m(ir::Reg::Rbx, ir::Reg::Flags, 0, 0xC));
+    const auto r = wvmp::regvm::translator::translate_function(
+        fn_of({blk(0x1000, {i})}));
+    EXPECT_TRUE(r.notes.empty());
+    const Decoded d = decode_program(r.program);
+    // Mov acc,rbx; Add acc,0xC(合成, dead 标); Load rax,[acc]; Jmp; Halt
+    ASSERT_EQ(d.insns.size(), static_cast<size_t>(5));
+    expect_is(d.insns[0], VmOp::Mov, OpKind::Reg, isa::kScratchFirst, OpKind::Reg,
+              kRbx, 0, kS64);
+    expect_is(d.insns[1], VmOp::Add, OpKind::Reg, isa::kScratchFirst, OpKind::Imm,
+              0, 0xC, kS64);
+    EXPECT_TRUE(isa::flags_dead_field(d.insns[1].cond_or_size));
+    expect_is(d.insns[2], VmOp::Load, OpKind::Reg, kRax, OpKind::Reg,
+              isa::kScratchFirst, 0, kS32);
+}
+
 TEST(Translate, X86AbsoluteAddressFoldsInEmitter) {
     // x86 绝对寻址 lea eax, [0x403000]（base/index 均 Flags，disp=VA）：
     // emit_address 折条 Mov acc,RVA + LeaRva，词流零裸 VA（looplea 22 处

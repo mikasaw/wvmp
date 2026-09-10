@@ -980,7 +980,7 @@ struct Translator {
             ok = translate_lock_family(em, sc, in, current_rva, next_ip);
         } else {
         switch (in.op) {
-        case ir::Op::Mov: ok = translate_mov(em, sc, in); break;
+        case ir::Op::Mov: ok = translate_mov(em, sc, in, current_rva, next_ip); break;
         case ir::Op::Lea: ok = translate_lea(em, sc, in, current_rva, next_ip); break;
         case ir::Op::Load: ok = translate_load(em, sc, in, current_rva, next_ip); break;
         case ir::Op::Store: ok = translate_store(em, sc, in, current_rva, next_ip); break;
@@ -1522,7 +1522,10 @@ struct Translator {
 
     // mov 不接 mem 操作数（lifter 已将 mem-src 拆为 Load, mem-dst 拆为 Store），
     // 故不需要 next_ip 参数.
-    bool translate_mov(Emitter& em, Scratch& sc, const ir::Insn& in) {
+    // MIT-494h：current_rva/next_ip 供 mem 源 Mov 的 emit_address（rip 形
+    // RVA 计算）；reg/imm 形不消费，零行为影响。
+    bool translate_mov(Emitter& em, Scratch& sc, const ir::Insn& in,
+                       u64 current_rva, u64 next_ip) {
         // MIT-415: rep 串指令经 Op::Mov + src2=imm(family) 编码 (lifter 约定)
         // — 普通 mov 的 src2 恒空, 零碰撞。
         if (in.src2.kind == ir::Operand::Kind::Imm)
@@ -1536,8 +1539,24 @@ struct Translator {
             em.emit_rr(VmOp::Mov, d, isa::vm_reg_of(in.src.reg), sz);
             return true;
         }
+        // MIT-494h：mem 源 Mov 真发射（此前静默 skip → IR liveness 以该
+        // 定义为据判死的下游 mutate 注入点失守：MIT-494g scas 比较子污
+        // 染——junk 落点按 IR 合法，但重定义形态从未到达词流）。形态 =
+        // emit_address + Load/LoadRva 直入 dst（rip 源走 LoadRva：RVA +
+        // image_base 槽）；地址形态不支持时 gate 兜底。
+        if (in.src.kind == ir::Operand::Kind::Mem) {
+            u8 acc = 0;
+            if (!emit_address(em, sc, in.src.mem, current_rva, next_ip,
+                              sz_step_, acc, image_base_, image_extent_))
+                return skip(in, "mov mem 源地址形态未支持", &in.src.mem);
+            const isa::VmOp load_op = (in.src.mem.base == ir::Reg::Rip)
+                                          ? isa::VmOp::LoadRva
+                                          : isa::VmOp::Load;
+            em.emit_rr(load_op, d, acc, sz);
+            return true;
+        }
         if (in.src.kind != ir::Operand::Kind::Imm)
-            return skip(in, "mov 操作数形态未支持", nullptr); // mem 源应已 lift 成 Load
+            return skip(in, "mov 操作数形态未支持", nullptr);
         // MIT-494d/T27a：映像窗口立即数 → Mov(RVA)+LeaRva 折条（双 arch 统
         // 一）。x64: mov r64,imm64 函数指针（T26c，MIT-494a 野跳实证）；
         // x86: mov r32,imm32 地址常量（词流 RVA 化主面）。窗口
