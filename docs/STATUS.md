@@ -1080,7 +1080,16 @@ asmgen 零触碰 → dump 锚不受影响（无换代）。
 - 验证：ctest 23/23（+5 测试）；wvmpTest x64 9/11-pass 与 x86 6/9/11-pass
   双跑 103/103×5；blob 扫描真 aux 残留 8→0；multiseed 基线 335/335；
   multiseed_aslr 335/335（REPEATS=10+探针）；tls 4/4；crypt 20/20；
-  real_world 五目标首查 DYNAMIC_BASE 保留姿态（notepad/curl PASS，
-  tasklist/cmd = passthrough 资源面 pitfall 独立挂账）；Defender 4/4 未
-  标记。验收 ACCEPT with SHOULD-FIX（SH1/2/3 已修，SH4 口径已并入）。
-  证据链 GAPS MIT-494j 节。
+  real_world 五目标首查 DYNAMIC_BASE 保留姿态（notepad/curl PASS；
+  tasklist/cmd mismatch 初判 passthrough 资源面 pitfall，**MIT-494k 翻
+  案为脚本位置假阳**）；Defender 4/4 未标记。验收 ACCEPT with
+  SHOULD-FIX（SH1/2/3 已修，SH4 口径已并入）。证据链 GAPS MIT-494j 节。
+### MIT-494k (T33 · real_world 位置对齐基线) ✅ 2026-09-11
+- tasklist/cmd mismatch 翻案：protected 与 native 逐字节全同（pass
+  through 零改动），mismatch 纯系系统工具运行位置依赖（native 拷出
+  System32 后与 protected 行为一致，tasklist /? 空输出 + cmd 0x2350
+  消息文本均复现）= MIT-350 脚本方法学假阳，非产品缺陷。
+- 修复：verify_real_world.sh native 基线同拷出原位运行（位置对齐）。
+- 复跑：4 pass / 0 fail / 1 skip（7z 未装）；tasklist/cmd 转 byte-exact
+  PASS → **passthrough 重写面真 ASLR 姿态行为正确**的正面实证；
+  Defender 4/4 不变。详见 GAPS MIT-494k。

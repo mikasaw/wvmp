@@ -2710,10 +2710,10 @@ T30 后首个正式基线，后续大改可对照。
   tls_e2e 4/4；multiseed_crypt 20/20。
 - real_world 五目标（首查 DYNAMIC_BASE 保留姿态）：notepad PASS（protect
   OK）/ curl PASS byte-exact（C1 gate 全兜底）/ 7z SKIP（未安装）/
-  tasklist+cmd stdout mismatch——**passthrough 目标（零 stub 无词流）的
-  资源/console 面 pitfall，与本轮两修复无关**（pe_writer 零改动；cdb 实
-  证其 ASLR delta≠0 重定位健康）；无 MIT-350 时代基线记录，不判回踩，
-  立为 passthrough 资源面独立挂账。
+  tasklist+cmd stdout mismatch——初判"passthrough 资源面 pitfall 独立挂
+  账"，**T33（MIT-494k）翻案为脚本方法学假阳**：protected 与 native 逐字
+  节全同，mismatch 纯系运行位置变量（系统工具从 System32 原位 vs 项目目
+  录副本行为不同），详见 MIT-494k。
 - Defender 姿态：4/4 protected PE 未被标记（Get-MpThreatDetection）。
 
 ### blob 扫描判据精确口径（验收 SH4）
@@ -2721,3 +2721,27 @@ T30 后首个正式基线，后续大改可对照。
 流区域**（.wvmpc 或未加密 blob；crypt 管线下密文区随机碰撞期望命中数 =
 密文字节/2^32×窗口密度，~11KB 密文 ≈ 0.75 处，验收实测 1 处 0x42FB60
 经熵/解码双重甄别为碰撞假阳）。
+
+## MIT-494k（T33 · real_world 位置对齐基线——tasklist/cmd mismatch 翻案，2026-09-11）
+
+**T32 遗留定性翻案**：MIT-494j 将 tasklist/cmd 打包后 stdout 空/错乱定性
+为"passthrough 资源面 pitfall"。T33 判别链推翻该定性：
+
+1. **逐字节对账**：tasklist.protected.exe 与 native 头字段/节表/全部节内
+   容/checksum **完全一致**（passthrough 零 stub → pe_writer 零改动）。
+2. **位置对照**（决定性实验）：native tasklist.exe 拷到任意非 System32
+   目录跑 `/?` 同样只输出空行；native cmd.exe 拷出跑 `/c echo` 同样报
+   "系统无法在消息文件中为 Application 找到消息号为 0x2350 的消息文本"
+   ——**Windows 系统工具存在运行位置依赖**（资源/初始化面），与保护无
+   关。
+3. **裁定**：MIT-350 脚本的对比方法（native 原位 System32 vs protected
+   项目目录副本）天然产生该 mismatch = 方法学假阳，非产品缺陷。
+
+**修复**：verify_real_world.sh stdout 模式的 native 基线同样拷出原位运
+行（`$out_dir/$name.native.exe`，跑完即删）——位置变量对齐后，差异才是
+保护语义差异。
+
+**验证**：五目标复跑 4 pass / 0 fail / 1 skip（7z 未安装）；tasklist/
+cmd 转 **byte-exact PASS**（C1 gate 全兜底 = 系统二进制无 marker，pass
+through 重写字节保持 → 行为与 native 副本一致）→ **passthrough 重写面
+在真 ASLR 姿态下行为正确**的正面实证。Defender 4/4 未标记（不变）。
