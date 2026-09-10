@@ -68,7 +68,7 @@ fail=0
 # 探针不适用); 2 = 探针自身出错 (基址没解析到, FAIL 以防静默)。
 probe_delta() {
     local exe_win="$1"
-    local tmp pref base log dll
+    local tmp pref base log dll soi_hex
     tmp="$(mktemp -d)"
     log="$tmp/probe.log"
     pref="$(python - "$exe_win" <<'PYEOF'
@@ -79,19 +79,32 @@ opt = e + 24
 magic = struct.unpack_from('<H', img, opt)[0]
 v = (struct.unpack_from('<Q', img, opt + 24)[0] if magic == 0x20B
      else struct.unpack_from('<I', img, opt + 28)[0])
+soi = struct.unpack_from('<I', img, opt + 56)[0]
 dll = struct.unpack_from('<H', img, opt + 0x46)[0]
-print('0x%X' % v, 'NOASLR' if not (dll & 0x40) else 'ASLR')
+print('0x%X' % v, hex(soi), 'NOASLR' if not (dll & 0x40) else 'ASLR')
 PYEOF
 )" || { rm -rf "$tmp"; return 2; }
-    dll="$(echo "$pref" | awk '{print $2}')"
+    dll="$(echo "$pref" | awk '{print $3}')"
+    soi_hex="$(echo "$pref" | awk '{print $2}')"
     pref="$(echo "$pref" | awk '{print $1}')"
     if [[ "$dll" == "NOASLR" ]]; then
         rm -rf "$tmp"
         return 3
     fi
     printf 'g\nq\n' | "$CDB" -G -logo "$log" "$exe_win" > /dev/null 2>&1
-    # 主 exe 恒为首个 ModLoad 行 (loader 顺序), 去掉 cdb 地址里的反引号。
-    base="$(grep -m1 '^ModLoad: ' "$log" | awk '{print $2}' | tr -d '`')"
+    # 主 exe 识别 = ModLoad 行中 (end-start) == SizeOfImage 的首行。x86
+    # (WOW64) 进程的加载顺序存在抖动（gate 实测一次首行歧义致 delta 误
+    # 判），首行假设不鲁棒；映像尺寸才是主键。去掉 cdb 地址里的反引号。
+    base="$(python - "$log" "$soi_hex" <<'PYEOF'
+import re, sys
+soi = int(sys.argv[2], 16)
+for line in open(sys.argv[1], errors='replace'):
+    m = re.match(r'ModLoad: ([0-9a-f`]+) ([0-9a-f`]+)\s', line)
+    if m and int(m.group(2).replace('`', ''), 16) - int(m.group(1).replace('`', ''), 16) == soi:
+        print(m.group(1).replace('`', ''))
+        break
+PYEOF
+)"
     rm -rf "$tmp"
     if [[ -z "$base" || -z "$pref" ]]; then
         return 2

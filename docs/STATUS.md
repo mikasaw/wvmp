@@ -1040,3 +1040,21 @@ asmgen 零触碰 → dump 锚不受影响（无换代）。
   下 edx 写落优先基址野地址——tls_e2e x86 回填腿 FAIL 根因）。
 - 验证：ctest 23/23（+3 用例）；tls_e2e 4/4；基线 multiseed 335/335；
   全池 multiseed_aslr REPEATS=10 全绿（x86 85 产物升级真基址）。
+
+
+### MIT-494f (T28+T29 · Park 清账 + undefined-flags 普查) ✅ 2026-09-09
+- T28：X86* 折条三单测切换真 x86 夹具 fn86_of（S32 tag 断言）；Park
+  三项核实早已在 MIT-488/489/490 完成（勾销）。
+- T29：undefined-flags 夹具依赖普查零新增（div_flags 唯一命中已修；
+  imul 无探针夹具 / x87 永久 gate / rol-ror-sse 读均 defined）。
+
+### MIT-494g (T30 · crypt×ASLR 全栈组合门 + T30-d 修复) ✅ 2026-09-10
+- 组合门首跑 19/20：红面 = string_ops×seed99999 rep scasb 全扫未命中
+  （mutate-only 即红，与 crypt/ASLR 无关）。
+- T30-d 两层修复：① translate_mov mem 源 Mov 真发射（IR↔词流发射契
+  约缺口闭合，+MovMemSrcRealEmit 单测）；② 串微程序区域 junk-Mov 禁
+  注入（rep/plain 载体判据 Op::Mov+src2=imm family 0..4/23..27；
+  Nop 面保留；lock 5..8 不在判据——单 op 直发无包裹活性一致）。
+- 验证：ctest 23/23；mutate-only 复现 byte-exact 转绿；crypt×ASLR 组
+  合门 19/20 → **20/20**；tls 4/4；基线 335/335；全池 multiseed_aslr
+  REPEATS=10 = 335/335。证据链 GAPS MIT-494g 节（TEMP2/TEMP3 对账）。

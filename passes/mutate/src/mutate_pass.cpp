@@ -253,11 +253,27 @@ void MutatePass::run(ProtectionContext& ctx) {
         // 部分 fail→Halt 折叠 + Call aux 错位，wvmpTest kern.md5 单 Nop
         // 实录），fallback 并非整体 gate → 保守跳过整函数注入。
         bool has_indirect_jump = false;
+        bool has_string_op = false;
         for (const auto& b2 : fn.blocks)
-            for (const auto& i2 : b2.insns)
+            for (const auto& i2 : b2.insns) {
                 if ((i2.op == ir::Op::Jmp || i2.op == ir::Op::Jcc) &&
                     i2.dst.kind == ir::Operand::Kind::Reg)
                     has_indirect_jump = true;
+                // MIT-494h (T30-d)：串微程序区域 junk-Mov 禁注入判据——
+                // rep 串指令经 Op::Mov + src2=imm(family) 编码（MIT-415：
+                // rep 形 family 0..4 / plain 形 23..27；真实 mov 的立即数
+                // 在 src，src2 恒空零碰撞；lock 载体 family 5..8 不在判据
+                // 内——strip-and-execute 单 op 直发无 GetFlags/SetFlags 包
+                // 裹，IR 活性与词流一致）。此类区域经微程序展开，IR 级死
+                // 寄存器判定与词流发射活性口径不一致（MIT-494g TEMP3 对
+                // 账：IR"死"边界的 junk 写仍可命中词流真活值链 → scas 比
+                // 较子污染）。junk-Mov 禁用；Nop 面不写寄存器保留。
+                if (i2.op == ir::Op::Mov && i2.src2.kind == ir::Operand::Kind::Imm) {
+                    const i64 fam = i2.src2.imm;
+                    if ((fam >= 0 && fam <= 4) || (fam >= 23 && fam <= 27))
+                        has_string_op = true;
+                }
+            }
 
         // MIT-478 (T6)：区域级 CFG 反向活跃度不动点。live_out(B) = 后继
         // live_in 并集；间接跳转/不可解析目标 = 全活（保守）；区域出口
@@ -320,41 +336,17 @@ void MutatePass::run(ProtectionContext& ctx) {
                             "跳过注入（MIT-480 跳表匹配保守门控）");
             continue;
         }
+        if (has_string_op) {
+            ctx.diag.report(Severity::Note, name(),
+                            "函数 " + fn.name + " 含串微程序（rep 串载体），"
+                            "junk-Mov 跳过（MIT-494h 活性口径不一致防线；Nop 面保留）");
+        }
 
         for (size_t blk_i = 0; blk_i < fn.blocks.size(); ++blk_i) {
             ir::BasicBlock& block = fn.blocks[blk_i];
             if (block.insns.empty()) continue;
             const auto dead = dead_at_boundaries(block, candidates, fn.arch,
                                                  live_out_v[&block - fn.blocks.data()]);
-            // TEMP-DIAG (T30-d, 收口前移除)：紧凑版——每个边界的 live(0..7)
-            // 位串 + 指令 op/dst/src，无截断风险。
-            if (region_allowed) {
-                std::string d = "TEMP2 b" + std::to_string(blk_i) +
-                                " n=" + std::to_string(block.insns.size()) + " lo={";
-                for (size_t r = 0; r < 8; ++r)
-                    if (live_out_v[blk_i][r]) d += std::to_string(r);
-                d += "}";
-                for (size_t i = 0; i <= block.insns.size() && i < 16; ++i) {
-                    d += " @" + std::to_string(i) + "d{";
-                    for (ir::Reg r : dead[i]) d += std::to_string(static_cast<int>(r));
-                    d += "}";
-                    if (i < block.insns.size()) {
-                        const auto& in2 = block.insns[i];
-                        d += "op" + std::to_string(static_cast<int>(in2.op)) +
-                             " d" + std::string(
-                                       in2.dst.kind == ir::Operand::Kind::Reg
-                                           ? std::to_string(static_cast<int>(in2.dst.reg))
-                                           : "x") +
-                             " s" + std::string(
-                                       in2.src.kind == ir::Operand::Kind::Reg
-                                           ? std::to_string(static_cast<int>(in2.src.reg))
-                                           : (in2.src.kind == ir::Operand::Kind::Imm
-                                                  ? "i"
-                                                  : "m"));
-                    }
-                }
-                ctx.diag.report(Severity::Note, name(), d);
-            }
             std::vector<ir::Insn> mutated;
             mutated.reserve(block.insns.size() + 8);
             bool inserted = false;
@@ -383,7 +375,8 @@ void MutatePass::run(ProtectionContext& ctx) {
                             inserted = true;
                             site_log += site_note(fn, blk_i, i, host, -1, false, 0);
                         }
-                    } else if (kEnableJunkMov && !dead[i].empty() &&
+                    } else if (kEnableJunkMov && !has_string_op &&
+                               !dead[i].empty() &&
                                rng.chance(junk_probability)) {
                         // MIT-478 (T6)：dead[i] 已由区域级 CFG 反向活跃度背书
                         //（live_out(B) 折入后继可见性 + 隐式读补录），直接注入。
