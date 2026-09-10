@@ -5,8 +5,10 @@
 // 解释器密集的微基准（长循环/大区域）而非进程级 wall clock"。本样本即该
 // 口径的落地：
 //   - 区域内 = 单个 5M 次迭代的 xorshift32 ALU 循环（mov/add/xor/shl/shr/
-//     cmp/jb 全在白名单内，/Od codegen 无乘除/SSE）——protected 版每次迭
-//     代走解释器 dispatch 十余词，循环时间为解释器吞吐主导；
+//     inc/cmp/jb 全在白名单内，/Od codegen 无乘除/SSE）——protected 版每
+//     次迭代走解释器 dispatch 62 词（实测词流：/Od 访存型 codegen 使每次
+//     mem 访问扩为 Lea+Sub+Load 三词，29 条 native 指令 → 62 词），循环
+//     时间为解释器吞吐主导；
 //   - 区域外 = QPC（QueryPerformanceCounter）计时包裹对区域函数的调用。
 //
 // ⚠️ byte-exact 口径：stdout 含毫秒计时值，native 与 protected 必然不同

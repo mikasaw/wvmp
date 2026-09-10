@@ -60,10 +60,17 @@ if [[ $rc -ne 0 || ! -f "$out" ]]; then
     echo "[hotloop] protect 失败 rc=$rc" >&2; echo "$log" | tail -3 >&2; exit 2
 fi
 stubs="$(echo "$log" | grep -oE '已生成 [0-9]+ 个入口 stub' | tail -1)"
+# MIT-306 REQUIRE_REAL 纪律：区域整函数 gate 退化时脚本须红灯而非静默 ~1.0x。
+if ! echo "$stubs" | grep -qE '已生成 [1-9]'; then
+    echo "[hotloop] FAIL 非真虚拟化（$stubs / C1 gate 退化）" >&2; exit 3
+fi
 echo "[hotloop] protect OK ($stubs)"
 
 "$sample" > "$tmp/native.out" 2>/dev/null
 native_rc=$?
+if [[ $native_rc -ne 0 ]]; then
+    echo "[hotloop] FAIL native rc=$native_rc ≠ 0（样本哨兵/锚漂移）" >&2; exit 3
+fi
 packed_ck="$(checksum_of "$tmp/native.out")"
 
 native_mss=()
@@ -87,5 +94,4 @@ ratio="$(awk -v a="$p_med" -v b="$n_med" 'BEGIN {printf "%.1f", a/b}')"
 echo "[hotloop] native 循环中位: ${n_med} ms ($repeats 次)"
 echo "[hotloop] protected 循环中位: ${p_med} ms ($repeats 次, checksum=$packed_ck 一致)"
 echo "[hotloop] 解释器减速比: ${ratio}x"
-[[ "$native_rc" -eq 0 ]] || { echo "[hotloop] native rc=$native_crc ≠ 0" >&2; exit 3; }
 exit 0

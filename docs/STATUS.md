@@ -1097,6 +1097,8 @@ asmgen 零触碰 → dump 锚不受影响（无换代）。
 ### MIT-494l (T34 · 解释器密集微基准) ✅ 2026-09-11
 - wvmp_hotloop_sample（5M 迭代 xorshift32 ALU 循环区域，do-while 规避
   MIT-326 跨 END gate）+ scripts/measure_hotloop.sh（双侧中位 + checksum
-  哨兵）。native 6.73ms vs protected 410.8ms = **61.0x 减速比**（≈88M
-  词/秒吞吐），T31 口径建议落地，解释器优化后续以此为基线。不进 byte-
-  exact 池（stdout 含计时行）。ctest 23/23；证据链 GAPS MIT-494l 节。
+  哨兵 + ≥1 stub 断言）。native 6.73ms vs protected 410.8ms = **61.0x
+  减速比**；吞吐 = 62 词/迭代（验收实测词流，/Od 访存型 codegen 29 指令
+  → 62 词）≈ **755M 词/秒**（T34 验收 SH1 修正口径），T31 口径建议落地，
+  解释器优化后续以此为基线。不进 byte-exact 池（stdout 含计时行）。
+  ctest 23/23；证据链 GAPS MIT-494l 节。
