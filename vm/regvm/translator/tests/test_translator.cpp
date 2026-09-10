@@ -404,6 +404,58 @@ TEST(Translate, X86AbsoluteAddressFoldsInEmitter) {
         EXPECT_NE(g.aux, 0x403000u);
 }
 
+TEST(Translate, X86BaseDispImageVaFoldsDispToRva) {
+    // MIT-494j：base+index+disp 形态的 disp 折叠——native `mov eax,
+    // [ecx+ecx*4+0x403000]`（MSVC 对 table[i+i*4] 类 5-stride 表寻址的
+    // 真实产物，wvmpTest x86 实证）：disp 承载 .rdata 表基址，ASLR 重定
+    // 位后必须 RVA 化。序列 = Mov acc,base + Mov ix,index + Shl ix,2 +
+    // Add acc,ix + Add acc,RVA + LeaRva + Load；零裸 VA 自检同上单。
+    ir::Insn mov = I(ir::Op::Mov, ir::Size::S32);
+    mov.dst = ir::Operand::reg_(ir::Reg::Rax);
+    mov.src = ir::Operand::mem_(m(ir::Reg::Rcx, ir::Reg::Rcx, 4, 0x403000));
+    const auto r = wvmp::regvm::translator::translate_function(
+        fn86_of({blk(0x1000, {mov})}), {}, {}, 0x400000ull, 0xF000ull);
+    EXPECT_TRUE(r.notes.empty());
+    const Decoded d = decode_program(r.program);
+    ASSERT_EQ(d.insns.size(), static_cast<size_t>(9));
+    const u8 acc = isa::kScratchFirst;
+    const u8 ix = isa::kScratchFirst + 1;
+    expect_is(d.insns[0], VmOp::Mov, OpKind::Reg, acc, OpKind::Reg, kRcx, 0,
+              kS32);
+    expect_is(d.insns[1], VmOp::Mov, OpKind::Reg, ix, OpKind::Reg, kRcx, 0,
+              kS32);
+    expect_is(d.insns[2], VmOp::Shl, OpKind::Reg, ix, OpKind::Imm, 0, 2, kS32);
+    expect_is(d.insns[3], VmOp::Add, OpKind::Reg, acc, OpKind::Reg, ix, 0,
+              kS32);
+    expect_is(d.insns[4], VmOp::Add, OpKind::Reg, acc, OpKind::Imm, 0, 0x3000,
+              kS32);
+    expect_is(d.insns[5], VmOp::LeaRva, OpKind::Reg, acc, OpKind::Reg, acc, 0,
+              kS32);
+    expect_is(d.insns[6], VmOp::Load, OpKind::Reg, kRax, OpKind::Reg, acc, 0,
+              kS32);
+    for (const auto& g : d.insns)
+        EXPECT_NE(g.aux, 0x403000u);
+}
+
+TEST(Translate, X86BaseSmallDispNotFolded) {
+    // 回归面：普通 base+小偏移（结构体字段寻址）不得误折——disp < ImageBase
+    // 不满足窗口判据，词流保持 Add acc,disp 且**无 LeaRva**（误折会把
+    // image_base 槽错误加进偏移语义）。
+    ir::Insn mov = I(ir::Op::Mov, ir::Size::S32);
+    mov.dst = ir::Operand::reg_(ir::Reg::Rax);
+    mov.src = ir::Operand::mem_(m(ir::Reg::Rcx, ir::Reg::Flags, 0, 0x10));
+    const auto r = wvmp::regvm::translator::translate_function(
+        fn86_of({blk(0x1000, {mov})}), {}, {}, 0x400000ull, 0xF000ull);
+    EXPECT_TRUE(r.notes.empty());
+    const Decoded d = decode_program(r.program);
+    bool saw_raw_disp = false;
+    for (const auto& g : d.insns) {
+        EXPECT_NE(g.op, VmOp::LeaRva);
+        if (g.op == VmOp::Add && g.aux == 0x10u) saw_raw_disp = true;
+    }
+    EXPECT_TRUE(saw_raw_disp);  // disp 原样入算，未 RVA 化
+}
+
 // ---------------- 整函数：块布局 / fallthrough / 相对偏移 ----------------
 
 TEST(Translate, TwoBlockLayoutAndOffsets) {

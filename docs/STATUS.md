@@ -1064,3 +1064,23 @@ asmgen 零触碰 → dump 锚不受影响（无换代）。
 - 运行时开销 0.98x–1.07x（进程启动主导，byte-exact 全过）；体积
   2.37x–2.52x。T30 后首个正式基线入册 GAPS MIT-494i（含"后续应采用
   解释器密集微基准"口径建议）。
+### MIT-494j (T32 · 真实世界目标真 ASLR 姿态全面复验) ✅ 2026-09-11
+- wvmpTest x86（888KB MSVC /DYNAMICBASE，x86 ASLR 面首个大目标）首爆
+  两红面，均已修复：① stub_link 8KB emit 预算 vs native reloc 28.5KB
+  （x86 绝对寻址遍地；x64 仅 3.1KB）→ 预算动态加成（rebuild 上界 ×1.25
+  +64 + 站点余量 4KB 超 8192 才加成；x64 wvmpTest 加成 0 产物 cmp 逐字
+  节不变，x86 加成 31640）；kEmitReserveExtra 槽落值修正 pe_writer 高水
+  位 Note（验收 SH1）。② fold_disp：base+disp 形态的 disp 绝对 VA 漏折
+  叠（MSVC 5-stride 表寻址单条 `mov eax,[ecx+ecx*4+disp32]`，T27a
+  fold_abs 只覆盖无 base 形）→ delta≠0 野读；修复 = base/index 拼装后
+  Add acc,RVA + mark_last_dead + LeaRva（与 fold_abs 对偶，窗口判据同
+  宽）；aslr=false 判别刀 103/103 定位 ASLR 面。
+- 探针 delta=0 一次性抖动自动重试（callgate seed=1 单点 3/3 delta≠0 实
+  证抖动；真假绿 per-boot 确定性不被重试放行）。
+- 验证：ctest 23/23（+5 测试）；wvmpTest x64 9/11-pass 与 x86 6/9/11-pass
+  双跑 103/103×5；blob 扫描真 aux 残留 8→0；multiseed 基线 335/335；
+  multiseed_aslr 335/335（REPEATS=10+探针）；tls 4/4；crypt 20/20；
+  real_world 五目标首查 DYNAMIC_BASE 保留姿态（notepad/curl PASS，
+  tasklist/cmd = passthrough 资源面 pitfall 独立挂账）；Defender 4/4 未
+  标记。验收 ACCEPT with SHOULD-FIX（SH1/2/3 已修，SH4 口径已并入）。
+  证据链 GAPS MIT-494j 节。

@@ -98,31 +98,36 @@ void PeWriterPass::run(ProtectionContext& ctx) {
     // MIT-491 (T23，MIT-476 观察项落地)：Emit 预留区高水位观测——使用
     // 超过 75% 预算打 Note（协议超限本身是 emit_reserve_take 硬失败，
     // 此处为提前预警面）。游标是 .wvmp 数据节专属预算（MIT-488 R1 教
-    // 训），预留区 = [size - kEmitReserveBytes, size)；无游标槽（旧夹
-    // 具）或 .wvmp 缺席 → 静默跳过。
+    // 训），预留区 = [size - 预算总量, size)；预算总量 = 8KB 基础 +
+    // kEmitReserveExtra 加成（MIT-494j 验收 SH1：stub_link 按原生 reloc
+    // 目录尺寸扩容时落槽，不修正则 extra>0 时 used 恒 ≤0 → 预警静默失
+    // 效）。无游标槽（旧夹具）或 .wvmp 缺席 → 静默跳过。
+    u64 reserve_total = kEmitReserveBytes;
+    if (const u64* extra = ctx.find_slot<u64>(kEmitReserveExtra))
+        reserve_total += *extra;
     if (auto* sections = ctx.find_slot<std::vector<NewSection>>(kNewSections);
         sections != nullptr)
         if (auto* r = ctx.find_slot<u64>(kEmitReserveBase); r != nullptr &&
             *r != 0)
             for (const auto& s : *sections) {
                 if (s.name != ".wvmp" ||
-                    s.data.size() <= kEmitReserveBytes)
+                    s.data.size() <= reserve_total)
                     continue;
-                const u64 reserve_start = s.data.size() - kEmitReserveBytes;
+                const u64 reserve_start = s.data.size() - reserve_total;
                 if (*r <= reserve_start) continue;
                 const u64 used = *r - reserve_start;
                 // 除法形态恒无乘法回绕（MIT-491 验收建议 1：游标被外部
                 // 腐化 ≥2^62 时 used*4 理论回绕；当前威胁模型不可达，
                 // 形态防御仍取）。
-                if (used > kEmitReserveBytes / 4 * 3) {
-                    char hw[128];
+                if (used > reserve_total / 4 * 3) {
+                    char hw[160];
                     std::snprintf(hw, sizeof(hw),
-                                  "Emit 预留区高水位：%llu / %u 字节（%.0f%%）"
+                                  "Emit 预留区高水位：%llu / %llu 字节（%.0f%%）"
                                   "——逼近预算上限，请评估 kEmitReserveBytes 扩容",
                                   static_cast<unsigned long long>(used),
-                                  static_cast<unsigned>(kEmitReserveBytes),
+                                  static_cast<unsigned long long>(reserve_total),
                                   100.0 * static_cast<double>(used) /
-                                      static_cast<double>(kEmitReserveBytes));
+                                      static_cast<double>(reserve_total));
                     ctx.diag.report(Severity::Note, name(), hw);
                 }
                 break;

@@ -785,6 +785,22 @@ void emit_imm64_split(Emitter& em, Scratch& sc, u8 d, u64 v, u8 sz_step) {
         no_base && image_base != 0 && m.disp >= 0 &&
         static_cast<u64>(m.disp) >= image_base &&
         static_cast<u64>(m.disp) - image_base < win_extent;
+    // MIT-494j（T32 复验发现）：base+disp 形态的 disp 同样承载映像窗口内
+    // 绝对 VA——wvmpTest x86 实证：MSVC 把 table[i + i*4] 类 5-stride 表
+    // 寻址编成单条 `mov eax, [ecx + ecx*4 + disp32]`（disp = .rdata 表基
+    // 址），无 base 折叠（T27a）覆盖不到 → ASLR 重定位后旧 ImageBase 域
+    // VA 进访存 → 解释器野读（cdb 实证 second-chance AV，读 0x4AFAB0）。
+    // delta=0（aslr=false 回退 / 优先基址加载）时旧 VA 自洽 = 假绿，真
+    // delta≠0 才暴露——multiseed 池小样本无此形态故 335/335 假阴性。
+    // 语义：disp 以 RVA 入算（Add acc, RVA），base/index 运行时值拼装完
+    // 成后 LeaRva 原位 + image_base 槽 = native disp_VA 域（与 no_base 折
+    // 叠分支的 Mov RVA+LeaRva 前置形互为对偶）。窗口判据与 fold_abs 同宽
+    //（≥ImageBase 且 <ImageBase+SizeOfImage），普通小字段偏移（<4MB 常见
+    // ImageBase）不满足 ≥ImageBase 恒不误折。
+    const bool fold_disp =
+        !no_base && image_base != 0 && m.disp >= 0 &&
+        static_cast<u64>(m.disp) >= image_base &&
+        static_cast<u64>(m.disp) - image_base < win_extent;
     if (no_base) {
         if (fold_abs) {
             em.emit_ri(VmOp::Mov, acc,
@@ -816,7 +832,16 @@ void emit_imm64_split(Emitter& em, Scratch& sc, u8 d, u64 v, u8 sz_step) {
         em.mark_last_dead();      // MIT-494d
     }
     if (m.disp != 0 && !fold_abs) {
-        if (fits_aux(m.disp)) {
+        if (fold_disp) {
+            // MIT-494j：base/index 拼装完成后 disp 以 RVA 入算 + LeaRva
+            // 原位还原 VA 域（native disp 即绝对 VA；Add 为合成地址算术，
+            // native 访存不写 flags → mark_last_dead 沿用）。
+            em.emit_ri(VmOp::Add, acc,
+                       static_cast<u32>(static_cast<u64>(m.disp) - image_base),
+                       sz_step);
+            em.mark_last_dead();
+            em.emit_rr(VmOp::LeaRva, acc, acc, sz_step);
+        } else if (fits_aux(m.disp)) {
             em.emit_ri(VmOp::Add, acc, static_cast<u32>(m.disp), sz_step);
             em.mark_last_dead();  // MIT-494d: disp 拼装（native lea 不写 flags）
         } else if (m.disp < 0) {

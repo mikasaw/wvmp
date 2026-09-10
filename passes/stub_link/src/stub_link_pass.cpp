@@ -6,6 +6,7 @@
 #include "wvmp/framework/context.hpp"
 #include "wvmp/framework/diagnostics.hpp"
 #include "wvmp/framework/keys.hpp"
+#include "wvmp/framework/protect_levels.hpp"
 #include "wvmp/framework/registry.hpp"
 #include "wvmp/passes/pe_loader/pe_image.hpp"
 #include "wvmp/passes/virtualize/virtualize_pass.hpp"
@@ -193,8 +194,60 @@ void StubLinkPass::run(ProtectionContext& ctx) {
     // "not contiguous" 硬失败；全 gate（零 blob）时数据节为空被
     // add_sections 拒绝。预留 8KB 并随节发射（ emit_reserve_take 协议见
     // pe_image.hpp），节最终尺寸恒定 → 连续性恒成立、数据节恒非空。
+    //
+    // MIT-494j（T32 复验发现）：pe_writer 的 ASLR reloc 扩展（原目录剪
+    // 枝重建 + packer 站点块，dd[5] 重指）也走同一预留区，而固定 8KB 只
+    // 覆盖 x64 典型面（wvmpTest 3160 B / 1504 条目）；x86 真实世界目标
+    // imm32 绝对寻址遍地（wvmpTest 888 KB MSVC /DYNAMICBASE = 28.5 KB /
+    // 13472 条目 HIGHLOW），emit_reserve_take fail-closed 打包硬失败。
+    // 预留量按原生 reloc 目录尺寸动态加成；判据 = 重建上界（×1.25：垫
+    // 补齐 + 块头重建余量）+ 站点余量 4KB（实测站点面 x64 56 站点≈0.4 KB、
+    // x86 词流 RVA 化后仅 stub 序言面，4KB ≈ 10 倍实测）未超 8KB 基础预
+    // 算时加成为零 → 既有产物（multiseed 池 / x64 wvmpTest）字节零扰动。
+    // [pe] aslr=false 或 native 未声明 DYNAMIC_BASE 时 pe_writer 不扩展，
+    // 加成同步为零。
+    // ⚠️ 判据上界披露（T32 验收 SH2）：×1.25 非最坏界——剪枝重建把每块
+    // 条目垫到 4 条目倍数，全 2-条目块目录最坏膨胀 1.33×（S>768B 时
+    // 可能低估）；低估后果 = pe_writer emit_reserve_take fail-closed 硬
+    // 失败（报错可读，不静默腐化），不产坏镜像。精确上界需遍历目录逐
+    // 块算 Σ(8+垫)，留作需要时的增强（T32 口径：启发式 + fail-closed 兜
+    // 底已覆盖全部现网目标）。
+    u64 aslr_reloc_extra = 0;
+    {
+        const auto rd_le = [](const u8* p, size_t n) {
+            u64 v = 0;
+            for (size_t i = 0; i < n; ++i) v |= u64(p[i]) << (8 * i);
+            return v;
+        };
+        const auto* rules = ctx.find_slot<ProtectRules>(kProtectRules);
+        const bool aslr_on =
+            rules == nullptr || !rules->has_pe_aslr || rules->pe_aslr;
+        const size_t opt = pe->nt_headers_offset + 24;
+        const size_t dd5 = opt + (pe->is_pe32_plus ? 112u : 96u) + 5 * 8;
+        if (aslr_on && opt + 0x48 <= ctx.image.size() && dd5 + 8 <= ctx.image.size()) {
+            const u32 reloc_size = static_cast<u32>(rd_le(ctx.image.data() + dd5 + 4, 4));
+            const u16 dllchars = static_cast<u16>(rd_le(ctx.image.data() + opt + 0x46, 2));
+            if (reloc_size > 0 && (dllchars & 0x0040) != 0) {
+                const u64 rebuild_need =
+                    u64(reloc_size) + reloc_size / 4 + 64;
+                const u64 sites_need = 4096;
+                if (rebuild_need + sites_need > kEmitReserveBytes)
+                    aslr_reloc_extra = align_up(
+                        rebuild_need + sites_need - kEmitReserveBytes, 8);
+            }
+        }
+    }
     const u64 blobs_total = data_total;
-    data_total += kEmitReserveBytes;
+    data_total += kEmitReserveBytes + aslr_reloc_extra;
+    if (aslr_reloc_extra > 0) {
+        // MIT-494j 验收 SH1：加成量落槽——pe_writer 高水位 Note 由此修正
+        // 真预留区起点（否则 extra>0 时 used 恒 ≤0 → 预警静默失效）。
+        ctx.slot<u64>(kEmitReserveExtra) = aslr_reloc_extra;
+        ctx.diag.report(Severity::Note, name(),
+                        "ASLR reloc 扩展预算加成 +" +
+                            std::to_string(aslr_reloc_extra) +
+                            " 字节（原生 reloc 目录超出 8KB 基础预留）");
+    }
 
     const u64 code_rva = align_up(
         data_section_rva + align_up(data_total, sec_align), sec_align);

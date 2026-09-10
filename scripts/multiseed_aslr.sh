@@ -105,6 +105,24 @@ for line in open(sys.argv[1], errors='replace'):
         break
 PYEOF
 )"
+    # T32：delta=0 一次性抖动复测（gate 实测第二例 wvmp_x86_callgate
+    # seed=1：单点复跑 3/3 delta≠0，产物 per-boot 基址命运恒定 → 真假绿
+    # 应逐次稳定 delta=0，抖动才一次性）。rc=1 重试一次，仍 delta=0 才判
+    # 假绿——确定性属性不会因重试误放行。
+    if [[ -n "$base" && -n "$pref" ]] && (( 16#${base#0x} == 16#${pref#0x} )); then
+        sleep 1
+        printf 'g\nq\n' | "$CDB" -G -logo "$log" "$exe_win" > /dev/null 2>&1
+        base="$(python - "$log" "$soi_hex" <<'PYEOF'
+import re, sys
+soi = int(sys.argv[2], 16)
+for line in open(sys.argv[1], errors='replace'):
+    m = re.match(r'ModLoad: ([0-9a-f`]+) ([0-9a-f`]+)\s', line)
+    if m and int(m.group(2).replace('`', ''), 16) - int(m.group(1).replace('`', ''), 16) == soi:
+        print(m.group(1).replace('`', ''))
+        break
+PYEOF
+)"
+    fi
     rm -rf "$tmp"
     if [[ -z "$base" || -z "$pref" ]]; then
         return 2

@@ -6,6 +6,11 @@ inline constexpr std::string_view kImage="image", kFunctions="functions", kLifte
 // 末端；import_protect/tls_hook 读写推进）。类型 u64，槽未置 = 旧"尾部
 // 追加"语义（旧夹具/单测兼容）。
 inline constexpr std::string_view kEmitReserveBase="pe.emit_reserve_base";
+// MIT-494j（T32）：.wvmp 预留区在 8KB 基础预算之上的 ASLR reloc 扩展加成
+// 量（stub_link 按原生 reloc 目录尺寸计算并写入；pe_writer 高水位 Note 消
+// 费修正真预留区起点与分母）。类型 u64，槽未置 = 加成 0（小样本/无 ASLR
+// 目标，既有产物字节不变的锚）。
+inline constexpr std::string_view kEmitReserveExtra="pe.emit_reserve_extra";
 // MIT-494 ASLR 兼容：packer 发射的绝对 VA 站点 RVA 表（stub_link/tls_hook/
 // import_protect 发射点登记 → pe_writer 消费生成 .reloc 扩展块）。类型
 // std::vector<u32>（站点 RVA）。发射点登记优于全镜像事后扫描——扫描在

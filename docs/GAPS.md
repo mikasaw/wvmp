@@ -2639,3 +2639,85 @@ ALL OK）；② 运行时开销 = 启动噪声带内（≤1.07x），T26/T27/T30
 流增量在此量级样本上不可辨——后续性能工作（如 T31 后继）应采用解
 释器密集的微基准（长循环/大区域）而非进程级 wall clock；③ 本表为
 T30 后首个正式基线，后续大改可对照。
+
+## MIT-494j（T32 · 真实世界目标真 ASLR 姿态全面复验——两红面修复，2026-09-11）
+
+**背景**：T32 复验 = wvmpTest 双架构三管道（6/9/11-pass）双跑 + real_world
+五目标 + Defender 姿态检查。wvmpTest x86（888KB MSVC /DYNAMICBASE）是
+**x86 ASLR 面首个大目标**——multiseed 池全部为小样本（reloc ≤ 数百字
+节），对该面构成假阴性池；两红面均在其上首爆。
+
+### 红面 A：stub_link 8KB emit 预算 vs x86 大 reloc 目录
+- **现象**：wvmpTest x86 全管道打包硬失败 `emit data reserve exhausted:
+  need 53488, budget 32624`（pe_writer ASLR reloc 扩展走 emit_reserve_take
+  协议，固定 8KB fail-closed）。
+- **根因**：T26 注释"典型 3KB reloc"只量了 x64 面（wvmpTest x64 = 3160B
+  /1504 条目）；x86 imm32 绝对寻址遍地 → wvmpTest x86 native reloc 目录
+  28536B/13472 HIGHLOW 条目，超预算一个数量级。
+- **修复**：stub_link 预扩动态加成——判据 `rebuild_need = size*1.25+64`
+  （剪枝重建上界）`+ sites_need = 4096`（站点余量，实测 x64 56 站点≈
+  0.4KB 的 ~10 倍）超 8192 才加成（8 对齐）；`[pe] aslr=false` 或 native
+  无 DYNAMIC_BASE 时加成零。
+- **两锚点**：x64 wvmpTest 8110≤8192 → 加成 0 → **产物逐字节不变**（cmp
+  实证）；x86 wvmpTest 加成 31640 → 预算 64264 ≥ 实测缺口 53488。
+- **⚠️ 判据上界披露**（验收 SH2）：×1.25 非最坏界（全 2-条目块目录剪枝
+  重建最坏 1.33×）；低估后果 = emit_reserve_take fail-closed 硬失败（报
+  错可读，不产坏镜像）。精确上界（遍历目录逐块 Σ(8+垫)）留作需要时的
+  增强。
+- **验收 SH1 修复**：加成量落 `kEmitReserveExtra` 槽 → pe_writer 高水位
+  Note 修正真预留区起点与分母（否则 extra>0 时 75% 预警静默失效）。
+
+### 红面 B：fold_disp——base+disp 形态的 disp 绝对 VA 漏折叠（核心修复）
+- **现象**：wvmpTest x86 修复 A 后全管道运行 segfault；aslr=false 判别
+  刀 103/103 全绿 → ASLR 面缺陷。
+- **根因**（cdb second-chance AV 全链定位）：MSVC 对 `table[i+i*4]` 类
+  5-stride 表寻址发**单条** `mov eax,[ecx+ecx*4+disp32]`（SIB base=index=
+  ECX），disp 承载 .rdata 表基址（0x4AFAB0）。emit_address 的 T27a
+  fold_abs 只覆盖**无 base** 纯 disp 形 → base+disp 形态的 disp 保持旧
+  ImageBase 域 VA 入算 → delta≠0 时解释器 Load 野读（崩溃读地址与 blob
+  扫描 aux 残留 0x4AFAB0 精确吻合）。delta=0 时旧 VA 自洽 = 假绿。
+- **修复**：fold_disp 分支——窗口判据与 fold_abs 同宽（disp≥ImageBase 且
+  <ImageBase+SizeOfImage），base/index 拼装完成后 `Add acc, RVA(disp)` +
+  mark_last_dead + `LeaRva acc` 原位 +image_base 槽 = native disp_VA 域。
+  与 fold_abs 的 Mov(RVA)+LeaRva 前置形互为对偶。模 2^32/2^64 算术经双
+  执行面（x86 Add/LeaRva 原生 32 位回绕）核实与 native 严格等价（验收
+  A1）。
+- **已知边界**（继承 T27a 口径，非本次引入）：① ImageBase ≥ 2GB 的镜像
+  VA 编码为负 disp32，永不折叠（fold_abs 同源缺口）；② 窗口内非 VA 常
+  数 disp 会被误折（+delta 偏差）——启发式固有风险。零误伤锚：普通小字
+  段偏移（<4MB 常见 ImageBase）恒不满足 ≥ImageBase。
+- **确定性**：fold_disp 只依赖 image_base/SizeOfImage（seed 无关）；
+  x64 词流无 base+abs-disp 命中形态（RIP-relative），产物 cmp 逐字节不
+  变；同 seed byte-exact 不变量无破坏面（验收 A6/A7）。
+
+### 探针 delta=0 一次性抖动自动重试
+- ASLR 门首跑 334/335：wvmp_x86_callgate seed=1 探针 delta=0；单点复测
+  3/3 delta≠0（产物 DYNAMIC_BASE/reloc 目录均正常）→ 定性 cdb 一次性
+  抖动（T30 pushmem 同类第二例，SizeOfImage 匹配加固后仍存的残余通道）。
+- probe_delta 增重试：rc=1（delta=0）时 sleep 1 重测一次，仍 delta=0 才
+  判假绿——Windows 映像基址 per-boot 确定且同 boot 逐次一致 → 真
+  delta=0 重试仍 delta=0（重试不会误放行真假绿）；抖动恢复。全池复跑
+  335/335。
+
+### 验证（验收 ACCEPT with SHOULD-FIX → SH1/2/3 已修，SH4 = 本节口径）
+- ctest 23/23（+5 新测试：fold_disp 正面 9 词序列逐条断言 + 零裸 VA 自
+  检 / 小偏移不误折（saw_raw_disp 正向锚）/ 预算加成精确值 EQ 锚 14448 /
+  小目录与大目录无 ASLR 位双零加成 / aslr=false 配置侧零加成 + 加成槽
+  不写入）；单测二进制 128/128（translator 120 + stub_link 8）。
+- wvmpTest：x64 9/11-pass 双跑 103/103 + 产物零扰动；x86 6/9/11-pass 三
+  管道双跑 103/103（修复前全 segfault）。
+- 门：multiseed 基线 335/335；multiseed_aslr 335/335（REPEATS=10+探针）；
+  tls_e2e 4/4；multiseed_crypt 20/20。
+- real_world 五目标（首查 DYNAMIC_BASE 保留姿态）：notepad PASS（protect
+  OK）/ curl PASS byte-exact（C1 gate 全兜底）/ 7z SKIP（未安装）/
+  tasklist+cmd stdout mismatch——**passthrough 目标（零 stub 无词流）的
+  资源/console 面 pitfall，与本轮两修复无关**（pe_writer 零改动；cdb 实
+  证其 ASLR delta≠0 重定位健康）；无 MIT-350 时代基线记录，不判回踩，
+  立为 passthrough 资源面独立挂账。
+- Defender 姿态：4/4 protected PE 未被标记（Get-MpThreatDetection）。
+
+### blob 扫描判据精确口径（验收 SH4）
+窗口值残留定性须同时满足 ① offset%8==4（aux 域对齐）② 位于**明文指令
+流区域**（.wvmpc 或未加密 blob；crypt 管线下密文区随机碰撞期望命中数 =
+密文字节/2^32×窗口密度，~11KB 密文 ≈ 0.75 处，验收实测 1 处 0x42FB60
+经熵/解码双重甄别为碰撞假阳）。

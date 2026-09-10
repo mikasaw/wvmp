@@ -13,6 +13,7 @@
 #include "wvmp/framework/context.hpp"
 #include "wvmp/framework/diagnostics.hpp"
 #include "wvmp/framework/keys.hpp"
+#include "wvmp/framework/protect_levels.hpp"
 #include "wvmp/passes/pe_loader/pe_image.hpp"
 #include "wvmp/passes/stub_link/stub_link_pass.hpp"
 #include "wvmp/passes/virtualize/virtualize_pass.hpp"
@@ -240,6 +241,104 @@ TEST(StubLinkPass, UnmappableRegionKeepsNative) {
     pass.run(ctx);
     EXPECT_TRUE(ctx.diag.has_errors());
     EXPECT_EQ(ctx.image[0x300], 0x90);  // .text 未动
+}
+
+namespace {
+
+// 在夹具 PE 上声明 dd[5]（base reloc 目录）尺寸与 DllCharacteristics 位。
+// stub_link 的加成判据只读这两个字段（dd[5].Size + DYNAMIC_BASE），不解析
+// reloc 块内容（那是 pe_writer 的职责）。
+void declare_reloc_dir(std::vector<u8>& img, u32 rva, u32 size, bool dynamic_base) {
+    const size_t nt = 0x40;
+    const size_t opt = nt + 24;
+    wr32(img, opt + 112 + 5 * 8, rva);          // DataDirectory[5].VirtualAddress
+    wr32(img, opt + 112 + 5 * 8 + 4, size);     // DataDirectory[5].Size
+    const size_t dllchar_off = opt + 0x46;
+    unsigned short cur =
+        static_cast<unsigned short>(img[dllchar_off]) |
+        static_cast<unsigned short>(static_cast<unsigned short>(img[dllchar_off + 1]) << 8);
+    cur = dynamic_base ? static_cast<unsigned short>(cur | 0x0040)
+                       : static_cast<unsigned short>(cur & static_cast<unsigned short>(~0x0040));
+    img[dllchar_off] = u8(cur);
+    img[dllchar_off + 1] = u8(cur >> 8);
+}
+
+} // namespace
+
+TEST(StubLinkPass, LargeNativeRelocGrowsEmitReserve) {
+    // MIT-494j：原生 reloc 目录超 8KB 基础预算（判据 = size*1.25+64+4096
+    // > 8192，size=0x2000 → 加成 6208）→ .wvmp 数据节随之扩容，防
+    // emit_reserve_take fail-closed 打包硬失败（wvmpTest x86 28.5KB
+    // reloc 实录）。
+    auto ctx = make_ctx_with_one_function();
+    declare_reloc_dir(ctx.image, 0x1000, 0x2000, true);
+    ctx.slot<PeImage>(wvmp::kPeImage) = wvmp::passes::parse_pe_image(ctx.image);
+
+    wvmp::passes::StubLinkPass pass;
+    pass.run(ctx);
+    ASSERT_FALSE(ctx.diag.has_errors());
+
+    const auto* reqs = ctx.find_slot<std::vector<NewSection>>(wvmp::kNewSections);
+    ASSERT_NE(reqs, nullptr);
+    ASSERT_EQ(reqs->size(), static_cast<size_t>(2));
+    const NewSection& data_req = (*reqs)[0];
+    // blob 48B（对齐 8）+ 8192 基础 + 6208 加成（精确值锚）。
+    EXPECT_EQ(data_req.data.size(), static_cast<size_t>(48) + 8192 + 6208);
+    bool note_found = false;
+    for (const auto& d : ctx.diag.items())
+        if (d.message.find("ASLR reloc 扩展预算加成") != std::string::npos)
+            note_found = true;
+    EXPECT_TRUE(note_found);
+}
+
+TEST(StubLinkPass, SmallOrAbsentNativeRelocKeepsBaseReserve) {
+    // 零扰动面：小 reloc 目录 / 无 DYNAMIC_BASE → 加成严格为零，.wvmp
+    // 尺寸 = blobs + 8KB 基础预算（multiseed 池与 x64 wvmpTest 产物字节
+    // 不变的锚）。
+    auto ctx = make_ctx_with_one_function();
+    declare_reloc_dir(ctx.image, 0x1000, 0x100, true);   // 小目录：不触发
+    ctx.slot<PeImage>(wvmp::kPeImage) = wvmp::passes::parse_pe_image(ctx.image);
+    wvmp::passes::StubLinkPass pass;
+    pass.run(ctx);
+    ASSERT_FALSE(ctx.diag.has_errors());
+    const auto* reqs = ctx.find_slot<std::vector<NewSection>>(wvmp::kNewSections);
+    ASSERT_NE(reqs, nullptr);
+    EXPECT_EQ((*reqs)[0].data.size(),
+              static_cast<size_t>(48) + wvmp::passes::kEmitReserveBytes);
+
+    auto ctx2 = make_ctx_with_one_function();
+    declare_reloc_dir(ctx2.image, 0x1000, 0x2000, false);  // 大目录但无 ASLR 位
+    ctx2.slot<PeImage>(wvmp::kPeImage) = wvmp::passes::parse_pe_image(ctx2.image);
+    wvmp::passes::StubLinkPass pass2;
+    pass2.run(ctx2);
+    ASSERT_FALSE(ctx2.diag.has_errors());
+    const auto* reqs2 = ctx2.find_slot<std::vector<NewSection>>(wvmp::kNewSections);
+    ASSERT_NE(reqs2, nullptr);
+    EXPECT_EQ((*reqs2)[0].data.size(),
+              static_cast<size_t>(48) + wvmp::passes::kEmitReserveBytes);
+}
+
+TEST(StubLinkPass, AslrConfigOffKeepsBaseReserve) {
+    // MIT-494j 验收 SH3：配置侧零加成路径——[pe] aslr=false（ProtectRules
+    // 显式覆写）时即使原生 reloc 目录超预算也不加成（pe_writer 同步走清
+    // DYNAMIC_BASE 回退，无扩展无预算需求）。
+    auto ctx = make_ctx_with_one_function();
+    declare_reloc_dir(ctx.image, 0x1000, 0x2000, true);
+    ctx.slot<PeImage>(wvmp::kPeImage) = wvmp::passes::parse_pe_image(ctx.image);
+    wvmp::ProtectRules rules;
+    rules.has_pe_aslr = true;
+    rules.pe_aslr = false;
+    ctx.slot<wvmp::ProtectRules>(wvmp::kProtectRules) = rules;
+
+    wvmp::passes::StubLinkPass pass;
+    pass.run(ctx);
+    ASSERT_FALSE(ctx.diag.has_errors());
+    const auto* reqs = ctx.find_slot<std::vector<NewSection>>(wvmp::kNewSections);
+    ASSERT_NE(reqs, nullptr);
+    EXPECT_EQ((*reqs)[0].data.size(),
+              static_cast<size_t>(48) + wvmp::passes::kEmitReserveBytes);
+    // 加成槽不得被写入。
+    EXPECT_EQ(ctx.find_slot<u64>(wvmp::kEmitReserveExtra), nullptr);
 }
 
 TEST(StubGen, StubBytesStartWithPushesAndSubRsp) {
