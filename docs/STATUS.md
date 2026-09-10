@@ -1091,5 +1091,6 @@ asmgen 零触碰 → dump 锚不受影响（无换代）。
   消息文本均复现）= MIT-350 脚本方法学假阳，非产品缺陷。
 - 修复：verify_real_world.sh native 基线同拷出原位运行（位置对齐）。
 - 复跑：4 pass / 0 fail / 1 skip（7z 未装）；tasklist/cmd 转 byte-exact
-  PASS → **passthrough 重写面真 ASLR 姿态行为正确**的正面实证；
+  PASS → passthrough 字节保持 + 真 ASLR 加载运行正确（零 stub，非虚
+  拟化行为实证）；
   Defender 4/4 不变。详见 GAPS MIT-494k。

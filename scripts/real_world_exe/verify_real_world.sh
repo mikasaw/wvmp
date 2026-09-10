@@ -120,6 +120,8 @@ for cfg_line in "${configs[@]}"; do
 
     if [[ "$mode" == "rc" ]]; then
         # GUI mode: spawn + kill after timeout, compare rc
+        #（MIT-494k 注：GUI 模式只对拍 rc 不比输出，无位置假阳面；将来若
+        # 升级为输出对比，须同步 stdout 模式的位置对齐基线。）
         "$input" "${args[@]}" >"$native_stdout" 2>/dev/null &
         native_pid=$!
         sleep "$gui_timeout"
@@ -145,16 +147,16 @@ for cfg_line in "${configs[@]}"; do
     # stdout mode: capture full stdout + rc
     # MIT-494k (T33)：位置对齐基线——Windows 系统工具（tasklist/cmd 实证）
     # 从 System32 原位运行与从任意其他目录运行行为不同（tasklist /? 原位
-    # 71 行帮助 vs 副本 0 行；cmd /c echo 原位正常 vs 副本报"消息号
+    # 71 行帮助 vs 副本仅一空行；cmd /c echo 原位正常 vs 副本报"消息号
     # 0x2350"——资源/初始化位置依赖）。protected 副本恒在 out_dir 运行，
     # native 基线若取原位则 mismatch 是方法学假阳（T32 复验误记为
     # pitfall，实为脚本缺陷：protected 与 native 逐字节全同）。native
-    # 同样拷出原位运行，位置变量对齐后差异才是保护语义差异。
-    native_copy="$out_dir/$name.native.exe"
+    # 同样拷出原位运行（放 $tmp = 非系统目录，随循环尾 rm -rf 统一清
+    # 理），位置变量对齐后差异才是保护语义差异。
+    native_copy="$tmp/$name.native.exe"
     cp "$input" "$native_copy"
     "$native_copy" "${args[@]}" >"$native_stdout" 2>/dev/null
     echo $? >"$native_rc_file"
-    rm -f "$native_copy"
 
     "$output" "${args[@]}" >"$protected_stdout" 2>/dev/null
     echo $? >"$protected_rc_file"

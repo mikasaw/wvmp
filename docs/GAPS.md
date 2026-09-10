@@ -2743,5 +2743,7 @@ T30 后首个正式基线，后续大改可对照。
 
 **验证**：五目标复跑 4 pass / 0 fail / 1 skip（7z 未安装）；tasklist/
 cmd 转 **byte-exact PASS**（C1 gate 全兜底 = 系统二进制无 marker，pass
-through 重写字节保持 → 行为与 native 副本一致）→ **passthrough 重写面
-在真 ASLR 姿态下行为正确**的正面实证。Defender 4/4 未标记（不变）。
+through 重写字节保持 → 行为与 native 副本一致）→ **passthrough 管线端
+到端字节保持 + 保留 DYNAMIC_BASE 的未改镜像在非系统路径真 ASLR 重定位
+下加载运行正确**的正面实证（零 stub，非虚拟化行为实证）。Defender 4/4
+未标记（不变）。
