@@ -245,6 +245,32 @@ TEST(StubLinkPass, UnmappableRegionKeepsNative) {
 
 namespace {
 
+// 扩展夹具：.text vs/rs 扩到 0x2000（区域 0x1100 仍在节内），文件随
+// raw 末端扩到 0x2200——给"真实 reloc 块内容"测试提供可容纳大目录的
+// 原生节空间（基础夹具 0x400 raw 装不下触发精确路径的目录规模）。
+std::vector<u8> build_pe_with_region_bigtext() {
+    std::vector<u8> img = build_pe_with_region();
+    const size_t sh = 0x40 + 24 + 240;
+    wr32(img, sh + 8, 0x2000);   // VirtualSize
+    wr32(img, sh + 16, 0x2000);  // SizeOfRawData
+    img.resize(0x2200, 0x90);
+    return img;
+}
+
+// 在 [off, off+len) 写 n 个合法 reloc 块（每块 ents 个条目 + 4 字节倍数
+// 对齐语义由断言方按 Σ(8+pad4·2) 推导期望）。
+void write_reloc_blocks(std::vector<u8>& img, size_t off, int n, u32 ents) {
+    size_t pos = off;
+    for (int i = 0; i < n; ++i) {
+        const u32 bsz = 8 + ents * 2;
+        wr32(img, pos, 0x1000u + u32(i) * 0x1000);  // page
+        wr32(img, pos + 4, bsz);
+        for (u32 e = 0; e < ents; ++e)
+            wr32(img, pos + 8 + e * 2, (3u << 12) | (e & 0xFFF));  // HIGHLOW
+        pos += bsz;
+    }
+}
+
 // 在夹具 PE 上声明 dd[5]（base reloc 目录）尺寸与 DllCharacteristics 位。
 // stub_link 的加成判据只读这两个字段（dd[5].Size + DYNAMIC_BASE），不解析
 // reloc 块内容（那是 pe_writer 的职责）。
@@ -282,7 +308,10 @@ TEST(StubLinkPass, LargeNativeRelocGrowsEmitReserve) {
     ASSERT_NE(reqs, nullptr);
     ASSERT_EQ(reqs->size(), static_cast<size_t>(2));
     const NewSection& data_req = (*reqs)[0];
-    // blob 48B（对齐 8）+ 8192 基础 + 6208 加成（精确值锚）。
+    // blob 48B（对齐 8）+ 8192 基础 + 6208 加成。
+    // T36 口径：size=0x2000 超出小夹具文件（0x600）= dd[5] 目录不可映射
+    // （pe_writer 同样放弃原块拷贝）→ 启发式兜底 size×1.25+64 = 5184 →
+    // extra = align8(5184+4096−8192) = 6208。
     EXPECT_EQ(data_req.data.size(), static_cast<size_t>(48) + 8192 + 6208);
     bool note_found = false;
     for (const auto& d : ctx.diag.items())
@@ -315,6 +344,49 @@ TEST(StubLinkPass, SmallOrAbsentNativeRelocKeepsBaseReserve) {
     const auto* reqs2 = ctx2.find_slot<std::vector<NewSection>>(wvmp::kNewSections);
     ASSERT_NE(reqs2, nullptr);
     EXPECT_EQ((*reqs2)[0].data.size(),
+              static_cast<size_t>(48) + wvmp::passes::kEmitReserveBytes);
+}
+
+TEST(StubLinkPass, ExactRebuildUpperBoundFromRealBlocks) {
+    // T36：加成判据精确化——dd[5] 指向真实 reloc 块内容时，重建上界 =
+    // 逐块 Σ(8 + pad4(entries)·2)（全保留展开，剪枝只减不增）+ 未解析
+    // 尾段原样计入。构造：64 块 × 3 条目（bsz=14，重建 16B/块 > 原 14B
+    // ——pad4 膨胀面），size=0x1000：
+    //   exact = 64×16 + 尾段(0x1000 − 896) = 1024 + 3200 = 4224
+    //   extra = align8(4224 + 4096 − 8192) = 128
+    // （×1.25 启发式会给 1088——本测试锁死精确值，启发式即挂。）
+    auto ctx = make_ctx_with_one_function();
+    ctx.image = build_pe_with_region_bigtext();
+    write_reloc_blocks(ctx.image, 0x200, 64, 3);
+    declare_reloc_dir(ctx.image, 0x1000, 0x1000, true);
+    ctx.slot<PeImage>(wvmp::kPeImage) = wvmp::passes::parse_pe_image(ctx.image);
+
+    wvmp::passes::StubLinkPass pass;
+    pass.run(ctx);
+    ASSERT_FALSE(ctx.diag.has_errors());
+    const auto* reqs = ctx.find_slot<std::vector<NewSection>>(wvmp::kNewSections);
+    ASSERT_NE(reqs, nullptr);
+    EXPECT_EQ((*reqs)[0].data.size(),
+              static_cast<size_t>(48) + wvmp::passes::kEmitReserveBytes + 128);
+}
+
+TEST(StubLinkPass, BrokenRelocBlockTailCountedInFull) {
+    // 块头断裂（bsz 越界）= pe_writer 同口径提前终止遍历、其后不发射 →
+    // 上界 = 已展开 0 + 尾段 size 全额 = 0x1000 → 4096+4096 = 8192 不超
+    // 基础预算 → 加成 0（启发式会给 1088——保守方向正确但过宽）。
+    auto ctx = make_ctx_with_one_function();
+    ctx.image = build_pe_with_region_bigtext();
+    wr32(ctx.image, 0x200, 0x1000u);          // page 合法
+    wr32(ctx.image, 0x204, 0xFFFFFFF0u);      // bsz 越界 → 断裂
+    declare_reloc_dir(ctx.image, 0x1000, 0x1000, true);
+    ctx.slot<PeImage>(wvmp::kPeImage) = wvmp::passes::parse_pe_image(ctx.image);
+
+    wvmp::passes::StubLinkPass pass;
+    pass.run(ctx);
+    ASSERT_FALSE(ctx.diag.has_errors());
+    const auto* reqs = ctx.find_slot<std::vector<NewSection>>(wvmp::kNewSections);
+    ASSERT_NE(reqs, nullptr);
+    EXPECT_EQ((*reqs)[0].data.size(),
               static_cast<size_t>(48) + wvmp::passes::kEmitReserveBytes);
 }
 

@@ -1109,3 +1109,13 @@ asmgen 零触碰 → dump 锚不受影响（无换代）。
   （marker_begin 跨 call 毁易失寄存器 + pitfall #36 marker_end 毁 eax
   ——dumpbin 反汇编 + python 基准双刀定位）；跨 arch 词密度不可直比披
   露。ctest 23/23；证据链 GAPS MIT-494m 节。
+### MIT-494n (T36 · 加成判据精确上界) ✅ 2026-09-11
+- stub_link 加成判据从 ×1.25 启发式精确化：dd[5] 可映射时逐块 Σ(8+
+  pad4·2)（全保留展开 = pe_writer 剪枝重建严格上界），断裂块 = 展开 +
+  尾段计入，不可映射回退启发式。单测 +3（stub_link 11/11，精确值 128
+  vs 启发式 1088 区分度锁定）；wvmpTest x86 加成 31640→24848 语义绿、
+  x64 零扰动 cmp 不变、multiseed 335/335。
+- ⚠️ Defender 误报实录：T36 加成版 wvmpTest x86 产物被实时保护确定性
+  检出清除（ThreatID 251873；首跑 SUMMARY 103/103 语义无损）；推测与
+  .wvmp 高水位 87.9% 熵密度特征相关（T32 版 72.9% 未检出）。杀软误报
+  面（MIT-370 再确认），非语义缺陷。详见 GAPS MIT-494n。

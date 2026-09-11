@@ -206,12 +206,14 @@ void StubLinkPass::run(ProtectionContext& ctx) {
     // 算时加成为零 → 既有产物（multiseed 池 / x64 wvmpTest）字节零扰动。
     // [pe] aslr=false 或 native 未声明 DYNAMIC_BASE 时 pe_writer 不扩展，
     // 加成同步为零。
-    // ⚠️ 判据上界披露（T32 验收 SH2）：×1.25 非最坏界——剪枝重建把每块
-    // 条目垫到 4 条目倍数，全 2-条目块目录最坏膨胀 1.33×（S>768B 时
-    // 可能低估）；低估后果 = pe_writer emit_reserve_take fail-closed 硬
-    // 失败（报错可读，不静默腐化），不产坏镜像。精确上界需遍历目录逐
-    // 块算 Σ(8+垫)，留作需要时的增强（T32 口径：启发式 + fail-closed 兜
-    // 底已覆盖全部现网目标）。
+    // ⚠️ 判据上界（T32 验收 SH2 → T36 精确化）：重建上界不再用 ×1.25
+    // 启发式（全 2-条目块目录最坏膨胀 1.33× 可低估），改为**逐块精确展
+    // 开** Σ(8 + pad4(entries)·2)——pe_writer 剪枝重建的 keep ≤ 块条目全
+    // 数（pad4 单调、全 type-0 空块整体删除只减不增），"全保留"展开即
+    // 严格上界。目录解析失败（块头断裂/越界，与 pe_writer 遍历同口径）
+    // 时回退启发式并把未解析尾段原样计入（保守不低估）。低估后果本来
+    // 也只是 pe_writer emit_reserve_take fail-closed 硬失败（报错可读，
+    // 不产坏镜像）——本精确化消除该劣化路径。
     u64 aslr_reloc_extra = 0;
     {
         const auto rd_le = [](const u8* p, size_t n) {
@@ -225,11 +227,41 @@ void StubLinkPass::run(ProtectionContext& ctx) {
         const size_t opt = pe->nt_headers_offset + 24;
         const size_t dd5 = opt + (pe->is_pe32_plus ? 112u : 96u) + 5 * 8;
         if (aslr_on && opt + 0x48 <= ctx.image.size() && dd5 + 8 <= ctx.image.size()) {
+            const u32 reloc_rva = static_cast<u32>(rd_le(ctx.image.data() + dd5, 4));
             const u32 reloc_size = static_cast<u32>(rd_le(ctx.image.data() + dd5 + 4, 4));
             const u16 dllchars = static_cast<u16>(rd_le(ctx.image.data() + opt + 0x46, 2));
             if (reloc_size > 0 && (dllchars & 0x0040) != 0) {
-                const u64 rebuild_need =
-                    u64(reloc_size) + reloc_size / 4 + 64;
+                // 逐块精确展开（全保留上界）。断裂块（bsz 越界，pe_writer
+                // 同口径提前终止遍历、其后不发射）= 已展开部分 + 尾段原
+                // 样计入——恒 ≥ pe_writer 实际发射，保守不低估。
+                u64 rebuild_exact = 0;
+                if (reloc_rva != 0) {
+                    if (const auto old_off = pe->rva_to_offset(reloc_rva);
+                        old_off.has_value() &&
+                        u64(*old_off) + reloc_size <= ctx.image.size()) {
+                        const u8* rp = ctx.image.data() + *old_off;
+                        u32 pos = 0;
+                        while (pos + 8 <= reloc_size) {
+                            const u32 bsz =
+                                static_cast<u32>(rd_le(rp + pos + 4, 4));
+                            if (bsz < 8 || pos + bsz > reloc_size)
+                                break;  // 断裂：尾段原样计入（循环外）
+                            const u32 ents = (bsz - 8) / 2;
+                            const u32 padded =
+                                static_cast<u32>((ents + 3) / 4 * 4);
+                            rebuild_exact += 8 + u64(padded) * 2;
+                            pos += bsz;
+                        }
+                        rebuild_exact += reloc_size - pos;
+                    } else {
+                        // 目录不可映射（rva 失配/越界，pe_writer 同样放弃
+                        // 原块拷贝只发站点块）：退回启发式覆盖未判定面。
+                        rebuild_exact = u64(reloc_size) + reloc_size / 4 + 64;
+                    }
+                } else {
+                    rebuild_exact = u64(reloc_size) + reloc_size / 4 + 64;
+                }
+                const u64 rebuild_need = rebuild_exact;
                 const u64 sites_need = 4096;
                 if (rebuild_need + sites_need > kEmitReserveBytes)
                     aslr_reloc_extra = align_up(
