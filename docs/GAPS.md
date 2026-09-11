@@ -2776,3 +2776,36 @@ fetch/decode/execute 一次）；③ checksum 行一致性哨兵绿（虚拟化�
 访存/词流密度）以此为基线。**x86 面留待扩展**（asm 区域编写独立小任务，x64 先行锚定方
 法论）；本样本 stdout 含非确定计时行，**不进 multiseed byte-exact 池**
 （checksum 行固定可作对拍锚）。
+
+## MIT-494m（T35 · x86 微基准——hotloop asm 面补齐，2026-09-11）
+
+**背景**：MIT-494l 的 x86 扩展（asm 区域独立小任务）。新样本 wvmp_x86_
+hotloop_sample（手写 ml.asm 区域：do-while xorshift32，x=eax/i=ecx/
+tmp=edx 纯易失寄存器，唯一跳转为向后回边（MIT-326/407 纪律），iters
+从传入槽读（442 区域内无 push/pop））；构建接线 = build_x86_e2e_samples
+.bat 条目 + CMake DEPENDS（MIT-437/450 配方）；measure_hotloop.sh 参数
+化 ARCH=x86。
+
+**开发实录（两坑，均 asm 特有——x64 C 版无此面）**：
+1. marker_begin 毁 eax（自身 magic 常量）——asm 把 x 放易失寄存器跨
+   call 即毁（x64 C 版 x 在栈槽天然免疫）；修 = 先 call 再装载。
+2. **pitfall #36 复现**：marker_end 毁 eax（END1 magic 0x31444E45）——
+   循环结果在 `call marker_end` 后被覆盖，返回值恒 = magic（826560069
+   = 0x31444E45 的特征值直指病灶）；修 = prologue 栈槽存取（deepcall_
+   entry 同款纪律）。
+两坑均由 native checksum ≠ x64 锚（785016842）暴露：python 基准模拟 +
+dumpbin 反汇编双刀定位（反汇编逐条正确 → 结果恒 magic → pitfall #36）。
+
+**测量结果**（6-pass，seed 12345，5 次中位，1 stub，checksum 一致）：
+
+| 侧 | 循环中位 | 说明 |
+|---|---:|---|
+| native x86 | 6.95 ms | 同 xorshift32 数学，checksum 与 x64 同锚 |
+| protected x86 | 157.1 ms | 22.6x 减速比 |
+| （对照 x64） | 410.8 ms / 61.0x | MIT-494l |
+
+**口径披露**：x64/x86 样本词密度不同（x64 = C /Od codegen 62 词/迭代；
+x86 = 手写 asm ~15 词/迭代），**跨 arch 每词耗时不可直接互比**（x64
+1.32ns/词 vs x86 2.09ns/词——KS_MODE_32 dispatch 与词流密度混杂）；单次
+迭代成本对比成立：x86 ≈ 31.4ns/迭代 vs x64 ≈ 82ns/迭代。同词密度对照
+样本留后续。样本 stdout 含计时行，不进 byte-exact 池。

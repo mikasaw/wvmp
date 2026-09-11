@@ -1102,3 +1102,10 @@ asmgen 零触碰 → dump 锚不受影响（无换代）。
   → 62 词）≈ **755M 词/秒**（T34 验收 SH1 修正口径），T31 口径建议落地，
   解释器优化后续以此为基线。不进 byte-exact 池（stdout 含计时行）。
   ctest 23/23；证据链 GAPS MIT-494l 节。
+### MIT-494m (T35 · x86 微基准) ✅ 2026-09-11
+- wvmp_x86_hotloop_sample（ml.asm 区域，纯易失寄存器 do-while xorshift32）
+  + measure_hotloop.sh ARCH=x86。native 6.95ms vs protected 157.1ms =
+  **22.6x 减速比**（~478M 词/秒，15 词/迭代口径）。开发实录两坑入册
+  （marker_begin 跨 call 毁易失寄存器 + pitfall #36 marker_end 毁 eax
+  ——dumpbin 反汇编 + python 基准双刀定位）；跨 arch 词密度不可直比披
+  露。ctest 23/23；证据链 GAPS MIT-494m 节。

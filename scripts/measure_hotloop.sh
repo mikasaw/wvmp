@@ -17,7 +17,13 @@ repo="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$repo"
 
 cli="build/cli/wvmp_cli.exe"
-sample="build/passes/marker_scan/tests/wvmp_hotloop_sample.exe"
+# MIT-494m (T35)：ARCH=x86 切 x86 靶标（build/x86_samples 池约定路径）。
+arch="${ARCH:-x64}"
+if [[ "$arch" == "x86" ]]; then
+    sample="build/x86_samples/wvmp_x86_hotloop_sample.exe"
+else
+    sample="build/passes/marker_scan/tests/wvmp_hotloop_sample.exe"
+fi
 repeats="${1:-5}"
 [[ "$repeats" =~ ^[1-9][0-9]*$ ]] || { echo "[hotloop] REPEATS 须为正整数" >&2; exit 2; }
 [[ -f "$cli" && -f "$sample" ]] || { echo "[hotloop] 未找到 $cli / $sample" >&2; exit 2; }
