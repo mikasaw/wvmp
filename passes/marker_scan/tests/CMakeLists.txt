@@ -284,7 +284,8 @@ target_link_options(wvmp_snake_sample PRIVATE
 )
 
 # MIT-494q (T40): x64 同词密度 asm 微基准——hotloop_asm_sample 与 x86
-# hotloop asm 样本逐词同形（15 dword 指令/迭代），消除词密度混杂后直比
+# hotloop asm 样本同指令形态（13 条指令/迭代；词流 13 vs 16 词——x86
+# cmp-mem 展开多 3 词），词密度近似对齐后直比
 # 双 arch 每词 dispatch 成本。stdout 含计时行，不进 byte-exact 池。
 add_executable(wvmp_hotloop_asm_sample
     hotloop_asm_main.cpp
