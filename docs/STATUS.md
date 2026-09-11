@@ -1119,3 +1119,10 @@ asmgen 零触碰 → dump 锚不受影响（无换代）。
   检出清除（ThreatID 251873；首跑 SUMMARY 103/103 语义无损）；推测与
   .wvmp 高水位 87.9% 熵密度特征相关（T32 版 72.9% 未检出）。杀软误报
   面（MIT-370 再确认），非语义缺陷。详见 GAPS MIT-494n。
+### MIT-494o (T37 · 负 disp 折叠口径) ✅ 2026-09-12
+- disp32 语义按 arch 分叉：x86 模 2^32 回绕口径（负 disp 以 u32 入窗折
+  叠），x64 符号扩展真负偏移不折叠；emit_address/emit_load/emit_store
+  贯通 arch 参数，发射改 disp_addr 口径（非负路径恒等）。
+- 可达性三层证据（capstone int32 符号扩展 / LNK1249 实测 / 2GB 用户分
+  界）→ 定性防御深度修复，无现网行为变化。单测 +3；ctest 23/23；
+  multiseed 335/335；x64 零扰动 cmp。详见 GAPS MIT-494o。

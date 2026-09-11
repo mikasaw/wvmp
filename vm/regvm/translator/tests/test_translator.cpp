@@ -456,6 +456,58 @@ TEST(Translate, X86BaseSmallDispNotFolded) {
     EXPECT_TRUE(saw_raw_disp);  // disp 原样入算，未 RVA 化
 }
 
+TEST(Translate, X86HighImageBaseNegativeDispFolds) {
+    // MIT-494o：x86 disp32 = 模 2^32 口径——ImageBase ≥ 2GB 高基址目标
+    // VA 0x80001000 经 capstone 符号扩展 = disp −0x7FFFF000，须按 u32 口
+    // 径入窗折叠（原 `m.disp >= 0` 判据永不命中 = ASLR 野访缺口）。
+    ir::Insn lea = I(ir::Op::Lea, ir::Size::S32);
+    lea.dst = ir::Operand::reg_(ir::Reg::Rax);
+    lea.src = ir::Operand::mem_(m(ir::Reg::Flags, ir::Reg::Flags, 0,
+                                  -static_cast<i64>(0x7FFFF000ull)));
+    const auto r = wvmp::regvm::translator::translate_function(
+        fn86_of({blk(0x1000, {lea})}), {}, {}, 0x80000000ull, 0x11000ull);
+    EXPECT_TRUE(r.notes.empty());
+    const Decoded d = decode_program(r.program);
+    ASSERT_EQ(d.insns.size(), static_cast<size_t>(5));
+    const u8 acc = isa::kScratchFirst;
+    expect_is(d.insns[0], VmOp::Mov, OpKind::Reg, acc, OpKind::Imm, 0, 0x1000,
+              kS32);  // RVA = 0x80001000 − 0x80000000
+    expect_is(d.insns[1], VmOp::LeaRva, OpKind::Reg, acc, OpKind::Reg, acc, 0,
+              kS32);
+    for (const auto& g : d.insns)
+        EXPECT_NE(g.aux, 0x80001000u);
+}
+
+TEST(Translate, X64NegativeDispNeverFolds) {
+    // x64 disp32 = 符号扩展真负偏移（非高位 VA）——同形 disp 在 x64 面
+    // 不得折叠（u32 口径会把 [rbx−0x7FFFF000] 误判为 0x80001000 窗口
+    // VA）。保持原 Add acc, disp 负路径。
+    ir::Insn lea = I(ir::Op::Lea, ir::Size::S64);
+    lea.dst = ir::Operand::reg_(ir::Reg::Rax);
+    lea.src = ir::Operand::mem_(m(ir::Reg::Rbx, ir::Reg::Flags, 0,
+                                  -static_cast<i64>(0x7FFFF000ull)));
+    const auto r = wvmp::regvm::translator::translate_function(
+        fn_of({blk(0x1000, {lea})}), {}, {}, 0x140000000ull, 0x11000ull);
+    EXPECT_TRUE(r.notes.empty());
+    const Decoded d = decode_program(r.program);
+    for (const auto& g : d.insns)
+        EXPECT_NE(g.op, VmOp::LeaRva);
+}
+
+TEST(Translate, X86SmallNegativeDispNotFolded) {
+    // x86 回归面：普通结构体小负偏移 [ecx−0x10] 的 u32 口径值 0xFFFFFFF0
+    // 不落映像窗口 → 不折叠（saw_raw_disp 同款正向锚）。
+    ir::Insn lea = I(ir::Op::Lea, ir::Size::S32);
+    lea.dst = ir::Operand::reg_(ir::Reg::Rax);
+    lea.src = ir::Operand::mem_(m(ir::Reg::Rcx, ir::Reg::Flags, 0, -0x10));
+    const auto r = wvmp::regvm::translator::translate_function(
+        fn86_of({blk(0x1000, {lea})}), {}, {}, 0x80000000ull, 0x11000ull);
+    EXPECT_TRUE(r.notes.empty());
+    const Decoded d = decode_program(r.program);
+    for (const auto& g : d.insns)
+        EXPECT_NE(g.op, VmOp::LeaRva);
+}
+
 // ---------------- 整函数：块布局 / fallthrough / 相对偏移 ----------------
 
 TEST(Translate, TwoBlockLayoutAndOffsets) {

@@ -2859,3 +2859,32 @@ exe.wvmp-tmp 删除，T36 验收补充）。**定性**：杀软启发式误报�
 SH2：兜底注释算术修正（0x2000×1.25+64 = 10304）；虚拟尾兜底角（rva 落
 [va+raw, va+vs) 时启发式与 pe_writer 精确口径不一致）留痕不修（可达性
 趋零 + fail-closed 兜底）。
+
+## MIT-494o（T37 · 负 disp 折叠口径——语义完备性修复，2026-09-12）
+
+**背景**：T32 验收记录的 fold_abs/fold_disp 同源缺口——`m.disp >= 0` 判
+据下，负 disp 永不折叠。本单修正 + 可达性定性。
+
+**修复**：disp32 地址语义按 arch 分叉（emit_address/emit_load/emit_store
+贯通 arch 参数）：x86（PE32）32 位寻址 = 模 2^32 回绕（无符号口径），
+负 disp 以 u32 值入窗判定与发射（RVA = u32(disp) − image_base）；x64
+（PE32+）disp32 = 符号扩展真负偏移（非高位 VA），负值永不入窗（正
+disp32 ≤ 2^31−1 < 典型 x64 ImageBase，现状本就不触发）。发射两处改
+disp_addr 口径（非负路径数值恒等 → 既有产物零扰动）。
+
+**可达性分析（三层证据，定性 = 防御深度修复）**：
+1. capstone `consumeInt32` 用 int32_t——X86_32 disp 字节流 ≥ 0x80000000
+   符号扩展为负 = 负 disp 形态真实存在于解码口径（修复必要）；
+2. MSVC x86 链接器物理禁止基址越过 0x80000000（/FIXED 与 /DYNAMICBASE
+   均报 LNK1249，实测）；
+3. 默认 Windows 2GB 用户空间分界下 0x80000000 不可映射（loader 拒绝）。
+→ 高基址（≥2GB）x86 目标无现网可运行形态；该形态此前若被手工构造，
+   旧口径发 Sub |disp| 在 delta=0 下数值碰巧正确、真 ASLR 下将错位。
+   本修复 = capstone 口径对齐 + 防御深度，无现网行为变化。
+
+**验证**：单测 +3（x86 高基址 0x80000000 折叠 RVA=0x1000 断言 / x64 同
+形 disp 不折叠 / x86 小负偏移 [ecx−0x10] 不折叠回归锚）；既有负 disp
+测试族（StoreRegToMemNegativeDispUsesSub 等）全绿 = 非负路径零变化；
+ctest 23/23；multiseed 335/335；x64 wvmpTest 产物 cmp 逐字节不变（x86
+单产物对照被 Defender 环境面阻断，语义由 multiseed x86 85 项真跑对拍
+覆盖）。
