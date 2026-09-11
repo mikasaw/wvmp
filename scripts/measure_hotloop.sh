@@ -19,10 +19,15 @@ cd "$repo"
 cli="build/cli/wvmp_cli.exe"
 # MIT-494m (T35)：ARCH=x86 切 x86 靶标（build/x86_samples 池约定路径）。
 arch="${ARCH:-x64}"
+# T35 验收 SH1：未知 ARCH fail-closed（静默回退 x64 会让拼错大小写的
+# x86 测量被当 x64 数据记录）。
 if [[ "$arch" == "x86" ]]; then
     sample="build/x86_samples/wvmp_x86_hotloop_sample.exe"
-else
+elif [[ "$arch" == "x64" ]]; then
     sample="build/passes/marker_scan/tests/wvmp_hotloop_sample.exe"
+else
+    echo "[hotloop] 未知 ARCH='$arch'（仅支持 x64/x86）" >&2
+    exit 2
 fi
 repeats="${1:-5}"
 [[ "$repeats" =~ ^[1-9][0-9]*$ ]] || { echo "[hotloop] REPEATS 须为正整数" >&2; exit 2; }
@@ -97,7 +102,7 @@ done
 n_med="$(printf '%s\n' "${native_mss[@]}" | median)"
 p_med="$(printf '%s\n' "${packed_mss[@]}" | median)"
 ratio="$(awk -v a="$p_med" -v b="$n_med" 'BEGIN {printf "%.1f", a/b}')"
-echo "[hotloop] native 循环中位: ${n_med} ms ($repeats 次)"
-echo "[hotloop] protected 循环中位: ${p_med} ms ($repeats 次, checksum=$packed_ck 一致)"
+echo "[hotloop] native 循环中位: ${n_med} ms ($arch, $repeats 次)"
+echo "[hotloop] protected 循环中位: ${p_med} ms ($arch, $repeats 次, checksum=$packed_ck 一致)"
 echo "[hotloop] 解释器减速比: ${ratio}x"
 exit 0
