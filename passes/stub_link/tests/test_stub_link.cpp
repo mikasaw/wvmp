@@ -310,8 +310,8 @@ TEST(StubLinkPass, LargeNativeRelocGrowsEmitReserve) {
     const NewSection& data_req = (*reqs)[0];
     // blob 48B（对齐 8）+ 8192 基础 + 6208 加成。
     // T36 口径：size=0x2000 超出小夹具文件（0x600）= dd[5] 目录不可映射
-    // （pe_writer 同样放弃原块拷贝）→ 启发式兜底 size×1.25+64 = 5184 →
-    // extra = align8(5184+4096−8192) = 6208。
+    // （pe_writer 同样放弃原块拷贝）→ 启发式兜底 size×1.25+64 = 0x2000×
+    // 1.25+64 = 10304 → extra = align8(10304+4096−8192) = 6208。
     EXPECT_EQ(data_req.data.size(), static_cast<size_t>(48) + 8192 + 6208);
     bool note_found = false;
     for (const auto& d : ctx.diag.items())

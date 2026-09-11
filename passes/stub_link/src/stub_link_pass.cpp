@@ -234,28 +234,39 @@ void StubLinkPass::run(ProtectionContext& ctx) {
                 // 逐块精确展开（全保留上界）。断裂块（bsz 越界，pe_writer
                 // 同口径提前终止遍历、其后不发射）= 已展开部分 + 尾段原
                 // 样计入——恒 ≥ pe_writer 实际发射，保守不低估。
+                // T36 验收 SH1：pos/bsz 全程 size_t（u32 会回绕——畸形块
+                // bsz=0xFFFFFFF0 时 pos+bsz ≡ 0 不断裂、rebuild_exact 每
+                // 圈 +4GB 且 pos 原地打转 = 死循环；pe_writer 同处为
+                // size_t 不回绕，畸形目录立即 break）。
                 u64 rebuild_exact = 0;
                 if (reloc_rva != 0) {
                     if (const auto old_off = pe->rva_to_offset(reloc_rva);
                         old_off.has_value() &&
                         u64(*old_off) + reloc_size <= ctx.image.size()) {
                         const u8* rp = ctx.image.data() + *old_off;
-                        u32 pos = 0;
-                        while (pos + 8 <= reloc_size) {
-                            const u32 bsz =
-                                static_cast<u32>(rd_le(rp + pos + 4, 4));
-                            if (bsz < 8 || pos + bsz > reloc_size)
+                        const size_t rsize = reloc_size;
+                        size_t pos = 0;
+                        while (pos + 8 <= rsize) {
+                            const size_t bsz = static_cast<size_t>(
+                                rd_le(rp + pos + 4, 4));
+                            if (bsz < 8 || pos + bsz > rsize)
                                 break;  // 断裂：尾段原样计入（循环外）
-                            const u32 ents = (bsz - 8) / 2;
-                            const u32 padded =
-                                static_cast<u32>((ents + 3) / 4 * 4);
-                            rebuild_exact += 8 + u64(padded) * 2;
+                            const size_t ents = (bsz - 8) / 2;
+                            const size_t padded = (ents + 3) / 4 * 4;
+                            rebuild_exact += 8 + padded * 2;
                             pos += bsz;
                         }
-                        rebuild_exact += reloc_size - pos;
+                        rebuild_exact += rsize - pos;
                     } else {
                         // 目录不可映射（rva 失配/越界，pe_writer 同样放弃
                         // 原块拷贝只发站点块）：退回启发式覆盖未判定面。
+                        // ⚠️ 残留劣化角（T36 验收发现 2）：本兜底口径与
+                        // pe_writer 的节表扫描（ext=max(rs,vs)）不完全一
+                        // 致——目录 RVA 落节虚拟尾 [va+raw, va+vs) 时本侧
+                        // 回退启发式而 pe_writer 仍精确重建；启发式对小块
+                        // 病态目录可低估，后果仍 = emit_reserve_take
+                        // fail-closed 硬失败（不产坏镜像）。真实 .reloc 恒
+                        // 在已初始化节，该角可达性趋近零，留痕不修。
                         rebuild_exact = u64(reloc_size) + reloc_size / 4 + 64;
                     }
                 } else {
