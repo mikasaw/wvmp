@@ -2943,3 +2943,34 @@ ThreatID 251873），当时"推测与 .wvmp 高水位 87.9%（vs 未检出的 72
 **工具遗产**：MpCmdRun -Scan -ScanType 3 -File <path> -DisableRemediation
 （custom scan 限定；非管理员可用，"只检不除"；退出码 0 = 无威胁、检出
 非零并输出 threat 行）——可编入门户脚本，替代被动等 Get-MpThreatDetection。
+
+## MIT-494q（T40 · 同词密度双 arch 微基准对照，2026-09-12）
+
+**背景**：MIT-494m 披露"跨 arch 词密度不可直比"（x64 C /Od 62 词/迭代
+vs x86 asm ~15 词/迭代）。本单落地同形态对照：wvmp_hotloop_asm_sample
+（x64 ml.asm 区域，与 x86 asm 样本同一 15 指令循环体——mov/xor/shl/shr/
+add/inc/cmp/jb 全 32 位子寄存器形态；栈对齐 sub rsp,28h 沿 deepcall_
+entry 先例，pitfall #36 结果影子槽中转同款）。measure_hotloop.sh 扩
+ARCH=x64asm。
+
+**词流实测对账**（直解 .wvmp 明文 blob）：
+- x64asm 循环体 = **13 词/迭代**（xorshift 9 + add + inc + cmp reg-reg +
+  jcc；iters 驻 r8d 不占词）
+- x86 循环体 = **16 词/迭代**（同 12 词 + iters 槽装载链 mov+add+load 3
+  词——[esp+8] 栈偏移走非折叠 Add+Load；+cmp +jcc）
+
+**测量**（6-pass，seed 12345，5 次中位，checksum 三样本同锚一致）：
+
+| 靶标 | native | protected | 减速比 | 词/迭代 | **每词耗时** |
+|---|---:|---:|---:|---:|---:|
+| x64asm | 6.72 ms | 107.5 ms | 16.0x | 13 | **1.653 ns** |
+| x86 | 6.95 ms | 154.1 ms | 22.9x | 16 | **1.926 ns** |
+| （x64 C /Od，T34） | 6.73 ms | 410.8 ms | 61.0x | 62 | 1.323 ns |
+
+**结论**：① 词密度对齐后（13 vs 16，差 23% 而非 4 倍）每词直比成立：
+**KS_MODE_32 dispatch 每词成本 ≈ 1.17× x64**——比 T35 口径（2.09 vs
+1.32 = 1.58×，被词密度混杂放大）显著收窄；② x64 C /Od 样本（62 词）
+每词 1.323 ns 反而最低——词流访存局部性/链式形态影响每词成本，"每词"
+并非常量，解释器优化（dispatch 主循环）收益按词数线性放大；③ 后续解
+释器优化以 x86 dispatch（1.93ns/词）为首要靶标（1.17× 差距 = ~16% 理
+论收益空间）。

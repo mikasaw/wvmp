@@ -283,6 +283,22 @@ target_link_options(wvmp_snake_sample PRIVATE
     $<$<CXX_COMPILER_ID:MSVC>:/INCREMENTAL:NO>
 )
 
+# MIT-494q (T40): x64 同词密度 asm 微基准——hotloop_asm_sample 与 x86
+# hotloop asm 样本逐词同形（15 dword 指令/迭代），消除词密度混杂后直比
+# 双 arch 每词 dispatch 成本。stdout 含计时行，不进 byte-exact 池。
+add_executable(wvmp_hotloop_asm_sample
+    hotloop_asm_main.cpp
+    hotloop_asm_sample.asm
+)
+target_link_libraries(wvmp_hotloop_asm_sample PRIVATE wvmp::sdk)
+target_compile_options(wvmp_hotloop_asm_sample PRIVATE
+    $<$<CXX_COMPILER_ID:MSVC>:/Od;/Ob0;/utf-8>
+    $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-O0>
+)
+target_link_options(wvmp_hotloop_asm_sample PRIVATE
+    $<$<CXX_COMPILER_ID:MSVC>:/INCREMENTAL:NO>
+)
+
 # MIT-494l (T34): 解释器密集微基准样本——5M 次 xorshift32 ALU 循环区域，
 # 量化解释器真实吞吐（T31 口径建议落地）。stdout 含非确定计时行，不进
 # multiseed byte-exact 池，仅作 measure 管道计时靶标（checksum 行可对拍）。

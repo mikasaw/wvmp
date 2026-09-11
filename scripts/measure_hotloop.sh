@@ -25,6 +25,9 @@ if [[ "$arch" == "x86" ]]; then
     sample="build/x86_samples/wvmp_x86_hotloop_sample.exe"
 elif [[ "$arch" == "x64" ]]; then
     sample="build/passes/marker_scan/tests/wvmp_hotloop_sample.exe"
+elif [[ "$arch" == "x64asm" ]]; then
+    # T40 同词密度对照：x64 asm 区域（与 x86 asm 样本逐词同形）
+    sample="build/passes/marker_scan/tests/wvmp_hotloop_asm_sample.exe"
 else
     echo "[hotloop] 未知 ARCH='$arch'（仅支持 x64/x86）" >&2
     exit 2

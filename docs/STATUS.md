@@ -1135,3 +1135,10 @@ asmgen 零触碰 → dump 锚不受影响（无换代）。
   误报与布局参数无稳定关联，不可参数化缓解；应对 = 申诉 + 语义验证解
   耦 + 哈希级时效性标注。MIT-494n 高水位推测同步否证修正。证据链 GAPS
   MIT-494p。
+### MIT-494q (T40 · 同词密度双 arch 微基准) ✅ 2026-09-12
+- wvmp_hotloop_asm_sample（x64 asm 区域，与 x86 asm 样本同 15 指令循环
+  体）+ measure_hotloop.sh ARCH=x64asm。词流实测对账：x64 13 词/迭代 vs
+  x86 16 词（差 = x86 iters 槽装载链 3 词）。**每词 dispatch 成本：x64
+  1.653ns vs x86 1.926ns = 1.17×**（T35 的 1.58× 系词密度混杂放大）——
+  x86 dispatch 为解释器优化首要靶标。开发实录：x64 asm 栈对齐 sub rsp,28h
+  先例复用。ctest 23/23 不变；证据链 GAPS MIT-494q。
