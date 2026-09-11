@@ -494,6 +494,22 @@ TEST(Translate, X64NegativeDispNeverFolds) {
         EXPECT_NE(g.op, VmOp::LeaRva);
 }
 
+TEST(Translate, X64LowImageBaseNegativeDispNeverFolds) {
+    // T37 验收注记②：ib < 4GB 的 x64 负 disp——若实现误把 u32 口径用于
+    // x64（u32(−0x7FFFF000) = 0x80001000 > ib 0x400000 且差 < extent），
+    // 本测试会折叠而挂；正确实现（arch 判别式）恒不折叠。
+    ir::Insn lea = I(ir::Op::Lea, ir::Size::S64);
+    lea.dst = ir::Operand::reg_(ir::Reg::Rax);
+    lea.src = ir::Operand::mem_(m(ir::Reg::Rbx, ir::Reg::Flags, 0,
+                                  -static_cast<i64>(0x7FFFF000ull)));
+    const auto r = wvmp::regvm::translator::translate_function(
+        fn_of({blk(0x1000, {lea})}), {}, {}, 0x400000ull, 0x11000ull);
+    EXPECT_TRUE(r.notes.empty());
+    const Decoded d = decode_program(r.program);
+    for (const auto& g : d.insns)
+        EXPECT_NE(g.op, VmOp::LeaRva);
+}
+
 TEST(Translate, X86SmallNegativeDispNotFolded) {
     // x86 回归面：普通结构体小负偏移 [ecx−0x10] 的 u32 口径值 0xFFFFFFF0
     // 不落映像窗口 → 不折叠（saw_raw_disp 同款正向锚）。
