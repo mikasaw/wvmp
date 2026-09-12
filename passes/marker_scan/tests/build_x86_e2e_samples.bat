@@ -155,6 +155,14 @@ cl /nologo /utf-8 /O1 /MD /c "%~dp0x86_pushmem_main.c" || goto :fail
 link /nologo /SUBSYSTEM:CONSOLE /MACHINE:X86 x86_pushmem_main.obj x86_pushmem_sample.obj /OUT:"%~1\wvmp_x86_pushmem_sample.exe" || goto :fail
 .\wvmp_x86_pushmem_sample.exe || goto :fail
 
+rem (18) fastcall: register-arg callee faces (MIT-498 T51 bridge) --
+rem fastcall ecx/edx args, custom-convention cl-count shift helper
+rem (__aullshr pattern), edx:eax pair return (step 5.5 storeback).
+ml /nologo /c /Coff "%~dp0x86_fastcall_sample.asm" || goto :fail
+cl /nologo /utf-8 /O1 /MD /c "%~dp0x86_fastcall_main.c" || goto :fail
+link /nologo /SUBSYSTEM:CONSOLE /MACHINE:X86 x86_fastcall_main.obj x86_fastcall_sample.obj /OUT:"%~1\wvmp_x86_fastcall_sample.exe" || goto :fail
+.\wvmp_x86_fastcall_sample.exe || goto :fail
+
 rem ---- MIT-494m (T35): interpreter-dense microbenchmark (x86 dispatch
 rem throughput; QPC-timed region loop, checksum sentinel). Measured by
 rem scripts/measure_hotloop.sh; NOT in the byte-exact pools (ms line).

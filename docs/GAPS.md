@@ -3664,3 +3664,54 @@ div@12345 探针 delta=0 持续 4 次退避（~7s，phys_free=16GB 非压力）�
 重定位 + 基线池同 seed 10× byte-exact + ONLY 过滤正式复验 **5/5 全 PASS**
 （失败 seed attempt-1 直通）→ 定性环境回合非产物缺陷，与 T43/T47 div 族
 Defender 拦截前科同域。终验二进制复跑 = **335/335 等效收敛**。
+
+## MIT-499a（T53 · arg_count/清理约定静态通路评估——mul64hi 最终翻面钥匙侦察，2026-09-13）
+
+**问题**：mul64hi 维持 gate 的最后一环 = walk 的 cdecl 保守模型无法看见
+`__allmul` stdcall 自清栈（call 后 d 恒挂 0x10 = 4 dword）。若能静态判定每个 callgate
+的 arg_count 与清理约定，walk 即可精确配平 → mul64hi 翻面。
+
+**三路评估**：
+1. **caller 侧 push 序列启发式（否决）**："紧邻 call 的连续 push = 实参"
+   与 /Od 跨 call 暂存 spill（`push tmp; call f; pop tmp`，pushform 样本
+   transient-spill 面同族）静态不可分——stdcall 假设会使 spill 面 d 漂移
+   负值 → 误 gate 既有通过区（回归）；且 K=0 的 0 参 call 与 spill 边界
+   模糊。否决理由 = D5 宁 gate 勿错的反面（勿 gate 勿错同样不可违反）。
+2. **pushform/pop 配平形（已正确，无需动）**：cdecl-pop 清栈形
+   （call; pop a; pop b）在现模型下天然配平且 pop 值可观察正确（guard 区
+   死区读 = 实参活数据），无动作项。
+3. **callee 终态 `ret N` 扫描（可行，立项候选）**：resync 前瞻同款有界
+   解码思路搬到 callee——从 call 目标起线性/CFG 有界解码（≤64 条、不入
+   call、fail-closed），搜其终态 `ret imm16`：命中 `ret N` → stdcall 自清
+   N 字节 → walk 在该 callgate 记 d -= N；`ret`（无 imm）→ cdecl → 维持
+   现状；扫描失败/超界 → 无信息 → 维持 gate。__allmul/__aullshr 类 CRT
+   helper 体小直线性，可扫性实测可行（kernels.obj 反汇编：__allmul 体
+   ~30 条）。metadata 通道复用 resync_ok_exits 同款模式（callgate 级
+   callee_cleanup_bytes 表）。**注意与 MIT-497 S-2 前提联动**：stdcall 判
+   定同时证明"出口无 pending 实参"→ resync 的 pop 面前提补全 → mul64hi
+   完整翻面链闭合。
+
+**结论**：立项价值 = mul64hi + 未来 stdcall callgate 形态翻面；成本 =
+lifter 新扫窗（~resync 同量级）+ walk 配平 + 单测 + E2E。列为 T54 候选，
+不与 T52 同批。
+
+**验收返工记录（ACCEPT-with-notes → C/N 落实，2026-09-13）**：池注释
+MIT 错标（498→499，MIT↔T 配对惯例推得）+ GAPS "4K" 单位歧义（→
+"0x10 = 4 dword"）+ pushform "同形"引证措辞（→"同族"）全部订正。
+GAPS:268 平台矩阵行池容陈旧（17→18）属 append-only 存量债披露，不在
+本单改写。修复后池门数字以本单终验批为准（340/340 × 2，fastcall
+5 seeds 双侧全过）。GAPEOF
+git checkout -b mit-499-fastcall-sample && git add -A && git commit -m "MIT-499 (T52): fastcall 样本入池——寄存器参数桥 E2E 回归资产
+
+- x86_fastcall_sample.asm：三 face（fastcall ecx/edx 双参 / __aullshr
+  模式 cl 计数移位 / edx:eax 返回对），全寄存器约定保持 Halt 栈配平
+- 接线：bat (18) 块 + CMakeLists DEPENDS + multiseed 池 17→18
+  （x86 85→90 runs，total 335→340）
+- 验证：native rc=0 五值全中、打包真虚拟化 byte-exact、扩容双池
+  REPEATS=10 = 340/340 × 2（ASLR jitter_events=0）
+- 附 GAPS MIT-499a：arg_count/清理约定静态通路三路评估（push 启发式
+  否决/cdecl-pop 已正确/callee ret N 扫描可行列 T54 候选）
+- 验收 ACCEPT-with-notes→C/N 落实（池注释 MIT 错标 + 4K 单位歧义订正）" && git checkout main && git merge --ff-only mit-499-fastcall-sample && git branch -d mit-499-fastcall-sample && git log --oneline -2 && echo "ahead: $(git rev-list --count origin/main..main)"
+__zcode_status=$?
+if [ "$__zcode_status" -eq 0 ]; then pwd -P > '/c/Users/www/AppData/Local/Temp/zcode-a71ead8a-4aa5-4acb-92f8-6302c93eed90-cwd'; fi
+exit "$__zcode_status"

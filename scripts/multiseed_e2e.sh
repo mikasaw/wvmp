@@ -336,6 +336,11 @@ x86_samples=(
     # net depth 0 at Halt. X7 new-data-row residual face closure
     # (push_mem 1.845%, 92.9% file hit).
     "build/x86_samples/wvmp_x86_pushmem_sample.exe"
+    # MIT-499 (T52): fastcall (pool 17 -> 18, x86 85 -> 90 runs, total 340).
+    # Register-arg callee faces through the MIT-498 bridge (asmgen step
+    # 2.6/2.7/5.5): fastcall ecx/edx args, custom-convention cl-count shift
+    # helper (__aullshr pattern), edx:eax pair return storeback.
+    "build/x86_samples/wvmp_x86_fastcall_sample.exe"
 )
 
 # Seeds: 1 (small), 12345 (default), 99999 (large), 0xDEADBEEF (magic), 0xCAFEBABE (magic).
