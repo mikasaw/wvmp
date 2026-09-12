@@ -1210,3 +1210,11 @@ asmgen 零触碰 → dump 锚不受影响（无换代）。
   （protected 与原件 byte-identical）；查询修复后杀软节 8/8 全 PASS。
   findstr /L 吞参弱 oracle 修复（SF-2，真实匹配 3 行实测）。证据链
   GAPS MIT-494v。
+
+### MIT-494w (T46 · wvmpTest 真实源码 VM 覆盖扩展——8 新 kernel) ✅ 2026-09-12
+- 兄弟仓 496db33：矩阵乘/链表指针链/堆 sift/modpow/按值 struct/switch/
+  像素灰度/atoi（全 32 位安全，modpow 限域）+ 共识驱动 ×2。**native 双
+  arch 105/105；x64 22 stubs（+8 全虚拟化）/ x86 18 stubs（+6，2 新
+  gate RVA 已录）；packed LOG IDENTICAL 双侧 105/105**。词流 +21.6%
+  （x64），ExitNative 多出口词 +12 与 switch 多出口自洽。证据链 GAPS
+  MIT-494w。

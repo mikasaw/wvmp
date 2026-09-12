@@ -3310,3 +3310,51 @@ oracle——修复 = 去掉 /L（字面检索本就是默认），检索逻辑�
 3 行含 "line" → 确定性 3 行匹配输出）；fixture 顺带改确定性内容（跨运
 行可比，N-2）；N-3（avscan 分母 9 vs 可检 8）为预存在汇总口径，随查询
 修复一并对齐到实际产物数。
+
+## MIT-494w（T46 · wvmpTest 真实源码 VM 覆盖扩展——8 新 kernel，2026-09-12）
+
+**背景**：T45 披露"VM 真实源码覆盖载体 = wvmpTest"。本单为 wvmpTest 新
+增 8 个真实 codegen 面 kernel（兄弟仓提交 496db33）+ 2 个分组驱动：
+矩阵乘 4x4 i32（嵌套循环 + 变址寻址，64 mul）、单链表求和/计数（指针追
+踪 Load 链——既有 kernel 全为数组面，指针链为新形态）、二叉堆
+sift-down（分支密集 + 成对交换）、u32 模幂（平方乘；**限 mod<2^16** 使
+中继积恒 <2^32——规避 x86 64 位 CRT 辅助调用出白名单）、按值 struct
+ABI（wv_pt 打包）、5 路 switch 分派（查表/比较链 codegen 实证探针）、
+RGBX 像素灰度混合（/10 常量除 = magic-mul 面十进制解析）、atoi（解析
+状态机）。驱动 = 共识/黄金向量（naive 循环、u64 参考、std::sort、
+Fermat 锚 3^65520 mod 65521 = 1）。**驱动首版笔误**：负值用例 want 已
+含符号再拼 "-" 前缀成 "--N"（atoi 正确返 0）——双 arch native 立即暴
+露，驱动侧修复。
+
+**结果**：native 双 arch **105/105**（103+2 新驱动）；打包（6-pass，
+seed 12345，当前运行时 fcaac56）：**x64 22 stubs（+8 = 新 kernel 全数
+真虚拟化，含 switch）**；x86 **18 stubs（+6，2 新 gate）**。packed vs
+native 运行日志 **LOG IDENTICAL 双侧 105/105**。词流画像：x64 3345→
+4068 词（+21.6%）、x86 2789→3404；ExitNative 17→29（+12 = 新 kernel
+多出口词，switch 单函数 5 出口的直接证据）。
+
+**x86 gate 面口径（计数论证 + RVA 记录）**：22 区 4 gate（间接 jmp ×2
+@0xAFCB/0xC079、栈深 @0xB63D、lifter-C1 @0xB1EB）。旧 14 区代码与 gate
+逻辑未变 → 旧 gate 数不变（2）→ **+2 gate 必属新 8 kernel**（其一 =
+间接 jmp，与 switch 查表 codegen 的设计预期一致；精确 kernel 命名留
+RVA，未逐一定名——归因对语义结论无影响，双侧日志恒等已闭合）。x86 白
+名单 gate = 防御面（passthrough 保持语义）非缺陷。
+
+**边界披露**：kernel 选择以 32 位安全为先（64 位除法/CRT 辅助调用会
+出白名单——modpow 以 mod<2^16 限域规避）；list_sum 的 sum<<32 在 x86
+/Od 下编译为 CRT helper（__allshl）——该区被 SSE 零初始化 C1-gate 从
+未入 VM，无语义影响（x64 为内联移位）；switch 在 x64 全虚拟化、x86
+gate，构成同源跨 arch codegen 对照点；pragma optimize("", off) 使
+codegen 停留 /Od 形态（MIT-379 既定纪律，marker_end 尾调用防护）。
+
+**验收返工记录（ACCEPT-with-notes → SF 落实，2026-09-12）**：验收将 gate
+归因升级为逐区反汇编定名——4 gate = 旧 duff_copy（间接 jmp 跳表，T32 口
+径原样）+ 旧 mul64hi（栈深，X5b 永久 gate）+ **新 list_sum（xorps/movlpd
+零初始化触发 lifter-C1）+ 新 switch_grade（idiv 25 + 4 项跳表间接 jmp，
+设计预期实证）**；8 新 = 6 虚拟化 + 2 gate，旧区 gate 数不变经逐区定名
+二次确认。SF 落实：① siftdown 返回值（交换数）补 5 条手工推演闭式断
+言（置换类断言测不出返回值错算——驱动盲区）；② switch_grade 头注截断
+语义修正（[-24,-1] 归 0 非 4，C 向零截断）；③ Nit：list_sum 的 sum<<32
+在 x86 /Od 下为 CRT helper 调用（该区被 C1-gate 从未入 VM，无碍）已补
+边界披露。SF 后复验：双 arch native 105/105、重打包 + LOG IDENTICAL
+双侧、兄弟仓 SF 提交（amend 剔除验收探针遗留文件）。
