@@ -9,6 +9,8 @@
 #include "wvmp/framework/registry.hpp"
 #include "wvmp/passes/lifter/lift_metadata.hpp"
 
+#include <cstdio>
+#include <set>
 #include <span>
 #include <string>
 
@@ -86,6 +88,44 @@ void LifterPass::run(ProtectionContext& ctx) {
         lifter::disassemble_and_lift(session, ctx.image.data() + offset, len, fr.begin_rva,
                                      fr.end_rva, fr.name, name(), ctx.diag, fr, meta,
                                      exit_guard);
+        // MIT-497 (T50, X5b 挂账落地)：出口 esp-resync 前瞻。对区域全部
+        // 区外出口目标（越区 Jmp/Jcc Imm + 末端 fallthrough end_rva）做
+        // 延续扫窗（exit_resync_verified），绝对恢复可达 → 记入
+        // fr.resync_ok_exits，供 translator 栈深 walk 规则 5 对 d≠0 出口
+        // 放行。ExitNative 出口 esp=ns 冻结协议零触碰（放行安全性来自
+        // 延续代码自身的绝对恢复，论证见 lifter_core.hpp）。
+        // x64 跳过：walk budget=0 下任何 push/sub rsp 即 gate，d≠0 出口
+        // 不可达，前瞻为死代码面。
+        if (fr.arch == ir::Arch::X86) {
+            std::set<u64> exits;
+            for (const ir::BasicBlock& b : fr.blocks)
+                for (const ir::Insn& in : b.insns)
+                    if ((in.op == ir::Op::Jmp || in.op == ir::Op::Jcc) &&
+                        in.dst.kind == ir::Operand::Kind::Imm) {
+                        const u64 t = static_cast<u64>(in.dst.imm);
+                        if (t < fr.begin_rva || t >= fr.end_rva) exits.insert(t);
+                    }
+            exits.insert(fr.end_rva);
+            for (const u64 t : exits) {
+                if (lifter::exit_resync_verified(session, std::span<const u8>(ctx.image),
+                                                 pe, t)) {
+                    fr.resync_ok_exits.push_back(t);
+                }
+            }
+            if (!fr.resync_ok_exits.empty()) {
+                std::string rvas;
+                char buf[24];
+                for (const u64 t : fr.resync_ok_exits) {
+                    std::snprintf(buf, sizeof(buf), " 0x%llX",
+                                  static_cast<unsigned long long>(t));
+                    rvas += buf;
+                }
+                ctx.diag.report(Severity::Note, name(),
+                                "函数 '" + fr.name + "': 出口 esp-resync 前瞻通过 (" +
+                                    std::to_string(fr.resync_ok_exits.size()) + " 出口:" +
+                                    rvas + ")——d≠0 出口在栈深 walk 中放行");
+            }
+        }
         metadata.push_back(std::move(meta));
         ++lifted;
     }

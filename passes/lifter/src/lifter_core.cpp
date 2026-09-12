@@ -106,6 +106,86 @@ bool back_jump_reaches_region(CapstoneSession& session, std::span<const u8> imag
     return false;
 }
 
+// MIT-497 (T50): 出口 esp-resync 前瞻（声明处注释见 lifter_core.hpp）。
+// 必须在匿名 namespace 之外——lifter_pass.cpp 直接调用（MIT-407 同款）。
+bool exit_resync_verified(CapstoneSession& session, std::span<const u8> image,
+                          const PeSectionMap& pe, u64 target_rva) {
+    const auto off = pe.rva_to_offset(target_rva);
+    if (!off || *off >= image.size()) return false;
+    const u8* p = image.data() + *off;
+    size_t left = image.size() - *off;
+    u64 addr = target_rva;
+    // 线性扫窗；256 条为防御上限（现实形态 ≤32 条：mul64hi 实测）。
+    // session.next 按引用自推进 p/left/addr（capstone_session.hpp 契约）。
+    for (int budget = 0; budget < 256; ++budget) {
+        const cs_insn* ci = session.next(p, left, addr);
+        if (ci == nullptr) return false;  // 解码失败：不可证 → 保守拒
+        static const cs_x86 kNoDetail{};
+        const cs_x86& x = ci->detail != nullptr ? ci->detail->x86 : kNoDetail;
+        const auto touches_sp = [&x]() {
+            for (unsigned i = 0; i < x.op_count; ++i) {
+                const cs_x86_op& op = x.operands[i];
+                if (op.type == X86_OP_REG &&
+                    (op.reg == X86_REG_ESP || op.reg == X86_REG_RSP ||
+                     op.reg == X86_REG_SPL))
+                    return true;
+                if (op.type == X86_OP_MEM &&
+                    (op.mem.base == X86_REG_ESP || op.mem.base == X86_REG_RSP ||
+                     op.mem.index == X86_REG_ESP || op.mem.index == X86_REG_RSP))
+                    return true;
+            }
+            return false;
+        };
+        // 终止符：绝对恢复（mov esp/rsp, ebp/rbp 或 leave）→ 窗口安全关闭。
+        if (ci->id == X86_INS_MOV && x.op_count == 2 &&
+            x.operands[0].type == X86_OP_REG &&
+            (x.operands[0].reg == X86_REG_ESP || x.operands[0].reg == X86_REG_RSP) &&
+            x.operands[1].type == X86_OP_REG &&
+            (x.operands[1].reg == X86_REG_EBP || x.operands[1].reg == X86_REG_RBP))
+            return true;
+        if (ci->id == X86_INS_LEAVE) return true;
+        // T50 验收 S-1/N-1 补拒：push/pop 族隐式 esp 不进 capstone 操作数
+        // （实证 push eax operands 仅 [eax]、pushfd operands 空），上方
+        // touches_sp 探不到——按 id 显式封禁；far call（LCALL，id≠CALL 不
+        // 走下方 IMM 判据）/iret 族/中断系统调用入口一并保守拒。
+        switch (ci->id) {
+        case X86_INS_PUSH: case X86_INS_POP:
+        case X86_INS_PUSHAL: case X86_INS_POPAL:
+        case X86_INS_PUSHF: case X86_INS_PUSHFD: case X86_INS_PUSHFQ:
+        case X86_INS_POPF: case X86_INS_POPFD: case X86_INS_POPFQ:
+        case X86_INS_LCALL: case X86_INS_INT: case X86_INS_INT1:
+        case X86_INS_INT3: case X86_INS_INTO:
+        case X86_INS_IRET: case X86_INS_IRETD: case X86_INS_IRETQ:
+        case X86_INS_SYSCALL: case X86_INS_SYSENTER:
+            return false;
+        default: break;
+        }
+        // 其余任何 esp/rsp 触碰（加移/xchg/[esp±k] 访存）→ 拒。
+        if (touches_sp()) return false;
+        // 控制流：任何 jmp/jcc/ret/间接 call 都可能离开窗口或无 resync → 拒；
+        // 仅 E8 直呼（ABI 自配平）允许顺序续行。loop/jrcxz 族条件分支显式
+        // 拒（capstone 分组不保证归 X86_GRP_JUMP）。
+        if (ci->id == X86_INS_JMP || ci->id == X86_INS_RET ||
+            ci->id == X86_INS_LOOP || ci->id == X86_INS_LOOPE ||
+            ci->id == X86_INS_LOOPNE || ci->id == X86_INS_JRCXZ ||
+            ci->id == X86_INS_JECXZ)
+            return false;
+        {
+            const cs_detail* det = ci->detail;
+            if (det != nullptr) {
+                for (size_t g = 0; g < det->groups_count; ++g) {
+                    if (det->groups[g] == X86_GRP_JUMP || det->groups[g] == X86_GRP_RET)
+                        return false;
+                }
+            }
+        }
+        if (ci->id == X86_INS_CALL) {
+            if (x.op_count != 1 || x.operands[0].type != X86_OP_IMM) return false;
+        }
+    }
+    return false;  // 预算耗尽无终止符 → 不可证 → 拒
+}
+
 void build_blocks(u64 begin_rva, u64 end_rva, std::span<const LiftedItem> items,
                   std::vector<ir::BasicBlock>& out) {
     out.clear();

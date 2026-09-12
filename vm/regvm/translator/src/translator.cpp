@@ -11,6 +11,7 @@
 // MIT-451 (X5b) B.2：kX86GuardBytes（x86 栈深 walk 预算单一来源）。
 #include "wvmp/regvm/runtime/runtime_x86.hpp"
 
+#include <algorithm>
 #include <cinttypes>
 #include <cstdio>
 #include <limits>
@@ -3351,9 +3352,14 @@ struct Translator {
 //      可达终态）点要求 d == 0——出口物理 esp = ns（stub 尾声 add esp,kCtxSize
 //      + 4 pop + add esp,G 后终态 jmp；Ret 出口例外，物理 esp := v4' 自配
 //      平），延续代码对 esp 敏感（/O2 esp 帧 [esp±X]）时 d!=0 即静默错。
-//      mul64hi（call-arg push、清栈在区外延迟执行）由此保持 gate——行为
-//      保真，esp-resync 前瞻（静态验证延续代码 mov esp,ebp 重同步）留档
-//      GAPS X5b 节后续单。
+//      MIT-497 (T50) 例外：出口目标经 lifter esp-resync 前瞻（延续扫窗仅
+//      call rel32 + 非 esp 访存，终止于 mov esp,ebp/leave 绝对恢复 →
+//      fr.resync_ok_exits）→ d!=0 放行——出口偏差被终止符无条件抹除，窗口
+//      内两世界各自读写死区无观察者（安全性论证 lifter_core.hpp）。实证
+//      翻面实证 = wvmpTest wv_mul64hi：出口前瞻本身通过，但翻面后暴露
+//      callgate 隐式 cl 参数面（__aullshr 经 cl 取参桥接未建模，VM 错值
+//      实测）→ 邻接规则保守 gate，mul64hi + 2 区回退 native 保 byte-exact
+//      （x86 19 stubs，GAPS MIT-497；T51 callgate 寄存器桥落地后撤销）。
 //   6) 跳转表命中（Jmp Reg/Mem 预扫描 ok）：targets 逐个按 4) 检查；未命中
 //      间接 jmp 不在此 gate（translate_jump 既有 note 兜底，避免双 note）。
 //   7) Ret 不检查（出口自配平）；Call 不改 d（callgate 参数桥读 [v4+4i]，
@@ -3411,6 +3417,7 @@ struct StackWalkVerdict {
 
     i64 d = 0;                                  // 净深（字节，v4 相对 ns）
     i64 max_d = 0;
+    bool prev_insn_wrote_ecx = false;  // MIT-497: 邻接 cl 参数装配探测
     std::unordered_map<ir::Reg, i64> alias;     // 寄存器 → 相对 v4 偏移
     std::unordered_map<u64, i64> d_at;          // 指令地址 → walk 时刻 d
     d_at.reserve(fn.blocks.size() * 8);
@@ -3527,6 +3534,20 @@ struct StackWalkVerdict {
                 if (!defined) alias.erase(rd);
             }
             if (in.op == ir::Op::Call) {
+                // MIT-497 (T50) E2E 发现面：callgate 隐式 cl 参数——自定义
+                // 约定 callee（__aullshr/__allshr 类 RTL helper 经 cl 取
+                // 移位量）的参数桥未建模（x86 pc_=ecx 常驻耦合，guest cl
+                // 桥接待专单）。判据 = **紧邻**：call 前一条指令写 ecx/cx/cl
+                // ——编译器对移位 helper 的参数装配恒为 `mov cl,imm/reg;
+                // call` 邻接形（wvmpTest wv_mul64hi 反汇编实证）；隔 insn 的
+                // cl 写（0xab8b 字符串扫描循环形，T47 以来字节精确通过）callee
+                // 不消费 cl，不 gate（邻接 = 消费意图的最窄可见代理，剩余
+                // 风险 = 非邻接装配的自定义约定 callee，披露 GAPS MIT-497）。
+                // x86 专属面：pc_=ecx 耦合与 __aullshr 类 32 位 RTL 约定均
+                // 不存在于 x64（D4 对称性由 arch 判据显式表达，避免误伤
+                // x64 无栈 callgate 区——首版缺失实测 x64 22→18 stubs 回归）。
+                if (fn.arch == ir::Arch::X86 && prev_insn_wrote_ecx)
+                    fail(in.addr, "callgate 隐式 cl 参数面未支持 (mov ecx/cx/cl 邻接直呼，自定义约定 callee 桥接未建模)");
                 for (int r = 0; r < 32; ++r)
                     if (is_caller_saved(static_cast<ir::Reg>(r))) alias.erase(static_cast<ir::Reg>(r));
             }
@@ -3543,8 +3564,21 @@ struct StackWalkVerdict {
                     const bool in_region =
                         target >= fn.begin_rva && target < fn.end_rva;
                     if (!in_region) {
-                        if (d != 0)
-                            fail(in.addr, "ExitNative 出口栈不平衡 (d != 0)");
+                        if (d != 0) {
+                            // MIT-497 (T50, X5b 挂账落地)：esp-resync 前瞻放行——
+                            // 出口目标的延续代码经 lifter 静态扫窗证明以绝对恢复
+                            // （mov esp,ebp/leave）收口（fr.resync_ok_exits），
+                            // 出口物理 esp=ns（冻结协议单基准）与真实 esp=ns-d
+                            // 的偏差被终止符无条件抹除 → 放行（安全性论证与
+                            // 前提披露见 lifter_core.hpp；实证形态 = wvmpTest
+                            // wv_mul64hi）。
+                            const bool resync =
+                                std::find(fn.resync_ok_exits.begin(),
+                                          fn.resync_ok_exits.end(),
+                                          target) != fn.resync_ok_exits.end();
+                            if (!resync)
+                                fail(in.addr, "ExitNative 出口栈不平衡 (d != 0)");
+                        }
                     } else {
                         // lifter 不变量：区内分支目标必为已提升指令地址
                         // （块切分即分支目标）；d_at miss 仅见于合成 IR
@@ -3569,18 +3603,29 @@ struct StackWalkVerdict {
                     // 未命中表形态 → translate_jump 既有 gate note 兜底
                 }
             }
+            // 邻接探测推进：本条是否写 ecx/cx/cl（供下一条 call 判定用）。
+            prev_insn_wrote_ecx = in.dst.kind == ir::Operand::Kind::Reg &&
+                                  in.dst.reg == ir::Reg::Rcx;
             if (!v.ok) return v;  // 首违例即收（note 一次，门为函数粒度）
         }
     }
     // --- 终态平衡（规则 5）：末块 fallthrough 可达 Halt 时 d 必须为 0 ---
+    // MIT-497 (T50)：例外 = end_rva 延续代码 esp-resync 前瞻通过
+    // （fn.resync_ok_exits 含 end_rva）→ d≠0 放行（mul64hi 形态：/Od
+    // 延迟清栈 + 尾声 mov esp,ebp 绝对恢复，反汇编实证 GAPS MIT-497）。
     if (!fn.blocks.empty()) {
         const ir::BasicBlock& last = fn.blocks.back();
         const bool falls_through =
             last.insns.empty() ||
             (last.insns.back().op != ir::Op::Jmp &&
              last.insns.back().op != ir::Op::Ret);
-        if (falls_through && d != 0)
-            fail(fn.end_rva, "Halt 出口栈不平衡 (d != 0，区外延迟清栈形态)");
+        if (falls_through && d != 0) {
+            const bool resync =
+                std::find(fn.resync_ok_exits.begin(), fn.resync_ok_exits.end(),
+                          fn.end_rva) != fn.resync_ok_exits.end();
+            if (!resync)
+                fail(fn.end_rva, "Halt 出口栈不平衡 (d != 0，区外延迟清栈形态)");
+        }
     }
     (void)max_d;
     return v;

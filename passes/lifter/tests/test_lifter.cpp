@@ -2177,6 +2177,112 @@ TEST(LifterPeMap, SectionMapping) {
     EXPECT_FALSE(lifter::PeSectionMap::parse(junk).valid);
 }
 
+// ==================== MIT-497 (T50): 出口 esp-resync 前瞻 ====================
+// 出口延续代码扫窗：终止符 mov esp,ebp/leave + 窗内仅 call rel32/寄存器/
+// 非 esp 访存 → true；delta 清栈/[esp±k]/jmp/间接 call/预算耗尽 → false。
+// 字节编码为手工核对的 x86 指令（编码↔语义由 CapstoneSession 解码背书）。
+namespace {
+bool resync_of(std::span<const wvmp::u8> code, wvmp::u64 rva) {
+    const auto img = make_min_pe(code);
+    const lifter::PeSectionMap pe = lifter::PeSectionMap::parse(img);
+    EXPECT_TRUE(pe.valid);
+    lifter::CapstoneSession session(ir::Arch::X86);
+    return lifter::exit_resync_verified(
+        session, std::span<const wvmp::u8>(img), pe, rva);
+}
+} // namespace
+
+TEST(LifterResync, Mul64hiShapePasses) {
+    // mul64hi 延续形态：[ebp±X] 寻址 + call rel32（目标不跟）+ 尾声
+    // mov esp,ebp 终止。
+    const wvmp::u8 cont[] = {
+        0x8B, 0x45, 0xD8,             // mov eax,[ebp-0x28]
+        0x8B, 0x55, 0xDC,             // mov edx,[ebp-0x24]
+        0xB1, 0x20,                   // mov cl,0x20
+        0xE8, 0x00, 0x00, 0x00, 0x00, // call next (rel32)
+        0x33, 0xC9,                   // xor ecx,ecx
+        0x03, 0xC1,                   // add eax,ecx
+        0x89, 0xEC,                   // mov esp,ebp   ← 终止符
+        0xC3,                         // ret（窗后不扫）
+    };
+    EXPECT_TRUE(resync_of(std::span<const wvmp::u8>(cont), 0x1000));
+}
+
+TEST(LifterResync, LeaveTerminatorPasses) {
+    const wvmp::u8 cont[] = {
+        0x8B, 0x45, 0x08,             // mov eax,[ebp+8]
+        0xE8, 0x00, 0x00, 0x00, 0x00, // call next
+        0xC9,                         // leave ← 终止符
+    };
+    EXPECT_TRUE(resync_of(std::span<const wvmp::u8>(cont), 0x1000));
+}
+
+TEST(LifterResync, DeltaCleanupStaysGated) {
+    // 增量式清栈（call 后 add esp）在错基 esp=ns 上语义即错 → 拒。
+    const wvmp::u8 cont[] = {
+        0xE8, 0x00, 0x00, 0x00, 0x00, // call next
+        0x83, 0xC4, 0x40,             // add esp,0x40 ← esp 触碰非终止符
+        0xC3,                         // ret
+    };
+    EXPECT_FALSE(resync_of(std::span<const wvmp::u8>(cont), 0x1000));
+}
+
+TEST(LifterResync, EspRelMemStaysGated) {
+    // [esp+4] 数据读在错基上读到死参数区 → 拒。
+    const wvmp::u8 cont[] = {
+        0x8B, 0x44, 0x24, 0x04,       // mov eax,[esp+4]
+        0x89, 0xEC,                   // mov esp,ebp
+    };
+    EXPECT_FALSE(resync_of(std::span<const wvmp::u8>(cont), 0x1000));
+}
+
+TEST(LifterResync, PushInWindowStaysGated) {
+    // T50 验收 S-1：push/pop 族隐式 esp 不进 capstone 操作数（touches_sp
+    // 探不到）→ 按 id 显式封禁（push 写 [ns-4] 与 native 世界 [ns-d-4]
+    // 错位，静默错值面）。
+    const wvmp::u8 cont[] = {
+        0x50,                         // push eax
+        0x89, 0xEC,                   // mov esp,ebp
+    };
+    EXPECT_FALSE(resync_of(std::span<const wvmp::u8>(cont), 0x1000));
+}
+
+TEST(LifterResync, FarCallStaysGated) {
+    // T50 验收 N-1：far call（9A，id=LCALL≠CALL，不走 IMM 判据）显式拒。
+    const wvmp::u8 cont[] = {
+        0x9A, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // lcall far
+        0x89, 0xEC,                   // mov esp,ebp
+    };
+    EXPECT_FALSE(resync_of(std::span<const wvmp::u8>(cont), 0x1000));
+}
+
+TEST(LifterResync, JmpInWindowStaysGated) {
+    // 窗内控制流离开（jmp）→ resync 不可证 → 拒。
+    const wvmp::u8 cont[] = {
+        0xB8, 0x01, 0x00, 0x00, 0x00, // mov eax,1
+        0xE9, 0x00, 0x00, 0x00, 0x00, // jmp next
+        0x89, 0xEC,                   // mov esp,ebp（不可达，不进窗）
+    };
+    EXPECT_FALSE(resync_of(std::span<const wvmp::u8>(cont), 0x1000));
+}
+
+TEST(LifterResync, IndirectCallStaysGated) {
+    // 间接 call（FF /2）保守拒（目标未知，宁窄勿宽）。
+    const wvmp::u8 cont[] = {
+        0xFF, 0xD0,                   // call eax
+        0x89, 0xEC,                   // mov esp,ebp
+    };
+    EXPECT_FALSE(resync_of(std::span<const wvmp::u8>(cont), 0x1000));
+}
+
+TEST(LifterResync, BudgetExhaustedStaysGated) {
+    // 预算耗尽无终止符 → 拒（nops + ret，ret 在预算内触发 grp 拒——
+    // 双重防线取先到者）。
+    std::vector<wvmp::u8> cont(300, 0x90);
+    cont.push_back(0xC3);
+    EXPECT_FALSE(resync_of(std::span<const wvmp::u8>(cont), 0x1000));
+}
+
 TEST(LifterPass, RunLiftsFunctionsFromImage) {
     wvmp::ProtectionContext ctx;
     ctx.image = make_min_pe(std::span<const wvmp::u8>(kBlockBytes));

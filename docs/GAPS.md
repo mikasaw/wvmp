@@ -3511,3 +3511,84 @@ REPEATS=10 = **335/335 PASS，jitter_events=0**——零真实抖动事件（对
 ① x87 L0（x86 旧世界 FP 面，大生产量，蓝图在档）；② ymm 档B（kCtxSize
 合同 bump）；③ BMI G8b 直执行基建。任一立项即按在档蓝图展开；均不立项
 则本面收口，无遗留工程债。
+
+## MIT-497（T50 · mul64hi 复评翻案 + esp-resync 前瞻 + callgate cl 面发现，2026-09-13）
+
+**任务口径**："mul64hi 栈深永久 gate 复评（X5b 裁决；区外延迟清栈形态专用
+通路评估）"。复评结论 = **X5b 两项前提均被反汇编推翻**，面按新事实重塑。
+
+**反汇编实证（wvmpTest kernels.obj `_wv_mul64hi`，/Od MSVC x86）**：
+- **X5b 前提①推翻**："add esp 清栈在区域外延迟执行"——实际延续代码中
+  **不存在任何 `add esp`**：MSVC /Od 对 4×`__allmul`（16 call-arg push）
+  的清栈交给 **callee stdcall 自清**，native 出口真实 esp = v4 = ns，与
+  ExitNative 物理出口天然一致；
+- **X5b 前提②（前瞻救不了 mul64hi 的预判）推翻**：尾声 = `pop edi/esi;
+  mov esp,ebp` **绝对恢复**——正是 X5b 挂账"esp-resync 前瞻"设计的目标
+  形态；
+- 真实出口几何：出口物理 esp=ns（冻结协议单基准）下，延续窗内 call/ret
+  对两世界各自读写死区（native 侧 [ns-d±k] / VM 侧 [ns±k]，均无观察者），
+  终止符 `mov esp,ebp` 无条件抹除残余偏差 → 放行无观察语义差。
+
+**落地（三件套）**：
+1. **esp-resync 前瞻分析**（lifter_core `exit_resync_verified` + lifter_pass
+   出口收集）：从出口目标线性解码 ≤256 条，窗内仅允许 `call rel32`（ABI
+   自配平）、非 esp 操作数指令与访存，终止于 `mov esp,ebp/rsp,rbp` 或
+   `leave`；任何 jmp/jcc/ret/loop 族/间接 call/esp 触碰 → 拒。结果经
+   `ir::FunctionRegion.resync_ok_exits`（append-only 字段）传 translator
+   栈深 walk 规则 5 查表放行（ExitNative 出口 + Halt 末块两点）。**ExitNative
+   协议零触碰**；x64 跳过（budget=0 下 d≠0 出口不可达，死代码面）。
+2. **callgate 隐式 cl 参数面 gate（E2E 发现的新真凶）**：mul64hi 翻面后
+   wvmpTest x86 打包 **104/105 错值**（`mov cl,20h; call __aullshr` 的
+   移位量经 callgate 后成垃圾——__aullshr 自定义约定经 cl 取参，而 x86
+   VM pc_=ecx 常驻耦合下 guest cl 参数桥未建模）。X5b 时代该区被栈深 gate
+   遮蔽，此执行面缺陷首次暴露。保守防线（D5）= walk 邻接规则：call 的
+   紧邻前一条写 ecx/cx/cl → 整函数 gate。**判据窄化实录**：首版"区内
+   任意 ecx 写后 call"误伤 3 个 T47 以来字节精确通过区（22→18）→ 收窄
+   邻接（18→19）；首版缺 arch 限定误伤 x64 无栈 callgate 区（22→18）→
+   补 x86 专属判据（x64 复原 22）。剩余披露 = 非邻接装配的自定义约定
+   callee 静态不可见。
+3. **净效果**：x86 22 → **19 stubs**（mul64hi + 2 邻接 cl 区回退 native
+   保字节精确）；x64 22 stubs 恒等。出口扫窗 22 区中 21 区通过（含 2 个
+   随后被 cl 邻接 gate 的区——前瞻通过 ≠ 最终虚拟化，cl 面独立裁决），
+   纯增防御。
+
+**构建坑入册**：`ir/region.hpp` 结构体加字段后 Ninja 增量构建漏编部分
+依赖 TU → CLI 打包全线 segfault（MSVC debug 堆 0xabababab 签名，cdb
+栈定位于 LifterPass::run）→ `--clean-first` 全量重建消除。**改 IR 结构
+布局头必须 clean 重建**（升级双树纪律）。
+
+**验证**：translator 132/132（+7：resync 放行×2/错目标仍 gate/x64 忽略
+前瞻集/cl 邻接 gate/非邻接通过/纯 cdecl 通过）、lifter 169/169（+7
+resync 扫窗正反例）、ctest 23/23、x86 电池 PASS、x64 dump sha
+f8b0ebd6/164,350B 恒等（asmgen 零改动机器证明）、wvmpTest 双 arch
+LOG IDENTICAL 105/105、crypt 20/20、tls 4/4、池门见运行注记。
+
+**后续单（T51 候选）**：callgate 寄存器参数桥（x86：native call 前
+eax/edx/ecx ← ctx GP 槽、返回后恢复 + pc_ 回填）——落地后 cl 邻接
+gate 撤销，mul64hi + 2 区翻回，x86 冲击 22/22 全虚拟化； Gate 面联动
+fastcall/fastcall-args 样本扩面。
+
+**验收返工记录（ACCEPT-with-notes → S/N 全落实，2026-09-13）**：独立验收
+（capstone 5.0.6 独立探针实证 + 三套测试复跑）检出于下：
+- **S-1（必修，已修）**：touches_sp 对 push/pop 族失效——capstone 隐式
+  esp 不进操作数（push eax operands=[eax]、pushfd 空），hpp 声称的
+  "push/pop 保守禁绝"与实现不符，窗内 pop 读 [ns-4] 死区 = 静默错值面
+  → 按 id 显式封禁 PUSH/POP/PUSHAL/POPAL/PUSHF(FD/Q)/POPF(FD/Q) 全族
+  （capstone 无 PUSHA/POPA id，首版编译错当场证伪后修正）+ 新增
+  PushInWindowStaysGated 单测；
+- **S-2（披露路径）**：call rel32 允许项安全性依赖"callee 不从 caller
+  栈读参"——d≠0 时栈参 callee 跨世界读参错位（native [ns-d±k] vs
+  protected [ns±k]），caller 侧静态不可判定 → hpp 正式改写论证 +
+  前提披露（现实锚 = RTL 移位 helper 寄存器约定；E2E byte-exact 兜底）；
+- **N 全清**：LCALL/iret 族/INT 系/SYSCALL/SYSENTER id 补拒 +
+  FarCallStaysGated 单测；x64 cl 免疫补 StackWalkX64CallgateClImmune
+  单测（E2E stub 计数外独立钉）；GAPS/hpp/cpp 三处预算与措辞矛盾修齐
+  （≤256 条统一）；walk 缩进塌陷归位。
+- 修复后复验：translator 133/133（+1 x64 cl 免疫）、lifter 171/171
+  （LifterResync 9/9）、ctest 23/23、x86 电池 PASS、x64 dump sha
+  f8b0ebd6/164,350B 恒等、wvmpTest 双 arch LOG IDENTICAL、stub 计数
+  x64=22/x86=19 不变。池门用修复后二进制终验（见下）。
+
+**池门运行注记（2026-09-13，验收修复后终验二进制）**：multiseed 基线
+REPEATS=10 = **335/335**；multiseed_aslr 全池 = **335/335，jitter_events=0**
+（T48 加固后探针零事件零额外开销）。

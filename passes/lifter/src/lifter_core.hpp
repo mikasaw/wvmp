@@ -54,6 +54,31 @@ void build_blocks(u64 begin_rva, u64 end_rva, std::span<const LiftedItem> items,
 bool back_jump_reaches_region(CapstoneSession& session, std::span<const u8> image,
                               const PeSectionMap& pe, u64 target, u64 begin_rva, u64 end_rva);
 
+// MIT-497 (T50, X5b 挂账落地): 出口 esp-resync 前瞻——区域出口 d≠0 的
+// 静态安全证明。从出口目标 target_rva 起线性解码 ≤256 条（防御预算），
+// 仅当窗口内指令全部满足：
+//   - 栈触碰只有 call rel32（E8 直呼）与显式绝对恢复终止符
+//     `mov esp,ebp`（x64: mov rsp,rbp）/ `leave`；push/pop 族（隐式 esp
+//     不进 capstone 操作数，验收 S-1 按 id 显式封禁）、far call/iret/中断
+//     入口、任何 esp/rsp 显式操作数（xchg/add esp…）、[esp±k] 访存全拒；
+//   - 无控制流离开窗口（jcc/jmp/ret/loop 族/间接 call——任何越窗路径都
+//     可能在 resync 前延续，静态不可证 → 保守拒）。
+// 且终止符在预算内到达 → true。此时出口物理 esp=ns（ExitNative 冻结协议
+// 单基准）与真实 esp=ns-d 的偏差被终止符无条件抹除。
+//
+// 安全性前提（验收 S-2，正式披露面）：出口 d≠0 时窗内 `call rel32` 的
+// 安全性要求 **callee 不从 caller 栈读参**——否则 callee 在 native 世界
+// 读 [ns-d±k]（region 待清栈活数据）而 protected 世界读 [ns±k]（死区），
+// 跨世界错位。现实锚 = RTL 移位 helper（__aullshr 类）寄存器约定；该
+// 前提对 caller 侧静态不可判定（callee ABI 在区外），出现栈参 callee 形
+// 态时由 E2E byte-exact 对账兜底（错值必现于 diff）。d=0 出口不经本
+// 前瞻（walk 规则 5 直接放行），前提无涉。实证形态 = wvmpTest
+// wv_mul64hi（/Od 四次 __allmul 16 push，stdcall 自清 → 出口真实 esp=ns；
+// 延续 [ebp±X] 寻址 + 3×__aullshr + 尾声 mov esp,ebp，kernels.obj 反汇编
+// 在案 GAPS MIT-497）。
+bool exit_resync_verified(CapstoneSession& session, std::span<const u8> image,
+                          const PeSectionMap& pe, u64 target_rva);
+
 // MIT-407: 越区跳转目标回跳检出回调（lifter_pass 构造，捕获 session/image/
 // pe_map；true = 目标可达集回跳本区 → 该函数禁用 ExitNative）。
 using ExitNativeGuardFn = std::function<bool(u64 target_rva)>;

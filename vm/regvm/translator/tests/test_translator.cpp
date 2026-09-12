@@ -65,6 +65,12 @@ ir::Insn jump(ir::Op op, u64 target, ir::Cond c = ir::Cond::Ne) {
     i.dst = ir::Operand::imm_(static_cast<i64>(target));
     return i;
 }
+ir::Insn call_insn(u64 target, ir::Size sz = ir::Size::S32) {
+    // MIT-497: callgate 正例/污点用例用（x86 S32，越区 Imm 目标）。
+    ir::Insn i = I(ir::Op::Call, sz);
+    i.dst = ir::Operand::imm_(static_cast<i64>(target));
+    return i;
+}
 
 ir::MemOperand m(ir::Reg base, ir::Reg index = ir::Reg::Flags, u8 scale = 0, i64 disp = 0) {
     ir::MemOperand o;
@@ -3028,6 +3034,114 @@ TEST(Translate, StackWalkX86HaltUnbalancedGatesMul64hiShape) {
         fn86_of({blk(0x1000, v)}));
     EXPECT_TRUE(has_stack_depth_gate(r));
 }
+
+// ==================== MIT-497 (T50): esp-resync 前瞻放行 ====================
+
+TEST(Translate, StackWalkX86HaltUnbalancedResyncPasses) {
+    // T50 正例：同 mul64hi 形（16 push、d=0x40），但 end_rva 出口经 lifter
+    // esp-resync 前瞻通过（fr.resync_ok_exits 含 end_rva）→ 放行无 note。
+    // 出口物理 esp=ns 冻结协议不变；放行安全性来自延续代码 mov esp,ebp
+    // 绝对恢复（wvmpTest 反汇编实证 GAPS MIT-497）。
+    std::vector<ir::Insn> v;
+    for (int i = 0; i < 16; ++i) v.push_back(push_insn(ir::Reg::Rax, ir::Size::S32));
+    ir::FunctionRegion fn = fn86_of({blk(0x1000, v)});
+    fn.resync_ok_exits.push_back(fn.end_rva);
+    const auto r = wvmp::regvm::translator::translate_function(fn);
+    EXPECT_TRUE(r.notes.empty());
+}
+
+TEST(Translate, StackWalkX86ExitNativeUnbalancedResyncPasses) {
+    // T50 正例：ExitNative 出口（jcc 越区 0x8000）d≠0 + 前瞻目标命中 → 放行。
+    // （ExitNative 通道自身可能携带既有披露 note——断言限定栈深 gate 消失。）
+    ir::FunctionRegion fn = fn86_of({
+        blk(0x1000, {push_insn(ir::Reg::Rax, ir::Size::S32),
+                     jump(ir::Op::Jcc, 0x8000, ir::Cond::Ne)})});
+    // jcc 越区 + 条件假 fallthrough 到 end_rva——两个出口都带 d=4，前瞻集
+    // 须同时命中（lifter 侧收集 = 分支出口 + end_rva 全收，本例对齐）。
+    fn.resync_ok_exits.push_back(0x8000);
+    fn.resync_ok_exits.push_back(fn.end_rva);
+    const auto r = wvmp::regvm::translator::translate_function(fn);
+    EXPECT_FALSE(has_stack_depth_gate(r));
+}
+
+TEST(Translate, StackWalkX86ResyncWrongTargetStillGates) {
+    // T50 反例：前瞻集含其他出口但不含实际出口目标 → 照旧 gate（目标精确
+    // 匹配，不做区域级宽放）。
+    ir::FunctionRegion fn = fn86_of({
+        blk(0x1000, {push_insn(ir::Reg::Rax, ir::Size::S32),
+                     jump(ir::Op::Jcc, 0x8000, ir::Cond::Ne)})});
+    fn.resync_ok_exits.push_back(0x9000);  // 非本出口
+    const auto r = wvmp::regvm::translator::translate_function(fn);
+    EXPECT_TRUE(has_stack_depth_gate(r));
+}
+
+TEST(Translate, StackWalkX64ResyncFieldIgnored) {
+    // T50 D4 对称：x64 budget=0 下 push 即 gate（d≠0 出口不可达），前瞻集
+    // 不参与——置位也不改变 gate 结果（死代码面防御锚）。
+    ir::FunctionRegion fn = fn_of({
+        blk(0x1000, {push_insn(ir::Reg::Rax, ir::Size::S64)})});
+    fn.resync_ok_exits.push_back(fn.end_rva);
+    const auto r = wvmp::regvm::translator::translate_function(fn);
+    EXPECT_TRUE(has_stack_depth_gate(r));
+}
+
+TEST(Translate, StackWalkX86CallgateClTaintGates) {
+    // T50 E2E 发现面：**邻接**形 `mov cl,imm; call`（callgate）→ 隐式 cl
+    // 参数面 gate（__aullshr 类自定义约定 callee 经 cl 取参，桥接未建模；
+    // wv_mul64hi 打包实测错值实证 + kernels.obj 反汇编邻接形态实证）。
+    ir::FunctionRegion fn = fn86_of({blk(0x1000, {
+        alu_ri(ir::Op::Mov, ir::Reg::Rcx, 0x20, ir::Size::S8),  // mov cl,20h
+        call_insn(0x2000),                                      // 紧邻 call
+    })});
+    const auto r = wvmp::regvm::translator::translate_function(fn);
+    ASSERT_TRUE(has_stack_depth_gate(r));
+    bool cl_note = false;
+    for (const auto& n : r.notes)
+        if (n.find("callgate 隐式 cl 参数面") != std::string::npos) cl_note = true;
+    EXPECT_TRUE(cl_note);
+}
+
+TEST(Translate, StackWalkX86NonAdjacentClWritePasses) {
+    // 非邻接 cl 写（0xab8b 字符串扫描循环形：mov cl,[eax] 后隔多条指令才
+    // call）→ callee 不消费 cl（T47 以来字节精确通过）→ 不 gate。
+    ir::FunctionRegion fn = fn86_of({blk(0x1000, {
+        alu_ri(ir::Op::Mov, ir::Reg::Rcx, 0x20, ir::Size::S8),  // mov cl,20h
+        alu_ri(ir::Op::Add, ir::Reg::Rax, 1, ir::Size::S32),    // 隔断邻接
+        push_insn(ir::Reg::Rax, ir::Size::S32),
+        push_insn(ir::Reg::Rbx, ir::Size::S32),
+        call_insn(0x2000),
+        alu_ri(ir::Op::Add, ir::Reg::Rsp, 8, ir::Size::S32),
+    })});
+    const auto r = wvmp::regvm::translator::translate_function(fn);
+    EXPECT_FALSE(has_stack_depth_gate(r));
+}
+
+TEST(Translate, StackWalkX64CallgateClImmune) {
+    // T50 验收 N-3：cl 邻接面为 x86 专属（pc_=ecx 耦合与 __aullshr 类
+    // 32 位 RTL 约定不存在于 x64）——x64 邻接形照旧不 gate（首版缺失
+    // 实测 x64 22→18 stubs 回归，E2E 背书外补单测钉）。
+    ir::FunctionRegion fn = fn_of({blk(0x1000, {
+        alu_ri(ir::Op::Mov, ir::Reg::Rcx, 0x20, ir::Size::S8),  // mov cl,20h
+        call_insn(0x2000, ir::Size::S64),
+    })});
+    const auto r = wvmp::regvm::translator::translate_function(fn);
+    EXPECT_FALSE(has_stack_depth_gate(r));
+}
+
+TEST(Translate, StackWalkX86CallgateNoClTaintPasses) {
+    // 反例：无 ecx 写的纯 cdecl callgate（__allmul 形，4 栈参）→ 无 cl note。
+    ir::FunctionRegion fn = fn86_of({blk(0x1000, {
+        push_insn(ir::Reg::Rax, ir::Size::S32),
+        push_insn(ir::Reg::Rbx, ir::Size::S32),
+        call_insn(0x2000),
+        alu_ri(ir::Op::Add, ir::Reg::Rsp, 8, ir::Size::S32),
+    })});
+    const auto r = wvmp::regvm::translator::translate_function(fn);
+    EXPECT_FALSE(has_stack_depth_gate(r));
+}
+
+// 污点清除分支说明：有污 callgate 即整函数 gate（首违例即收），"清污后
+// 复用"路径在有污语义下不可达——污点清除仅为 walk 状态机完备性保留。
 
 TEST(Translate, StackWalkX64ZeroBudgetGatesAnyPush) {
     // D4 双 arch 对称：x64 无 guard（budget=0）→ 任何区内 push 即 gate
