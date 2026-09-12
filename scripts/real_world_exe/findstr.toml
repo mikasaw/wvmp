@@ -1,0 +1,24 @@
+# MIT-494v (T45): findstr 覆盖面扩展——Windows 自带真实工具入池。
+#
+# 类别: 文本检索工具（正则引擎）
+# 验证目标: 确定性文本匹配输出（对固定文本 fixture 字面检索；检索词不带 /L —— MSYS 斜杠参数路径转换毁参，T45 验收 SF-2）
+# 预期: 系统二进制无 WVMP marker → passthrough 类（零 stub），覆盖管线在
+#       真实 PE 结构（节表/重定位/导入/清单）上的字节保持鲁棒性（T32/T33
+#       该类暴露过 fold/位置依赖真 bug）。byte-exact = 管线不破坏目标。
+# 用法: verify_real_world.sh 统一驱动；输出 ./build/real_world_exe/findstr.protected.exe
+input  = "C:/Windows/System32/findstr.exe"
+output = "./build/real_world_exe/findstr.protected.exe"
+seed   = 12345
+
+[[passes]]
+name = "pe_loader"
+[[passes]]
+name = "marker_scan"
+[[passes]]
+name = "lifter"
+[[passes]]
+name = "virtualize"
+[[passes]]
+name = "stub_link"
+[[passes]]
+name = "pe_writer"

@@ -1,0 +1,24 @@
+# MIT-494v (T45): certutil 覆盖面扩展——Windows 自带真实工具入池。
+#
+# 类别: 证书与哈希工具（1.59MB，CNG 加密导入面）
+# 验证目标: 确定性计算输出（-hashfile SHA256 对固定 fixture）+ 大体量真实 PE 管线鲁棒性
+# 预期: 系统二进制无 WVMP marker → passthrough 类（零 stub），覆盖管线在
+#       真实 PE 结构（节表/重定位/导入/清单）上的字节保持鲁棒性（T32/T33
+#       该类暴露过 fold/位置依赖真 bug）。byte-exact = 管线不破坏目标。
+# 用法: verify_real_world.sh 统一驱动；输出 ./build/real_world_exe/certutil.protected.exe
+input  = "C:/Windows/System32/certutil.exe"
+output = "./build/real_world_exe/certutil.protected.exe"
+seed   = 12345
+
+[[passes]]
+name = "pe_loader"
+[[passes]]
+name = "marker_scan"
+[[passes]]
+name = "lifter"
+[[passes]]
+name = "virtualize"
+[[passes]]
+name = "stub_link"
+[[passes]]
+name = "pe_writer"

@@ -1,0 +1,24 @@
+# MIT-494v (T45): tar 覆盖面扩展——Windows 自带真实工具入池。
+#
+# 类别: 命令行归档工具（bsdtar 3.8.8，libarchive/zlib/lzma/zstd/cng）
+# 验证目标: 归档类计算负载（7z 缺位的同类替代）+ 丰富第三方库导入面
+# 预期: 系统二进制无 WVMP marker → passthrough 类（零 stub），覆盖管线在
+#       真实 PE 结构（节表/重定位/导入/清单）上的字节保持鲁棒性（T32/T33
+#       该类暴露过 fold/位置依赖真 bug）。byte-exact = 管线不破坏目标。
+# 用法: verify_real_world.sh 统一驱动；输出 ./build/real_world_exe/tar.protected.exe
+input  = "C:/Windows/System32/tar.exe"
+output = "./build/real_world_exe/tar.protected.exe"
+seed   = 12345
+
+[[passes]]
+name = "pe_loader"
+[[passes]]
+name = "marker_scan"
+[[passes]]
+name = "lifter"
+[[passes]]
+name = "virtualize"
+[[passes]]
+name = "stub_link"
+[[passes]]
+name = "pe_writer"

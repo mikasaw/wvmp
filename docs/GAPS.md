@@ -3253,3 +3253,60 @@ real_world 池 7z 缺装、tasklist/cmd 为 passthrough 无词流）；画像工
 opcode 频率结构）；x86 打包日志 17 条 exit-native 记录 vs 词流 16 词 =
 1 条位点因"间接 jmp 未支持"整区 passthrough 不发词（pack 日志可查，
 词流口径为准）。
+
+## MIT-494v（T45 · real_world 池覆盖面扩展，2026-09-12）
+
+**背景**：T44 后方向性议题用户拍板"覆盖面扩展"。real_world 池 5 目标
+（7z 缺装长期 SKIP）→ 扩至 **9 目标**：新增 tar（bsdtar 3.8.8，归档计
+算类 = 7z 同类替代）、certutil（1.59MB，CNG 加密导入面，池内最大真实
+PE）、findstr（正则引擎）、where（最小 PE）。类属披露：系统二进制无
+WVMP marker → 本池为 **passthrough/管线鲁棒性类**（pe_loader/pe_writer/
+重定位/导入面在真实 PE 结构多样性上的字节保持），非 VM 执行覆盖；VM
+真实源码覆盖载体仍是 wvmpTest。7z 正式以 tar 替代（不装软件、零网络
+依赖），7z.toml 保留（装后即用）。
+
+**实现**：verify_real_world.sh configs 数组 +4 条目；certutil/findstr
+新增确定性 fixture 机制（固定内容 64KB bin + 固定文本 txt，cygpath -m
+注入 test_arg——两条运行读同一文件，byte-exact 对比成立，跨运行可比）；
+TOML ×4（6-pass，绝对 System32 路径）。
+
+**结果**：**新 4 目标全 PASS byte-exact**（tar --version / certutil
+-hashfile SHA256 / findstr 字面检索 / where 枚举），且 protected 与
+native **byte-identical**（cmp 实证）= 完全 passthrough（零 stub 的直
+接证据，管线未做任何语义改写）+ 非 ASLR 真实重定位加载运行正确。老 4
+目标复归不变（notepad rc 模式 PASS；tasklist/cmd/curl byte-exact + C1
+gate fallback 口径）；7z SKIP（缺装，口径不变）。池合计 **8 PASS / 1
+SKIP**。
+
+**Defender 威胁表状态（验收 SF-1 修正口径）**：杀软节（MIT-370）首轮
+输出"0/9 通过、8 被标"——独立验收实证该表述系**查询缺陷 + 威胁表历史
+残留的伪影**：① 脚本查询 `Get-MpThreatDetection | ... -or $_.ThreatID`
+恒真（预存在缺陷，任何历史条目即全目标 FAIL），已修复为按本池产物路径
+精确匹配；② 威胁表既有检测的 Resources 全部指向**历史任务临时产物**
+（t32/t43 等目录），无一条指向本池产物；两轮池跑零新增检测；③ 新 4 目
+标 protected 与系统原件 byte-identical——云 ML 对其单独标定基本不可能。
+真实状态 = 威胁表自 09-11 起含历史任务产物的 Contebrew.A!ml（251873）
+持久检测（T38 口径），查询缺陷放大为节级全红；查询修复后杀软节 **8/8
+全 PASS**（per-PE 实证口径；汇总行分母含 7z 缺装项为预存在口径）。
+
+**边界披露**：passthrough 类不产生解释器词流/吞吐信号（计时恒 ~1.0×，
+无度量价值，本单不做）；VM 真实源码覆盖的扩展载体 = wvmpTest 新
+kernel（后续派单）；certutil 输出含本地化文案（同机同 locale 对比成
+立）；fixture 固定内容（跨运行可比，验收 N-2）。
+
+**验收返工记录（ACCEPT-with-notes → SF/N 落实，2026-09-12）**：① SF-1
+= Defender 表述修正（上段重写）+ 杀软节查询缺陷修复（`-or $_.ThreatID`
+恒真 → 按池产物路径精确匹配；预存在缺陷非本单引入），修复后杀软节
+8/8 全 PASS（findstr 真实匹配 3 行输出双侧一致实测）；② SF-2 = findstr
+检索词 `/L` 被 MSYS 斜杠参数路径转换吞参 → 空输出对空输出弱 oracle——
+修复 = 去掉 /L（字面检索本就是默认）；③ N-2 fixture 固定内容、N-3 汇总
+分母口径随查询修复对齐，均已注记。
+
+**验收返工记录（ACCEPT-with-notes → SF 落实，2026-09-12）**：① SF-1 =
+Defender 表述修正（见上段重写）+ 杀软节查询缺陷修复（`-or $_.ThreatID`
+恒真 → 按池产物路径精确匹配；预存在缺陷非本单引入）；② SF-2 = findstr
+检索词 `/L` 被 MSYS 斜杠参数路径转换吞参 → 实际空输出对空输出的弱
+oracle——修复 = 去掉 /L（字面检索本就是默认），检索逻辑真实执行（fixture
+3 行含 "line" → 确定性 3 行匹配输出）；fixture 顺带改确定性内容（跨运
+行可比，N-2）；N-3（avscan 分母 9 vs 可检 8）为预存在汇总口径，随查询
+修复一并对齐到实际产物数。

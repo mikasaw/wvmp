@@ -1198,3 +1198,15 @@ asmgen 零触碰 → dump 锚不受影响（无换代）。
   法学，验收 SF-1 更正）：native 42.5ms vs packed 73.9/73.0ms =
   **1.74×/1.72×**（首版 1.19× 系进程启动开销计入窗口的低估，已作废）。
   解释器优化战役（T41-T44）至此收口。证据链 GAPS MIT-494u。
+
+### MIT-494v (T45 · real_world 池覆盖面扩展) ✅ 2026-09-12
+- 池 5→9 目标：新增 tar（7z 缺位替代）/ certutil（1.59MB 最大真实 PE）/
+  findstr / where；**新 4 目标全 PASS byte-exact 且 protected byte-identical
+  （完全 passthrough 实证）**，池合计 8 PASS/1 SKIP（7z 缺装）。certutil/
+  findstr 确定性 fixture 机制入脚本。passthrough 类 = 管线鲁棒性覆盖
+  （真实 PE 结构多样性），非 VM 执行覆盖（载体仍是 wvmpTest）。
+- **Defender 状态（验收 SF-1 修正）**：杀软节首轮全红系查询缺陷
+  （`-or $_.ThreatID` 恒真）+ 威胁表历史残留伪影——本池产物零检出
+  （protected 与原件 byte-identical）；查询修复后杀软节 8/8 全 PASS。
+  findstr /L 吞参弱 oracle 修复（SF-2，真实匹配 3 行实测）。证据链
+  GAPS MIT-494v。

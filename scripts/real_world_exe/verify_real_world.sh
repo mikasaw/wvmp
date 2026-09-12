@@ -64,6 +64,28 @@ declare -a configs=(
     "curl|/c/Program Files/Git/mingw64/bin/curl.exe|--version|stdout"
 )
 
+# MIT-494v (T45) coverage expansion: built-in real tools (pipeline
+# robustness class -- unmarked system binaries exercise pe_loader/pe_writer/
+# reloc/import faces via passthrough; tar replaces the missing 7z in the
+# archive-compute class). Fixtures are DETERMINISTIC (repeating pattern /
+# fixed text) so cross-run results stay comparable; certutil/findstr run
+# against them so both runs see byte-identical inputs. findstr 检索词不带
+# /L（MSYS 会把斜杠参数路径转换毁参，T45 验收 SF-2；字面检索本就是默认）。
+fixture_bin="$out_dir/t45_fixture.bin"
+fixture_txt="$out_dir/t45_fixture.txt"
+{ printf 'WVMP-T45-FIXTURE-0123456789abcdef\n'; for i in 1 2 3 4 5 6 7 8 9 10; do printf 'WVMP-T45-FIXTURE-0123456789abcdef%.0s' $(seq 1 22); echo; done; } \
+    | head -c 65536 > "$fixture_bin"
+printf 'alpha line one\nbeta line two\ngamma line three\nnumber 42 here\n' \
+    > "$fixture_txt"
+fixture_bin_win="$(cygpath -m "$fixture_bin")"
+fixture_txt_win="$(cygpath -m "$fixture_txt")"
+configs+=(
+    "tar|/c/Windows/System32/tar.exe|--version|stdout"
+    "certutil|/c/Windows/System32/certutil.exe|-hashfile $fixture_bin_win SHA256|stdout"
+    "findstr|/c/Windows/System32/findstr.exe|\"line\" $fixture_txt_win|stdout"
+    "where|/c/Windows/System32/where.exe|tar.exe|stdout"
+)
+
 # GUI app timeout in seconds: protected GUI binary may hang on missing display.
 gui_timeout=3
 
@@ -231,7 +253,7 @@ if command -v powershell.exe >/dev/null 2>&1; then
         # Defender 标记的项, 我们按 Resources 字段匹配本脚本生成的 protected PE.
         threats=$(powershell.exe -NoProfile -Command "
             try {
-                Get-MpThreatDetection | Where-Object { \$_.Resources -and (\$_.Resources -like '*$(basename "$win_path")*' -or \$_.ThreatID) } | Select-Object -First 5 | ConvertTo-Json -Depth 2 -Compress
+                Get-MpThreatDetection | Where-Object { \$_ -and (\$_.Resources -like '*$(basename "$win_path")*') } | Select-Object -First 5 | ConvertTo-Json -Depth 2 -Compress
             } catch {
                 ''
             }
