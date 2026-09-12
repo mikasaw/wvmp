@@ -125,6 +125,42 @@ void LifterPass::run(ProtectionContext& ctx) {
                                     std::to_string(fr.resync_ok_exits.size()) + " 出口:" +
                                     rvas + ")——d≠0 出口在栈深 walk 中放行");
             }
+            // MIT-500 (T54)：callgate 清理约定扫描。对越区直接 call 的目标
+            // （Imm 形）做终态 ret imm 判定（callee_ret_imm），stdcall 形
+            // （imm>0）记入 fr.callgate_cleanup —— translator 两处消费：
+            // 栈深 walk 记 d -= imm（native esp 语义精确化）+ CallGate 词后
+            // 合成 `Add Rsp, imm`（guest rsp 槽真实推进，守卫用量与模型恒
+            // 对齐）。imm==0（cdecl）/扫描失败不入表 = 维持保守模型。
+            {
+                std::set<u64> targets;
+                for (const ir::BasicBlock& b : fr.blocks)
+                    for (const ir::Insn& in : b.insns)
+                        if (in.op == ir::Op::Call &&
+                            in.dst.kind == ir::Operand::Kind::Imm) {
+                            const u64 t = static_cast<u64>(in.dst.imm);
+                            if (t < fr.begin_rva || t >= fr.end_rva) targets.insert(t);
+                        }
+                for (const u64 t : targets) {
+                    const auto imm = lifter::callee_ret_imm(
+                        session, std::span<const u8>(ctx.image), pe, t);
+                    if (imm.has_value() && *imm > 0)
+                        fr.callgate_cleanup.emplace_back(t, *imm);
+                }
+                if (!fr.callgate_cleanup.empty()) {
+                    std::string rvas;
+                    char buf[32];
+                    for (const auto& [t, n] : fr.callgate_cleanup) {
+                        std::snprintf(buf, sizeof(buf), " 0x%llX+%u",
+                                      static_cast<unsigned long long>(t),
+                                      static_cast<unsigned>(n));
+                        rvas += buf;
+                    }
+                    ctx.diag.report(Severity::Note, name(),
+                                    "函数 '" + fr.name + "': callgate 清理约定扫描 " +
+                                        std::to_string(fr.callgate_cleanup.size()) +
+                                        " 项(stdcall):" + rvas);
+                }
+            }
         }
         metadata.push_back(std::move(meta));
         ++lifted;

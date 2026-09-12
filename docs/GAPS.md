@@ -3715,3 +3715,68 @@ git checkout -b mit-499-fastcall-sample && git add -A && git commit -m "MIT-499 
 __zcode_status=$?
 if [ "$__zcode_status" -eq 0 ]; then pwd -P > '/c/Users/www/AppData/Local/Temp/zcode-a71ead8a-4aa5-4acb-92f8-6302c93eed90-cwd'; fi
 exit "$__zcode_status"
+
+**MIT-499a 补充（T54 实施前设计定案，2026-09-13）**：路线 3 的关键约束
+补全——仅 walk 记 d -= N 不充分：VM guest rsp 槽不随 stdcall 清理前进会
+使守卫区**实际用量**与 walk 模型脱钩（多次 stdcall callgate 后真实 push
+深度持续增长而模型回卷 = X5b 守卫预算被绕过 = 写穿面回归）。完整闭环 =
+① lifter 扫描（bounded decode callee 终态 ret imm；全部终态一致 →
+N；call/间接跳/解码失败/预算耗尽/终态冲突 → 无信息）② 元数据经
+FunctionRegion 新字段下发 ③ translator 对已验证 callgate **合成
+`Add Rsp, N` 词**（真实推进 guest rsp 槽 = native 语义精确化，非模型
+虚构）④ walk 同表 d -= N（模型/现实恒对齐，守卫预算诚实）。合成词对
+ spill 形也精确（ret N 无条件弹 N 字节，与 caller push 意图无关）。
+
+## MIT-500（T54 · callee 终态 ret N 扫描——callgate 清理约定通道，mul64hi 翻面，2026-09-13）
+
+**背景**：MIT-499a 评估路线 3 立项。mul64hi 最后一环 = walk 的 cdecl 保守
+模型看不见 `__allmul` stdcall 自清栈（call 后 d 恒挂 0x10）。本单 = 清理
+约定静态通道全链落地，**x86 22/22 区全虚拟化达成**。
+
+**实现（四件套，零新 VmOp/零协议面/冻结契约零触碰）**：
+1. **lifter `callee_ret_imm` 扫描**（lifter_core）：从 callgate 目标起沿
+   静态控制流边有界遍历（jcc 双跟、无条件 jmp Imm 单跟、其他 fallthrough；
+   visited 去重兜循环 + 预算 256 节点），收集全部终态 `ret` 的 imm16——
+   全部一致 → 返回（0 = cdecl / N>0 = stdcall 自清 N 字节）；call/far
+   call/间接 jmp/解码失败/终态冲突/越界 → nullopt（fail-closed 维持
+   cdecl 模型）。验收 S-1/S-2 修正：loop 族与 retf/iretd/中断入口按 id
+   显式封禁移出分组判据（capstone 实证 loop 族分组无 JUMP、retf 族
+   id≠RET——首版经分组门漏判，真返回终结符被穿过解码）。
+2. **元数据通道**：`FunctionRegion.callgate_cleanup`
+   （vector<pair<target_rva, ret_imm>>，append-only；lifter 对越区直接
+   call 的 Imm 目标填充，imm>0 才入表，诊断 Note 披露）。
+3. **walk 记账**：call 处查表 d -= imm——native `ret imm` 无条件弹 imm
+   字节，与 caller push 意图无关（spill 形亦逐位精确）。
+4. **translate_call 合成词**：已验证 callgate 后发射 `Add Rsp, imm`
+   （emit_ri + mark_last_dead——`ret imm` 本身不写 flags，MIT-494d 合成
+   栈调整同款）——guest rsp 槽**真实推进**，守卫区用量与 walk 模型恒
+   对齐（MIT-499a 设计定案④：仅 walk 记账会让多次 stdcall callgate 的
+   真实 push 深度持续增长而模型回卷 = 守卫预算被绕过的写穿面回归）。
+
+**mul64hi 翻面链完整闭合**：d 记账精确化（call 后 d=0）→ 规则 5 直放
+（resync 不再被咨询）→ 22 stubs（22/22 区全虚拟化，x86 gate 面清零）。
+x64 面：扫描仅 x86 填表（Win64 无 stdcall，caller-clean 恒定），map 恒空
+= 死代码面，dump sha 恒等机器证明。
+
+**验证**：translator 135/135（+2：stdcall 记账配平正例 = mul64hi 形
+gate↔放行对照、合成词序 [CallGate, Add Rsp 16, CallGate, ...] 断言）、
+lifter 177/177（+6 LifterCleanup：裸 ret/ret 10h/循环出口 ret（jnz 偏移
+笔误 0xF9→0xF8 当场炸出修正）/终态冲突/call 体/无终态死循环）、ctest
+23/23、x86 电池、x64 dump sha f8b0ebd6/164,350B 恒等、x86 结构门 94 项、
+wvmpTest 双 arch LOG IDENTICAL 105/105（x86 **22 stubs** 首次全虚拟化）、
+crypt/tls、池门见运行注记。
+
+**验收返工记录（ACCEPT-with-notes → S 全落实，2026-09-13）**：独立验收
+（capstone 5.0.6 独立探针 + 三层测试复跑）检出于下：
+- **S-1（已修）**：callee_ret_imm 的 loop 族 id 拒在 is_jump 分组门内 =
+  死代码（实证 loop 族分组仅 [BRANCH_RELATIVE] 无 JUMP 组）→ id 级封禁
+  移出分组门；
+- **S-2（已修）**：retf/iretd 族 id≠RET、分组不命中 → 穿过远/中断返回
+  终结符继续解码（假一致 imm 通道）→ id 级补拒 RETF/IRET/IRETD/IRETQ/
+  INT 系/SYSCALL/SYSENTER（对齐 exit_resync_verified 先例）；
+- **S-3（已修）**：ConflictingRetsRejected 字节布局 jz +4 目标落节外经
+  "越界拒绝"通过（冲突分支从未执行）→ 74 01 真钉终态冲突语义；
+- GAPS 措辞两处随修（loop 拒/失败枚举）。修复后复验：translator
+  135/135、lifter 177/177、ctest 23/23、x86 电池、x64 sha 恒等、x86
+  结构门、wvmpTest 双 arch LOG IDENTICAL 105/105（x86 22 stubs）。池门
+  340/340 × 2（翻面后首跑，ASLR jitter_events=0）。

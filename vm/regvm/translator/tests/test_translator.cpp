@@ -3138,6 +3138,50 @@ TEST(Translate, StackWalkX86CallgateNoClTaintPasses) {
     EXPECT_FALSE(has_stack_depth_gate(r));
 }
 
+// ==================== MIT-500 (T54): callgate 清理约定通道 ==================
+
+TEST(Translate, StackWalkX86StdcallCleanupBalances) {
+    // T54 正例（mul64hi 形）：4×push + call 后区外清栈 → walk cdecl 模型
+    // d=16 ≠ 0 gate；登记 callgate_cleanup={{0x2000,16}}（lifter 终态
+    // ret 10h 扫描产物）→ call 记 d -= 16 → 出口平衡 → 无 gate。
+    ir::FunctionRegion fn = fn86_of({blk(0x1000, {
+        push_insn(ir::Reg::Rax, ir::Size::S32),
+        push_insn(ir::Reg::Rbx, ir::Size::S32),
+        push_insn(ir::Reg::Rcx, ir::Size::S32),
+        push_insn(ir::Reg::Rdx, ir::Size::S32),
+        call_insn(0x2000),
+    })});
+    const auto r_gated = wvmp::regvm::translator::translate_function(fn);
+    EXPECT_TRUE(has_stack_depth_gate(r_gated));
+    fn.callgate_cleanup.emplace_back(0x2000, 16u);
+    const auto r = wvmp::regvm::translator::translate_function(fn);
+    EXPECT_FALSE(has_stack_depth_gate(r));
+}
+
+TEST(Translate, TranslateSynthesizesAddRspAfterStdcallCallgate) {
+    // T54 合成词：登记 {0x2000,16} 的 Imm callgate → 词序 = [CallGate,
+    // Add Rsp 16, CallGate(未登记, 无合成), Halt]。
+    ir::FunctionRegion fn = fn86_of({blk(0x1000, {
+        call_insn(0x2000),
+        call_insn(0x3000),
+    })});
+    fn.callgate_cleanup.emplace_back(0x2000, 16u);
+    const auto r = wvmp::regvm::translator::translate_function(fn);
+    const Decoded d = decode_program(r.program);
+    ASSERT_GE(d.insns.size(), static_cast<size_t>(4));
+    expect_is(d.insns[0], VmOp::CallGate, OpKind::None, 0, OpKind::None, 0, 0x2000, 0);
+    expect_is(d.insns[1], VmOp::Add, OpKind::Reg, isa::vm_reg_of(ir::Reg::Rsp),
+              OpKind::Imm, 0, 16, kS32);
+    expect_is(d.insns[2], VmOp::CallGate, OpKind::None, 0, OpKind::None, 0, 0x3000, 0);
+    int synth_adds = 0;
+    for (const auto& w : d.insns)
+        if (w.op == VmOp::Add && w.a_kind == OpKind::Reg &&
+            w.reg_a == isa::vm_reg_of(ir::Reg::Rsp) && w.b_kind == OpKind::Imm &&
+            w.aux == 16)
+            ++synth_adds;
+    EXPECT_EQ(synth_adds, 1);  // 仅登记目标合成一次（块桥 Jmp 数量随块切分）
+}
+
 TEST(Translate, StackWalkX64ZeroBudgetGatesAnyPush) {
     // D4 双 arch 对称：x64 无 guard（budget=0）→ 任何区内 push 即 gate
     // （手写/第三方 x64 形态的现网盲区预防；MSVC x64 产物 sub rsp 形不受扰

@@ -2256,6 +2256,77 @@ TEST(LifterResync, FarCallStaysGated) {
     EXPECT_FALSE(resync_of(std::span<const wvmp::u8>(cont), 0x1000));
 }
 
+// ==================== MIT-500 (T54): callee 清理约定扫描 ====================
+namespace {
+std::optional<wvmp::u32> ret_imm_of(std::span<const wvmp::u8> code, wvmp::u64 rva) {
+    const auto img = make_min_pe(code);
+    const lifter::PeSectionMap pe = lifter::PeSectionMap::parse(img);
+    EXPECT_TRUE(pe.valid);
+    lifter::CapstoneSession session(ir::Arch::X86);
+    return lifter::callee_ret_imm(
+        session, std::span<const wvmp::u8>(img), pe, rva);
+}
+} // namespace
+
+TEST(LifterCleanup, PlainRetIsCdecl) {
+    const wvmp::u8 body[] = {0xC3};  // ret
+    const auto v = ret_imm_of(std::span<const wvmp::u8>(body), 0x1000);
+    ASSERT_TRUE(v.has_value());
+    EXPECT_EQ(*v, 0u);
+}
+
+TEST(LifterCleanup, RetImm8IsStdcall) {
+    const wvmp::u8 body[] = {0xC2, 0x10, 0x00};  // ret 10h (__allmul 形)
+    const auto v = ret_imm_of(std::span<const wvmp::u8>(body), 0x1000);
+    ASSERT_TRUE(v.has_value());
+    EXPECT_EQ(*v, 0x10u);
+}
+
+TEST(LifterCleanup, LoopBodyFallsToRet) {
+    // fc_shr64/__aullshr 形：shr/rcr/dec/jnz 回边循环 + 循环出口裸 ret
+    // （visited 去重兜回边，出口可达 → 终态唯一）。
+    const wvmp::u8 body[] = {
+        0xD1, 0xEA,                   // shr edx,1      @+0
+        0xD1, 0xD8,                   // rcr eax,1      @+2
+        0xFE, 0xC9,                   // dec cl         @+4
+        0x75, 0xF8,                   // jnz -8（回边到块首 @0）
+        0xC3,                         // ret
+    };
+    const auto v = ret_imm_of(std::span<const wvmp::u8>(body), 0x1000);
+    ASSERT_TRUE(v.has_value());
+    EXPECT_EQ(*v, 0u);
+}
+
+TEST(LifterCleanup, ConflictingRetsRejected) {
+    // jcc 分叉到裸 ret 与 ret 8 → 终态冲突 → nullopt（fail-closed）。
+    // T54 验收 S-3 布局修正：jz rel8=1（目标 = 5+1 = 6 = C2 08 00 处；
+    // 首版 74 04 目标 9 落节外经"越界拒绝"通过，冲突分支从未执行）。
+    const wvmp::u8 body[] = {
+        0x83, 0xC0, 0x01,             // add eax,1
+        0x74, 0x01,                   // jz +1 → ret 8
+        0xC3,                         // ret（cdecl 支路）
+        0xC2, 0x08, 0x00,             // ret 8（stdcall 支路）
+    };
+    EXPECT_FALSE(ret_imm_of(std::span<const wvmp::u8>(body), 0x1000).has_value());
+}
+
+TEST(LifterCleanup, CallInsideBodyRejected) {
+    // 体含 call → callee 体量与副作用不可界 → nullopt。
+    const wvmp::u8 body[] = {
+        0xE8, 0x00, 0x00, 0x00, 0x00, // call next
+        0xC3,                         // ret
+    };
+    EXPECT_FALSE(ret_imm_of(std::span<const wvmp::u8>(body), 0x1000).has_value());
+}
+
+TEST(LifterCleanup, NoTerminalRejected) {
+    // 无终态（自跳死循环）→ visited 去重耗尽队列 → nullopt。
+    const wvmp::u8 body[] = {
+        0xEB, 0xFE,                   // jmp self
+    };
+    EXPECT_FALSE(ret_imm_of(std::span<const wvmp::u8>(body), 0x1000).has_value());
+}
+
 TEST(LifterResync, JmpInWindowStaysGated) {
     // 窗内控制流离开（jmp）→ resync 不可证 → 拒。
     const wvmp::u8 cont[] = {

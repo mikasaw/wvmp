@@ -186,6 +186,93 @@ bool exit_resync_verified(CapstoneSession& session, std::span<const u8> image,
     return false;  // 预算耗尽无终止符 → 不可证 → 拒
 }
 
+// MIT-500 (T54): callee 清理约定扫描（声明处注释见 lifter_core.hpp）。
+// 必须在匿名 namespace 之外——lifter_pass.cpp 直接调用（MIT-407 同款）。
+std::optional<u32> callee_ret_imm(CapstoneSession& session, std::span<const u8> image,
+                                  const PeSectionMap& pe, u64 target) {
+    std::vector<u64> queue{target};
+    std::set<u64> visited;
+    std::optional<u32> found;
+    size_t budget = 256;
+    while (!queue.empty()) {
+        const u64 addr = queue.front();
+        queue.erase(queue.begin());
+        if (!visited.insert(addr).second) continue;
+        if (budget-- == 0) return std::nullopt;
+        const auto off = pe.rva_to_offset(addr);
+        if (!off || *off >= image.size()) return std::nullopt;
+        const u8* p = image.data() + *off;
+        size_t left = image.size() - *off;
+        u64 cur = addr;
+        const cs_insn* ci = session.next(p, left, cur);
+        if (ci == nullptr) return std::nullopt;  // 解码失败：不可判 → 放弃
+        const cs_detail* det = ci->detail;
+        // 终态：ret [imm16]——收集 imm，冲突即放弃。
+        if (ci->id == X86_INS_RET) {
+            u32 imm = 0;
+            if (det != nullptr && det->x86.op_count == 1 &&
+                det->x86.operands[0].type == X86_OP_IMM)
+                imm = static_cast<u32>(det->x86.operands[0].imm);
+            else if (det != nullptr && det->x86.op_count != 0)
+                return std::nullopt;
+            if (found.has_value() && *found != imm) return std::nullopt;
+            found = imm;
+            continue;  // 无后继
+        }
+        // call（含 far）/间接转移面：callee 体量与副作用不可界 → 放弃。
+        if (ci->id == X86_INS_CALL || ci->id == X86_INS_LCALL)
+            return std::nullopt;
+        // T54 验收 S-1/S-2：id 级封禁移出 is_jump 门之外——capstone 实证
+        // loop 族分组仅 [BRANCH_RELATIVE]（无 JUMP 组，id 拒在组门内 = 死
+        // 代码且丢 taken 边）；retf/iretd 族 id≠RET、分组 [RET]/[IRET] 均
+        // 不命中 → 会穿过远/中断返回终结符继续解码（假一致 imm 通道）。
+        // 对齐 exit_resync_verified 先例：id 级显式封禁优先于分组分类。
+        switch (ci->id) {
+        case X86_INS_LOOP: case X86_INS_LOOPE: case X86_INS_LOOPNE:
+        case X86_INS_JRCXZ: case X86_INS_JECXZ:
+        case X86_INS_RETF: case X86_INS_IRET: case X86_INS_IRETD:
+        case X86_INS_IRETQ:
+        case X86_INS_INT: case X86_INS_INT1: case X86_INS_INT3:
+        case X86_INS_INTO:
+        case X86_INS_SYSCALL: case X86_INS_SYSENTER:
+            return std::nullopt;
+        default: break;
+        }
+        if (det != nullptr) {
+            bool is_jump = false, direct_imm = false;
+            u64 imm_target = 0;
+            for (size_t g = 0; g < det->groups_count; ++g)
+                if (det->groups[g] == X86_GRP_JUMP) is_jump = true;
+            if (is_jump) {
+                if (det->x86.op_count > 0 &&
+                    det->x86.operands[0].type == X86_OP_IMM) {
+                    direct_imm = true;
+                    imm_target = static_cast<u64>(det->x86.operands[0].imm);
+                } else {
+                    return std::nullopt;  // 间接 jmp → 放弃
+                }
+                const u64 next = ci->address + ci->size;
+                // 无条件 jmp（X86_INS_JMP）单后继；jcc 双后继（保守双跟；
+                // loop/jrcxz 族已由上方 id 封禁拦截）。
+                if (ci->id == X86_INS_JMP) {
+                    queue.push_back(imm_target);
+                    continue;
+                }
+                if (ci->id == X86_INS_LOOP || ci->id == X86_INS_LOOPE ||
+                    ci->id == X86_INS_LOOPNE || ci->id == X86_INS_JRCXZ ||
+                    ci->id == X86_INS_JECXZ)
+                    return std::nullopt;
+                queue.push_back(imm_target);
+                queue.push_back(next);
+                continue;
+            }
+        }
+        // 普通指令：顺序续行。
+        queue.push_back(ci->address + ci->size);
+    }
+    return found;  // 遍历完（可能 0 终态 = 纯循环无出口 → nullopt）
+}
+
 void build_blocks(u64 begin_rva, u64 end_rva, std::span<const LiftedItem> items,
                   std::vector<ir::BasicBlock>& out) {
     out.clear();

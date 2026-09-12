@@ -1005,6 +1005,10 @@ struct Translator {
     // op 形）。translate_function 按 fn.arch 派生，禁止逐点位再各持分叉。
     ir::Arch arch_ = ir::Arch::X64;
     u8 sz_step_ = isa::size_field(ir::Size::S64);
+    // MIT-500 (T54)：callgate 清理约定表（lifter 填充，fn.callgate_cleanup）。
+    // nullptr = 未提供（单测旧路径）→ 不合成 Add Rsp 词。walk 侧不经此指针
+    // （直接读 fn.callgate_cleanup）。
+    const std::vector<std::pair<u64, u32>>* callgate_cleanup_ = nullptr;
 
     bool skip(const ir::Insn& in, std::string_view what, const ir::MemOperand* rip) {
         if (rip && rip->base == ir::Reg::Rip)
@@ -2026,6 +2030,22 @@ struct Translator {
         // a_kind/b_kind/reg_a/reg_b 一律 None——CallGate 与 VM 操作数无关。
         em.emit(VmOp::CallGate, OpKind::None, 0, OpKind::None, 0,
                 static_cast<u32>(rva_i), 0);
+        // MIT-500 (T54)：已验证 stdcall callee → 合成 `Add Rsp, imm`——guest
+        // rsp 槽真实推进（callee `ret imm` 的弹栈语义），使守卫区用量与 walk
+        // 模型恒对齐（MIT-499a 设计定案④：仅 walk 记账不推进 rsp 槽会让多次
+        // stdcall callgate 的真实 push 深度持续增长而模型回卷 = 守卫预算
+        // 被绕过）。`ret imm` 本身不写 flags → mark_last_dead（MIT-494d 合成
+        // 栈调整同款）。imm == 0（cdecl）/未验证形不合成。
+        if (callgate_cleanup_ != nullptr && arch_ == ir::Arch::X86) {
+            for (const auto& entry : *callgate_cleanup_) {
+                if (entry.first == static_cast<u64>(rva_i) && entry.second > 0) {
+                    em.emit_ri(VmOp::Add, isa::vm_reg_of(ir::Reg::Rsp),
+                               entry.second, isa::size_field(ir::Size::S32));
+                    em.mark_last_dead();
+                    break;
+                }
+            }
+        }
         return true;
     }
 
@@ -3534,11 +3554,18 @@ struct StackWalkVerdict {
                 if (!defined) alias.erase(rd);
             }
             if (in.op == ir::Op::Call) {
-                // MIT-498 (T51)：callgate 隐式 cl 参数面 gate 撤销——寄存器
-                // 参数桥落地（asmgen build_callgate_x86 step 2.7：guest
-                // eax/ecx/edx → 物理；step 5.5 edx 写回），__aullshr 类
-                // 自定义约定 callee 经桥取参（mul64hi 翻面回 22/22，GAPS
-                // MIT-498）。gate 存续期 = MIT-497（2026-09-13 撤）。
+                // MIT-500 (T54)：已验证 stdcall callgate 的清理记账——native
+                // callee `ret imm` 无条件弹 imm 字节，d -= imm 与 caller push
+                // 意图无关（spill 形亦精确，native esp 收支逐位一致）。
+                // cdecl/未验证形不入表，模型维持 cdecl 保守现状。
+                if (in.dst.kind == ir::Operand::Kind::Imm) {
+                    const u64 t = static_cast<u64>(in.dst.imm);
+                    for (const auto& entry : fn.callgate_cleanup)
+                        if (entry.first == t) {
+                            d -= static_cast<i64>(entry.second);
+                            break;
+                        }
+                }
                 for (int r = 0; r < 32; ++r)
                     if (is_caller_saved(static_cast<ir::Reg>(r))) alias.erase(static_cast<ir::Reg>(r));
             }
@@ -3858,6 +3885,9 @@ TranslateResult translate_function(const ir::FunctionRegion& fn,
         isa::size_field(fn.arch == ir::Arch::X86 ? ir::Size::S32 : ir::Size::S64);
     // MIT-494c：映像基址 → translate_mov 绝对 VA 折条判定（0 = 未提供）。
     tr.image_base_ = image_base;
+    // MIT-500 (T54)：callgate 清理约定表接线（translate_call 合成 Add Rsp 词
+    // 消费；walk 直接读 fn.callgate_cleanup 不经此指针）。
+    tr.callgate_cleanup_ = &fn.callgate_cleanup;
     // MIT-494d/T27a：映像窗口边界（5 参版传入；0 = 未提供）。
     tr.image_extent_ = image_extent;
     // MIT-407: 把上界查询与区域端点写入 Translator, translate_jump 据此判定

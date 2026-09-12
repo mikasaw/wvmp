@@ -79,6 +79,19 @@ bool back_jump_reaches_region(CapstoneSession& session, std::span<const u8> imag
 bool exit_resync_verified(CapstoneSession& session, std::span<const u8> image,
                           const PeSectionMap& pe, u64 target_rva);
 
+// MIT-500 (T54): callee 清理约定扫描——callgate 目标的终态 `ret imm` 判定。
+// 从 target 起沿静态控制流边有界遍历（jcc → {target, fallthrough}、无条件
+// jmp Imm → target、其他 → fallthrough；**call/间接 jmp/解码失败 → 立即
+// 放弃**；visited 去重兜循环 + 总预算 256 节点），收集全部终态 `ret` 的
+// imm16：全部终态一致 → 返回该值（0 = cdecl 裸 ret；N>0 = stdcall 自清
+// N 字节）；存在任一歧义（终态冲突/遍历不完/越界）→ nullopt（fail-closed，
+// 调用方维持 cdecl 保守模型）。消费方 = translator 两处（walk 的 d 记账
+// 与 CallGate 后的合成 Add Rsp 词，见 region.hpp callgate_cleanup 注）。
+// 实证可扫形 = __allmul（ret 10h）/ __aullshr（dec cl; jnz 循环后裸 ret，
+// GAPS MIT-499a）。
+std::optional<u32> callee_ret_imm(CapstoneSession& session, std::span<const u8> image,
+                                  const PeSectionMap& pe, u64 target);
+
 // MIT-407: 越区跳转目标回跳检出回调（lifter_pass 构造，捕获 session/image/
 // pe_map；true = 目标可达集回跳本区 → 该函数禁用 ExitNative）。
 using ExitNativeGuardFn = std::function<bool(u64 target_rva)>;
