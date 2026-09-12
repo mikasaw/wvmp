@@ -3434,3 +3434,56 @@ div@99999 措辞更新（验收复验同哈希 3/3 byte-exact + MpCmdRun 无威�
 MovlpdStoreLiftsToScalarMov（Movss+S64 统一编码口径）。修复后终验：
 lifter 电池 162/162、ctest 23/23、x86 电池 46/46、wvmpTest 重打包 21
 stubs / 零探针噪声 / LOG IDENTICAL 105/105。
+
+## MIT-495（T48 · ASLR 探针 delta=0 抖动根因 + 探针加固，2026-09-12）
+
+**背景**：multiseed_aslr.sh cdb 基址探针三次单轮 delta=0 假绿签名（T30
+pushmem / T32 wvmp_x86_callgate seed=1 / T47 pushimm@12345，复跑即恢复），
+T32 防线 = 单次重试（sleep 1），T47 证明可连两次。本单 = 根因定位 + 重试
+策略加强。
+
+**受控实验（scripts/experiments/t48_pack_and_measure.sh +
+t48_stress_batch.sh，5 产物 × 200 次 + 施压 150 次，cdb 逐次启动读
+ModLoad 基址）**：
+- **空闲态 0/1000 delta=0**（x86 native 对照 / x86 packed pushimm@T47 同款
+  / callgate@T32 同款 / pushmem@T30 同款 / x64 packed rol）；
+- **18GB commit 压力（3×6GB 触摸式 hog）0/150**——内存压力假说未获复现
+  支持；
+- **基址"窗口内恒定"（T32 表述修正）**：批内 200/200 同基址；两批间隔
+  ~40min 同产物基址重掷（0x920000→0x460000）——非 per-boot 绝对恒定，
+  重掷事件级 trigger 未定位；
+- **偏置按文件身份键控**：同字节不同路径（fresh_a/fresh_b）同窗口内基址
+  不同（0x920000 vs 0x630000）；稳定路径逐次恒定、新建路径逐次随机化
+  （mktemp 8/8 全不同）；
+- **真实抖动事件本轮零捕获**——三例历史事件全部发生在全池跑批负载上下文
+  （打包连发 + Defender 逐产物扫描 + cdb 内存峰值组合），孤立条件（空闲/
+  受压/新路径/新鲜写入/packer 刚写出 + 毫秒级探测，共 21 项对照）均无法
+  复现 → 定性为**环境偶发通道**，按防线工程管理而非根因消除。
+
+**探针加固（multiseed_aslr.sh）**：
+- 退避重试 PROBE_ATTEMPTS=4（含首发，间隔 1/2/4s，env 可调）——覆盖 T47
+  连两次形态 + 倍余量；仅首启 delta=0 才进入重试；
+- 语义不变量保持：真 delta=0（loader 放弃重定位的映像级缺陷）跨次稳定，
+  重试不误放行；持续 delta=0 = 4 次全 delta=0 → FAIL 前记录内存水位
+  （未来事件归因线索）；
+- 抖动可见性：恢复事件计数 JITTER_EVENTS 进 TOTAL 行 + 单事件 NOTE +
+  PASS 标签 "probe ok (jitter xN)"；
+- 附带健壮性（当日实锤缺口）：① cdb 调用加 timeout 封装（CDB_TIMEOUT=30
+  ——当日实测 debuggee 不退出时 cdb 携 EOF-stdin 无限等待，探针挂死整池
+  且发现 3 个跨日残留 cdb 进程）；② 残留 cdb 进程预检 fail-closed；
+  ③ parse_modbase 抽取（原两份内联 python 重复块）+ ASLR_DEBUG_KEEP
+  诊断钩子（env 门控，正式口径零行为差异）。
+
+**返工记录（自检抓获）**：重写重试循环时丢失 T32 原门语义（仅首启
+delta=0 才重试），致无条件重试把正常产物全误标 jitter（全池 335/335
+幻影计数，每产物 "probe ok (jitter x1)"）——attempt2 的正常恢复被计为
+"抖动恢复"。修复 = 重试循环包回首启 delta=0 门内 + 返工注释。教训：
+计数器语义必须与门条件同处声明；修复后 smoke 5/5 jitter_events=0。
+
+**验证**：probe 单元四例（正常产物 rc=0 attempt=1 / NOASLR rc=3 /
+PROBE_ATTEMPTS=1 兼容口径 / 语法门）；smoke ONLY=x86_callgate REPEATS=1
+5/5 PASS jitter=0；全池 REPEATS=10 335/335 PASS（见池门运行注记）。
+
+**池门运行注记（2026-09-12，加固后终验）**：multiseed_aslr 全池
+REPEATS=10 = **335/335 PASS，jitter_events=0**——零真实抖动事件（对照
+返工前幻影 335/335），探针 happy path 零额外开销（无事件不进重试）。
