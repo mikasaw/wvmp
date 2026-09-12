@@ -3206,3 +3206,50 @@ FetchDecryptSemanticParity 旧种子集 {1,7,0xC0FFEE} 恰全非 eax → 全绿
 （该套件对 roll 状态空间覆盖 ~1% 量级）。修复后全门复验：双电池 46/46
 （新种子集）/57+2SKIP、ctest 23/23、x64 sha f8b0ebd6 恒等、crypt
 20/20、x86/x86mem 抽测 checksum 一致。
+
+## MIT-494u（T44 · 真实词流画像 + cond 链推广收口，2026-09-12）
+
+**背景**：T42① 留口"setcc/cmovcc/条件 ExitNative 链推广待真实词流测温"；
+解释器战役（T41-T43）的合成基准口径也需真实负载对照收尾。本单零生产代
+码：wvmpTest（x86 888KB / x64 919KB，MSVC 真实目标）双 arch × 双管道
+（6-pass 基础 / 8-pass +import_protect+tls_hook 全栈）用当前运行时
+（fcaac56）重打包 + 词流全量画像（仓库外 t44_wordprofile.py：.wvmp 全
+blob 从 +32 解码、无效词游程分界、全 opcode 直方图）。
+
+**回归刷新（T42/T43 新运行时的真实目标验证）**：native vs packed
+SUMMARY 对比 **4/4 × 103/103 全 PASS**（x64/x86 × base/stack，x64 14
+stub / x86 12 stub 与 T32 口径一致）——jcc cond 跳表 + lo 交接 + ecx 常
+驻在真实目标双管道语义无损。
+
+**真实词流画像**（wvmpTest 全 blob；x64 3345 词 / x86 2789 词）：
+- Top 族：Mov 30-34%、Add 12-25%、Load 13.7-16.2%、Store 7%、Sub（x86 栈
+  调整）16%、Jmp 3.7-4.3%、Jcc 0.9-1.0%；mem 族合计 21.6-23.8%
+- **Setcc = 0、Cmovcc = 0、GetFlags/SetFlags = 0（双 arch 一致）**；
+- ExitNative：x64 17 = 5 无条件 + **12 条件形**；x86 16 = 5 + **11 条件
+  形**——每条仅执行一次/全程（区域出口）。
+
+**cond 链推广定论：不推广**。① setcc/cmovcc 在真实翻译流中零出现；
+② 条件 ExitNative 全程 12/11 次 × ~15 条链指令 ≈ 180 条宿主指令/整个程
+序运行——跳表化收益四五个数量级低于其 128B/handler 静态成本与回归面。
+T42① 的"冷面不推广"判断被数据闭合。附带佐证：GetFlags=0 = MIT-474
+flags-dead 消除在真实代码上完全生效；mem 族占比 ~22-24% 印证 T41 "真实
+负载位于每词成本曲线便宜端"（C 自然 1.33ns 形态）。
+
+**真实负载计时**（wvmpTest x64 全 103 kernel；受控方法学 = python
+perf_counter 单进程包裹 subprocess、捕获输出、native/base/stack 交错 7
+轮取中位）：native **42.5ms** vs packed base **73.9ms（1.74×）** / stack
+**73.0ms（1.72×）**——含进程固定开销；合成口径 16-61x 为虚拟化区域内部
+峰值，真实程序墙钟代价 ≈ +72%。⚠️ 方法学注记（验收 SF-1）：首版
+115.7/137.3ms（1.19×/1.18×）把外层进程启动开销计入计时窗口（bash 双
+python -c 差分，每窗多 ~45ms 固定量），系统性**低估**比值且不可复现，
+已作废；更正后与验收独立实测（46.5/77.3ms，1.66×）同量级。这组数字给
+解释器战役补上真实负载成绩单：优化（T42/T43 −10~14%/词）在真实墙钟上
+的弹性以此为上界参照。
+
+**边界披露**：单目标画像（wvmpTest 为唯一大体量真实翻译流来源；
+real_world 池 7z 缺装、tasklist/cmd 为 passthrough 无词流）；画像工具
+对 blob 尾部预留区按无效游程分界（尾部 8.6KB/33KB 为预留区非词流）；
+管道未含 mutate/crypt 变体（词流分布与 base 同源，junk 词注入面不改变
+opcode 频率结构）；x86 打包日志 17 条 exit-native 记录 vs 词流 16 词 =
+1 条位点因"间接 jmp 未支持"整区 passthrough 不发词（pack 日志可查，
+词流口径为准）。

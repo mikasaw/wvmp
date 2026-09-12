@@ -1187,3 +1187,14 @@ asmgen 零触碰 → dump 锚不受影响（无换代）。
   tls 4/4、7 点 checksum 一致；multiseed_aslr 334/335 + 1 环境项
   （div@seed99999 打包哈希被 Defender Contebrew.A!ml 拦截，T38 先例定
   诊，同样本 4 seed 哈希全过 = 非语义回归）。证据链 GAPS MIT-494t。
+
+### MIT-494u (T44 · 真实词流画像 + cond 链推广收口) ✅ 2026-09-12
+- 零生产代码：wvmpTest 双 arch × 双管道（6-pass/8-pass 全栈）当前运行时
+  重打包，**回归刷新 4/4 × 103/103 全 PASS**（x64 14 stub / x86 12 stub）
+  ——T42/T43 新运行时真实目标语义无损。词流全量画像（t44_wordprofile
+  .py）：**Setcc/Cmovcc/GetFlags/SetFlags 真实占比 = 0**；条件 ExitNative
+  12/11 条 × 1 次执行/全程 → **cond 链推广定论不推广**（收益 ≈180 条指
+  令/全程，低于 128B/handler 成本四五个数量级）。真实负载墙钟（受控方
+  法学，验收 SF-1 更正）：native 42.5ms vs packed 73.9/73.0ms =
+  **1.74×/1.72×**（首版 1.19× 系进程启动开销计入窗口的低估，已作废）。
+  解释器优化战役（T41-T44）至此收口。证据链 GAPS MIT-494u。
