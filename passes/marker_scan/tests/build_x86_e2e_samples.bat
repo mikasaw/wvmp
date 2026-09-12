@@ -163,6 +163,19 @@ cl /nologo /utf-8 /O1 /MD /c "%~dp0x86_hotloop_main.c" || goto :fail
 link /nologo /SUBSYSTEM:CONSOLE /MACHINE:X86 x86_hotloop_main.obj x86_hotloop_sample.obj /OUT:"%~1\wvmp_x86_hotloop_sample.exe" || goto :fail
 .\wvmp_x86_hotloop_sample.exe || goto :fail
 
+rem ---- MIT-494r (T41): word-mix matrix microbenchmarks (LD/ST-dense +
+rem branch/flags-dense; x64 hotloop_mem/br_sample.asm counterparts).
+rem Measured by scripts/measure_hotloop.sh ARCH=x86mem / x86br; NOT in the
+rem byte-exact pools (ms line).
+ml /nologo /c /Coff "%~dp0x86_hotloop_mem_sample.asm" || goto :fail
+cl /nologo /utf-8 /O1 /MD /c "%~dp0x86_hotloop_mem_main.c" || goto :fail
+link /nologo /SUBSYSTEM:CONSOLE /MACHINE:X86 x86_hotloop_mem_main.obj x86_hotloop_mem_sample.obj /OUT:"%~1\wvmp_x86_hotloop_mem_sample.exe" || goto :fail
+.\wvmp_x86_hotloop_mem_sample.exe || goto :fail
+ml /nologo /c /Coff "%~dp0x86_hotloop_br_sample.asm" || goto :fail
+cl /nologo /utf-8 /O1 /MD /c "%~dp0x86_hotloop_br_main.c" || goto :fail
+link /nologo /SUBSYSTEM:CONSOLE /MACHINE:X86 x86_hotloop_br_main.obj x86_hotloop_br_sample.obj /OUT:"%~1\wvmp_x86_hotloop_br_sample.exe" || goto :fail
+.\wvmp_x86_hotloop_br_sample.exe || goto :fail
+
 popd
 exit /b 0
 :fail

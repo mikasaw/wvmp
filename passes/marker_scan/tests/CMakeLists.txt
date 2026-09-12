@@ -313,6 +313,37 @@ target_link_options(wvmp_hotloop_sample PRIVATE
     $<$<CXX_COMPILER_ID:MSVC>:/INCREMENTAL:NO>
 )
 
+# MIT-494r (T41): 词形态矩阵微基准——LD/ST 密度（hotloop_mem_sample，3
+# load + 3 store/迭代常驻缓冲）与分支/标志密度（hotloop_br_sample，内层
+# jnz 旋 + 外层 jb，4 条件词/迭代）。与 hotloop_asm_sample（纯 ALU）构成
+# 三形态对照，定位 x86 dispatch 慢词族（GAPS MIT-494r）。stdout 含计时
+# 行，不进 byte-exact 池（measure_hotloop.sh ARCH=x64mem / x64br）。
+add_executable(wvmp_hotloop_mem_sample
+    hotloop_mem_main.cpp
+    hotloop_mem_sample.asm
+)
+target_link_libraries(wvmp_hotloop_mem_sample PRIVATE wvmp::sdk)
+target_compile_options(wvmp_hotloop_mem_sample PRIVATE
+    $<$<CXX_COMPILER_ID:MSVC>:/Od;/Ob0;/utf-8>
+    $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-O0>
+)
+target_link_options(wvmp_hotloop_mem_sample PRIVATE
+    $<$<CXX_COMPILER_ID:MSVC>:/INCREMENTAL:NO>
+)
+
+add_executable(wvmp_hotloop_br_sample
+    hotloop_br_main.cpp
+    hotloop_br_sample.asm
+)
+target_link_libraries(wvmp_hotloop_br_sample PRIVATE wvmp::sdk)
+target_compile_options(wvmp_hotloop_br_sample PRIVATE
+    $<$<CXX_COMPILER_ID:MSVC>:/Od;/Ob0;/utf-8>
+    $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-O0>
+)
+target_link_options(wvmp_hotloop_br_sample PRIVATE
+    $<$<CXX_COMPILER_ID:MSVC>:/INCREMENTAL:NO>
+)
+
 # MIT-301: 端到端正路径样本——区域内含 cl 变体 shift (D3 /5: shl/shr/sar/
 # rol/ror), 验证 cl 变体 shift 修复后翻译成功、运行时走真 ShlCl/ShrCl/
 # SarCl/RolCl/RorCl handler、行为与原生逐字节一致。用 volatile uint8_t

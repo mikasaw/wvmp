@@ -28,8 +28,15 @@ elif [[ "$arch" == "x64" ]]; then
 elif [[ "$arch" == "x64asm" ]]; then
     # T40 同词密度对照：x64 asm 区域（与 x86 asm 样本逐词同形）
     sample="build/passes/marker_scan/tests/wvmp_hotloop_asm_sample.exe"
+elif [[ "$arch" == "x64mem" || "$arch" == "x64br" || "$arch" == "x86mem" || "$arch" == "x86br" ]]; then
+    # T41 词形态矩阵：LD/ST 密度（*mem）与分支/标志密度（*br）
+    if [[ "$arch" == x64* ]]; then
+        sample="build/passes/marker_scan/tests/wvmp_hotloop_${arch#x64}_sample.exe"
+    else
+        sample="build/x86_samples/wvmp_x86_hotloop_${arch#x86}_sample.exe"
+    fi
 else
-    echo "[hotloop] 未知 ARCH='$arch'（仅支持 x64/x86）" >&2
+    echo "[hotloop] 未知 ARCH='$arch'（支持 x64/x86/x64asm/x64mem/x64br/x86mem/x86br）" >&2
     exit 2
 fi
 repeats="${1:-5}"
