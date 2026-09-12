@@ -3805,3 +3805,26 @@ CPU 0.1s 计算完成后进程不退出 20+ 分钟，前台直跑同程序 0.075
 **登记**：bridge 开销 = 每 callgate 词流 +4 词（step 2.6 条件转存 + 2.7
 三桥入）+ 每已验证 stdcall callgate +1 合成 Add 词——callgate 位点级，
 热循环/全量墙钟均无病理回归。
+
+## MIT-502（T56 · 2GB ImageBase 非 MSVC 工具链面可达性评估——T37④ 实证关闭，2026-09-13）
+
+**任务**：T37 验收注记④"ImageBase ≥ 2GB 的非 MSVC 工具链面"可达性评估。
+
+**实验（手工构造 LAA 高基址 x86 镜像）**：取 wvmp_x86_pushimm_sample.exe
+（MSVC x86，有 reloc 目录 + DYNAMIC_BASE）→ PE 头补丁 ImageBase
+0x400000 → 0xA0000000 + 置 LARGEADDRESSAWARE(0x20)：
+- **加载器行为**：优先基址 ≥2GB **被忽略**——镜像被 ASLR 重定位至
+  0x09d00000（2GB 线下自有槽位，cdb ModLoad 实证）；
+- **运行结果**：确定性 segfault（3/3），AV 现场 = `mov eax, ds:[0x103040]`
+  ——**未修复的旧基址绝对引用**（moved-but-unfixed 不一致态：loader 搬移
+  镜像但放弃重定位处理，与 MIT-494a 的"放弃重定位 → delta=0 自洽加载"
+  不同，此形态为搬移+不修 = 必然崩溃）；
+- **解读**：手工构造的 ≥2GB ImageBase x86 镜像在本 OS（WOW64 + LAA）上
+  **无可执行形态**——非 MSVC 工具链即便产出此类 PE，Windows loader 也
+  不给其 runnable 通路。T37 折叠口径修复（capstone 解码层）已是该维度的
+  完备防御；运行时层不可达。
+
+**结论**：T37④ 关闭——"非 MSVC/手工构造高基址输入"无现网可达形态
+（loader 层双重拒绝：基址忽略 + 重定位放弃），防御深度定位维持，无后续
+工程项。本实验为破坏性输入诊断（非产品路径），T37 单测族（0x80000000
+折叠断言等）保持有效。
