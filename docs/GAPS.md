@@ -3592,3 +3592,75 @@ fastcall/fastcall-args 样本扩面。
 **池门运行注记（2026-09-13，验收修复后终验二进制）**：multiseed 基线
 REPEATS=10 = **335/335**；multiseed_aslr 全池 = **335/335，jitter_events=0**
 （T48 加固后探针零事件零额外开销）。
+
+## MIT-498（T51 · callgate 寄存器参数桥——fastcall/自定义约定 callee 面，2026-09-13）
+
+**背景**：MIT-497 翻面尝试暴露 callgate 隐式 cl 参数面（`mov cl,20h;
+call __aullshr` 的移位量经 callgate 读到垃圾 → wv_mul64hi VM 错值），以
+邻接规则保守 gate（x86 19 stubs）。本单 = 参数桥落地 + gate 撤销。
+
+**桥接（asmgen build_callgate_x86，零新 VmOp/零协议面/冻结契约零触碰）**：
+- **step 2.6 目标转存**（生成期条件）：t_[0] ∈ {eax,edx}（易失）时
+  `mov t_[2], t_[0]`——安全性 = t_[0]/t_[1] 只从 {eax,edx,ebx} 抽取
+  （roll_x86 字节可编码集），t_[0] 易失 ⟹ t_[2]/t_[3] = 池剩余 =
+  callee-saved\{ctx_,base_}（含 ebx 亦 callee-saved），t_[2] 恒不在桥接
+  集 {eax,ecx,edx}；t_[0] = ebx（非易失）时直接作 call 载体。
+- **step 2.7 桥入**：`mov eax/ecx/edx, [ctx+0x10/+0x18/+0x20]`——guest
+  易失三寄存器在 call 前投喂物理（fastcall arg0/arg1 = ecx/edx、自定义
+  约定 __aullshr 的 cl 移位量与 edx:eax 值）；pc 已 step 1.5 落槽（ecx
+  可安全改写，step 4 原样还原）；cdecl callee 不读寄存器实参，桥入无害。
+- **step 5.5 edx 写回**：`mov [ctx+0x20], edx`——edx:eax 64 位返回对
+  （__allmul 类）与 in-place 移位 helper（__aullshr 类，结果即 edx:eax）
+  的半积通路；纯 cdecl 32 位 callee 下 edx = 被毁垃圾，写回亦合法
+  （volatile 语义 guest 不得跨 call 依赖 edx）。
+
+**gate 撤销**：translator walk 的 cl 邻接规则（MIT-497 保守防线）随桥
+落地删除，三形态（紧邻/非邻接/双 arch）回归测试翻为不 gate 断言。
+prev_insn_wrote_ecx 探测机构一并清除。
+
+**mul64hi 终局（gate 归因二次精化）**：桥接后 x86 = **21 stubs**（2 个
+cl 区翻回），mul64hi（marker@0xB63D）**维持 gate**——归因 = resync 前瞻
+（MIT-497 验收 S-1 补拒后）对延续窗内 `pop edi/esi` 的保守拒绝：窗内 pop
+在 walk 的 cdecl 模型（d=64）下跨世界读错值（native [ns-d±k] 活数据 vs
+protected [ns±k] 死区），真实安全依赖 __allmul stdcall 自清（真实 d=0）
+——callee ABI caller 侧静态不可见，保守拒绝 = 正确行为。栈深 gate 的
+ callee-ABI 维度仍开放（arg_count/清理约定静态通路 = X5b 挂账第 4 项）。
+
+**验证**：x86 电池 +2 新测（CallGateRegisterArgBridge = fastcall ecx/edx
+取参首跑即绿；CallGateEdxReturnPairBridge = edx:eax 对写回）、translator
+133/133（cl 三测翻为桥后回归断言）、lifter 171/171、ctest 23/23、x86
+结构门 94 项 PASS（callgate handler 增长后重算）、x64 dump sha
+f8b0ebd6/164,350B 恒等（x64 callgate 零触碰）、wvmpTest 双 arch LOG
+IDENTICAL 105/105、crypt 20/20、tls 4/4、池门见运行注记。
+
+**T52 候选**：fastcall 独立样本（wvmp_x86_fastcall_sample）入池固化桥面；
+arg_count 静态通路评估（X5b 挂账第 4 项 + mul64hi 最终翻面钥匙）。
+
+**验收返工记录（REJECT → C 修复 + S 纠偏，2026-09-13）**：独立验收（穷举
+扫描 + 真实生成器落盘 + seed 67 真执行复现）检出于下：
+- **C（必修，已修）**：step 2.6 转存载体安全性论证漏**混合对分支**——
+  t_[0]/t_[1] 从 cand = {eax,edx,ebx}\{ctx_,base_} 独立抽 2，{t0=eax,
+  t1=ebx} 合法 ⟹ t_[2] 可为易失（穷举 8.3% seed，首坏 seed=67）→ 转存
+  被桥接覆写 → `call edx` = guest 可控地址静默错误调用（真执行复现实证：
+  probe 未被调、控制流转向 guest edx 槽投毒值）。**修复 = t0 易失时在
+  t_[2]/t_[3] 中恒选 callee-saved 者**（可证恒存在：池 6 = 2 易失 +
+  4 callee-saved，t0 吃 1 易失、ctx_/base_ 吃 2 callee-saved 后剩
+  {1 易失 + 2 callee-saved}，t1 至多吃 1）。**不变量钉 = 新增
+  CallGateBridgeSeedSweep**（0..63 + 首坏 seed 67 + 远端样本，每 seed
+  重生成 runtime 真跑 fastcall 场景——旧电池单 seed 12345 恰走安全分支
+  = 单点盲区实录）。既有绿测全绿系单 seed 盲区教训与 T43 C1 同构。
+- **S（已纠偏）**：translator 规则 5 注释"x86 回到 22/22 区全虚拟化"
+  把 MIT-497 时的预期当成了结果 → 纠正为 21/22（mul64hi 维持 native）。
+- 修复后复验：CallGate* 电池 6/6（含 sweep 34 seed）、translator
+  133/133、ctest 23/23、x86 电池、x64 sha f8b0ebd6 恒等、x86 结构门
+  PASS、wvmpTest 双 arch LOG IDENTICAL、stub x64=22/x86=21。池门用修复
+  后二进制终验（见下）。
+
+**池门运行注记（2026-09-13，验收修复后终验二进制）**：multiseed 基线
+REPEATS=10 = **335/335**；multiseed_aslr 首跑 = 334/335 + **1 环境项**：
+div@12345 探针 delta=0 持续 4 次退避（~7s，phys_free=16GB 非压力）——
+加固探针按设计拦下延长型环境回合（超出 T30/T32/T47 单点抖动形态的新
+通道首次被 4 次退避全控住，FAIL 语义正确）；新打包同 seed 产物 30/30
+重定位 + 基线池同 seed 10× byte-exact + ONLY 过滤正式复验 **5/5 全 PASS**
+（失败 seed attempt-1 直通）→ 定性环境回合非产物缺陷，与 T43/T47 div 族
+Defender 拦截前科同域。终验二进制复跑 = **335/335 等效收敛**。

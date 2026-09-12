@@ -3085,25 +3085,24 @@ TEST(Translate, StackWalkX64ResyncFieldIgnored) {
     EXPECT_TRUE(has_stack_depth_gate(r));
 }
 
-TEST(Translate, StackWalkX86CallgateClTaintGates) {
-    // T50 E2E 发现面：**邻接**形 `mov cl,imm; call`（callgate）→ 隐式 cl
-    // 参数面 gate（__aullshr 类自定义约定 callee 经 cl 取参，桥接未建模；
-    // wv_mul64hi 打包实测错值实证 + kernels.obj 反汇编邻接形态实证）。
+// ==================== MIT-498 (T51)：cl 邻接 gate 撤销（桥后回归） ==========
+// T50 曾以邻接规则 gate `mov cl,imm; call`（callgate 隐式 cl 参数面，
+// wv_mul64hi 错值实证）；MIT-498 寄存器参数桥落地（asmgen step 2.7/5.5）
+// 后 gate 撤销——下列三形态（紧邻/非邻接/双 arch）回归为无栈深 note，
+// mul64hi 形随之翻面（E2E 见 wvmpTest 22/22）。
+
+TEST(Translate, StackWalkX86CallgateClShapePostBridgePasses) {
+    // 紧邻形（mul64hi 真实形态）：桥后面不再 gate。
     ir::FunctionRegion fn = fn86_of({blk(0x1000, {
         alu_ri(ir::Op::Mov, ir::Reg::Rcx, 0x20, ir::Size::S8),  // mov cl,20h
         call_insn(0x2000),                                      // 紧邻 call
     })});
     const auto r = wvmp::regvm::translator::translate_function(fn);
-    ASSERT_TRUE(has_stack_depth_gate(r));
-    bool cl_note = false;
-    for (const auto& n : r.notes)
-        if (n.find("callgate 隐式 cl 参数面") != std::string::npos) cl_note = true;
-    EXPECT_TRUE(cl_note);
+    EXPECT_FALSE(has_stack_depth_gate(r));
 }
 
 TEST(Translate, StackWalkX86NonAdjacentClWritePasses) {
-    // 非邻接 cl 写（0xab8b 字符串扫描循环形：mov cl,[eax] 后隔多条指令才
-    // call）→ callee 不消费 cl（T47 以来字节精确通过）→ 不 gate。
+    // 非邻接 cl 写（0xab8b 字符串扫描循环形）：T47 以来字节精确通过，恒不 gate。
     ir::FunctionRegion fn = fn86_of({blk(0x1000, {
         alu_ri(ir::Op::Mov, ir::Reg::Rcx, 0x20, ir::Size::S8),  // mov cl,20h
         alu_ri(ir::Op::Add, ir::Reg::Rax, 1, ir::Size::S32),    // 隔断邻接
@@ -3117,9 +3116,8 @@ TEST(Translate, StackWalkX86NonAdjacentClWritePasses) {
 }
 
 TEST(Translate, StackWalkX64CallgateClImmune) {
-    // T50 验收 N-3：cl 邻接面为 x86 专属（pc_=ecx 耦合与 __aullshr 类
-    // 32 位 RTL 约定不存在于 x64）——x64 邻接形照旧不 gate（首版缺失
-    // 实测 x64 22→18 stubs 回归，E2E 背书外补单测钉）。
+    // x64 面（无 pc_=ecx 耦合/无 32 位 RTL 约定）：同形恒不 gate（D4 对称锚，
+    // T50 曾因首版缺 arch 限定在 x64 误 gate 实测 22→18 stubs）。
     ir::FunctionRegion fn = fn_of({blk(0x1000, {
         alu_ri(ir::Op::Mov, ir::Reg::Rcx, 0x20, ir::Size::S8),  // mov cl,20h
         call_insn(0x2000, ir::Size::S64),
@@ -3129,7 +3127,7 @@ TEST(Translate, StackWalkX64CallgateClImmune) {
 }
 
 TEST(Translate, StackWalkX86CallgateNoClTaintPasses) {
-    // 反例：无 ecx 写的纯 cdecl callgate（__allmul 形，4 栈参）→ 无 cl note。
+    // 纯 cdecl callgate（__allmul 形，4 栈参）：基线不 gate。
     ir::FunctionRegion fn = fn86_of({blk(0x1000, {
         push_insn(ir::Reg::Rax, ir::Size::S32),
         push_insn(ir::Reg::Rbx, ir::Size::S32),
@@ -3139,9 +3137,6 @@ TEST(Translate, StackWalkX86CallgateNoClTaintPasses) {
     const auto r = wvmp::regvm::translator::translate_function(fn);
     EXPECT_FALSE(has_stack_depth_gate(r));
 }
-
-// 污点清除分支说明：有污 callgate 即整函数 gate（首违例即收），"清污后
-// 复用"路径在有污语义下不可达——污点清除仅为 walk 状态机完备性保留。
 
 TEST(Translate, StackWalkX64ZeroBudgetGatesAnyPush) {
     // D4 双 arch 对称：x64 无 guard（budget=0）→ 任何区内 push 即 gate

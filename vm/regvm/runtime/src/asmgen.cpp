@@ -5440,9 +5440,16 @@ public:
     //      flags 内存常驻，native callee 不识 ctx 无需 save/restore。
     //      base_/ctx_ 恒 callee-saved（roll_x86
     //      约束）跨 call 存活；esp 经 host_rsp 重基（step 4）。
-    //   4) 返回值：eax → regs[0] 低 dword（槽高半字清零不变量维持）。guest
-    //      flags 天然存活（内存常驻，native call 不触 ctx）。x87/MMX callee
-    //      副作用不建模（x86 面 D1 恒 gate，无 SSE/x87 handler）。
+    //   4) 返回值：eax → regs[0] 低 dword（槽高半字清零不变量维持）。MIT-498
+    //      (T51) 寄存器参数桥：call 前 guest eax/ecx/edx（ctx 槽 +0x10/
+    //      +0x18/+0x20）→ 物理寄存器（fastcall/自定义约定 callee 参数面——
+    //      __aullshr 类 RTL helper 经 ecx 取移位量此前读垃圾 = wv_mul64hi
+    //      E2E 错值根因）；call 后 edx → +0x20 写回（edx:eax 64 位返回对 +
+    //      in-place 移位 helper 半积；cdecl volatile 下写垃圾值亦合法）。
+    //      call 目标载体易失（t_[0] ∈ {eax,edx}）时先转存 t_[2]（此时恒
+    //      callee-saved，论证见 step 2.6 注）。guest flags 天然存活（内存
+    //      常驻，native call 不触 ctx）。x87/MMX callee 副作用不建模（x86
+    //      面 D1 恒 gate，无 SSE/x87 handler）。
     //   5) rsp 纪律：call 前切 esp 到窗口、call 后重读 host_rsp，handler
     //      出口 esp 恢复原值——"x86 执行帧 esp 跨指令稳定"既有不变量不受扰
     //      （执行帧槽在窗口上方，callee 栈活动只向下生长，零重叠）。
@@ -5487,14 +5494,51 @@ public:
             o += std::string("    push dword ptr [") + r32x(t_[1]) + " + " +
                  imm(i * 4) + "]\n";
         }
+        // step 2.6 (MIT-498 T51)：目标 VA 转存 callee-saved 载体（仅 t_[0]
+        // ∈ {eax,edx} 易失时）——step 2.7 桥接覆盖物理 eax/edx，t_[0]
+        //（call 目标）可能正是其一。
+        // 载体选择（T51 验收 C 修复）：t_[0]/t_[1] 从 cand =
+        // {eax,edx,ebx}\{ctx_,base_} **独立**抽 2，{t0=eax, t1=ebx} 混合对
+        // 为合法抽取（首版"t_[2] 恒 callee-saved"论证漏此分支——验收穷举
+        // 8.3% seed 落坏配置，seed 67 真执行复现 = 转存被桥接覆写 →
+        // call guest edx 槽值，静默劫持面）。修复 = t0 易失时在
+        // t_[2]/t_[3] 中**恒选 callee-saved 者**：池 6 = 2 易失(eax/edx)
+        // + 4 callee-saved；t0 吃 1 易失、ctx_/base_ 吃 2 callee-saved 后
+        // 剩 {1 易失 + 2 callee-saved}，t1 至多吃走 1 个 ⟹ t_[2]/t_[3]
+        // **至少一个 callee-saved**，选择恒命中。t_[0] 非 易失（=ebx，
+        // callee-saved）时直接作 call 载体（桥接不触及）。
+        const bool t0_volatile = (t_[0] == 0 || t_[0] == 1);
+        int call_carrier = t_[0];
+        if (t0_volatile) {
+            const bool t2_saved =
+                std::find(std::begin(kX86CalleeSaved), std::end(kX86CalleeSaved),
+                          t_[2]) != std::end(kX86CalleeSaved);
+            call_carrier = t2_saved ? t_[2] : t_[3];
+            o += std::string("    mov ") + r32x(call_carrier) + ", " +
+                 r32x(t_[0]) + "\n";
+        }
+        // step 2.7 (MIT-498 T51)：guest 易失寄存器 → 物理——fastcall/自定义
+        // 约定 callee 参数面（__aullshr 类 RTL helper 经 ecx 取移位量、
+        // edx:eax 取值，此前读到的是垃圾 = wv_mul64hi E2E 错值根因，GAPS
+        // MIT-497）。pc 已 step 1.5 落槽（physical ecx 可安全改写）；此时
+        // eax/edx 上唯一活值 = call 载体（易失形已转存 callee-saved）。
+        // cdecl callee 不读寄存器实参 → 桥入值被忽略，无害。
+        o += std::string("    mov eax, dword ptr [") + r32x(ctx_) + " + 0x10]\n";
+        o += std::string("    mov ecx, dword ptr [") + r32x(ctx_) + " + 0x18]\n";
+        o += std::string("    mov edx, dword ptr [") + r32x(ctx_) + " + 0x20]\n";
         // step 3: call native（cdecl 参数窗已预置；esp 由 step 4 host_rsp 重基回收）
-        o += std::string("    call ") + r32x(t_[0]) + "\n";
+        o += std::string("    call ") + r32x(call_carrier) + "\n";
         // step 4: esp 重基（host_rsp 单一来源，跨 call 稳定）
         o += std::string("    mov esp, dword ptr [") + r32x(ctx_) + " + 0x128]\n";
         // pc 还原（MIT-494t②；step 1.5 的同步配对）。
         o += std::string("    mov ecx, dword ptr [") + r32x(ctx_) + " + 0x8]\n";
         // step 5: 返回值写回 regs[0] 低 dword（槽高半字 0 不变量维持）
         o += std::string("    mov dword ptr [") + r32x(ctx_) + " + 0x10], eax\n";
+        // step 5.5 (MIT-498 T51)：edx 写回——edx:eax 64 位返回对（__allmul
+        // 类）与 in-place 移位 helper（__aullshr 类，结果 edx:eax）的半积
+        // 通路；纯 cdecl 32 位 callee 下 edx = caller-saved 被毁垃圾，写回
+        // 同样合法（volatile 语义 guest 不得跨 call 依赖 edx）。
+        o += std::string("    mov dword ptr [") + r32x(ctx_) + " + 0x20], edx\n";
         o += advance_x86(dispatch);
         return o;
     }

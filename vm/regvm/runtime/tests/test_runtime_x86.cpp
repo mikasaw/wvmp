@@ -2762,6 +2762,108 @@ TEST(X86Battery, CallGateRegFormComputedTarget) {
 }
 
 // ---------------------------------------------------------------------------
+// (31.5) MIT-498 (T51)：寄存器参数桥。fastcall callee 经 ecx/edx 取参——
+//       guest 槽 → 桥入物理（step 2.7）→ callee 读参 → eax（+ edx:eax 64
+//       位返回对）写回（step 5/5.5）。此前物理 ecx/edx = 垃圾（wv_mul64hi
+//       E2E 错值根因，GAPS MIT-497/498）。
+static u32 __fastcall xcg_fast(u32 a, u32 b) {
+    ++g_xcg_calls;
+    return (a << 16) | (b & 0xFFFFu);
+}
+static u64 __fastcall xcg_pair(u32 a, u32 b) {
+    ++g_xcg_calls;
+    return (static_cast<u64>(a) << 32) | b;
+}
+
+TEST(X86Battery, CallGateRegisterArgBridge) {
+    wvmp::Rng rng(12345);
+    const auto gen = rt::generate_runtime_x86(rng);
+    RwxImage rwx(gen.image.code);
+    constexpr u64 kFakeBase = 0x400000;
+    const u32 fn_rva = static_cast<u32>(reinterpret_cast<uintptr_t>(&xcg_fast)) -
+                       static_cast<u32>(kFakeBase);
+    std::vector<u8> s;
+    isa::append_insn(s, callgate_rva(fn_rva));                           // 0
+    isa::append_insn(s, halt());                                         // 1
+    rt::VmContext ctx;
+    ctx.bytecode = s.data();
+    ctx.pc = 0;
+    ctx.scratch_mem = kFakeBase;
+    ctx.regs[isa::vm_reg_of(ir::Reg::Rsp)] =
+        reinterpret_cast<u64>(g_xcg_stack + 0x20);
+    ctx.regs[isa::vm_reg_of(ir::Reg::Rcx)] = 0x1234;   // fastcall arg0 (ecx)
+    ctx.regs[isa::vm_reg_of(ir::Reg::Rdx)] = 0x5678;   // fastcall arg1 (edx)
+    g_xcg_calls = 0;
+    rwx.entry()(&ctx);
+    EXPECT_EQ(g_xcg_calls, 1u);            // 真调用
+    expect_slot32(ctx, 0, (0x1234u << 16) | 0x5678u);  // callee 收到桥入值
+    EXPECT_EQ(ctx.pc, 2u);
+}
+
+TEST(X86Battery, CallGateEdxReturnPairBridge) {
+    // edx:eax 64 位返回对（step 5.5 写回；__allmul/移位 helper 半积通路）。
+    wvmp::Rng rng(12345);
+    const auto gen = rt::generate_runtime_x86(rng);
+    RwxImage rwx(gen.image.code);
+    constexpr u64 kFakeBase = 0x400000;
+    const u32 fn_rva = static_cast<u32>(reinterpret_cast<uintptr_t>(&xcg_pair)) -
+                       static_cast<u32>(kFakeBase);
+    std::vector<u8> s;
+    isa::append_insn(s, callgate_rva(fn_rva));                           // 0
+    isa::append_insn(s, halt());                                         // 1
+    rt::VmContext ctx;
+    ctx.bytecode = s.data();
+    ctx.pc = 0;
+    ctx.scratch_mem = kFakeBase;
+    ctx.regs[isa::vm_reg_of(ir::Reg::Rsp)] =
+        reinterpret_cast<u64>(g_xcg_stack + 0x20);
+    ctx.regs[isa::vm_reg_of(ir::Reg::Rcx)] = 0xDEAD;   // fastcall arg0
+    ctx.regs[isa::vm_reg_of(ir::Reg::Rdx)] = 0xBEEF;   // fastcall arg1
+    g_xcg_calls = 0;
+    rwx.entry()(&ctx);
+    EXPECT_EQ(g_xcg_calls, 1u);
+    expect_slot32(ctx, 0, 0xBEEFu);        // regs[0] = 返回低 dword (eax)
+    expect_slot32(ctx, 2, 0xDEADu);        // regs[2] = 返回高 dword (edx, step 5.5)
+    EXPECT_EQ(ctx.pc, 2u);
+}
+
+TEST(X86Battery, CallGateBridgeSeedSweep) {
+    // T51 验收 C 修复钉：call 载体选择对 roll 随机性的不变量——{t0=eax,
+    // t1=ebx} 混合对分支使 t_[2] 可为易失（首版转存被桥接覆写 → call
+    // guest edx 槽值，seed 67 真执行复现）。扫 0..63 + 首个坏 seed 67 +
+    // 远端样本：每 seed 重生成 runtime 后跑 fastcall 场景，callee 被调
+    // 且返回值正确 = 载体选择跨 roll 正确。
+    constexpr u64 kFakeBase = 0x400000;
+    const u32 fn_rva = static_cast<u32>(reinterpret_cast<uintptr_t>(&xcg_fast)) -
+                       static_cast<u32>(kFakeBase);
+    const u64 seeds[] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+                         16, 20, 24, 28, 32, 36, 40, 44, 48, 52, 56, 60, 63,
+                         67, 128, 999, 0xDEADBEEF, 0xCAFEBABE};
+    for (const u64 seed : seeds) {
+        wvmp::Rng rng(seed);
+        const auto gen = rt::generate_runtime_x86(rng);
+        RwxImage rwx(gen.image.code);
+        std::vector<u8> s;
+        isa::append_insn(s, callgate_rva(fn_rva));
+        isa::append_insn(s, halt());
+        rt::VmContext ctx;
+        ctx.bytecode = s.data();
+        ctx.pc = 0;
+        ctx.scratch_mem = kFakeBase;
+        ctx.regs[isa::vm_reg_of(ir::Reg::Rsp)] =
+            reinterpret_cast<u64>(g_xcg_stack + 0x20);
+        ctx.regs[isa::vm_reg_of(ir::Reg::Rcx)] = 0x1234;
+        ctx.regs[isa::vm_reg_of(ir::Reg::Rdx)] = 0x5678;
+        g_xcg_calls = 0;
+        rwx.entry()(&ctx);
+        EXPECT_EQ(g_xcg_calls, 1u) << "seed=" << seed << " callee 未被调用";
+        EXPECT_EQ(ctx.regs[isa::vm_reg_of(ir::Reg::Rax)],
+                  static_cast<u64>((0x1234u << 16) | 0x5678u))
+            << "seed=" << seed << " 桥入返回值错";
+    }
+}
+
+// ---------------------------------------------------------------------------
 // (32) X3c B.2：ExitNative 无条件直退 + 4B 退出槽协议（真执行断言）。
 //      槽地址 = native_sp - kX86ExitSlotDepth（X4 stub_gen 读侧对接
 //      锚）；槽内容 = aux + image_base（目标 VA dword）。epilogue（帧回收 +

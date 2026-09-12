@@ -3355,11 +3355,12 @@ struct Translator {
 //      MIT-497 (T50) 例外：出口目标经 lifter esp-resync 前瞻（延续扫窗仅
 //      call rel32 + 非 esp 访存，终止于 mov esp,ebp/leave 绝对恢复 →
 //      fr.resync_ok_exits）→ d!=0 放行——出口偏差被终止符无条件抹除，窗口
-//      内两世界各自读写死区无观察者（安全性论证 lifter_core.hpp）。实证
-//      翻面实证 = wvmpTest wv_mul64hi：出口前瞻本身通过，但翻面后暴露
-//      callgate 隐式 cl 参数面（__aullshr 经 cl 取参桥接未建模，VM 错值
-//      实测）→ 邻接规则保守 gate，mul64hi + 2 区回退 native 保 byte-exact
-//      （x86 19 stubs，GAPS MIT-497；T51 callgate 寄存器桥落地后撤销）。
+//      内两世界各自读写死区无观察者（安全性论证与前提披露见
+//      lifter_core.hpp）。实证翻面 = wvmpTest wv_mul64hi（/Od 16 push
+//      stdcall 自清 + 尾声 mov esp,ebp）；曾短暂并存的 callgate 隐式 cl
+//      参数面 gate 已随 MIT-498 寄存器参数桥落地撤销（GAPS MIT-498），
+//      2 个 cl 区翻回；mul64hi 本区仍因 resync 对延续窗内 pop 的保守拒绝
+//      维持 native（callee ABI caller 侧静态不可见），x86 = 21/22 stubs。
 //   6) 跳转表命中（Jmp Reg/Mem 预扫描 ok）：targets 逐个按 4) 检查；未命中
 //      间接 jmp 不在此 gate（translate_jump 既有 note 兜底，避免双 note）。
 //   7) Ret 不检查（出口自配平）；Call 不改 d（callgate 参数桥读 [v4+4i]，
@@ -3417,7 +3418,6 @@ struct StackWalkVerdict {
 
     i64 d = 0;                                  // 净深（字节，v4 相对 ns）
     i64 max_d = 0;
-    bool prev_insn_wrote_ecx = false;  // MIT-497: 邻接 cl 参数装配探测
     std::unordered_map<ir::Reg, i64> alias;     // 寄存器 → 相对 v4 偏移
     std::unordered_map<u64, i64> d_at;          // 指令地址 → walk 时刻 d
     d_at.reserve(fn.blocks.size() * 8);
@@ -3534,20 +3534,11 @@ struct StackWalkVerdict {
                 if (!defined) alias.erase(rd);
             }
             if (in.op == ir::Op::Call) {
-                // MIT-497 (T50) E2E 发现面：callgate 隐式 cl 参数——自定义
-                // 约定 callee（__aullshr/__allshr 类 RTL helper 经 cl 取
-                // 移位量）的参数桥未建模（x86 pc_=ecx 常驻耦合，guest cl
-                // 桥接待专单）。判据 = **紧邻**：call 前一条指令写 ecx/cx/cl
-                // ——编译器对移位 helper 的参数装配恒为 `mov cl,imm/reg;
-                // call` 邻接形（wvmpTest wv_mul64hi 反汇编实证）；隔 insn 的
-                // cl 写（0xab8b 字符串扫描循环形，T47 以来字节精确通过）callee
-                // 不消费 cl，不 gate（邻接 = 消费意图的最窄可见代理，剩余
-                // 风险 = 非邻接装配的自定义约定 callee，披露 GAPS MIT-497）。
-                // x86 专属面：pc_=ecx 耦合与 __aullshr 类 32 位 RTL 约定均
-                // 不存在于 x64（D4 对称性由 arch 判据显式表达，避免误伤
-                // x64 无栈 callgate 区——首版缺失实测 x64 22→18 stubs 回归）。
-                if (fn.arch == ir::Arch::X86 && prev_insn_wrote_ecx)
-                    fail(in.addr, "callgate 隐式 cl 参数面未支持 (mov ecx/cx/cl 邻接直呼，自定义约定 callee 桥接未建模)");
+                // MIT-498 (T51)：callgate 隐式 cl 参数面 gate 撤销——寄存器
+                // 参数桥落地（asmgen build_callgate_x86 step 2.7：guest
+                // eax/ecx/edx → 物理；step 5.5 edx 写回），__aullshr 类
+                // 自定义约定 callee 经桥取参（mul64hi 翻面回 22/22，GAPS
+                // MIT-498）。gate 存续期 = MIT-497（2026-09-13 撤）。
                 for (int r = 0; r < 32; ++r)
                     if (is_caller_saved(static_cast<ir::Reg>(r))) alias.erase(static_cast<ir::Reg>(r));
             }
@@ -3603,9 +3594,6 @@ struct StackWalkVerdict {
                     // 未命中表形态 → translate_jump 既有 gate note 兜底
                 }
             }
-            // 邻接探测推进：本条是否写 ecx/cx/cl（供下一条 call 判定用）。
-            prev_insn_wrote_ecx = in.dst.kind == ir::Operand::Kind::Reg &&
-                                  in.dst.reg == ir::Reg::Rcx;
             if (!v.ok) return v;  // 首违例即收（note 一次，门为函数粒度）
         }
     }
