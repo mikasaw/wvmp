@@ -1172,3 +1172,18 @@ asmgen 零触碰 → dump 锚不受影响（无换代）。
   multiseed_aslr 335/335（REPEATS=10）、crypt 20/20、tls 4/4、x86 结构
   门 + xmm 字节门 PASS；x64 dump 换代 67cfa727→**f8b0ebd6**/164,350B。
   证据链 GAPS MIT-494s。
+
+### MIT-494t (T43 · 解释器优化②③：x86 dispatch 税清零) ✅ 2026-09-12
+- ③' lo 寄存器交接（dispatch→decode 经 t_[3]，5 帧装载→5 传送）+ ②
+  pc_=ecx 常驻（池预算定案唯一机动位；三 sync 纪律：解密 t_[1] 往返 /
+  Cl 族块内 sync+双出口还原 / CallGate 窗口前后 + Halt/ExitNative 出口
+  落槽）。**x86 每词 ALU −12.1% / br −10.3% / mem −14.0%，x86/x64 比
+  1.14-1.18× → 0.99-1.02×（税清零）**；③ 原案（aux 惰性）被消费方存活
+  面分析推翻后改造落地。x64 字节恒等（dump sha f8b0ebd6 复验）。
+- 实现三坑入册：Cl 族还原点覆盖 cl 计数（电池五连败实锤）/ ExitNative
+  出口 pc 落槽契约 / 陈旧主树反噬（measure 用旧 wvmp_cli → 移位词流全
+  错+无移位词流假绿的归因误导；铁律升级 = asmgen 编辑后双树必重建）。
+- 全门绿：ctest 23/23、双电池 57+2SKIP/46、x86 结构门、crypt 20/20、
+  tls 4/4、7 点 checksum 一致；multiseed_aslr 334/335 + 1 环境项
+  （div@seed99999 打包哈希被 Defender Contebrew.A!ml 拦截，T38 先例定
+  诊，同样本 4 seed 哈希全过 = 非语义回归）。证据链 GAPS MIT-494t。

@@ -3122,3 +3122,87 @@ xmm 字节门 PASS；④ **x64 dump 换代**：67cfa727/161,861B →
 冷面，收益为零白付 128B/handler 静态尺寸；推广收益待真实词流测温）；
 单机单日采样（5 次中位，波动 ~1%）；cond 表 +128B/镜像静态成本（<0.5%
 码体）。
+
+## MIT-494t（T43 · 解释器优化②③：x86 dispatch 税清零，2026-09-12）
+
+**背景**：T41 立案②（x86 pc_ 寄存器常驻）③（dispatch 惰性 aux）。设计期
+预算核算推翻③原案：aux 帧槽为其消费方（Jcc/Jmp taken、imm 操作数）的
+存活面所必需，寄存器交接不成立；改为**③' = lo 寄存器交接**（dispatch →
+decode_prelude_x86 经 t_[3] 直传，5 次帧槽装载 → 5 次寄存器传送；帧槽
+本身仍落帧——handler 尾段 flags-dead test / reextract 读发生在数据临时
+消费之后，寄存器不保真）。②的寄存器预算：x86 池 6 寄存器全占
+（ctx_/base_ 双 callee-saved + t0/t1 字节可编址 + t2/t3 池剩余），ecx 是
+唯一机动位（保留移位计数）→ **pc_ = ecx 常驻 + 三 sync 纪律**：
+dispatch 解密（ecx 复用前 pc 存 t_[1]、解密后还原）/ Cl 移位族（计数即
+cl=ecx 低字节，块内 sync [ctx+0x8] + 双出口还原）/ CallGate（native call
+毁 caller-saved ecx，窗口前后 step 1.5 sync / step 4 还原）+ Halt 出口写
+回 + ExitNative taken 出口落槽（电池契约 "退出路径不 advance，pc 停在
+本条"）。
+
+**实现三坑**：
+1. **Cl 族还原点**：首版把 pc 还原放在 `and cl` 之后 `jz` 之前——`mov
+   ecx` 直接覆盖 cl = 计数本身，移位计数全错（电池 FiveSeed
+   expect_slot32 五连败实锤：期望 2^30 得 2^22）。修 = 还原移至两出口
+   （writeback 后 / adv_lbl），计数驻留期 pc 只存内存。
+2. **ExitNative 出口契约**：[ctx+0x8] 旧口径因 per-word 维护天然停在当
+   前词；pc 入 ecx 后变为陈旧值 → taken 出口补一次落槽（x64 面无此断
+   言——stub 出口语义，零触碰）。
+3. **陈旧主树（T42 旧坑反噬）**：cl 修复只重建了 x86 交叉树，measure 用
+   的 wvmp_cli（主树）仍是 bug 版——x86/x86mem（词流含移位词）E2E
+   checksum 全错、x86br（无移位词）假绿通过，一度误判为 ExitNative 同步
+   因果。铁律升级：**asmgen 任一编辑后，E2E/测量前必须重建双树**
+   （主树 wvmp_cli + build/x86 电池树）。
+
+**测量**（6-pass，seed 12345，5 次中位，7 点 checksum 全一致，与 T42 同
+日直比；x64 侧代码字节恒等（dump sha f8b0ebd6 复验），其 +0.5~2% 漂移
+为机器状态噪声）：
+
+| 形态 | arch | T42 每词 | T43 每词 | Δ | x86/x64 |
+|---|---|---:|---:|---:|---:|
+| 纯 ALU | x64 | 1.647 | 1.662 | +0.9%（漂移） | — |
+| 纯 ALU | x86 | 1.875 | **1.648** | **−12.1%** | **0.99×** |
+| LD/ST | x64 | 1.409 | 1.426 | +1.2%（漂移） | — |
+| LD/ST | x86 | 1.663 | **1.431** | **−14.0%** | **1.00×** |
+| 分支/标志 | x64 | 1.692 | 1.702 | +0.6%（漂移） | — |
+| 分支/标志 | x86 | 1.929 | **1.730** | **−10.3%** | **1.02×** |
+| C 自然 | x64 | 1.334 | 1.354 | +1.5%（漂移） | — |
+
+分阶段归因（x86）：③' 解码交接 ALU −8.7% / br −7.8% / mem −10.5%；②
+ecx 常驻再 ALU −3.8% / br −2.8% / mem −3.9%。
+
+**结论**：① **T41 发现的 x86 均匀税（1.14-1.18×）清零至 0.99-1.02×**
+——三形态对齐 x64 每词基线（结构税 = pc 装载/RMW + decode 帧槽装载的
+判断被测量闭环）；② x86 解释器每词绝对值进入 1.43-1.73 ns 区间；③
+x64 面字节恒等（sha 复验）+ 全门绿：ctest 23/23、x64 57+2SKIP、x86 电
+池 46/46（修复两轮后）、x86 结构门 PASS、crypt 20/20、tls 4/4、7 点
+checksum 一致；multiseed_aslr **334/335 + 1 环境项**（见披露）。
+
+**环境项披露（T38 先例，非语义回归）**：multiseed 池 wvmp_x86_div_
+sample seed=99999 打包哈希被 Defender 云 ML 判定拦截——运行 rc=126 /
+stdout 空 → byte-exact 失败 + ASLR 探针临时文件 OSError。MpCmdRun
+-DisableRemediation 定诊 **Program:Win32/Contebrew.A!ml**（T36/T38 同款
+ThreatID）；同一样本其余 4 seed 的不同哈希 byte-exact ×10 全过（含同
+样的 div/idiv/Cl 面）→ 判定为按哈希的云判定彩票（T38 已定论：按哈希
+持久、异步翻转、不可参数化）。任何 runtime 字节变化都会重掷此骰子。
+
+**边界披露**：ecx 常驻使 Cl 族/CallGate 路径各 +2-3 mem ops（冷面，电
+池含全语义覆盖）；x64 侧 +0.5~2% 为同机漂移（字节恒等排除代码因素）；
+halt/exit 路径 pc 落槽成本中性（旧口径本就写内存）。
+
+**验收返工记录（REJECT → C1 修复，2026-09-12）**：独立验收在 100-seed
+fetch-decrypt 探针中检出 **Critical C1**——本单把解密序列重排为"key0 先
+读进 eax → `mov t_[1], ecx` 暂存 pc"，而 t_[1..3] 至多一个物理上是 eax
+（kX86ByteCapable）：t_[1]==eax 的 seed 上暂存指令把 key0 覆盖成 pc →
+K = pc*STEP+pc → 语义损坏/崩溃。实测 100 seed 37% 失败、100% 与
+t_[1]==eax 相关；HEAD 基线同法 100/100（旧 MIT-473 序"先取 PC 再读
+key0"恰好别名安全——旧注纪律被重排反向踩中）。**门盲区**：电池
+FetchDecryptSemanticParity 旧种子集 {1,7,0xC0FFEE} 恰全非 eax → 全绿
+漏网；crypt E2E 5 seed 未中；multiseed 池无 crypt pass。**修复**：pc
+暂存目标改为生成期选定的首个非 eax t_[1..3]（恒可选，key0 仍走 eax，
+此刻四个 t 至多一个==eax 故其余皆安全），顺序 = 暂存→key0→乘加→还原。
+**SH1 落实**：FetchDecryptSemanticParity 种子扩为 0..49 连续 50 seed
+（eax 命中期望 ~17 次，别名缺陷必然检出；修复后 28.9s 全绿）。**SH2
+落实**：本节即补记；"crypt 20/20 ⇒ 加密面语义安全"的误读风险已注记
+（该套件对 roll 状态空间覆盖 ~1% 量级）。修复后全门复验：双电池 46/46
+（新种子集）/57+2SKIP、ctest 23/23、x64 sha f8b0ebd6 恒等、crypt
+20/20、x86/x86mem 抽测 checksum 一致。

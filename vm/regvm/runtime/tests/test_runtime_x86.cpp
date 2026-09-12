@@ -3090,10 +3090,13 @@ TEST(X86Battery, FetchDecryptSemanticParity) {
         return ctx;
     };
 
-    // 明文基线（fetch=false）。
+    // 明文基线（fetch=false）。MIT-494t 验收 SH1：种子集 {1,7,0xC0FFEE}
+    // 对 roll 状态空间（t_[1..3] 是否含 eax）覆盖 ≈0——fetch-decrypt 别名
+    // 回归曾 37% 种子失败而本测试全绿。扩为 0..49 连续 50 seed（eax 命中
+    // 期望 ~17 次，别名缺陷必然检出）。
     std::vector<u64> base_regs;
     u64 base_ret = 0, base_pc = 0;
-    for (const u32 seed : {1u, 7u, 0xC0FFEEu}) {
+    for (u32 seed = 0; seed < 50; ++seed) {
         wvmp::Rng rng(seed);
         const auto gen = rt::generate_runtime_x86(rng, false);
         std::vector<u8> stream = plain;
@@ -3111,7 +3114,7 @@ TEST(X86Battery, FetchDecryptSemanticParity) {
     EXPECT_EQ(base_regs[1], 0ull);
 
     // 加密态（fetch=true）：位置键流 + dispatch 织入解密，终态须逐位一致。
-    for (const u32 seed : {1u, 7u, 0xC0FFEEu}) {
+    for (u32 seed = 0; seed < 50; ++seed) {
         wvmp::Rng rng(seed);
         const auto gen = rt::generate_runtime_x86(rng, true);
         std::vector<u8> blob(codecs::kBlobHeaderBytes, 0);

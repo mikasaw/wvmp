@@ -553,8 +553,10 @@ public:
         rng_.shuffle(rest.begin(), rest.end());
         t_[2] = rest[0];
         t_[3] = rest[1];
-        // pc_/flags_ x86 内存常驻（[ctx+0x8] / [ctx+0x98] 既有槽），不占寄
-        // 存器 —— 置负值防误用（x86 emit 面禁触 r64()/r64(pc_)/r64(flags_)）。
+        // pc MIT-494t②：ecx 寄存器常驻（x86 池 6 寄存器全占，ecx 唯一机动
+        // ——保留移位计数；Cl 族/dispatch 解密/CallGate 三处 sync 纪律见各
+        // build_*_x86 注；flags_ 仍内存常驻 [ctx+0x98]）。置负值防误用
+        //（x86 emit 面禁触 r64()/r64(pc_)/r64(flags_)）。
         pc_ = -1;
         flags_ = -1;
         // 尺寸链 3 路随机（x86 无 S64 VmOp）+ 条件链 16 路随机（同 x64 机制）。
@@ -3690,8 +3692,10 @@ public:
     // 模式 / roll / build_entry / build_dispatch / handler 表选择五处），x64
     // 输出逐字节不变（D6）。x86 寄存器/栈/flags 模型见文件头 kX86 池注：
     //   - 寄存器：ctx_/base_（callee-saved）+ 临时 t_[0..3]（t_[0]/t_[1] =
-    //     数据临时，字节可编码约束；t_[2]/t_[3] = 寻址临时）；pc_/flags_ 内存
-    //     常驻 [ctx+0x8] / [ctx+0x98]（既有持久槽，零新字段，D4）。
+    //     数据临时，字节可编码约束；t_[2]/t_[3] = 寻址临时）；pc_ = ecx 寄
+    //     存器常驻（MIT-494t②，同步点：dispatch 解密 t_[1] 往返 / Cl 移位
+    //     族块内 sync+还原 / CallGate 窗口前后 / Halt 出口写回）；flags_ 内
+    //     存常驻 [ctx+0x98]（既有持久槽，零新字段，D4）。
     //   - 执行帧：kX86FrameSize 常量槽（decode 位域/aux/setcc 捕获区）。
     //   - flags：ctx+0x98 dword 访问，位布局 ZF/CF/OF/SF/PF = bit0..4 不变。
     //   - size：S8/S16/S32 三路（S64 块防御 no-op —— x86 翻译器不产 S64）。
@@ -3754,7 +3758,11 @@ public:
         // host_rsp 记账（callgate X3c B.1 消费：窗口锚 + 调后重基；槽高半
         // 字依赖零初始化不变量）。
         o += std::string("    mov dword ptr [") + r32x(ctx_) + " + 0x128], esp\n";
-        // pc_/flags_ 内存常驻（[ctx+0x8]/[ctx+0x98]），无需寄存器装载；跌入 dispatch。
+        // pc MIT-494t②：装载进 ecx（寄存器常驻——dispatch 以 [t0+ecx*8] 取
+        // 指、advance/taken 加算；flags_ 仍内存常驻 [ctx+0x98]）。同步点 =
+        // dispatch 解密（t_[1] 往返）/ Cl 移位族（cl 复用）/ CallGate
+        //（native call 毁 ecx）/ Halt 出口写回，见各 build_*_x86 注。
+        o += std::string("    mov ecx, dword ptr [") + r32x(ctx_) + " + 0x8]\n";
         return o;
     }
 
@@ -3763,33 +3771,48 @@ public:
     // <4GB），表字节格式与 x64 逐位一致，掩码/两遍法逻辑零改动。
     std::string build_dispatch_x86(u64 table_off) const {
         std::string o;
+        // MIT-494t②：pc 寄存器常驻 ecx —— 取指索引直达（省 [ctx+0x8] 装载；
+        // advance/jmp/jcc-taken 同步省 RMW）。同步点三处：dispatch 解密
+        // （ecx 复用前 t_[1] 存取往返）、Cl 移位族（cl 复用，块内 sync+还
+        // 原）、CallGate（native call 毁 caller-saved ecx，窗口前后 sync）。
         o += std::string("    mov ") + r32x(t_[0]) + ", dword ptr [" + r32x(ctx_) + "]\n";
-        o += std::string("    mov ") + r32x(t_[1]) + ", dword ptr [" + r32x(ctx_) +
-             " + 0x8]\n";
+        // MIT-494t③'：lo 取指后经 t_[3] 交接 decode_prelude_x86（5 次帧槽
+        // 装载 → 5 次寄存器传送；帧槽本身仍落帧——handler 尾段 flags-dead
+        // test / reextract 类读发生在数据临时消费之后，寄存器不保真）。
         // 指令字 64 位双字取指落帧（lo=域 0..31 → kX86FInsnLo；hi=aux → kX86FAux）。
         o += std::string("    mov ") + r32x(t_[2]) + ", dword ptr [" + r32x(t_[0]) +
-             " + " + r32x(t_[1]) + "*8]\n";
+             " + ecx*8]\n";
         o += std::string("    mov ") + r32x(t_[3]) + ", dword ptr [" + r32x(t_[0]) +
-             " + " + r32x(t_[1]) + "*8 + " + imm(4) + "]\n";
+             " + ecx*8 + " + imm(4) + "]\n";
         o += std::string("    mov dword ptr ") + xf(kX86FInsnLo) + ", " + r32x(t_[2]) + "\n";
         o += std::string("    mov dword ptr ") + xf(kX86FAux) + ", " + r32x(t_[3]) + "\n";
         if (fetch_decrypt_) {
             // MIT-473: x86 织入——lo/hi 已落帧（帧槽 RW），位置键流解密
             //（K = blob 头 seed + 字序 × STEP，仅依赖字序；初态 = blob 头
-            // seed 字段 = 流基址 -16）。⚠️ 顺序纪律：先 `mov ecx, t1`（PC
-            // 寄存器值）再 `mov eax, [t0-0x10]`（key0）——t0/t1 都可能被
-            // 分配到 eax（kX86ByteCapable 含 eax），先毁 eax 再读 t1 就会
-            // 把 key0 当 PC（K 全错，实测）；且 PC 必须取寄存器值，加 []
-            // 是把 PC 当地址解引用（pc=0 → 读地址 0 segfault，实测）。
-            // ecx 不在 x86 分配池（保留移位计数），作 K 暂存绝对安全。
-            o += std::string("    mov ecx, ") + r32x(t_[1]) + "\n";                                // PC（字序）先取
-            o += std::string("    mov eax, dword ptr [") + r32x(t_[0]) + " - " + hex(16) + "]\n";  // key0 后读
-            o += std::string("    imul ecx, ecx, ") + hex(0x9E3779B1ull) + "\n";                   // STEP
+            // seed 字段 = 流基址 -16）。
+            // ⚠️ 别名纪律（MIT-494t 验收 C1）：key0 载体固定 eax，而
+            // t_[0..3] 两两互异（roll_x86 去重保证）→ t_[1..3] 至多一个是
+            // eax——pc 暂存目标由生成期选定 t_scratch = 第一个非 eax 的
+            // t_[1..3]（恒可选），顺序 = 先暂存 pc、再读 key0、后乘加。首
+            // 版曾把 key0 读进 eax 之后再 `mov t_[1], ecx` 暂存——t_[1]==eax
+            // 时把 key0 覆盖成 pc → K = pc*STEP+pc → 语义损坏（100 seed 探
+            // 针 37% 失败，100% 与 t_[1]==eax 相关；电池旧种子集
+            // {1,7,0xC0FFEE} 恰全非 eax 故漏网）。旧 MIT-473 序"先取 PC 再
+            // 读 key0"的纪律同源，勿再重排。
+            int t_scratch = 1;
+            for (int j = 1; j <= 3; ++j) {
+                if (t_[j] != 0) { t_scratch = j; break; }   // 0 = kPhys eax
+            }
+            o += std::string("    mov ") + r32x(t_[t_scratch]) + ", ecx\n";                        // pc 暂存（先于一切复用）
+            o += std::string("    mov eax, dword ptr [") + r32x(t_[0]) + " - " + hex(16) + "]\n";  // key0（eax 此刻可毁）
+            o += std::string("    imul ecx, ecx, ") + hex(0x9E3779B1ull) + "\n";                   // STEP（ecx 已持 pc）
             o += std::string("    add ecx, eax\n");                                                // K
             o += std::string("    xor dword ptr ") + xf(kX86FInsnLo) + ", ecx\n";
             o += std::string("    xor dword ptr ") + xf(kX86FAux) + ", ecx\n";
-            o += std::string("    mov ") + r32x(t_[2]) + ", dword ptr " + xf(kX86FInsnLo) + "\n";
+            o += std::string("    mov ecx, ") + r32x(t_[t_scratch]) + "\n";                        // pc 还原
+            o += std::string("    mov ") + r32x(t_[2]) + ", dword ptr " + xf(kX86FInsnLo) + "\n";  // 解密后 lo
         }
+        o += std::string("    mov ") + r32x(t_[3]) + ", " + r32x(t_[2]) + "\n";   // lo 交接（③'）
         o += std::string("    and ") + r32x(t_[2]) + ", " + imm(kTableEntries - 1) + "\n";
         o += std::string("    mov ") + r32x(t_[1]) + ", dword ptr [" + r32x(base_) +
              " + " + r32x(t_[2]) + "*8 + " + hex(table_off) + "]\n";
@@ -3801,6 +3824,9 @@ public:
     // ---- x86 decode：六位域落帧 -------------------------------------------
     // lo 双字 → shr/and → [esp+off]；aux 无需抽取（dispatch 已把指令字高 32
     // 位落帧 kX86FAux，等价 x64 T5=w>>32 的常驻化）。
+    // MIT-494t③'：lo 源 = dispatch 交接的 t_[3]（寄存器）——5 次帧槽装载
+    // → 5 次寄存器传送；帧槽仍由 dispatch 落帧（handler 尾段 flags-dead
+    // test / reextract 类读发生在数据临时消费之后，寄存器不保真）。
     std::string decode_prelude_x86() const {
         struct Field { int shr; int mask; u64 slot; };
         static constexpr Field kFields[] = {
@@ -3812,7 +3838,7 @@ public:
         };
         std::string o;
         for (const auto& f : kFields) {
-            o += std::string("    mov ") + r32x(t_[0]) + ", " + xf(kX86FInsnLo) + "\n";
+            o += std::string("    mov ") + r32x(t_[0]) + ", " + r32x(t_[3]) + "\n";
             o += std::string("    shr ") + r32x(t_[0]) + ", " + imm(f.shr) + "\n";
             o += std::string("    and ") + r32x(t_[0]) + ", " + imm(f.mask) + "\n";
             o += std::string("    mov dword ptr ") + xf(f.slot) + ", " + r32x(t_[0]) + "\n";
@@ -3962,10 +3988,11 @@ public:
         return o;
     }
 
-    // x86 advance：pc 内存常驻（[ctx+0x8] dword），+1 后回 dispatch。
+    // x86 advance：pc 寄存器常驻（ecx，MIT-494t②），+1 后回 dispatch。
+    // Cl 移位族在块内 sync/还原 ecx（mov 不改 flags，jz 判据保真）后仍走
+    // 本寄存器形。
     std::string advance_x86(u64 dispatch) const {
-        return std::string("    add dword ptr [") + r32x(ctx_) + " + 0x8], " + imm(1) +
-               "\n    jmp " + hex(dispatch) + "\n";
+        return std::string("    add ecx, ") + imm(1) + "\n    jmp " + hex(dispatch) + "\n";
     }
 
     // x86 尺寸链：3 路各带显式 cmp/je（S8/S16/S32，perm 随机）+ 链尾顺延 =
@@ -4179,8 +4206,7 @@ public:
             std::string("    test ") + r32x(t_[0]) + ", " + r32x(t_[0]) + "\n" +
             "    jz " + fall_lbl + "\n" +
             std::string("    mov ") + r32x(t_[0]) + ", " + xf(kX86FAux) + "\n" +
-            std::string("    add dword ptr [") + r32x(ctx_) + " + 0x8], " +
-            r32x(t_[0]) + "\n" +
+            "    add ecx, " + r32x(t_[0]) + "\n" +   // pc（MIT-494t② 寄存器常驻）
             "    jmp " + hex(dispatch) + "\n" +
             fall_lbl + ":\n" + advance_x86(dispatch);
         int order[16];
@@ -4205,12 +4231,11 @@ public:
         return out;
     }
 
-    // x86 Jmp：pc dword += aux 原始双字（同 Jcc taken 路径，无条件）。
+    // x86 Jmp：pc（ecx，MIT-494t②）+= aux 原始双字，无条件。
     std::string build_jmp_x86(u64 dispatch) const {
         std::string o;
         o += std::string("    mov ") + r32x(t_[0]) + ", " + xf(kX86FAux) + "\n";
-        o += std::string("    add dword ptr [") + r32x(ctx_) + " + 0x8], " +
-             r32x(t_[0]) + "\n";
+        o += std::string("    add ecx, ") + r32x(t_[0]) + "\n";
         o += "    jmp " + hex(dispatch) + "\n";
         return o;
     }
@@ -4221,7 +4246,9 @@ public:
     std::string build_halt_x86(u64 /*dispatch*/) const {
         const auto order = x86_save_order();
         std::string o;
-        o += std::string("    add dword ptr [") + r32x(ctx_) + " + 0x8], " + imm(1) + "\n";
+        // pc+1（寄存器常驻）+ 出口同步写回 [ctx+0x8]（恢复友好语义不变）。
+        o += std::string("    add ecx, ") + imm(1) + "\n";
+        o += std::string("    mov dword ptr [") + r32x(ctx_) + " + 0x8], ecx\n";
         o += std::string("    mov ") + r32x(t_[0]) + ", dword ptr [" + r32x(ctx_) +
              " + 0x10]\n";
         o += std::string("    mov dword ptr [") + r32x(ctx_) + " + 0x118], " +
@@ -4553,17 +4580,27 @@ public:
             o += std::string("    mov ") + r32x(t_[1]) + ", " + xf(kX86FAux) + "\n";
             o += "xcntg" + stag + ":\n";
             // cl 计数装载 + 5 位掩码（32 位模式全宽统一，见上注）。
+            // MIT-494t②：pc 常驻 ecx —— 计数即 cl（= ecx 低字节），计数驻
+            // 留期间 pc 只存 [ctx+0x8]（sync 于 cl 装载前）；还原在两个出
+            // 口（移位路径 writeback 后 / 计数 0 出口 adv_lbl），寄存器
+            // advance 才能吃到正确 pc。⚠️ 不可在 jz 前还原——mov ecx 覆盖
+            // cl = 计数（T43 电池实测：ShiftCl 语义全错）。
+            o += std::string("    mov dword ptr [") + r32x(ctx_) + " + 0x8], ecx\n";
             o += std::string("    mov cl, ") + rs(t_[1], 0) + "\n";
             o += std::string("    and cl, ") + imm(0x1F) + "\n";
             o += "    jz " + adv_lbl + "\n";   // 计数 0：值与 flags 均不变
             o += std::string("    ") + native + " " + rs(t_[0], s) + ", cl\n";
             o += setcc5_x86();
             o += writeback_x86(s, kX86FRegA, t_[0], t_[1]);
+            o += std::string("    mov ecx, dword ptr [") + r32x(ctx_) + " + 0x8]\n";
             o += "    jmp " + tail_lbl + "\n";
             blocks[s] = o;
         }
         std::string out = decode_prelude_x86() + size_chain_x86(blocks, tag, dispatch);
-        out += adv_lbl + ":\n" + advance_x86(dispatch);   // 计数 0 出口
+        // 计数 0 出口：块内 jz 前未还原（见上注），此处先还原再寄存器 advance。
+        out += adv_lbl + ":\n" +
+               std::string("    mov ecx, dword ptr [") + r32x(ctx_) + " + 0x8]\n" +
+               advance_x86(dispatch);
         out += tail_lbl + ":\n" +
                (partial_flags ? flags_tail_partial_x86(dispatch) : flags_tail_x86(false, dispatch));
         return out;
@@ -5398,9 +5435,10 @@ public:
     //      未来 stub 皆零耦合）。窗口 = 对齐(host_rsp - kX86CallgateWindow)，
     //      探针写消除 guard page 边界（406 同款）；shr/shl 4 对齐
     //      （kCallgateAlignShift 复用）。
-    //   3) pc/flags 内存常驻（[ctx+0x8]/[ctx+0x98]）：native callee 不识
-    //      ctx → 无需 save/restore（x64 面因 pc_/flags_ 可能落 caller-saved
-    //      寄存器才需步骤 2/9 落盘）。base_/ctx_ 恒 callee-saved（roll_x86
+    //   3) pc（MIT-494t② 常驻 ecx）/flags（[ctx+0x98]）——pc 经 step 1.5
+    //      落槽跨 call（native callee 毁 caller-saved ecx），step 4 后还原；
+    //      flags 内存常驻，native callee 不识 ctx 无需 save/restore。
+    //      base_/ctx_ 恒 callee-saved（roll_x86
     //      约束）跨 call 存活；esp 经 host_rsp 重基（step 4）。
     //   4) 返回值：eax → regs[0] 低 dword（槽高半字清零不变量维持）。guest
     //      flags 天然存活（内存常驻，native call 不触 ctx）。x87/MMX callee
@@ -5428,6 +5466,9 @@ public:
         o += std::string("    add ") + r32x(t_[0]) + ", dword ptr [" + r32x(ctx_) +
              " + 0x110]\n";
         o += lbl_have + ":\n";
+        // step 1.5（MIT-494t②）：pc 出 ecx 落槽 —— native call 毁 caller-
+        // saved ecx；esp 切窗前同步（窗口 push 不触 ctx）。
+        o += std::string("    mov dword ptr [") + r32x(ctx_) + " + 0x8], ecx\n";
         // step 2: 切 esp → callee 窗口（16 对齐 + 底部探针写）
         o += std::string("    mov ") + r32x(t_[1]) + ", dword ptr [" + r32x(ctx_) +
              " + 0x128]\n";
@@ -5450,6 +5491,8 @@ public:
         o += std::string("    call ") + r32x(t_[0]) + "\n";
         // step 4: esp 重基（host_rsp 单一来源，跨 call 稳定）
         o += std::string("    mov esp, dword ptr [") + r32x(ctx_) + " + 0x128]\n";
+        // pc 还原（MIT-494t②；step 1.5 的同步配对）。
+        o += std::string("    mov ecx, dword ptr [") + r32x(ctx_) + " + 0x8]\n";
         // step 5: 返回值写回 regs[0] 低 dword（槽高半字 0 不变量维持）
         o += std::string("    mov dword ptr [") + r32x(ctx_) + " + 0x10], eax\n";
         o += advance_x86(dispatch);
@@ -5507,6 +5550,9 @@ public:
         // 2) 退出路径: 目标 VA = aux + image_base → 4B 退出槽
         //    （槽地址 = [ctx+0x120] - kX86ExitSlotDepth, 标签不吃 seq()）
         o += exit_lbl + ":\n";
+        // pc 出口同步（MIT-494t②）：[ctx+0x8] 须停在本条（电池契约 "退出
+        // 路径不 advance"）——pc 常驻 ecx 后寄存器值即真相源，落槽一次。
+        o += std::string("    mov dword ptr [") + r32x(ctx_) + " + 0x8], ecx\n";
         o += std::string("    mov ") + r32x(t_[1]) + ", " + xf(kX86FAux) + "\n";
         o += std::string("    add ") + r32x(t_[1]) + ", dword ptr [" + r32x(ctx_) +
              " + 0x110]\n";
