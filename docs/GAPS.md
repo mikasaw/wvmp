@@ -3487,3 +3487,27 @@ PROBE_ATTEMPTS=1 兼容口径 / 语法门）；smoke ONLY=x86_callgate REPEATS=1
 **池门运行注记（2026-09-12，加固后终验）**：multiseed_aslr 全池
 REPEATS=10 = **335/335 PASS，jitter_events=0**——零真实抖动事件（对照
 返工前幻影 335/335），探针 happy path 零额外开销（无事件不进重试）。
+
+## MIT-496（T49 · x87/AVX 剩余 gate 面复勘——决策备忘录，2026-09-12）
+
+**任务口径**："x87/AVX 补面"立项后逐面复勘的结论 = **无任何残面可在现
+行文档裁决/冻结合同内以 D 级权限开启**；本单产物 = 决策备忘录（reopen
+路径 + 量化成本 + 决策点），不产翻译器/handler 代码。逐面裁决：
+
+| 面 | 现状依据 | reopen 路径 | 决策层级 |
+|---|---|---|---|
+| x87 全族（D8-DF） | R3 裁决永久 gate（MIT-416/418）；x64 频率≈0、x86 0.01–0.88%（old_runtime 7.81% 为 OS runtime 域，非保护目标面）；v145 MSVC x86 默认 /arch:SSE2；B 路线（x87 L0）触发条件不满足（MIT-445 §6 原文口径，append-only 入册） | x87 L0 ~80 新 VmOp → 98+80=178 > 128（跳表唯一必然溢出者）→ 前置 = 跳表 128→256 扩容（G9r §3.2 spike 已验：S 级）+ ST 栈模型（triage §4/§5 蓝图在档）+ callgate FP 面复核（MIT-417 已修 = 前置已清） | **用户决策**（推翻 append-only 裁决 + 大生产量；触发条件在档，蓝图直接生效） |
+| AVX 档B（ymm/zmm 32B） | G6a 位宽闸按操作数尺寸拒（X86_INS_VADDPS 双宽同 id）；kCtxSize 冻结合同（ctx.xmm[8]×16B，ymm 需 +512B ctx 面） | kCtxSize 合同版本 bump + ctx.ymm[16] 面 + 跳表扩容前置（档B 20–30 op = 128 临界实质触发者）+ vzeroupper ABI 面 | **用户决策**（冻结合同触碰，零触碰纪律外） |
+| VEX-GP BMI 残族（mulx/pdep/pext） | G8a 负例族照旧 C1 gate（MIT-434）；G8b 档方向 = native 直执行 + CPUID gate 基建挂账；mulx CF Zen5 实测不写 vs SDM 厂商分叉待决（MIT-432 §2/§6.4） | 直执行基建（新通道）+ CPUID 门控 + 厂商分叉裁决 | **用户决策**（基建级 + CPU 行为语义未决） |
+| blsr 族四条（blsr/blsi/blsmsk/bextr） | 语料 27 文件命中 0，文档化永久 gate（432 §6.4） | 频率触发面（语料出现即立单） | 维持（零频率） |
+| d==s2 标量族（VEX 标量三态折叠盲区） | 合并频率 0.75% < 1% 准入门（MIT-426 B.3）；需 xmm→GP 双槽暂存原语 = 新 VmOp（G6a 批内 D1 零新 VmOp 纪律） | 频率过 1% 或批内预算出现 | 维持（低于准入门） |
+| FMA 族 | 双舍入红线，永不拆 mul+add（triage §6.5） | 无 | 永久 |
+| EVEX/AVX-512 | 62 前缀独立 INS 空间，天然不入白名单 | 无 | 永久（天然 gate） |
+| vpaddd/vpaddq/psubq 系 | MIT-427 实测砍面（paddq ≈0 在案 16/854k、psubq/vpaddd 0 + intrinsic 溢出形态） | 频率触发面 | 维持（频率门下） |
+| 跳表 128→256 扩容（独立落地） | G9r §3.4 明文"不独立立波"——仅在触发批次作为前置 commit 随单落地 | — | 维持（无触发批次） |
+
+**结论**：剩余面全部处于「append-only 裁决维持 / 冻结合同外 / 频率门下
+/ 永久红线」四类；文档推荐默认值 = 全部维持现状。三个**用户决策点**：
+① x87 L0（x86 旧世界 FP 面，大生产量，蓝图在档）；② ymm 档B（kCtxSize
+合同 bump）；③ BMI G8b 直执行基建。任一立项即按在档蓝图展开；均不立项
+则本面收口，无遗留工程债。
