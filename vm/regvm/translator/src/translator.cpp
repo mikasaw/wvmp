@@ -299,7 +299,8 @@ enum : u8 { kJtSemDeltaBase = 0, kJtSemDeltaJmp = 1, kJtSemAbsVa = 2 };
         h.sem == kJtSemDeltaBase ? "delta"
         : h.sem == kJtSemDeltaJmp ? "djmp" : "abs";
     return std::string(h.mem_source ? "mem-" : "reg-") +
-           std::to_string(h.width) + "B-" + sem_name;
+           std::to_string(h.width) + "B-" + sem_name +
+           ((h.mem_source && h.base_reg == ir::Reg::Flags) ? "-baseless" : "");
 }
 
 // 前块尾部防御常数解析：MSVC `cmp idx,K-1; ja`（K=imm+1）与 GCC
@@ -386,7 +387,9 @@ std::optional<JumpTableHandle> try_match_jump_table(
     // x64 S64 / x86 S32；表项读宽（4/8）判据与 scale 判据按既有口径不变
     // （x86 表 = 4B 项，8B 项 scale 判据自然排除）。
     const ir::Size ptr_sz = arch == ir::Arch::X86 ? ir::Size::S32 : ir::Size::S64;
-    if (ins.size() < 3) return std::nullopt; // MEM 源最少 [il,lea,jmp] 3 条
+    // MIT-494x: base-less MEM 表块尾仅 [il, jmp] 两条 → 顶判降至 2；各形态
+    // 分支自带更严的尺寸检查（REG ≥4/5、MEM 带 base ≥3、base-less ≥2）。
+    if (ins.size() < 2) return std::nullopt;
     const ir::Insn& jmp = ins.back();
     if (jmp.op != ir::Op::Jmp) return std::nullopt;
     const bool mem_source = (jmp.dst.kind == ir::Operand::Kind::Mem);
@@ -402,22 +405,47 @@ std::optional<JumpTableHandle> try_match_jump_table(
     i64 disp = 0;
     const ir::Insn* lea_p = nullptr; // 基址载入（lea rip / mov imm64）
     const ir::Insn* il_p = nullptr;  // idx 载入（mov <idx>, [mem]）
+    bool baseless = false;         // MIT-494x: base-less 绝对 VA 表（x86）
+    i64 disp_va = 0;               // base-less: 表 VA（链接期）
     if (mem_source) {
         const ir::MemOperand& jm = jmp.dst.mem;
-        if (jm.base == ir::Reg::Flags || jm.index == ir::Reg::Flags ||
-            jm.disp < 0)
-            return std::nullopt; // rip 直 disp 无 index 非表形态（K 不可推）
-        b = jm.base;
+        if (jm.index == ir::Reg::Flags) return std::nullopt; // 无 index 非表形态
         idx = jm.index;
         scale = static_cast<u8>(jm.scale);
-        disp = jm.disp;
         if (scale != 4 && scale != 8) return std::nullopt;
         width = (scale == 8) ? 8 : 4;
-        if (ins.size() < 3) return std::nullopt;
-        if (!classify_base_and_idx(ins[ins.size() - 2], ins[ins.size() - 3], idx,
-                                   lea_p, il_p))
-            return std::nullopt;
+        if (jm.base != ir::Reg::Flags) {
+            if (jm.disp < 0) return std::nullopt; // rip 直 disp 无 index 非表形态（K 不可推）
+            b = jm.base;
+            disp = jm.disp;
+            if (ins.size() < 3) return std::nullopt;
+            if (!classify_base_and_idx(ins[ins.size() - 2], ins[ins.size() - 3], idx,
+                                       lea_p, il_p))
+                return std::nullopt;
+        } else {
+            // MIT-494x (T47): base-less 绝对 VA 表——x86 `jmp [idx*4 + abs]`
+            // （MSVC /Od switch 查表形态，wvmpTest switch_grade 实测）。disp
+            // = 链接期表 VA，减 image_base 还原表 RVA；无独立 base 载入指
+            // 令 → 块尾 = [il, jmp] 两条，il 形状就地判定；b = Flags 哨兵
+            // （translate 侧走 LeaRva 表址物化分支）。
+            if (image_base == 0 || jm.disp < static_cast<i64>(image_base))
+                return std::nullopt;
+            b = ir::Reg::Flags;
+            disp = 0;  // 表址并入 base_rva（下方 base-less 推导），不再另加
+            if (ins.size() < 2) return std::nullopt;
+            const ir::Insn& il = ins[ins.size() - 2];
+            if (il.op != ir::Op::Load || il.dst.kind != ir::Operand::Kind::Reg ||
+                il.dst.reg != idx || il.src.kind != ir::Operand::Kind::Mem)
+                return std::nullopt;
+            il_p = &il;
+            disp_va = jm.disp;
+            baseless = true;
+        }
     } else {
+        // MIT-494x 验收 C1：顶判降为 2 后本分支必须自带 ≥3 守卫——
+        // `ld = ins[size-3]` 在 2 条块（如 `mov eax,[x]; jmp eax`）时为
+        // SIZE_MAX 越界下标（/MDd 实测 vector subscript out of range）。
+        if (ins.size() < 3) return std::nullopt;
         const ir::Insn& add = ins[ins.size() - 2];
         const ir::Insn& ld = ins[ins.size() - 3];
         if (add.op == ir::Op::Add) {
@@ -506,6 +534,13 @@ std::optional<JumpTableHandle> try_match_jump_table(
             base_rva = static_cast<u64>(lea_p->src.imm) - image_base;
             have_base = true;
         }
+    }
+    if (baseless) {
+        // MIT-494x: 表 RVA = 表 VA − image_base（无 lea/mov 基址可判，
+        // have_base 由本推导直接置位）。
+        if (lea_p != nullptr) return std::nullopt;
+        base_rva = static_cast<u64>(disp_va) - image_base;
+        have_base = true;
     }
     if (!have_base) return std::nullopt;
 
@@ -1902,12 +1937,21 @@ struct Translator {
             } else {
                 return skip(in, "跳转表 scale 非 4/8，保守 gate", nullptr);
             }
-            em.emit_rr(VmOp::Add, s, isa::vm_reg_of(h.base_reg), sz64);
+            if (h.base_reg != ir::Reg::Flags) {
+                em.emit_rr(VmOp::Add, s, isa::vm_reg_of(h.base_reg), sz64);
+                em.mark_last_dead();      // MIT-494d
+                if (h.disp > 0) {
+                    em.emit_ri(VmOp::Add, s, static_cast<u32>(h.disp), sz64);
+                    em.mark_last_dead();  // MIT-494d
+                }
+            } else {
+            // MIT-494x (T47) base-less 绝对 VA 表：表址 = LeaRva(表 RVA)
+            // 运行时物化（加载器已把 .rdata 表项重定位为真 VA，AbsVa 语义
+            // 与比较链的 LeaRva(target) 恒等）。
+            em.emit_ri(VmOp::Add, s, static_cast<u32>(h.table_rva), sz64);
             em.mark_last_dead();      // MIT-494d
-            if (h.disp > 0) {
-                em.emit_ri(VmOp::Add, s, static_cast<u32>(h.disp), sz64);
-                em.mark_last_dead();  // MIT-494d
-            }
+            em.emit_rr(VmOp::LeaRva, s, s, sz64);
+        }
             em.emit_rr(VmOp::Load, t, s,
                        h.width == 8 ? sz64 : isa::size_field(ir::Size::S32));
             if (h.sem != kJtSemAbsVa) {

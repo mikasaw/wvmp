@@ -1473,6 +1473,63 @@ TEST(Translate, JumpTableX86Abs4RegExpandsChain) {
               std::string::npos);
 }
 
+// x86 base-less 绝对 VA 4B 尾块（MIT-494x）：mov edx,[ebp-4] / jmp
+// [edx*4 + 0x402000]——MSVC /Od switch 查表形态，无独立 base 载入。
+ir::BasicBlock g2x_baseless4_tail_block() {
+    const ir::Insn il = at([] {
+        ir::Insn i = I(ir::Op::Load, ir::Size::S32);
+        i.dst = ir::Operand::reg_(ir::Reg::Rax);
+        i.src = ir::Operand::mem_(m(ir::Reg::Rsp, ir::Reg::Flags, 0, 8));
+        return i;
+    }(), 0x1020);
+    const ir::Insn j = at([] {
+        ir::Insn i = I(ir::Op::Jmp, ir::Size::S32);
+        i.dst = ir::Operand::mem_(m(ir::Reg::Flags, ir::Reg::Rax, 4, 0x402000));
+        return i;
+    }(), 0x1027);
+    return blk(0x1020, {il, j});
+}
+
+TEST(Translate, JumpTableX86MemBaselessAbsExpandsChain) {
+    // MIT-494x: base-less 绝对 VA 表（x86 MSVC /Od switch）→ 表址
+    // LeaRva(表 RVA) 物化 + AbsVa 比较链；标签 mem-4B-abs-baseless。
+    ir::FunctionRegion fn = g2x_fn_of(g2x_baseless4_tail_block(),
+                                      g2x_defense_block());
+    const u64 kImageBase = 0x400000ull;
+    std::vector<u64> tbl;
+    for (u64 t : g2_targets()) tbl.push_back(kImageBase + t);
+    const auto r = wvmp::regvm::translator::translate_function(
+        fn, wvmp::regvm::translator::FunctionUpperBoundFn{}, g2_read_fn(tbl),
+        kImageBase);
+    ASSERT_EQ(r.notes.size(), static_cast<size_t>(1));
+    EXPECT_NE(r.notes[0].find("jump-table @ 0x2000 entries=8 mem-4B-abs-baseless"),
+              std::string::npos);
+    const Decoded d = decode_program(r.program);
+    const auto& g = d.insns;
+    // b0 防御块 4 拍（x86 S32）→ il 3 拍（g[4..6]）→ 物化 4 拍（g[7..10]：
+    // Mov s,il; Shl s,2; Add s,0x2000; LeaRva s,s）→ Load t,[s] S32（g[11]）
+    // → 链首 g[12]（Mov 0x1100; LeaRva; Cmp; Jcc E）。
+    ASSERT_GE(g.size(), static_cast<size_t>(17));
+    expect_is(g[7], VmOp::Mov, OpKind::Reg, isa::kScratchFirst, OpKind::Reg, kRax,
+              0, kS32);
+    expect_is(g[8], VmOp::Shl, OpKind::Reg, isa::kScratchFirst, OpKind::Imm, 0, 2,
+              kS32);
+    expect_is(g[9], VmOp::Add, OpKind::Reg, isa::kScratchFirst, OpKind::Imm, 0,
+              0x2000, kS32);
+    expect_is(g[10], VmOp::LeaRva, OpKind::Reg, isa::kScratchFirst, OpKind::Reg,
+              isa::kScratchFirst, 0, kS32);
+    expect_is(g[11], VmOp::Load, OpKind::Reg, isa::kScratchFirst + 1, OpKind::Reg,
+              isa::kScratchFirst, 0, kS32);
+    expect_is(g[12], VmOp::Mov, OpKind::Reg, isa::kScratchFirst, OpKind::Imm, 0,
+              0x1100, kS32);
+    size_t jcc_e = 0;
+    for (const VmInsn& v : g)
+        if (v.op == VmOp::Jcc && v.cond_or_size == static_cast<u8>(ir::Cond::E))
+            ++jcc_e;
+    EXPECT_EQ(jcc_e, 8u);
+    EXPECT_EQ(g.back().op, VmOp::Halt);
+}
+
 TEST(Translate, JumpTableX64Delta4WrapStaysS64Face) {
     // 对账面：x64 8B delta signed 语义不受 4B 回绕修正影响（既有用例
     // JumpTable8DeltaRegExpandsChain 继续钉 x64 面；本用例钉 4B 回绕只在

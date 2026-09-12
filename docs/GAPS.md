@@ -3358,3 +3358,79 @@ codegen 停留 /Od 形态（MIT-379 既定纪律，marker_end 尾调用防护）
 在 x86 /Od 下为 CRT helper 调用（该区被 C1-gate 从未入 VM，无碍）已补
 边界披露。SF 后复验：双 arch native 105/105、重打包 + LOG IDENTICAL
 双侧、兄弟仓 SF 提交（amend 剔除验收探针遗留文件）。
+
+## MIT-494x（T47 · x86 gate 面收口——间接 jmp 与 SSE 零初始化，2026-09-12）
+
+**背景**：T46 验收逐区定名的两个 x86 gate——switch_grade（跳表间接
+jmp）与 list_sum（SSE 零初始化 lifter-C1）——本单收口。**duff_copy 的
+T32 时代残留间接 jmp gate 同源一并翻面**（同为 base-less 表形态）。
+
+**Fix A（base-less 绝对 VA 跳表）**：MSVC /Od 的 switch 查表形态 =
+`cmp [m],K-1; ja default; mov idx,[m]; jmp [idx*4 + absVA]`——表地址为
+无 base 的绝对 disp32。既有匹配器（MIT-409/413/451）硬性要求 base 寄存
+器 → 形状不命中落通用 gate。扩展三处：① 匹配器 mem_source 分支收
+`base==Flags + index + scale∈{4,8} + disp≥image_base` 形态（表 RVA =
+disp − image_base，b=Flags 哨兵，块尾 [il, jmp] 两条 il 就地判定，顶判
+ins.size 3→2）；② translate_jump_table 增 base-less 分支：`s = idx<<2;
+s += 表RVA; LeaRva s,s; Load t,[s]`（表项已被加载器重定位为真 VA，
+AbsVa 语义与比较链 LeaRva(target) 恒等）；③ jt_form_tag 补
+`-baseless` 标签。零新 VmOp（Mov/Shl/Add/LeaRva/Load/Cmp/Jcc 全白名
+单）。表验证链（read_fn 逐项 + 目标∈区域 + 防御常数 + 预算 32）全复用。
+
+**Fix B（MOVLPD store 入面）**：lifter 无 X86_INS_MOVLPD case → list_sum
+的 8 字节局部零初始化对（xorps + 2× movlpd [mem], xmm）两条被跳 → C1。
+修复 = MOVLPD **store 形（66 0F 13 /r）**映射既有 `Movss + Size::S64`
+编码（IR 口径 SSE 标量 mov 族统一 Movss+size 标签，与既有 X86_INS_MOVSD
+case 同款；低 64 存储语义恒等）——**零新 VmOp/零 asmgen 改动**。load 形
+（66 0F 12）上 64 位保留语义与标量 store 不同 → 仅收 store 形，load 维
+持 unsupported 保守 gate。（⚠️ 66 0F E2 = PSRAD——首版编码误认的出处，
+见实现坑。）
+
+**实现坑（解码探针证伪操作码假设）**：首版测试把 movlpd 编码写成
+`0F E2`——实为 **PSRAD**（capstone id=437）；MOVLPD store = `66 0F 13`、
+load = `66 0F 12`。解码序列探针（session.next 逐条打印 id/mnemonic）当
+场证伪。方法论：新 lift 面的单测必须先经 CapstoneSession 解码探针核验
+编码↔助记符映射，再断言 IR。
+
+**结果**：x86 打包 18 → **21 stubs（22 区）**——翻面 3 区：list_sum
+（C1 消除）、switch_grade（间接 jmp）、**duff_copy（T32 时代残留间接
+jmp gate 同源翻面，X7 概览"残余 gate 面 = 间接 jmp 1 + 栈深 1"的间接
+jmp 半边清零）**；仅剩 mul64hi 栈深（X5b 永久 gate）。跳表命中实证 =
+protect 日志 `jump-table @ 0xBD24 entries=8`（duff）+ `@ 0xCCC0
+entries=4`（switch），标签 mem-4B-abs-baseless。wvmpTest packed vs
+native **LOG IDENTICAL 双侧 105/105**。x64 面字节恒等（dump sha
+f8b0ebd6/164,350B 复验；base-less 分支 arch 共享但 x64 代码无该形态，
+行为零变化）。
+
+**全门**：ctest 23/23（+2 新单测：JumpTableX86MemBaselessAbsExpands
+Chain、MovlpdStoreLiftsToMovsdLoadStaysGate）、x86 电池 46/46、x86 结构
+门 PASS、crypt 20/20、tls 4/4、multiseed_aslr 全池（见 DEV_QUEUE 收口
+注记）、measure 7 点 checksum 一致。
+
+**边界披露**：base-less 匹配要求 disp ≥ image_base（表址合法性由
+read_fn 逐项读失败兜底 gate）；MOVLPD load 形维持 gate（上 64 保留语义
+不可映射 Movsd，出现频率低——/Od 零初始化恒为 store 对）；x64 面
+base-less 分支为共享代码的对称能力（现网 x64 跳表均为 RIP 相对形，不触
+发）。
+
+**池门运行注记（2026-09-12）**：multiseed_aslr 全池 **333/335 + 2 环境
+项**：① div@seed99999 池轮打包产物被实时保护删除（探针 OSError）——验
+收复验同 seed 重打包确定性哈希（2fac33d7…）3/3 rc=0 byte-exact 且
+MpCmdRun 无威胁 = **间歇性环境项，本次复验干净**；② pushimm@seed12345
+单轮 delta=0 假绿签名——**复跑 5/5 全过**（含该 seed）= OS 层 ASLR 偶
+发回落（T30/T32 已录抖动通道），非回归。两项均排除语义因素；x86 新增
+跳表翻转面的 byte-exact 由同批 235 个 x86 运行通过背书。
+
+**验收返工记录（ACCEPT-with-notes → C/SF 落实，2026-09-12）**：独立验收
+在 diff 审查检出 **C1**——顶判 ins.size 3→2 后 REG 源分支 `ld =
+ins[size-3]` 在 2 条块（`mov eax,[x]; jmp eax` 形）为 SIZE_MAX 越界下标
+（/MDd + cdb 实测 vector subscript out of range @ translator.cpp:446；
+垃圾消费路径全归 nullopt 故无可证语义影响，release 为惰性 OOB 读）→
+修复 = REG 分支头部补 `ins.size() < 3` 守卫。**C2** = 生产源码遗留
+[T47-PROBE] printf（污染 wvmp_cli stdout）→ 删除。SF 落实：GAPS/代码
+注释 MOVLPD 编码勘误（store=66 0F 13 / load=66 0F 12，0F E2=PSRAD）；
+div@99999 措辞更新（验收复验同哈希 3/3 byte-exact + MpCmdRun 无威胁 =
+间歇性环境项非持续拦截）；验收探针遗留文件清理 + 测试更名
+MovlpdStoreLiftsToScalarMov（Movss+S64 统一编码口径）。修复后终验：
+lifter 电池 162/162、ctest 23/23、x86 电池 46/46、wvmpTest 重打包 21
+stubs / 零探针噪声 / LOG IDENTICAL 105/105。

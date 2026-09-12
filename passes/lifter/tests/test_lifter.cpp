@@ -2025,6 +2025,51 @@ TEST(LifterBlocks, UnsupportedInsnRecordedButNotFatal) {
     EXPECT_EQ(meta.skipped_ranges[0].second, 2u);     // 0F A2 = 2 字节
 }
 
+TEST(LifterBlocks, MovlpdStoreLiftsToScalarMovLoadStaysGate) {
+    // MIT-494x (T47): movlpd store (66 0F E2 4D F8 = movlpd [ebp-8], xmm1)
+    // → Op::Movsd（低 64 存储语义恒等，零新 VmOp）；load 形（66 0F E2 45 F8
+    // = movlpd xmm1, [ebp-8]）上 64 保留语义不可映射 Movsd → 维持
+    // unsupported（skipped_ranges 记账 → C1 gate 保守面）。
+    // 前置标准序言（X86 lifter 面按真实函数形态驱动）
+    // ⚠️ MOVLPD store = 66 0F 13 /r（0F E2 = PSRAD，首版用错操作码被
+    // 解码探针当场证伪）；load = 66 0F 12 /r。
+    constexpr wvmp::u8 b[] = {0x55,                   // push ebp
+                              0x8B, 0xEC,             // mov ebp, esp
+                              0x66, 0x0F, 0x13, 0x4D, 0xF8, // movlpd [ebp-8], xmm1
+                              0x66, 0x0F, 0x12, 0x45, 0xF8, // movlpd xmm1, [ebp-8]
+                              0x5D, 0xC3};            // pop ebp; ret
+    lifter::CapstoneSession session(ir::Arch::X86);
+    ir::FunctionRegion fr;
+    fr.name = "movlpdz";
+    fr.arch = ir::Arch::X86;
+    fr.begin_rva = 0x1000;
+    fr.end_rva = 0x1000 + sizeof(b);
+
+    wvmp::Diagnostics diag;
+    lifter::LiftMetadata meta;
+    const wvmp::u64 decoded =
+        lifter::disassemble_and_lift(session, b, sizeof(b), fr.begin_rva,
+                                     fr.end_rva, fr.name, "lifter", diag, fr,
+                                     meta);
+    EXPECT_EQ(decoded, 6u);   // 5 lift + 1 skip（decoded 计数含跳过）
+    ASSERT_GE(fr.blocks.size(), 1u);
+    ASSERT_GE(fr.blocks[0].insns.size(), 1u);
+    // insns: push, mov ebp,esp, Movsd(store), pop, ret（load 形跳过不入列）
+    ASSERT_EQ(fr.blocks[0].insns.size(), 5u);
+    const ir::Insn& st = fr.blocks[0].insns[2];
+    // IR 口径：SSE 标量 mov 族统一 Movss + size 标签（S64 = movsd/movlpd
+    // 形），与既有 X86_INS_MOVSD case 同编码。
+    EXPECT_EQ(st.op, ir::Op::Movss);
+    EXPECT_EQ(st.size, ir::Size::S64);
+    EXPECT_EQ(st.dst.kind, ir::Operand::Kind::Mem);
+    EXPECT_EQ(st.src.kind, ir::Operand::Kind::Reg);
+    EXPECT_EQ(st.addr, 0x1003u);
+    // load 形不支持 → 恰 1 段 skipped（@0x1008, 5B）
+    ASSERT_EQ(meta.skipped_ranges.size(), 1u);
+    EXPECT_EQ(meta.skipped_ranges[0].first, 0x1008u);
+    EXPECT_EQ(meta.skipped_ranges[0].second, 5u);
+}
+
 TEST(LifterBlocks, CallTargetAndReturnPointAreLeaders) {
     // 0: E8 04 00 00 00  call 9
     // 5: 31 C0            xor eax,eax

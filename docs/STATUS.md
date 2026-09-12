@@ -1218,3 +1218,18 @@ asmgen 零触碰 → dump 锚不受影响（无换代）。
   gate RVA 已录）；packed LOG IDENTICAL 双侧 105/105**。词流 +21.6%
   （x64），ExitNative 多出口词 +12 与 switch 多出口自洽。证据链 GAPS
   MIT-494w。
+
+### MIT-494x (T47 · x86 gate 面收口——间接 jmp 与 SSE 零初始化) ✅ 2026-09-12
+- Fix A：跳表匹配器/翻译器收 base-less 绝对 VA 表（x86 `jmp [idx*4+abs]`
+  形，表 RVA = disp−image_base + LeaRva 物化 + AbsVa 链）——**翻面 3 区
+  （switch_grade/list_sum/duff_copy，T32 残留间接 jmp 同源清零）**，x86
+  18→21 stubs，仅剩 mul64hi 栈深永久 gate；jump-table 命中日志
+  mem-4B-abs-baseless ×2。Fix B：MOVLPD store → Movss/S64 既有编码（零
+  新 VmOp），list_sum C1 消除。x64 字节恒等（sha 复验）。
+- 实现坑：movlpd 操作码首版误写 0F E2（= PSRAD），CapstoneSession 解码
+  探针当场证伪（0F 13/12 才是 MOVLPD store/load）——新 lift 面单测须先
+  过解码探针。全门：ctest 23/23（+2 单测）、x86 电池 46/46、结构门、
+  crypt 20/20、tls 4/4、wvmpTest LOG IDENTICAL 双侧 105/105、池
+  333/335+2 环境项（div@99999 间歇删除/复验干净 + pushimm 抖动复跑 5/5
+  排除）。
+  证据链 GAPS MIT-494x。

@@ -2847,6 +2847,19 @@ TranslateResult translate_insn(const cs_insn& ci, ir::Arch arch) {
             return translate_string_op(ci, x, arch);
         }
         return translate_sse_mov(ci, x, arch, Op::Movss, Size::S64);
+    // MIT-494x (T47): movlpd store (66 0F 13 /r)——低 64 位存储与 Movss
+    // S64 编码语义恒等 → 复用既有 Movss+S64 通路（零新 VmOp/零 asmgen 改
+    // 动）。收口面 = MSVC /Od 的 8 字节局部零初始化对（xorps + movlpd
+    // [mem], xmm，wvmpTest list_sum 实测：两条 movlpd 未支持 → lifter 跳
+    // 2 条 → C1 gate）。load 形（66 0F 12）上 64 位保留语义与标量 store
+    // 不同 → 仅收 store 形，load 形维持 unsupported 保守 gate。⚠️ 编码：
+    // 0F E2 = PSRAD（首版误认，CapstoneSession 解码探针证伪）。
+    case X86_INS_MOVLPD:
+        if (x.op_count == 2 && x.operands[0].type == X86_OP_MEM &&
+            x.operands[1].type == X86_OP_REG) {
+            return translate_sse_mov(ci, x, arch, Op::Movss, Size::S64);
+        }
+        return unsupported(ci.address, ci.size);
     // MIT-442 (X2a) ②: plain 单发串形 (A4/A5/AA/AB/AC/AD/AE/A6/A7 + Q 形)。
     // rep 形经入口前缀闸 (prefix[0]=F3/F2) 派入同一 translate_string_op 的
     // rep 通路; 本组 case 只接 prefix 全零的单发形 (66 形 movsw/stosw/... 由
