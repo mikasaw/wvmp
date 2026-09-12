@@ -1157,3 +1157,18 @@ asmgen 零触碰 → dump 锚不受影响（无换代）。
   +10-15%。方法学两坑入册：GF(2) 线性校验和退化（f⁵ᴹ=恒等）、动态词
   账 ≠ 静态 span（块桥 Jmp+1 词 + 内层 ×3 行程）。ctest 23/23 不变；
   证据链 GAPS MIT-494r。
+
+### MIT-494s (T42 · 解释器优化①：jcc cond 跳表化) ✅ 2026-09-12
+- T41 三候选按收益排序实施①：jcc handler 私有 16×8B cond 跳表（dispatch
+  表后常量位、base 加算、随机置换保留、两遍法覆写）。**分支形态双侧 −6%
+  （每 Jcc 词 ~25%），jcc 静态 x64 147→120 / x86 149→123**；ALU/LD/ST
+  −1~2%；②pc_ 常驻 ③惰性 aux 留候（x86 税主体在 dispatch/帧槽）。
+- 实现两坑入册：keystone 前向未知标签 jmp 按距离选宽（EB rel8/E9 rel32，
+  哑绝对目标测量虚大 3B/块 → 错块路由挂死，capstone 实锤）+ 数值目标
+  jmp 选宽依赖 at → 尾段前置 + 前缀累进汇编（真实 self_off）测量。
+- ⚠️ 流程坑：build/x86 交叉树独立——cmake --build build 不覆盖，曾误跑
+  旧 x86 电池二进制假绿；x86 面改动必须 scripts/build_x86_tests.bat 重建。
+- 全门绿：ctest 23/23、x64 57+2SKIP、x86 电池 46/46（新二进制）、
+  multiseed_aslr 335/335（REPEATS=10）、crypt 20/20、tls 4/4、x86 结构
+  门 + xmm 字节门 PASS；x64 dump 换代 67cfa727→**f8b0ebd6**/164,350B。
+  证据链 GAPS MIT-494s。

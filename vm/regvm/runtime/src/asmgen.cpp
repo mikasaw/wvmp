@@ -7,6 +7,7 @@
 //
 //   [entry][dispatch][handler..（码序随机）][0x90 垫片至 8 对齐][跳转表 128xu64]
 //    ^入口    ^取指/跳表   ^各自独立 ks_asm          ^表项=handler 相对码基址偏移
+//   [cond 表 16xu64]（MIT-494s：jcc 私有 cc 块跳表，紧随跳转表之后；表项同构）
 //
 //   - 入口在 code 偏移 0：`lea BASE,[rip-7]` 取得码基址（位置无关），
 //     保存 Win64 callee-saved（rbx/rbp/rdi/rsi/r12-r15 共 8 个），RCX 的
@@ -91,6 +92,7 @@
 #include <keystone/keystone.h>
 
 #include <array>
+#include <algorithm>
 #include <cinttypes>
 #include <cstdint>
 #include <cstdio>
@@ -1256,33 +1258,73 @@ public:
     }
 
     // Jcc：cond=cond_or_size（ir::Cond 0..15）；成立 pc += sext32(aux)，否则 +1。
+    // ---- MIT-494s (T42)：cond 链 → handler 私有 16 项 cond 跳表 ----------
+    // T41 侦察（GAPS MIT-494r）：15 路线性 cmp/je 链每 Jcc 词平均白走 ~15
+    // 条宿主指令，是热词流唯一大体量 handler（147 指令）的慢点主项。结构
+    // 复用 dispatch 跳表 D3 机制：私有 16×8B 表挂 dispatch 表之后
+    //（condtable_off = table_off + kTableEntries*8，数据区常量位——静态
+    // 审门的线性反汇编扫至 dispatch 表为止，cond 表在其后零触碰），表项 =
+    // cc 块相对码基址偏移，运行时 base 寄存器加算（位置无关，ASLR 安全；
+    // x86 读低 dword 同 D3 口径）。cond_perm_ 随机置换保留（表项布局熵等
+    // 价）。块偏移经分量哑汇编测量：jmp 恒 E9 rel32 / SIB disp 恒 32 定宽
+    // → 子块编码与整装逐字节同宽，算术布局即真布局（keystone 无符号表回
+    // 读能力，此法绕开）。setcc/cmovcc/条件 ExitNative 的链保持原样（本
+    // 矩阵冷面，收益为零白付 128B/handler 静态尺寸），留待测温推广。
+    mutable std::array<u64, 16> last_cond_table_{};   // 最近一次 build_*_jcc_at 填写
+    const std::array<u64, 16>& last_cond_table() const { return last_cond_table_; }
+
+    // HandlerDef 表项兼容包装（generate_runtime_arch 按 "jcc" 名特殊化接管，
+    // 本包装不进主装配路径；哑偏移 0x40000000 强制 SIB disp32 定宽）。
     std::string build_jcc(u64 dispatch) const {
+        return build_jcc_at(dispatch, 0, 0x4000'0000ull);
+    }
+
+    std::string build_jcc_at(u64 dispatch, u64 self_off, u64 ctbl_off) const {
         const std::string tag = "jcc" + std::to_string(seq());
         const std::string test_lbl = "jtest" + tag;
         const std::string fall_lbl = "jfall" + tag;
-        std::string out = decode_prelude();
-        // 链式分派（顺序随机；末条件 perm[15] 为链尾顺延跌入，其块最先排放）。
-        // imm() 必须用：keystone Intel 裸数字按 16 进制解析（"14"→0x14=20），
-        // 十进制字符串会让条件 10..15 永远错配到链尾。
-        for (int i = 0; i < 15; ++i) {
-            const int c = cond_perm_[i];
-            out += std::string("    cmp ") + r64(t_[2]) + ", " + imm(c) + "\n";
-            out += "    je cc" + std::to_string(c) + "_" + tag + "\n";
+        const std::string prelude = decode_prelude();
+        // 取表三连：t_[2] 持 cond（decode_prelude 落点，先读后写一次取表），
+        // 表项 + base = cc 块运行地址（dispatch 跳表 add base 同构）。
+        const std::string fetch =
+            std::string("    mov ") + r64(t_[2]) + ", qword ptr [" + r64(base_) +
+            " + " + r64(t_[2]) + "*8 + " + hex(ctbl_off) + "]\n" +
+            "    add " + r64(t_[2]) + ", " + r64(base_) + "\n" +
+            "    jmp " + r64(t_[2]) + "\n";
+        // 尾部段前置（test/取径/顺延在块前）：块内 jmp test_lbl 全为已定义
+        // 背向引用。⚠️ 布局测量铁律：keystone 对 jmp 按"实际距离"选宽——
+        // 前向未知标签近距编 EB rel8（2B）、远距/绝对编 E9 rel32（5B），
+        // 哑绝对目标测量会系统性虚大 3B/块（T42 实测：FiveSeedStability
+        // 错块路由 + 挂死，capstone 实锤 eb04 序列）。前缀累进汇编量块偏
+        // 移：前缀与整装逐字节同前缀 → 块 k 偏移 = 前 k 块前缀的装配尺寸。
+        const std::string tail =
+            test_lbl + ":\n" +
+            std::string("    test ") + r64(t_[0]) + ", " + r64(t_[0]) + "\n" +
+            "    jz " + fall_lbl + "\n" +
+            build_jmp(dispatch) +   // taken：pc += sext(aux)
+            fall_lbl + ":\n" + advance(dispatch);
+        // 块发射序 = 原链序（perm[15] 最先顺延，perm[0..14] 随后）——顺序随
+        // 机保留。分量测量用局部会话（标签不污染主会话符号表）。
+        int order[16];
+        order[0] = cond_perm_[15];
+        for (int i = 0; i < 15; ++i) order[i + 1] = cond_perm_[i];
+        auto blk_text = [&](int k) {
+            return "cc" + std::to_string(order[k]) + "_" + tag + ":\n" +
+                   cond_eval(order[k]) + "    jmp " + test_lbl + "\n";
+        };
+        {
+            KsSession ks;
+            std::string prefix = prelude + fetch + tail;
+            for (int k = 0; k < 16; ++k) {
+                // ⚠️ 测量必须用真实 self_off：jmp dispatch（数值目标）的
+                // EB/E9 选宽取决于绝对距离，at=0 会编 EB、真址编 E9。
+                last_cond_table_[order[k]] =
+                    self_off + ks.assemble(prefix, self_off, "jcc prefix").size();
+                prefix += blk_text(k);
+            }
         }
-        out += "cc" + std::to_string(cond_perm_[15]) + "_" + tag + ":\n" +
-               cond_eval(cond_perm_[15]) + "    jmp " + test_lbl + "\n";
-        for (int i = 0; i < 15; ++i) {
-            const int c = cond_perm_[i];
-            out += "cc" + std::to_string(c) + "_" + tag + ":\n";
-            out += cond_eval(c);
-            out += "    jmp " + test_lbl + "\n";
-        }
-        out += test_lbl + ":\n";
-        out += std::string("    test ") + r64(t_[0]) + ", " + r64(t_[0]) + "\n";
-        out += "    jz " + fall_lbl + "\n";
-        out += build_jmp(dispatch);   // taken：pc += sext(aux)
-        out += fall_lbl + ":\n";
-        out += advance(dispatch);
+        std::string out = prelude + fetch + tail;
+        for (int k = 0; k < 16; ++k) out += blk_text(k);
         return out;
     }
 
@@ -4112,34 +4154,54 @@ public:
     // x86 Jcc：cond = cond_or_size（帧槽）；16 路链（cond_perm 随机，同 x64
     // 机制）→ cond_eval_x86 → t_[0]=0/1。taken：pc dword += aux 原始双字
     //（32 位模加 ≡ x64 sext32 加法 —— pc 恒在 32 位值域）；不取 +1。
-    std::string build_jcc_x86(u64 dispatch) const {
+    // HandlerDef 表项兼容包装（generate_runtime_arch 按 "jcc" 名特殊化接管）。
+    std::string build_x86_jcc(u64 dispatch) const {
+        return build_x86_jcc_at(dispatch, 0, 0x4000'0000ull);
+    }
+
+    // x86 cond 跳表（MIT-494s，build_jcc_at 的 KS_MODE_32 镜像；机制与块序
+    // 见 x64 侧注）。差异：cond 在 kX86FSize 帧槽（decode_prelude_x86 首字
+    // 段落点）→ fetch 先装载 t_[2] 再取表；表项 8B 步距读低 dword（D3）。
+    std::string build_x86_jcc_at(u64 dispatch, u64 self_off, u64 ctbl_off) const {
         const std::string tag = "xjcc" + std::to_string(seq());
         const std::string test_lbl = "xjt_" + tag;
         const std::string fall_lbl = "xjf_" + tag;
-        std::string out = decode_prelude_x86();
-        // 链式分派（顺序随机；末条件 perm[15] 为链尾顺延跌入，其块最先排放）。
-        for (int i = 0; i < 15; ++i) {
-            const int c = cond_perm_[i];
-            out += std::string("    cmp dword ptr ") + xf(kX86FSize) + ", " + imm(c) + "\n";
-            out += "    je xcc" + std::to_string(c) + "_" + tag + "\n";
+        const std::string prelude = decode_prelude_x86();
+        const std::string fetch =
+            std::string("    mov ") + r32x(t_[2]) + ", dword ptr " + xf(kX86FSize) + "\n" +
+            "    mov " + r32x(t_[2]) + ", dword ptr [" + r32x(base_) + " + " +
+            r32x(t_[2]) + "*8 + " + hex(ctbl_off) + "]\n" +
+            "    add " + r32x(t_[2]) + ", " + r32x(base_) + "\n" +
+            "    jmp " + r32x(t_[2]) + "\n";
+        // 尾部段前置 + 前缀累进测量（EB/E9 距离选宽铁律见 x64 侧注）。
+        const std::string tail =
+            test_lbl + ":\n" +
+            std::string("    test ") + r32x(t_[0]) + ", " + r32x(t_[0]) + "\n" +
+            "    jz " + fall_lbl + "\n" +
+            std::string("    mov ") + r32x(t_[0]) + ", " + xf(kX86FAux) + "\n" +
+            std::string("    add dword ptr [") + r32x(ctx_) + " + 0x8], " +
+            r32x(t_[0]) + "\n" +
+            "    jmp " + hex(dispatch) + "\n" +
+            fall_lbl + ":\n" + advance_x86(dispatch);
+        int order[16];
+        order[0] = cond_perm_[15];
+        for (int i = 0; i < 15; ++i) order[i + 1] = cond_perm_[i];
+        auto blk_text = [&](int k) {
+            return "xcc" + std::to_string(order[k]) + "_" + tag + ":\n" +
+                   cond_eval_x86(order[k]) + "    jmp " + test_lbl + "\n";
+        };
+        {
+            KsSession ks{unsigned(KS_MODE_32)};   // 花括号：防 most-vexing-parse
+            std::string prefix = prelude + fetch + tail;
+            for (int k = 0; k < 16; ++k) {
+                // 测量用真实 self_off（EB/E9 距离铁律，见 x64 侧注）。
+                last_cond_table_[order[k]] =
+                    self_off + ks.assemble(prefix, self_off, "xjcc prefix").size();
+                prefix += blk_text(k);
+            }
         }
-        out += "xcc" + std::to_string(cond_perm_[15]) + "_" + tag + ":\n" +
-               cond_eval_x86(cond_perm_[15]) + "    jmp " + test_lbl + "\n";
-        for (int i = 0; i < 15; ++i) {
-            const int c = cond_perm_[i];
-            out += "xcc" + std::to_string(c) + "_" + tag + ":\n";
-            out += cond_eval_x86(c);
-            out += "    jmp " + test_lbl + "\n";
-        }
-        out += test_lbl + ":\n";
-        out += std::string("    test ") + r32x(t_[0]) + ", " + r32x(t_[0]) + "\n";
-        out += "    jz " + fall_lbl + "\n";
-        out += std::string("    mov ") + r32x(t_[0]) + ", " + xf(kX86FAux) + "\n";
-        out += std::string("    add dword ptr [") + r32x(ctx_) + " + 0x8], " +
-               r32x(t_[0]) + "\n";
-        out += "    jmp " + hex(dispatch) + "\n";
-        out += fall_lbl + ":\n";
-        out += advance_x86(dispatch);
+        std::string out = prelude + fetch + tail;
+        for (int k = 0; k < 16; ++k) out += blk_text(k);
         return out;
     }
 
@@ -5630,7 +5692,7 @@ public:
     std::string build_x86_mov(u64 d) const { return build_mov_x86(d); }
     std::string build_x86_load(u64 d) const { return build_load_x86(d); }
     std::string build_x86_store(u64 d) const { return build_store_x86(d); }
-    std::string build_x86_jcc(u64 d) const { return build_jcc_x86(d); }
+    // build_x86_jcc = MIT-494s 跳表化包装（build_x86_jcc_at），原别名删除。
     std::string build_x86_jmp(u64 d) const { return build_jmp_x86(d); }
     std::string build_x86_nop(u64 d) const { return build_nop_x86(d); }
     std::string build_x86_halt(u64 d) const { return build_halt_x86(d); }
@@ -6006,8 +6068,35 @@ RuntimeGenResult generate_runtime_arch(wvmp::Rng& rng, AsmGen::HostArch arch,
     std::map<int, u64> handler_off;
     std::map<int, std::string> handler_text;   // dump 复用（标签序号勿再递增）
     u64 cursor = dispatch_addr + dispatch_size;
+    // MIT-494s 验收 Nit1：两遍法按表项名 "jcc" 特殊化——表项改名会静默落
+    // 入兼容包装（哑 +1GB 偏移路径，且无 pass2 尺寸断言可拦）。fail-fast。
+    if (std::count_if(handlers.begin(), handlers.end(),
+                      [](const HandlerDef& h) {
+                          return std::string_view(h.name) == "jcc";
+                      }) != 1)
+        throw std::runtime_error(
+            "regvm runtime: exactly one handler must be named \"jcc\" "
+            "(cond-table two-pass contract, MIT-494s)");
+    // MIT-494s (T42)：jcc 带 handler 私有 cond 跳表，表偏移依赖 table_off →
+    // dispatch 同款两遍法：先以哑偏移占位装配定尺寸（SIB disp32 定宽 → 与
+    // 真偏移逐字节同宽），表偏移已知后重汇编覆写（循环后）。
+    u64 jcc_off = 0, jcc_size = 0;
     for (const auto& h : handlers) {
-        std::string text = (g.*h.build)(dispatch_addr);
+        std::string text;
+        if (std::string_view(h.name) == "jcc") {
+            text = (arch == AsmGen::HostArch::X86)
+                       ? g.build_x86_jcc_at(dispatch_addr, cursor, kDummyTableOff)
+                       : g.build_jcc_at(dispatch_addr, cursor, kDummyTableOff);
+            const std::vector<u8> code = ks.assemble(text, cursor, h.name);
+            handler_off[h.opcode] = cursor;
+            jcc_off = cursor;
+            jcc_size = code.size();
+            handler_text[h.opcode] = std::move(text);   // pass1 占位（pass2 覆写）
+            handler_code.insert(handler_code.end(), code.begin(), code.end());
+            cursor += code.size();
+            continue;
+        }
+        text = (g.*h.build)(dispatch_addr);
         const std::vector<u8> code = ks.assemble(text, cursor, h.name);
         handler_off[h.opcode] = cursor;
         handler_text[h.opcode] = std::move(text);
@@ -6026,10 +6115,33 @@ RuntimeGenResult generate_runtime_arch(wvmp::Rng& rng, AsmGen::HostArch arch,
     if (dispatch2.size() != dispatch_size)
         throw std::runtime_error("regvm runtime: dispatch pass2 size drifted (two-pass broken)");
 
-    // —— 装配：[entry][dispatch][handlers][pad][table] ——
+    // —— MIT-494s：jcc 第 2 遍（真实 cond 表偏移 = dispatch 表紧随区）+
+    //    覆写占位码。尺寸必须与第 1 遍恒等（SIB disp32 定宽不变量）。——
+    const u64 condtable_off = table_off + kTableEntries * 8;
+    {
+        const std::string jcc_text2 =
+            (arch == AsmGen::HostArch::X86)
+                ? g.build_x86_jcc_at(dispatch_addr, jcc_off, condtable_off)
+                : g.build_jcc_at(dispatch_addr, jcc_off, condtable_off);
+        const std::vector<u8> jcc_code2 = ks.assemble(jcc_text2, jcc_off, "jcc pass2");
+        if (jcc_code2.size() != jcc_size)
+            throw std::runtime_error("regvm runtime: jcc pass2 size drifted (two-pass broken)");
+        const u64 jcc_pos = jcc_off - (dispatch_addr + dispatch_size);
+        std::copy(jcc_code2.begin(), jcc_code2.end(),
+                  handler_code.begin() + static_cast<std::ptrdiff_t>(jcc_pos));
+        // dump 覆写为 pass2 文本 + cond 表注记（透明度对齐 dispatch 表节）。
+        std::string dt = jcc_text2;
+        dt += "; ---- cond table @ +" + hex(condtable_off) +
+              " (16 x u64 LE, 项 = cc 块相对码基址偏移；x86 读低 dword；MIT-494s) ----\n";
+        for (int c = 0; c < 16; ++c)
+            dt += ";   [" + std::to_string(c) + "] = " + hex(g.last_cond_table()[c]) + "\n";
+        handler_text.at(int(VmOp::Jcc)) = std::move(dt);
+    }
+
+    // —— 装配：[entry][dispatch][handlers][pad][table][cond table] ——
     vm::RuntimeImage image;
     image.vm_entry_offset = 0;
-    image.code.reserve(size_t(table_off) + size_t(kTableEntries * 8));
+    image.code.reserve(size_t(table_off) + size_t(kTableEntries * 8) + 16 * 8);
     image.code.insert(image.code.end(), entry_code.begin(), entry_code.end());
     image.code.insert(image.code.end(), dispatch2.begin(), dispatch2.end());
     image.code.insert(image.code.end(), handler_code.begin(), handler_code.end());
@@ -6039,6 +6151,10 @@ RuntimeGenResult generate_runtime_arch(wvmp::Rng& rng, AsmGen::HostArch arch,
     };
     for (u64 op = 0; op < kTableEntries; ++op)
         push_u64(handler_off.count(int(op)) ? handler_off.at(int(op)) : halt_off);
+    // MIT-494s：jcc 私有 cond 表（16×8B，紧跟 dispatch 表之后；表项 = cc 块
+    // 相对码基址偏移，x86 消费低 dword）。
+    for (int c = 0; c < 16; ++c)
+        push_u64(g.last_cond_table()[static_cast<size_t>(c)]);
 
     // —— asm_dump（带布局注释的最终汇编文本）——
     std::string dump;
