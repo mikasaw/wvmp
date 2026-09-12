@@ -3780,3 +3780,28 @@ crypt/tls、池门见运行注记。
   135/135、lifter 177/177、ctest 23/23、x86 电池、x64 sha 恒等、x86
   结构门、wvmpTest 双 arch LOG IDENTICAL 105/105（x86 22 stubs）。池门
   340/340 × 2（翻面后首跑，ASLR jitter_events=0）。
+
+## MIT-501（T55 · 性能基线刷新——T51-T54 变更后测量，2026-09-13）
+
+**hotloop sweep（REPEATS=5，与基线同口径）**：
+- x64 主靶：native 6.732ms / protected 414.976ms = **61.6×**（T44 基线
+  410.8ms/61.0×，+1% 噪声带内——桥/合成词不在热循环词流，零影响 ✓）；
+- **x86 主靶：131.141ms**（T35 基线 157.1ms = **−16.5%**，T43 pc_=ecx
+  优化收益在当前树兑现实测）；x64br 136.7ms / x86br 166.8ms /
+  x64mem 178.2ms / x86mem 206.6ms（checksum 全一致）。
+
+**wvmpTest 全量单发墙钟（含进程启动，非受控中位口径）**：x64 native
+0.065s / packed 0.114s = 1.75×（T44 受控口径 1.74× 吻合）；x86 native
+0.075s / packed 0.119s = 1.59×（22 stubs 全虚拟化后首测；与 T44 的
+1.72× 差异含启动噪声主导 + mul64hi 入 VM 反向成本对冲，不作精确认定，
+受控口径刷新留后续）。
+
+**measure_perf 环境挂死披露**：脚本 x86 相位挂死两轮（native test_target
+CPU 0.1s 计算完成后进程不退出 20+ 分钟，前台直跑同程序 0.075s 干净
+退出；kill 后重试同样复现）——PowerShell 采样包装层 + 退出路径环境阻塞
+（Defender 退出扫描类，与今日 div 族探针 4×delta=0 回合同域），非 VM
+缺陷；工具层修复挂账。
+
+**登记**：bridge 开销 = 每 callgate 词流 +4 词（step 2.6 条件转存 + 2.7
+三桥入）+ 每已验证 stdcall callgate +1 合成 Add 词——callgate 位点级，
+热循环/全量墙钟均无病理回归。
