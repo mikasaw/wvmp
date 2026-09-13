@@ -2327,6 +2327,47 @@ TEST(LifterCleanup, NoTerminalRejected) {
     EXPECT_FALSE(ret_imm_of(std::span<const wvmp::u8>(body), 0x1000).has_value());
 }
 
+// ==================== MIT-506/507 (T60): x87 L0 解码 ====================
+TEST(LifterX87, RegionDecodesX87Sequence) {
+    // 真 x87 字节序列（fld m64; fadd m64; fstp m64; fchs; fnop）经
+    // LifterPass 全管道 → IR 断言（物理 FPU 驻留架构的解码层验证）。
+    const wvmp::u8 code[] = {
+        0xDD, 0x00,                   // fld qword [eax]      (DD /0)
+        0xD8, 0x40, 0x08,             // fadd dword [eax+8]   (D8 /0, modrm 40)
+        0xDD, 0x58, 0x10,             // fstp qword [eax+0x10]
+        0xD9, 0xE0,                   // fchs
+        0xD9, 0xD0,                   // fnop
+    };
+    const auto img = make_min_pe(std::span<const wvmp::u8>(code));
+    wvmp::ProtectionContext ctx;
+    ctx.image = img;
+    ir::FunctionRegion fr;
+    fr.name = "x87fn";
+    fr.arch = ir::Arch::X86;
+    fr.begin_rva = 0x1000;
+    fr.end_rva = 0x1000 + sizeof(code);
+    ctx.functions.push_back(fr);
+    wvmp::passes::LifterPass pass;
+    pass.run(ctx);
+    ASSERT_FALSE(ctx.functions[0].blocks.empty());
+    std::vector<ir::Op> ops;
+    for (const auto& b : ctx.functions[0].blocks)
+        for (const auto& i : b.insns) {
+            ops.push_back(i.op);
+            const auto nm = to_string(i.op);
+            std::printf("[T60-DBG] op=%u %.*s\n", static_cast<unsigned>(i.op),
+                        static_cast<int>(nm.size()), nm.data());
+        }
+    ASSERT_GE(ops.size(), static_cast<size_t>(5));
+    std::printf("[T60-ENUM] test-side Fld87Mem=%d ops0=%d\n",
+                static_cast<int>(ir::Op::Fld87Mem), static_cast<int>(ops[0]));
+    EXPECT_EQ(ops[0], ir::Op::Fld87Mem);
+    EXPECT_EQ(ops[1], ir::Op::Fadd87);
+    EXPECT_EQ(ops[2], ir::Op::Fstp87Mem);
+    EXPECT_EQ(ops[3], ir::Op::Fchs87);
+    EXPECT_EQ(ops[4], ir::Op::Nop);   // fnop 折 Nop (零新 op)
+}
+
 TEST(LifterResync, JmpInWindowStaysGated) {
     // 窗内控制流离开（jmp）→ resync 不可证 → 拒。
     const wvmp::u8 cont[] = {

@@ -3138,6 +3138,65 @@ TEST(Translate, StackWalkX86CallgateNoClTaintPasses) {
     EXPECT_FALSE(has_stack_depth_gate(r));
 }
 
+// ==================== MIT-506/507 (T60): x87 L0 发射 ====================
+
+TEST(Translate, X87MemArithEmitSequence) {
+    // fld m64; fadd m64; fstp m64 → [Fld87Mem(8), Fadd87(8), Fstp87Mem(8)]
+    // mem 词形: a=Reg acc 槽 + aux=宽度 (emit_address 产物)。
+    ir::MemOperand m{};
+    m.base = ir::Reg::Rax;  // [rax] 形
+    ir::Insn fld = I(ir::Op::Fld87Mem, ir::Size::S64);
+    fld.src = ir::Operand::mem_(m);
+    ir::Insn fadd = I(ir::Op::Fadd87, ir::Size::S64);
+    fadd.src = ir::Operand::mem_(m);
+    ir::Insn fstp = I(ir::Op::Fstp87Mem, ir::Size::S64);
+    fstp.dst = ir::Operand::mem_(m);
+    ir::FunctionRegion fn = fn86_of({blk(0x1000, {fld, fadd, fstp})});
+    const auto r = wvmp::regvm::translator::translate_function(fn);
+    EXPECT_TRUE(r.notes.empty());
+    const Decoded d = decode_program(r.program);
+    // emit_address 会前置 Mov acc,base 词 (寄存器基址形)——按 op 计数断言。
+    int flds = 0, adds = 0, fstps = 0;
+    for (const auto& w : d.insns) {
+        if (w.op == VmOp::Fld87Mem && w.aux == 8) ++flds;
+        if (w.op == VmOp::Fadd87 && w.aux == 8) ++adds;
+        if (w.op == VmOp::Fstp87Mem && w.aux == 8) ++fstps;
+    }
+    EXPECT_EQ(flds, 1);
+    EXPECT_EQ(adds, 1);
+    EXPECT_EQ(fstps, 1);
+}
+
+TEST(Translate, X87StTreeAndComiEmit) {
+    // st(i) 形: fld st(1) → b=Imm reg_b=1; fst st(3) → a=Imm reg_a=3;
+    // fadd87 reg {a=Imm 0, b=Imm 2} → a/b Imm 双栈位; fcomi → b=Imm 1。
+    ir::Insn fld = I(ir::Op::Fld87St, ir::Size::S32);
+    fld.src = ir::Operand::imm_(1);
+    ir::Insn fst = I(ir::Op::Fst87St, ir::Size::S32);
+    fst.dst = ir::Operand::imm_(3);
+    ir::Insn fadd = I(ir::Op::Fadd87, ir::Size::S32);
+    fadd.dst = ir::Operand::imm_(0);
+    fadd.src = ir::Operand::imm_(2);
+    ir::Insn comi = I(ir::Op::Fcomi87, ir::Size::S32);
+    comi.src = ir::Operand::imm_(1);
+    comi.updates_flags = true;
+    ir::FunctionRegion fn = fn86_of({blk(0x1000, {fld, fst, fadd, comi})});
+    const auto r = wvmp::regvm::translator::translate_function(fn);
+    EXPECT_TRUE(r.notes.empty());
+    const Decoded d = decode_program(r.program);
+    ASSERT_GE(d.insns.size(), static_cast<size_t>(5));
+    EXPECT_EQ(d.insns[0].op, VmOp::Fld87St);
+    EXPECT_EQ(d.insns[0].b_kind, OpKind::Imm);
+    EXPECT_EQ(d.insns[0].reg_b, 1u);
+    EXPECT_EQ(d.insns[1].op, VmOp::Fst87St);
+    EXPECT_EQ(d.insns[1].a_kind, OpKind::Imm);
+    EXPECT_EQ(d.insns[1].reg_a, 3u);
+    EXPECT_EQ(d.insns[2].op, VmOp::Fadd87);
+    EXPECT_EQ(d.insns[3].op, VmOp::Fcomi87);
+    EXPECT_EQ(d.insns[3].b_kind, OpKind::Imm);
+    EXPECT_EQ(d.insns[3].reg_b, 1u);
+}
+
 // ==================== MIT-500 (T54): callgate 清理约定通道 ==================
 
 TEST(Translate, StackWalkX86StdcallCleanupBalances) {

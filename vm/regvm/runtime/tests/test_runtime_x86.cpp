@@ -2566,6 +2566,121 @@ TEST(X86Battery, X86SseUcomisFlagsRealExec) {
 }
 
 // ---------------------------------------------------------------------------
+// (31.7) MIT-506/507 (T60): x87 L0 电池 —— 物理FPU驻留直执行真跑。
+// 全部用例栈配平 (fld/fstp 成对), 测试间物理 FPU 状态零残留。
+// ---------------------------------------------------------------------------
+alignas(8) static double g_x87_a = 1.5, g_x87_b = 2.5, g_x87_out = 0.0;
+alignas(8) static int32_t g_x87_i = 42, g_x87_io = 0;
+alignas(4) static uint16_t g_x87_cw = 0x027F, g_x87_cwo = 0;
+
+static isa::VmInsn x87_mem(u8 addr_slot, isa::VmOp op, u32 width) {
+    return isa::make_insn(op, isa::OpKind::Reg, addr_slot, isa::OpKind::None,
+                          0, width, isa::size_field(ir::Size::S64));
+}
+
+TEST(X86Battery, X87MemArithStoreRoundTrip) {
+    wvmp::Rng rng(12345);
+    const auto gen = rt::generate_runtime_x86(rng);
+    RwxImage rwx(gen.image.code);
+    g_x87_a = 1.5; g_x87_b = 2.5; g_x87_out = 0.0;
+    std::vector<u8> s;
+    isa::append_insn(s, mov_imm(5, static_cast<u32>(reinterpret_cast<uintptr_t>(&g_x87_a))));
+    isa::append_insn(s, x87_mem(5, isa::VmOp::Fld87Mem, 8));    // st0 = 1.5
+    isa::append_insn(s, mov_imm(6, static_cast<u32>(reinterpret_cast<uintptr_t>(&g_x87_b))));
+    isa::append_insn(s, x87_mem(6, isa::VmOp::Fadd87, 8));      // st0 += 2.5
+    isa::append_insn(s, mov_imm(7, static_cast<u32>(reinterpret_cast<uintptr_t>(&g_x87_out))));
+    isa::append_insn(s, x87_mem(7, isa::VmOp::Fstp87Mem, 8));   // out = 4.0
+    isa::append_insn(s, halt());
+    rt::VmContext ctx;
+    ctx.bytecode = s.data();
+    ctx.pc = 0;
+    rwx.entry()(&ctx);
+    EXPECT_EQ(g_x87_out, 4.0);
+}
+
+TEST(X86Battery, X87FchsFsqrtFildFistp) {
+    wvmp::Rng rng(12345);
+    const auto gen = rt::generate_runtime_x86(rng);
+    RwxImage rwx(gen.image.code);
+    g_x87_a = 4.0; g_x87_out = 0.0; g_x87_i = 42; g_x87_io = 0;
+    std::vector<u8> s;
+    isa::append_insn(s, mov_imm(5, static_cast<u32>(reinterpret_cast<uintptr_t>(&g_x87_a))));
+    isa::append_insn(s, x87_mem(5, isa::VmOp::Fld87Mem, 8));    // st0 = 4.0
+    isa::append_insn(s, isa::make_insn(isa::VmOp::Fsqrt87, isa::OpKind::None,
+                                       0, isa::OpKind::None, 0, 0, 0));
+    isa::append_insn(s, mov_imm(6, static_cast<u32>(reinterpret_cast<uintptr_t>(&g_x87_out))));
+    isa::append_insn(s, x87_mem(6, isa::VmOp::Fstp87Mem, 8));   // out = 2.0
+    isa::append_insn(s, mov_imm(5, static_cast<u32>(reinterpret_cast<uintptr_t>(&g_x87_i))));
+    isa::append_insn(s, x87_mem(5, isa::VmOp::Fild87Mem, 4));   // st0 = 42
+    isa::append_insn(s, mov_imm(6, static_cast<u32>(reinterpret_cast<uintptr_t>(&g_x87_io))));
+    isa::append_insn(s, x87_mem(6, isa::VmOp::Fistp87Mem, 4));  // io = 42
+    isa::append_insn(s, halt());
+    rt::VmContext ctx;
+    ctx.bytecode = s.data();
+    ctx.pc = 0;
+    rwx.entry()(&ctx);
+    EXPECT_EQ(g_x87_out, 2.0);
+    EXPECT_EQ(g_x87_io, 42);
+}
+
+TEST(X86Battery, X87ComiFlagsAndStTree) {
+    wvmp::Rng rng(12345);
+    const auto gen = rt::generate_runtime_x86(rng);
+    RwxImage rwx(gen.image.code);
+    g_x87_a = 2.5; g_x87_b = 1.5; g_x87_out = 0.0;
+    // fld a(2.5); fld b(1.5) → st0=1.5, st1=2.5;
+    // fcomi st, st(1) → 1.5 vs 2.5 = less → CF; getflags 断言;
+    // fstp st(0) 清; fld st(1)?? — 栈树: fst st(3) 存 st0 → st3;
+    // fld a; fadd st(0), st(3)?? — 简化: fstp st(0) 后 st0=2.5;
+    // fadd87 reg {a=Imm 0, b=Imm 3} = st0 += st3(=2.5 存的) → 5.0。
+    std::vector<u8> s;
+    isa::append_insn(s, mov_imm(5, static_cast<u32>(reinterpret_cast<uintptr_t>(&g_x87_a))));
+    isa::append_insn(s, x87_mem(5, isa::VmOp::Fld87Mem, 8));    // st0=2.5
+    isa::append_insn(s, mov_imm(6, static_cast<u32>(reinterpret_cast<uintptr_t>(&g_x87_b))));
+    isa::append_insn(s, x87_mem(6, isa::VmOp::Fld87Mem, 8));    // st0=1.5 st1=2.5
+    isa::append_insn(s, isa::make_insn(isa::VmOp::Fcomi87, isa::OpKind::None,
+                                       0, isa::OpKind::Imm, 1, 0,
+                                       isa::size_field(ir::Size::S32)));
+    isa::append_insn(s, getflags(2));
+    // st(3) 树面: fst st(3) (st0=1.5 → st3); fstp st(0) (清 1.5, st0=2.5);
+    // fadd87 {a=Imm 0, b=Imm 3} → st0 = 2.5 + st3(1.5) = 4.0; fstp out。
+    isa::append_insn(s, isa::make_insn(isa::VmOp::Fst87St, isa::OpKind::Imm, 3,
+                                       isa::OpKind::None, 0, 0, 0));
+    isa::append_insn(s, isa::make_insn(isa::VmOp::Fstp87St, isa::OpKind::Imm, 0,
+                                       isa::OpKind::None, 0, 0, 0));
+    isa::append_insn(s, isa::make_insn(isa::VmOp::Fadd87, isa::OpKind::Imm, 0,
+                                       isa::OpKind::Imm, 3, 0,
+                                       isa::size_field(ir::Size::S32)));
+    isa::append_insn(s, mov_imm(7, static_cast<u32>(reinterpret_cast<uintptr_t>(&g_x87_out))));
+    isa::append_insn(s, x87_mem(7, isa::VmOp::Fstp87Mem, 8));
+    isa::append_insn(s, halt());
+    rt::VmContext ctx;
+    ctx.bytecode = s.data();
+    ctx.pc = 0;
+    rwx.entry()(&ctx);
+    expect_slot32(ctx, 2, isa::kFlagCF);   // 1.5 < 2.5 → CF
+    EXPECT_EQ(g_x87_out, 4.0);             // st 树面: 2.5 + st3(1.5)
+}
+
+TEST(X86Battery, X87ControlWordRoundTrip) {
+    wvmp::Rng rng(12345);
+    const auto gen = rt::generate_runtime_x86(rng);
+    RwxImage rwx(gen.image.code);
+    g_x87_cw = 0x027F; g_x87_cwo = 0;
+    std::vector<u8> s;
+    isa::append_insn(s, mov_imm(5, static_cast<u32>(reinterpret_cast<uintptr_t>(&g_x87_cw))));
+    isa::append_insn(s, x87_mem(5, isa::VmOp::Fldcw87, 16));
+    isa::append_insn(s, mov_imm(6, static_cast<u32>(reinterpret_cast<uintptr_t>(&g_x87_cwo))));
+    isa::append_insn(s, x87_mem(6, isa::VmOp::Fnstcw87, 16));
+    isa::append_insn(s, halt());
+    rt::VmContext ctx;
+    ctx.bytecode = s.data();
+    ctx.pc = 0;
+    rwx.entry()(&ctx);
+    EXPECT_EQ(g_x87_cwo, 0x027F);
+}
+
+// ---------------------------------------------------------------------------
 // (27) X3b 批次六：RVA 族（LoadRva/StoreRva/LeaRva —— base+RVA 公式钉，非
 //      identity：base ≠ 0 时 VA ≠ RVA）
 // ---------------------------------------------------------------------------

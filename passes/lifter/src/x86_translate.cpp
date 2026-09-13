@@ -2687,6 +2687,194 @@ TranslateResult translate_bmi_shift(const cs_insn& ci, const cs_x86& x, ir::Arch
     return r;
 }
 
+// ============================================================================
+// MIT-506/507 (T60): x87 L0 translate —— 物理FPU驻留直执行 (架构定案
+// GAPS MIT-506)。guest ST 栈 = 物理 st0-st7 (硬件 TOP 相对, st(i) 索引
+// 即物理栈位, 零翻译); IR/VmOp 只携带 形/宽度/栈位, handler 直发真实
+// x87 指令。fnop → Op::Nop (零新 op); fcom/ftst/fcmov/超越族/状态控制
+// 全族维持 gate (L1-L3)。tbyte(10B) 宽度经 src2=Imm(10) 标记 (G8a src2
+// 载体先例; ir::Size 无 10B 值)。fstsw(含 wait 前缀) 与 fnstsw 同映射
+// (掩码异常缺省下 wait 语义等价, 披露)。
+// ============================================================================
+namespace {
+std::optional<u8> st87_index(x86_reg r) {
+    if (r >= X86_REG_ST0 && r <= X86_REG_ST7)
+        return static_cast<u8>(r - X86_REG_ST0);
+    return std::nullopt;
+}
+} // namespace
+
+TranslateResult translate_x87(const cs_insn& ci, const cs_x86& x) {
+    ir::Insn out;
+    out.addr = ci.address;
+    const auto fail = [&]() { return unsupported(ci.address, ci.size); };
+    // mem 宽度: 4 → S32, 8 → S64; 10 → S64 载体 + src2=Imm(10) (tbyte)。
+    const auto set_width = [&](ir::Insn& o, unsigned bytes) {
+        o.size = (bytes == 4) ? ir::Size::S32 : ir::Size::S64;
+        if (bytes == 10) o.src2 = ir::Operand::imm_(10);
+    };
+    switch (ci.id) {
+    case X86_INS_FLD: {
+        if (x.op_count != 1) return fail();
+        if (x.operands[0].type == X86_OP_MEM) {
+            auto m = mem_operand(x.operands[0].mem);
+            if (!m) return fail();
+            const unsigned w = x.operands[0].size;
+            if (w != 4 && w != 8 && w != 10) return fail();
+            out.op = Op::Fld87Mem;
+            out.src = *m;
+            set_width(out, w);
+            return ok(out);
+        }
+        const auto si = st87_index(x.operands[0].reg);
+        if (!si) return fail();
+        out.op = Op::Fld87St;
+        out.src = ir::Operand::imm_(*si);
+        return ok(out);
+    }
+    case X86_INS_FLD1:
+        out.op = Op::Fld87Const;
+        out.src = ir::Operand::imm_(1);
+        return ok(out);
+    case X86_INS_FLDZ:
+        out.op = Op::Fld87Const;
+        out.src = ir::Operand::imm_(0);
+        return ok(out);
+    case X86_INS_FST:
+    case X86_INS_FSTP: {
+        if (x.op_count != 1) return fail();
+        const bool pop = ci.id == X86_INS_FSTP;
+        if (x.operands[0].type == X86_OP_MEM) {
+            auto m = mem_operand(x.operands[0].mem);
+            if (!m) return fail();
+            const unsigned w = x.operands[0].size;
+            // fst 无 tbyte 形 (SDM: fst 仅 m32/m64/st(i)); fstp 有 10B。
+            if (w != 4 && w != 8 && !(pop && w == 10)) return fail();
+            out.op = pop ? Op::Fstp87Mem : Op::Fst87Mem;
+            out.dst = *m;
+            set_width(out, w);
+            return ok(out);
+        }
+        const auto si = st87_index(x.operands[0].reg);
+        if (!si) return fail();
+        out.op = pop ? Op::Fstp87St : Op::Fst87St;
+        out.dst = ir::Operand::imm_(*si);
+        return ok(out);
+    }
+    case X86_INS_FILD:
+    case X86_INS_FIST:
+    case X86_INS_FISTP: {
+        if (x.op_count != 1 || x.operands[0].type != X86_OP_MEM) return fail();
+        auto m = mem_operand(x.operands[0].mem);
+        if (!m) return fail();
+        const unsigned w = x.operands[0].size;
+        // SDM: FILD m16/m32/m64; FIST 仅 m16/m32 (**无 64 位形式**); FISTP
+        // m16/m32/m64。m16 维持 gate (L0 范围 m32/m64); FIST m64 → 编码不
+        // 存在 → fail (keystone 实证 fist qword 装配非法)。
+        if (w != 4 && w != 8) return fail();
+        if (ci.id == X86_INS_FIST && w == 8) return fail();
+        out.op = ci.id == X86_INS_FILD  ? Op::Fild87Mem
+                 : ci.id == X86_INS_FIST ? Op::Fist87Mem
+                                          : Op::Fistp87Mem;
+        out.src = *m;
+        set_width(out, w);
+        return ok(out);
+    }
+    case X86_INS_FADD:  // 含 faddp (DE /0 折叠, capstone 无 FADDP id)
+    case X86_INS_FMUL: case X86_INS_FMULP:
+    case X86_INS_FSUB: case X86_INS_FSUBP: case X86_INS_FSUBR: case X86_INS_FSUBRP:
+    case X86_INS_FDIV: case X86_INS_FDIVP: case X86_INS_FDIVR: case X86_INS_FDIVRP: {
+        // mem 形 op_count==1 (单 MEM 操作数); reg 矩阵形 op_count==2。
+        u32 aux = 0;
+        if (ci.id == X86_INS_FSUBR || ci.id == X86_INS_FSUBRP ||
+            ci.id == X86_INS_FDIVR || ci.id == X86_INS_FDIVRP)
+            aux |= 0x2;  // reverse 位 (R 助记符)
+        // capstone 5.0.6 无 FADDP id——faddp (DE /0) 折叠进 X86_INS_FADD,
+        // pop 位按首操作码字节判定 (D8/DC=不弹, DE=弹); FMULP/FSUBP 等有
+        // 独立 id, id 判定照旧。
+        if (ci.bytes[0] == 0xDE ||
+            ci.id == X86_INS_FMULP || ci.id == X86_INS_FSUBP ||
+            ci.id == X86_INS_FSUBRP || ci.id == X86_INS_FDIVP ||
+            ci.id == X86_INS_FDIVRP)
+            aux |= 0x1;  // pop 位
+        Op base;
+        if (ci.id == X86_INS_FADD) base = Op::Fadd87;  // 含 faddp (DE 折叠)
+        else if (ci.id == X86_INS_FMUL || ci.id == X86_INS_FMULP) base = Op::Fmul87;
+        else if (ci.id == X86_INS_FSUB || ci.id == X86_INS_FSUBR ||
+                 ci.id == X86_INS_FSUBP || ci.id == X86_INS_FSUBRP)
+            base = Op::Fsub87;
+        else base = Op::Fdiv87;
+        if (x.operands[0].type == X86_OP_MEM) {
+            // mem 形: st0 ±×÷ [mem], 无 pop (faddp 无 mem 形)。
+            if (x.op_count != 1) return fail();
+            if (aux & 0x1) return fail();
+            auto m = mem_operand(x.operands[0].mem);
+            if (!m) return fail();
+            const unsigned w = x.operands[0].size;
+            if (w != 4 && w != 8) return fail();
+            out.op = base;
+            out.src = *m;
+            set_width(out, w);
+            out.src2 = ir::Operand::imm_(aux);
+            return ok(out);
+        }
+        // (reg, reg) 矩阵: op0 = dst st(i), op1 = src st(j) (capstone 直读)。
+        if (x.op_count != 2) return fail();
+        const auto di = st87_index(x.operands[0].reg);
+        const auto sj = st87_index(x.operands[1].reg);
+        if (!di || !sj) return fail();
+        out.op = base;
+        out.dst = ir::Operand::imm_(*di);
+        out.src = ir::Operand::imm_(*sj);
+        out.src2 = ir::Operand::imm_(aux);
+        return ok(out);
+    }
+    case X86_INS_FCHS:
+        out.op = Op::Fchs87;
+        return ok(out);
+    case X86_INS_FABS:
+        out.op = Op::Fabs87;
+        return ok(out);
+    case X86_INS_FSQRT:
+        out.op = Op::Fsqrt87;
+        return ok(out);
+    case X86_INS_FCOMI: {  // 含 fcomip (DF F0+i 折叠; pop 按首字节判定)
+        if (x.op_count != 2) return fail();
+        const auto si = st87_index(x.operands[1].reg);
+        if (!si) return fail();
+        out.op = ci.bytes[0] == 0xDF ? Op::Fcomip87 : Op::Fcomi87;
+        out.src = ir::Operand::imm_(*si);
+        out.updates_flags = true;  // 物理 ZF/PF/CF → ctx flags 捕获链
+        return ok(out);
+    }
+    case X86_INS_FNSTCW:  // 含 fstcw (9B 前缀折叠, 无 FSTCW id)
+    case X86_INS_FNSTSW: {  // 含 fstsw ax/m16 (9B 折叠, 无 FSTSW id)
+        if (x.op_count != 1) return fail();
+        const bool sw = ci.id == X86_INS_FNSTSW;  // fstsw (9B) 折叠同 id
+        // AX 形 (fnstsw ax / fstsw ax): capstone op = REG_AX。
+        if (x.operands[0].type == X86_OP_REG && sw &&
+            x.operands[0].reg == X86_REG_AX) {
+            out.op = Op::Fnstsw87;
+            out.dst = ir::Operand::reg_(ir::Reg::Rax);  // AX 形标记
+            return ok(out);
+        }
+        if (x.operands[0].type != X86_OP_MEM) return fail();
+        auto m = mem_operand(x.operands[0].mem);
+        if (!m) return fail();
+        out.op = sw ? Op::Fnstsw87
+                     : (ci.id == X86_INS_FNSTCW ? Op::Fnstcw87 : Op::Fldcw87);
+        out.src = *m;
+        out.size = ir::Size::S16;
+        return ok(out);
+    }
+    case X86_INS_FNOP:
+        out.op = Op::Nop;
+        return ok(out);
+    default:
+        return fail();
+    }
+}
+
 TranslateResult translate_insn(const cs_insn& ci, ir::Arch arch) {
     if (ci.detail == nullptr) return unsupported(ci.address, ci.size);
     const cs_x86& x = ci.detail->x86;
@@ -3054,6 +3242,20 @@ TranslateResult translate_insn(const cs_insn& ci, ir::Arch arch) {
         out.updates_flags = false;
         return ok(out);
     }
+    // —— MIT-506/507 (T60): x87 L0 (物理 FPU 驻留直执行, GAPS MIT-506) ——
+    case X86_INS_FLD: case X86_INS_FLD1: case X86_INS_FLDZ:
+    case X86_INS_FST: case X86_INS_FSTP:
+    case X86_INS_FILD: case X86_INS_FIST: case X86_INS_FISTP:
+    case X86_INS_FADD:  // 含 faddp (DE /0, capstone 无 FADDP id)
+    case X86_INS_FMUL: case X86_INS_FMULP:
+    case X86_INS_FSUB: case X86_INS_FSUBP: case X86_INS_FSUBR: case X86_INS_FSUBRP:
+    case X86_INS_FDIV: case X86_INS_FDIVP: case X86_INS_FDIVR: case X86_INS_FDIVRP:
+    case X86_INS_FCHS: case X86_INS_FABS: case X86_INS_FSQRT:
+    case X86_INS_FCOMI:  // 含 fcomip (DF F0+i, capstone 无 FCOMIP id)
+    case X86_INS_FNSTCW:  // 含 fstcw (9B 前缀折叠, 无 FSTCW id)
+    case X86_INS_FNSTSW:  // 含 fstsw ax/m16 (9B 前缀折叠, 无 FSTSW id)
+    case X86_INS_FNOP:
+        return translate_x87(ci, x);
     default:
         return unsupported(ci.address, ci.size);
     }

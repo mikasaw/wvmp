@@ -253,7 +253,30 @@ enum class Op : u16 { Mov, Lea, Add, Sub, Adc, Sbb, And, Or, Xor, Not, Neg, Inc,
                       //     处置照抄 build_imul (setcc5 捕获同 CPU 真值)。
                       //   - 派活单 §B: 3 op 必 append-only 在 Ucomisd 之后、
                       //     enum 闭合之前 (pitfall #34 additive append-only)。
-                      Cdq, Div, Idiv };
+                      Cdq, Div, Idiv,
+
+                      // MIT-506/507 (T60): x87 L0 族——物理 FPU 驻留直执行
+                      // (架构定案 GAPS MIT-506: guest ST = 物理 st0-st7,
+                      // handler 直发真实 x87 指令; kCtxSize 零触碰)。x86
+                      // 专属 (x64 解释器不触 x87 词)。操作数约定:
+                      //   - Mem 形 src=Mem (宽度 = size: S32/S64; tbyte 10B
+                      //     经独立 op 承载); st(i) 形 dst=Reg(Rax 占位) +
+                      //     src=Imm(栈位 i); Fst/Fstp/Fist 的 Reg 目标形
+                      //     dst=Imm(i) 承载栈位。
+                      //   - updates_flags 仅 Fcomi/Fcomip (物理 EFLAGS
+                      //     ZF/PF/CF → ctx flags 捕获链, 同 Ucomiss 真写
+                      //     通路); fnop 折 Op::Nop 零新 op。
+                      //   - L1/L2/L3 全族 (fcom/ftst/fcmov/超越/状态控制/
+                      //       env/save) 维持 gate 未收录。
+                      //   - 派活单 §D 决策: 22 op 必 append-only 在 Idiv
+                      //     之后、enum 闭合之前 (pitfall #34)。
+                      Fld87Mem, Fld87St, Fld87Const,
+                      Fst87Mem, Fstp87Mem, Fst87St, Fstp87St,
+                      Fild87Mem, Fist87Mem, Fistp87Mem,
+                      Fadd87, Fmul87, Fsub87, Fdiv87,
+                      Fchs87, Fabs87, Fsqrt87,
+                      Fcomi87, Fcomip87,
+                      Fldcw87, Fnstcw87, Fnstsw87 };
 enum class Size : u8 { S8, S16, S32, S64 };
 enum class Cond : u8 { O, No, B, Ae, E, Ne, Be, A, S, Ns, P, Np, L, Ge, Le, G };
 constexpr u64 bits(Size s) { return s==Size::S8?8: s==Size::S16?16: s==Size::S32?32:64; }

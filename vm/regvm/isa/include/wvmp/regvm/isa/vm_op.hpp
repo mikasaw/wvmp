@@ -577,9 +577,45 @@ enum class VmOp : u16 {
     //   size (4/8)。不影响 EFLAGS; 直接 advance。
     //   派活单 §D 决策: 2 op 必 append-only 在 Andnps 之后 (pitfall #34);
     //   kVmOpMax+1=98 < 128 跳表余量 30。
-    XmmFromGp, GpFromXmm };
+    XmmFromGp, GpFromXmm,
 
-inline constexpr u16 kVmOpMax = static_cast<u16>(VmOp::GpFromXmm);  // MIT-427: 97
+    // —— MIT-506/507 (T60): x87 L0 族 —— 物理FPU驻留直执行 (架构定案见
+    // GAPS MIT-506: guest ST 栈 = 物理 st0-st7, handler 直发真实 x87 指
+    // 令; kCtxSize 零触碰; native callee 看到 guest 真实 x87 状态 =
+    // native-exact)。x86 专属 (x64 解释器不触 x87 词)。
+    //   约定: mem 形 a_kind=Reg reg_a=地址槽 (emit_address 产物), 宽度经
+    //   aux (4/8/10 字节); st(i) 形 b_kind=Imm reg_b=栈位 i; fadd/fsub/
+    //   fmul/fdiv 矩阵经 aux 低位编 pop/reverse 变体。updates_flags 仅
+    //   Fcomi/Fcomip (物理 EFLAGS ZF/PF/CF → ctx flags 捕获链)。
+    //   fnop 不设词 (lifter 折 VmOp::Nop); fcom/ftst/fcmov/超越/状态控制
+    //   全族 = L1-L2 维持 gate。
+    // 派活单 §D 决策: 22 op 必 append-only 在 GpFromXmm 之后 (pitfall
+    // #34); kVmOpMax+1=120 < 128 跳表余量 8。
+    Fld87Mem,       // fld m32/m64/tbyte [acc] (aux=宽度 4/8/10)
+    Fld87St,        // fld st(i) (reg_b = i)
+    Fld87Const,     // fld1/fldz (aux = 1/0)
+    Fst87Mem,       // fst m32/m64/tbyte [acc] (不弹栈)
+    Fstp87Mem,      // fstp m32/m64/tbyte [acc] (弹栈)
+    Fst87St,        // fst st(i) (不弹栈)
+    Fstp87St,       // fstp st(i) (弹栈)
+    Fild87Mem,      // fild m32/m64 [acc] (整数入栈)
+    Fist87Mem,      // fist m32/m64 [acc] (不弹栈)
+    Fistp87Mem,     // fistp m32/m64 [acc] (弹栈)
+    Fadd87,         // fadd/faddp 矩阵 (st(i),st / st,st(i) / m32/m64; aux=pop)
+    Fmul87,         // fmul/fmulp 同矩阵
+    Fsub87,         // fsub/fsubp/fsubr/fsubrp (aux=reverse+pop 位)
+    Fdiv87,         // fdiv/fdivp/fdivr/fdivrp (同上)
+    Fchs87,         // fchs (st0 变号)
+    Fabs87,         // fabs (st0 绝对值)
+    Fsqrt87,        // fsqrt (st0 平方根)
+    Fcomi87,        // fcomi st0, st(i) + ZF/PF/CF → ctx flags 捕获
+    Fcomip87,       // fcomip 同上 + 弹栈
+    Fldcw87,        // fldcw m16 [acc]
+    Fnstcw87,       // fnstcw m16 [acc]
+    Fnstsw87,       // fnstsw m16 [acc] (aux=0) / ax 槽 (aux=1)
+    };
+
+inline constexpr u16 kVmOpMax = static_cast<u16>(VmOp::Fnstsw87);  // MIT-507: 119
 inline constexpr u16 kVmOpLimit = 1u << 14;  // 14 位编码空间上限
 
 constexpr const char* to_string(VmOp op) {
@@ -674,6 +710,29 @@ constexpr const char* to_string(VmOp op) {
         // MIT-427 (G1c): movd/movq GP↔xmm 桥原语.
         case VmOp::XmmFromGp: return "xmmfromgp";
         case VmOp::GpFromXmm: return "gpfromxmm";
+        // MIT-507 (T60): x87 L0 族 (物理 FPU 驻留直执行).
+        case VmOp::Fld87Mem: return "fld87mem";
+        case VmOp::Fld87St: return "fld87st";
+        case VmOp::Fld87Const: return "fld87const";
+        case VmOp::Fst87Mem: return "fst87mem";
+        case VmOp::Fstp87Mem: return "fstp87mem";
+        case VmOp::Fst87St: return "fst87st";
+        case VmOp::Fstp87St: return "fstp87st";
+        case VmOp::Fild87Mem: return "fild87mem";
+        case VmOp::Fist87Mem: return "fist87mem";
+        case VmOp::Fistp87Mem: return "fistp87mem";
+        case VmOp::Fadd87: return "fadd87";
+        case VmOp::Fmul87: return "fmul87";
+        case VmOp::Fsub87: return "fsub87";
+        case VmOp::Fdiv87: return "fdiv87";
+        case VmOp::Fchs87: return "fchs87";
+        case VmOp::Fabs87: return "fabs87";
+        case VmOp::Fsqrt87: return "fsqrt87";
+        case VmOp::Fcomi87: return "fcomi87";
+        case VmOp::Fcomip87: return "fcomip87";
+        case VmOp::Fldcw87: return "fldcw87";
+        case VmOp::Fnstcw87: return "fnstcw87";
+        case VmOp::Fnstsw87: return "fnstsw87";
     }
     return "?";
 }

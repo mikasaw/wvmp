@@ -3896,3 +3896,19 @@ fstsw / fnop——合计 ~22-28。
 translate + asmgen handler + 单测，全门）→ MIT-508 E2E（新
 wvmp_x86_x87l0_sample 真实 IA32 FP 代码；x87gate fixture 的 L1/L2 面
 fsin/fcomip 维持 gate、fixture 有效性披露）→ 双池 + 验收。
+
+**MIT-507 落地记录（2026-09-13）**：22 VmOp/ir::Op 双枚举 append-only
+（kVmOpMax 97→119 < 128 跳表，扩容免触发）；lifter translate_x87（capstone
+id 缺口实证：无 FADDP/FCOMIP/FSTCW/FSTSW id——faddp/fcomip 折叠进
+FADD/FCOMI 按 bytes[0] 0xDE/0xDF 判 pop，fstcw/fstsw 折叠进 FNSTCW/
+FNSTSW；FADD mem 形 op_count==1 修正；FIST 无 64 位形式——**keystone 装
+配 handler 全部分支，不可达分支的非法指令同样炸装配**（fist qword →
+ks_errno 512 实证）→ handler 仅 dword 分支 + lifter m64 gate）；fcomi
+物理 EFLAGS 捕获链（setz/setp/setc → 帧捕获区 → ZF|CF<<1|PF<<4 →
+[ctx+0x98]，OF/SF=0 native 一致）；asmgen 22 handler（st(i) 8 路固定变
+体树 + 四则 (pop×reverse) 四象限助记符）。**测试三层**：lifter 解码（区
+域字节序列 → IR 断言；测试字节 modrm 笔误 0x48=FMUL 当场炸出修正）+
+translator 发射（计数式断言，emit_address 前置 Mov 词）+ x86 电池真
+执行 4 测（mem 算术往返/fchs+fsqrt/fild-fistp/fcomi flags+st 树/控制字
+往返）。全门：ctest 23/23、x86 电池、x64 sha f8b0ebd6 恒等、x86 结构门
+116 登记项。

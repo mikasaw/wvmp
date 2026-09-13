@@ -93,6 +93,8 @@ enum class FlagSem { kNone, kRead, kWrite, kWriteReadMerge, kWriteReadReg };
         case VmOp::Imul: case VmOp::Mul: case VmOp::Cmpxchg: case VmOp::Xadd:
         case VmOp::Bts: case VmOp::Btr: case VmOp::Btc:
         case VmOp::Ucomiss: case VmOp::Ucomisd:
+        case VmOp::Fcomi87: case VmOp::Fcomip87:  // MIT-507: 物理 EFLAGS
+            // ZF/PF/CF → ctx flags 捕获链
         case VmOp::Div: case VmOp::Idiv:
             return FlagSem::kWrite;
         default:

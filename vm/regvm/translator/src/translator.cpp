@@ -1171,6 +1171,20 @@ struct Translator {
                 ok = translate_div_idiv(em, sc, in, current_rva, next_ip);
             } else if (in.op == ir::Op::Bswap) {
                 ok = translate_bswap(em, in);
+            } else if (in.op == ir::Op::Fld87Mem || in.op == ir::Op::Fld87St ||
+                       in.op == ir::Op::Fld87Const || in.op == ir::Op::Fst87Mem ||
+                       in.op == ir::Op::Fstp87Mem || in.op == ir::Op::Fst87St ||
+                       in.op == ir::Op::Fstp87St || in.op == ir::Op::Fild87Mem ||
+                       in.op == ir::Op::Fist87Mem || in.op == ir::Op::Fistp87Mem ||
+                       in.op == ir::Op::Fadd87 || in.op == ir::Op::Fmul87 ||
+                       in.op == ir::Op::Fsub87 || in.op == ir::Op::Fdiv87 ||
+                       in.op == ir::Op::Fchs87 || in.op == ir::Op::Fabs87 ||
+                       in.op == ir::Op::Fsqrt87 || in.op == ir::Op::Fcomi87 ||
+                       in.op == ir::Op::Fcomip87 || in.op == ir::Op::Fldcw87 ||
+                       in.op == ir::Op::Fnstcw87 || in.op == ir::Op::Fnstsw87) {
+                // MIT-506/507 (T60): x87 L0 dispatch (物理 FPU 驻留直执行;
+                // x64 区恒无 x87 词——lifter 仅 x86 收录)。
+                ok = translate_x87(em, sc, in, current_rva, next_ip);
             } else if (in.op == ir::Op::Xchg) {
                 // MIT-419 (G4): xchg dispatch — REG-REG 形式 emit 单条
                 // VmOp::Xchg; MEM 形式 (xchg [m], r — InterlockedExchange 真
@@ -2938,6 +2952,119 @@ struct Translator {
         const u8 xmm_src_slot = static_cast<u8>(xmm_idx_src + 24u);
         em.emit_rr(vop, xmm_dst_slot, xmm_src_slot, isa::size_field(in.size));
         return true;
+    }
+
+    // ---- MIT-506/507 (T60): x87 L0 —— 物理 FPU 驻留直执行发射层 ----
+    //
+    // guest ST 栈 = 物理 st0-st7 (GAPS MIT-506 架构定案): 词只携带
+    // 形/宽度/栈位, asmgen handler 直发真实 x87 指令。发射约定:
+    //   - mem 形: emit_address → acc 槽, a=Reg reg_a=acc, aux=宽度
+    //     (4/8/10/16; tbyte 10B 经 IR src2=Imm(10) 载体);
+    //   - st(i) 形: 载入类 b=Imm reg_b=i; 存储类 a=Imm reg_a=i;
+    //   - 四则矩阵: reg 形 a=Imm(dst_i) b=Imm(src_i) aux=pop|reverse 位;
+    //     mem 形 a=Reg(acc) aux=reveverse 位 (无 pop);
+    //   - fcomi/fcomip: b=Imm reg_b=i (flags 捕获链在 handler)。
+    bool translate_x87(Emitter& em, Scratch& sc, const ir::Insn& in,
+                       u64 current_rva, u64 next_ip) {
+        // mem 宽度: src2=Imm(10) tbyte 标记优先, 否则 size 映射 (S32=4/其余=8)。
+        const auto mem_width = [&](const ir::Insn& o) -> u32 {
+            if (o.src2.kind == ir::Operand::Kind::Imm)
+                return static_cast<u32>(o.src2.imm);
+            return o.size == ir::Size::S32 ? 4u : 8u;
+        };
+        const auto emit_mem_op = [&](VmOp op, const ir::MemOperand& m,
+                                     u32 width) -> bool {
+            u8 acc = 0;
+            if (!emit_address(em, sc, m, current_rva, next_ip, sz_step_, acc,
+                              image_base_, image_extent_, arch_))
+                return skip(in, "x87 地址形态未支持", &m);
+            em.emit(op, OpKind::Reg, acc, OpKind::None, 0, width,
+                    isa::size_field(ir::Size::S64));
+            return true;
+        };
+        switch (in.op) {
+        case ir::Op::Fld87Mem:
+            return emit_mem_op(VmOp::Fld87Mem, in.src.mem, mem_width(in));
+        case ir::Op::Fst87Mem:
+            return emit_mem_op(VmOp::Fst87Mem, in.dst.mem, mem_width(in));
+        case ir::Op::Fstp87Mem:
+            return emit_mem_op(VmOp::Fstp87Mem, in.dst.mem, mem_width(in));
+        case ir::Op::Fild87Mem:
+            return emit_mem_op(VmOp::Fild87Mem, in.src.mem, mem_width(in));
+        case ir::Op::Fist87Mem:
+            return emit_mem_op(VmOp::Fist87Mem, in.src.mem, mem_width(in));
+        case ir::Op::Fistp87Mem:
+            return emit_mem_op(VmOp::Fistp87Mem, in.src.mem, mem_width(in));
+        case ir::Op::Fldcw87:
+        case ir::Op::Fnstcw87:
+        case ir::Op::Fnstsw87:
+            return emit_mem_op(in.op == ir::Op::Fldcw87 ? VmOp::Fldcw87
+                                : in.op == ir::Op::Fnstcw87 ? VmOp::Fnstcw87
+                                                              : VmOp::Fnstsw87,
+                               in.src.mem, 16);
+        case ir::Op::Fld87St:
+        case ir::Op::Fst87St:
+        case ir::Op::Fstp87St:
+        case ir::Op::Fcomi87:
+        case ir::Op::Fcomip87: {
+            const auto imm_of = in.op == ir::Op::Fld87St
+                                    ? in.src
+                                    : (in.op == ir::Op::Fst87St ||
+                                               in.op == ir::Op::Fstp87St
+                                           ? in.dst
+                                           : in.src);
+            if (imm_of.kind != ir::Operand::Kind::Imm) return false;
+            const u8 i = static_cast<u8>(imm_of.imm);
+            if (i > 7) return skip(in, "x87 栈位越界", nullptr);
+            if (in.op == ir::Op::Fld87St)
+                em.emit(VmOp::Fld87St, OpKind::None, 0, OpKind::Imm, i, 0, 0);
+            else if (in.op == ir::Op::Fst87St)
+                em.emit(VmOp::Fst87St, OpKind::Imm, i, OpKind::None, 0, 0, 0);
+            else if (in.op == ir::Op::Fstp87St)
+                em.emit(VmOp::Fstp87St, OpKind::Imm, i, OpKind::None, 0, 0, 0);
+            else if (in.op == ir::Op::Fcomi87)
+                em.emit(VmOp::Fcomi87, OpKind::None, 0, OpKind::Imm, i, 0,
+                        isa::size_field(ir::Size::S32));
+            else
+                em.emit(VmOp::Fcomip87, OpKind::None, 0, OpKind::Imm, i, 0,
+                        isa::size_field(ir::Size::S32));
+            return true;
+        }
+        case ir::Op::Fadd87: case ir::Op::Fmul87:
+        case ir::Op::Fsub87: case ir::Op::Fdiv87: {
+            VmOp vop = in.op == ir::Op::Fadd87 ? VmOp::Fadd87
+                       : in.op == ir::Op::Fmul87 ? VmOp::Fmul87
+                       : in.op == ir::Op::Fsub87 ? VmOp::Fsub87
+                                                  : VmOp::Fdiv87;
+            const u32 aux = in.src2.kind == ir::Operand::Kind::Imm
+                                ? static_cast<u32>(in.src2.imm)
+                                : 0u;
+            if (in.src.kind == ir::Operand::Kind::Mem) {
+                if (aux & 0x1) return skip(in, "x87 mem 形无 pop 变体", nullptr);
+                return emit_mem_op(vop, in.src.mem, mem_width(in));
+            }
+            if (in.dst.kind != ir::Operand::Kind::Imm ||
+                in.src.kind != ir::Operand::Kind::Imm)
+                return skip(in, "x87 四则操作数形态未支持", nullptr);
+            const u8 di = static_cast<u8>(in.dst.imm);
+            const u8 sj = static_cast<u8>(in.src.imm);
+            if (di > 7 || sj > 7) return skip(in, "x87 栈位越界", nullptr);
+            em.emit(vop, OpKind::Imm, di, OpKind::Imm, sj, aux,
+                    isa::size_field(ir::Size::S32));
+            return true;
+        }
+        case ir::Op::Fchs87:
+            em.emit(VmOp::Fchs87, OpKind::None, 0, OpKind::None, 0, 0, 0);
+            return true;
+        case ir::Op::Fabs87:
+            em.emit(VmOp::Fabs87, OpKind::None, 0, OpKind::None, 0, 0, 0);
+            return true;
+        case ir::Op::Fsqrt87:
+            em.emit(VmOp::Fsqrt87, OpKind::None, 0, OpKind::None, 0, 0, 0);
+            return true;
+        default:
+            return false;
+        }
     }
 
     // ---- MIT-425 (G1b): SSE 浮点乘 mulss/mulsd/mulps/mulpd ----
