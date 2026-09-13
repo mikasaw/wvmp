@@ -3942,3 +3942,38 @@ a_kind=Reg 被 handler 误入 AX 路径；AX 形无发射通路）。重启清�
 + 补 fsub/fdiv/fcomip/fnstsw 虚拟化执行覆盖（battery 10/22 词覆盖断层）
 + E2E 接 REQUIRE_REAL + main.c face4 断言修正（&0x41 应为 &0x4100 语义）。
 D5 热修下现状安全（全 x87 gate-native byte-exact，池 345/345）。
+
+**MIT-509 (T61) x87 L0 重启（2026-09-13）**：T60 验收 4C 全部修复，另挖出
+两个 4C 之外的深层真根因并修复。**4C**：① fdiv 四象限表（popnn/poprev 误
+填 fdiv/fdivp）；② farith reg 树重构（助记符按 aux(pop,rev) 四象限运行期
+选择 × 双布局 src==0/dst==0，不再按树位绑定）；③ fcomip 双弹栈移除；④
+Fnstsw87 判据对齐（AX 形 = a_kind Imm(2)+Rax 槽，translator 补 AX 形发射
+分支；mem 形 = a_kind Reg(1)+acc 槽）。**深层一（T60 词流值错乱真根因，
+验收误标"执行序"）**：farith mem 形 aux 编码冲突——lifter 把 rev 位放
+src2.imm，translator mem_width() 见 Imm 即当宽度（=0）→ handler 旧等值判
+据 cmp aux,4 不中走 qword 分支，4 字节 float 按 8 字节读。改 aux 位图
+bit1=rev/bit2=dword/bit3=qword 两侧同步（4/8 值与旧宽度等值编码兼容）。
+**深层二**：fnstsw ax 覆写宿主 EAX 违反 FPU handler 不触 GP 契约——种子
+相关临时寄存器分配把 t_[1] 映到 EAX 时槽索引被 SW 覆写 → ctx 野写 AV
+（DEADBEEF seed 实证，seed 12345 侥幸通过 = 覆盖盲区）。SW 先溢出帧
+FCC+3/4 空闲字节。**lifter**：rev/pop/目的方向改按编码字节推导——宿主
+CPU 实测钉表（X87MatrixHardwareTruthFull，15 编码落槽方向/值）：**D8 reg
+dst=st(0) 显式位=源**（f=4 sub/5 subr/6 div/7 divr）；**DC reg dst=st(rm)
+且 r 位反转**（f=4 subr/5 sub/6 divr/7 div）；DE=DC 方向+pop；mem 形不反
+转。勘误两处 Intel SDM 记忆：r 位反转在 D8/DC 之间而非 DC/DE（capstone
+5.0.6 命名与硬件全程一致，先前"不可信"判定有误）；FCOMI 只写 EFLAGS 不
+更新 SW C0。新增 D8/DE 单操作数解码路径（capstone 对这两族只报单操作数，
+原全部 fail() 门控 = L0 覆盖为零）；X86_INS_FCOMPI 独立 id 接入路由+解码。
+**样本/测试**：x87l0 扩至 9 面（fsub D8/fsubr DC/fdivp+fsubrp DE/fcomip+
+seta/fnstsw ax）；main.c 断言修 C0=bit8 + word 外部符号按真实尺寸声明
+（原 uint32_t 靠零填充侥幸——g_x_cmp 相邻后即假性失败）。电池新增 6 测
+（硬件真值矩阵/fcomip+fnstsw 语义/四象限 VM/gate 链复现/mem-rev 位图/
+FnstswAx）。**验收**：REJECT（agent_cb967a96）抓出 F1 Major——Fld87St
+handler 误读 reg_a（发射为 reg_b）→ fld st(k≥1) 静默执行成 fld st(0) 错
+值不 gate，电池零覆盖；修 handler 改读 FRegB + 删死助手 x87_st_tree + 新
+增 X87StTreeIndexing 判别面；F5 Fld87Const 补 translator case（原恒 gate
++ handler 死代码）；F2/F3/F4/F6 注释/死变量落账。复核 PASS。
+**验证**：x86 电池 61/61；主树 ctest 23/23；全池 345/345（REQUIRE_REAL=
+1）；x87l0/x87gate × seed 12345/DEADBEEF 四组 pack byte-exact rc=0。
+**挂账 N1（非阻塞）**：Fld87Const translator case 仅手构词 handler 面电
+池覆盖，无 E2E 流水线面样本。
