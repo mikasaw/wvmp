@@ -2630,9 +2630,9 @@ TEST(X86Battery, X87ComiFlagsAndStTree) {
     g_x87_a = 2.5; g_x87_b = 1.5; g_x87_out = 0.0;
     // fld a(2.5); fld b(1.5) → st0=1.5, st1=2.5;
     // fcomi st, st(1) → 1.5 vs 2.5 = less → CF; getflags 断言;
-    // fstp st(0) 清; fld st(1)?? — 栈树: fst st(3) 存 st0 → st3;
-    // fld a; fadd st(0), st(3)?? — 简化: fstp st(0) 后 st0=2.5;
-    // fadd87 reg {a=Imm 0, b=Imm 3} = st0 += st3(=2.5 存的) → 5.0。
+    // dst==0 树面: fadd87 {a=Imm 0, b=Imm 1} → st0 += st1 = 1.5+2.5 = 4.0;
+    // fstp out。(注: fst st(k)/fstp 混用会因 TOP 相对索引失效——测试保持
+    // 单一 dst==0 形。)
     std::vector<u8> s;
     isa::append_insn(s, mov_imm(5, static_cast<u32>(reinterpret_cast<uintptr_t>(&g_x87_a))));
     isa::append_insn(s, x87_mem(5, isa::VmOp::Fld87Mem, 8));    // st0=2.5
@@ -2656,7 +2656,7 @@ TEST(X86Battery, X87ComiFlagsAndStTree) {
     ctx.pc = 0;
     rwx.entry()(&ctx);
     expect_slot32(ctx, 2, isa::kFlagCF);   // 1.5 < 2.5 → CF
-    EXPECT_EQ(g_x87_out, 4.0);             // st 树面: 2.5 + st3(1.5)
+    EXPECT_EQ(g_x87_out, 4.0);             // dst==0 树面: 1.5 + 2.5
 }
 
 TEST(X86Battery, X87ControlWordRoundTrip) {
@@ -2693,7 +2693,6 @@ alignas(2) static uint16_t g_ht_sw16 = 0;
 struct HwTruth {
     double r0, r1;
 };
-alignas(4) static u32 g_ht_prog = 0;  // blob 进度哨兵 (1=压栈后 2=运算后 3=r0 存 4=r1 存)
 
 static HwTruth run_x87_native(u8 opc, u8 modrm, double a, double b, bool op_pops) {
     g_ht_a = a; g_ht_b = b; g_ht_r0 = g_ht_r1 = 0;
@@ -3020,6 +3019,51 @@ TEST(X86Battery, X87FnstswAxVm) {
     // RMW: 高 48 位保持。⚠️ 不断言 SW 低 8 位 == 0 — 掩码异常标志 (IE 等)
     // 是进程级粘滞位, 顺序依赖前面测试的 FPU 足迹 (D5: 测试也宁缺勿错)。
     EXPECT_EQ(ctx.regs[0] >> 16, 0xABCD'0000'0000ull);
+}
+
+TEST(X86Battery, X87StTreeIndexing) {
+    // F1 回归 (MIT-509 验收): Fld87St 词域 = reg_b — 原 handler 误读 reg_a
+    // (恒 0) → fld st(k≥1) 静默执行成 fld st(0) 错值不 gate。跨索引全链:
+    // fld a(4); fld b(10); fld c(20) → [20,10,4]; fld st(2) (判别点: 期望
+    // 复制 4, 错读 reg_a 则复制 st(0)=20) → [4,20,10,4]; 逐级 fstp 验证。
+    // 另: Fld87Const (fld1) 面 (验收 F5 — 原无 translator case 恒 gate)。
+    wvmp::Rng rng(12345);
+    const auto gen = rt::generate_runtime_x86(rng);
+    RwxImage rwx(gen.image.code);
+    alignas(8) static double sa = 4.0, sb = 10.0, sc = 20.0;
+    alignas(8) static double o1 = 0, o2 = 0, o3 = 0, o4 = 0, oc = 0;
+    sa = 4.0; sb = 10.0; sc = 20.0; o1 = o2 = o3 = o4 = oc = 0;
+    std::vector<u8> s;
+    isa::append_insn(s, mov_imm(5, static_cast<u32>(reinterpret_cast<uintptr_t>(&sa))));
+    isa::append_insn(s, x87_mem(5, isa::VmOp::Fld87Mem, 8));    // [4]
+    isa::append_insn(s, mov_imm(6, static_cast<u32>(reinterpret_cast<uintptr_t>(&sb))));
+    isa::append_insn(s, x87_mem(6, isa::VmOp::Fld87Mem, 8));    // [10,4]
+    isa::append_insn(s, mov_imm(7, static_cast<u32>(reinterpret_cast<uintptr_t>(&sc))));
+    isa::append_insn(s, x87_mem(7, isa::VmOp::Fld87Mem, 8));    // [20,10,4]
+    isa::append_insn(s, isa::make_insn(isa::VmOp::Fld87Const, isa::OpKind::None,
+                                       0, isa::OpKind::None, 0, 1, 0));  // fld1
+    isa::append_insn(s, mov_imm(5, static_cast<u32>(reinterpret_cast<uintptr_t>(&oc))));
+    isa::append_insn(s, x87_mem(5, isa::VmOp::Fstp87Mem, 8));   // oc = 1.0
+    isa::append_insn(s, isa::make_insn(isa::VmOp::Fld87St, isa::OpKind::None,
+                                       0, isa::OpKind::Imm, 2, 0, 0));   // fld st(2)
+    isa::append_insn(s, mov_imm(5, static_cast<u32>(reinterpret_cast<uintptr_t>(&o1))));
+    isa::append_insn(s, x87_mem(5, isa::VmOp::Fstp87Mem, 8));   // o1 = 4.0
+    isa::append_insn(s, mov_imm(6, static_cast<u32>(reinterpret_cast<uintptr_t>(&o2))));
+    isa::append_insn(s, x87_mem(6, isa::VmOp::Fstp87Mem, 8));   // o2 = 20.0
+    isa::append_insn(s, mov_imm(7, static_cast<u32>(reinterpret_cast<uintptr_t>(&o3))));
+    isa::append_insn(s, x87_mem(7, isa::VmOp::Fstp87Mem, 8));   // o3 = 10.0
+    isa::append_insn(s, mov_imm(5, static_cast<u32>(reinterpret_cast<uintptr_t>(&o4))));
+    isa::append_insn(s, x87_mem(5, isa::VmOp::Fstp87Mem, 8));   // o4 = 4.0
+    isa::append_insn(s, halt());
+    rt::VmContext ctx;
+    ctx.bytecode = s.data();
+    ctx.pc = 0;
+    rwx.entry()(&ctx);
+    EXPECT_EQ(oc, 1.0);   // fld1 (验收 F5)
+    EXPECT_EQ(o1, 4.0);   // fld st(2) 判别点 (错读 reg_a 则 = 20)
+    EXPECT_EQ(o2, 20.0);
+    EXPECT_EQ(o3, 10.0);
+    EXPECT_EQ(o4, 4.0);
 }
 
 // ---------------------------------------------------------------------------

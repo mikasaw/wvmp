@@ -3077,6 +3077,15 @@ struct Translator {
                     isa::size_field(ir::Size::S32));
             return true;
         }
+        case ir::Op::Fld87Const:
+            // fld1/fldz: lifter src=Imm(1/0) → handler aux=1/0 选助记符
+            // (MIT-509 验收 F5: 原无 case 恒 gate, handler 死代码)。
+            em.emit(VmOp::Fld87Const, OpKind::None, 0, OpKind::None, 0,
+                    in.src.kind == ir::Operand::Kind::Imm
+                        ? static_cast<u32>(in.src.imm)
+                        : 0u,
+                    0);
+            return true;
         case ir::Op::Fchs87:
             em.emit(VmOp::Fchs87, OpKind::None, 0, OpKind::None, 0, 0, 0);
             return true;

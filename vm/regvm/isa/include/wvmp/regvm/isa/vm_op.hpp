@@ -612,7 +612,9 @@ enum class VmOp : u16 {
     Fcomip87,       // fcomip 同上 + 弹栈
     Fldcw87,        // fldcw m16 [acc]
     Fnstcw87,       // fnstcw m16 [acc]
-    Fnstsw87,       // fnstsw m16 [acc] (aux=0) / ax 槽 (aux=1)
+    Fnstsw87,       // fnstsw: mem 形 (a_kind=Reg acc 槽) / AX 形 (a_kind=Imm
+                    //   a=Rax 槽); aux 对 farith mem 为位图 (bit1=rev /
+                    //   bit2=dword / bit3=qword), Fnstsw87 双形均 16
     };
 
 inline constexpr u16 kVmOpMax = static_cast<u16>(VmOp::Fnstsw87);  // MIT-507: 119

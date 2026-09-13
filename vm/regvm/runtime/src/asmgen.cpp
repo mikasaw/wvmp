@@ -93,7 +93,6 @@
 
 #include <array>
 #include <algorithm>
-#include <functional>
 #include <cinttypes>
 #include <cstdint>
 #include <cstdio>
@@ -5717,26 +5716,6 @@ public:
                " + " + r32x(t_[1]) + "*8 + 0x10]\n";
     }
 
-    // st(i) 8 路分派: 对 k=0..7 发 `insn_fmt` 的 k 变体 (insn(k) 回调),
-    // 各路汇入 end 标签。tag 由调用方提供 (op 名, 表内唯一)。
-    std::string x87_st_tree(u64 dispatch, const std::string& tag,
-                            const std::function<std::string(int)>& insn) const {
-        std::string o = std::string("    mov ") + r32x(t_[0]) + ", " +
-                        xf(kX86FRegA) + "\n";  // 或 FRegB —— 由调用方先搬
-        (void)tag;
-        std::string tree;
-        for (int k = 0; k < 8; ++k) {
-            tree += std::string("    cmp ") + r32x(t_[0]) + ", " + imm(k) +
-                    "\n    jne x87ne" + std::to_string(k) + "_" + tag + "\n" +
-                    insn(k) + "    jmp x87end_" + tag + "\nx87ne" +
-                    std::to_string(k) + "_" + tag + ":\n";
-        }
-        // k=7 直落 (最后一变体免跳转)。
-        tree += insn(7) + "x87end_" + tag + ":\n";
-        o += tree;
-        return o;
-    }
-
     std::string build_x87_fldmem(u64 dispatch) const {
         std::string o = decode_prelude_x86();
         o += x87_mem_addr();
@@ -5752,9 +5731,12 @@ public:
 
     std::string build_x87_fldst(u64 dispatch) const {
         std::string o = decode_prelude_x86();
+        // ⚠️ 词域 = reg_b (b=Imm i) — translator Fld87St 发射 (None,0,Imm,i),
+        // vm_op.hpp:597 规范 "reg_b = i"。原读 kX86FRegA (恒 0) → fld st(k≥1)
+        // 静默执行成 fld st(0) 错值不 gate (MIT-509 验收 F1)。
         std::string tree;
         for (int k = 0; k < 8; ++k) {
-            tree += std::string("    cmp dword ptr ") + xf(kX86FRegA) + ", " +
+            tree += std::string("    cmp dword ptr ") + xf(kX86FRegB) + ", " +
                     imm(k) + "\n    jne x87ne" + std::to_string(k) +
                     "\n    fld st(" + std::to_string(k) + ")\n    jmp x87end\nx87ne" +
                     std::to_string(k) + ":\n";
@@ -5864,8 +5846,9 @@ public:
         // reg 矩阵: 四象限 (pop × rev) × 双布局 (src==0 → <M> st(k), st;
         // dst==0 → <M> st, st(k))。助记符按 aux 位运行期选择 (首版按树位
         // 绑定 → fsubr/fdivr 系方向错 — T60 验收 [C]②)。rev 助记符经装配
-        // 器映射: <rev> st(k), st → DC E8+k (st(k)←st0−st(k)),
-        // <rev> st, st(k) → D8 E8+k (st0←st(k)−st0), 语义各归其位。
+        // 器映射 (X87FarithQuadrantsVm 装配+执行实测): <M> st(k), st →
+        // DC/DE E?+k 族 (fsubr st(k),st → DC E0+k = st(k)←st0−st(k)),
+        // <M> st, st(k) → D8 族 (fsubr st, st(k) → D8 E8+k = st0←st(k)−st0)。
         // ⚠️ FSTP m64 = DD /3 ([eax]=DD 18 / [edx]=DD 1A); DD 20 系 FRSTOR
         // (T61 探针实测踩雷)。
         struct Quad { const char* mn; const char* label; };
@@ -5936,7 +5919,8 @@ public:
 
     // fcomi/fcomip: 8 路 `fcomi st, st(k)` (+ pop 变体 fstp st(0)) → 物理
     // EFLAGS 捕获链 (setz/setp/setc → 帧字节 → 组装 ZF|CF<<1|PF<<4 →
-    // [ctx+0x98]; OF/SF 位天然 0, fcomi 不定义 = native 一致)。
+    // [ctx+0x98]; OF/SF 位写 0 — native 保持旧值, 编译器不产 fcomi 后读
+    // OF/SF 序列, 披露面 MIT-509 验收 F6)。
     std::string build_x87_fcomi(u64 dispatch, bool pop) const {
         std::string o = decode_prelude_x86();
         const std::string mn = pop ? "fcomip st, st(" : "fcomi st, st(";
