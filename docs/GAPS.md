@@ -3977,3 +3977,34 @@ handler 误读 reg_a（发射为 reg_b）→ fld st(k≥1) 静默执行成 fld s
 1）；x87l0/x87gate × seed 12345/DEADBEEF 四组 pack byte-exact rc=0。
 **挂账 N1（非阻塞）**：Fld87Const translator case 仅手构词 handler 面电
 池覆盖，无 E2E 流水线面样本。
+
+**MIT-510 (T62) x87 L1-L4 续延（2026-09-14）**：新增 22 VmOp（append-only，
+kVmOpMax 119→141）——Fcom87（fcom/fcomp/fucom/fucomp 归一，aux 位图
+bit0=pop/bit1=u/bit2=dword/bit3=qword）/Fcompp87/Ftst87/Fxam87/Fcmov87
+（aux=cc 0..7）/Fxch87/Ffree87/Fincdecstp87/超越 12 词（F2xm1/Fyl2x/
+Fyl2xp1/Fscale/Fpatan/Fprem 含 prem1/Fsin/Fcos/Fsincos/Fptan/Frndint/
+Fxtract）/Fnclex87/Fninit87；Fld87Const 扩 7 常量零新词。**跳表 128→256**
+（kVmOpMax 141 ≥ 128，冻结契约批量前置条款；掩码自动导出；DisasmStaticGate
+守卫同步 0xff；x64 字节换代=有意）。**lifter capstone 探针实证**：fcom/
+fcomp/fucom/fucomp D8/DC/DF 单操作数报告（op0=st(i)=源，DC 双操作数例外
+见 T61 表）；fcmov **DA=正形/DB=反形**（dbc1 报 fcmovnb — Intel 编码表
+DA C0+i=FCMOVB/DB C0+i=FCMOVNB），双操作数（op0=st0 dst, op1=st(i) 源）；
+fxch 双操作数；DF C0+i=ffreep（free+pop）。**fcmov handler**：keystone
+装配 fcmov 双操作数失败（ks_errno=512 实证）→ 每 k 分支新鲜读 [ctx+0x98]
+→ and 掩码（CF=2/ZF=1/BE=3/PF=16，and 自身置 ZF）→ jz/jnz 条件执行
+fld st(k)+fstp st(1) 组合（栈深不变语义等价）；cm7 直落块序（kOrder 置
+首——首版按序发射直落掉进 cm0 误物化，nu 用例实证）。**keystone jcc 仅
+rel8 短跳**（jmp 才自动选宽）→ 跨远距结构分支用短 je 越过+jmp 惯用法
+（fcom87 装配失败实证）。FUCOMI/FUCOMPI u 助记符位（aux bit0 → fucomi
+树，QNaN 静默比较）。**x87 路由架构门**（arch != X86 → unsupported）：
+回归修复——新增 case 使 x64 x87_gate 样本误入虚拟化（x64 运行时 x87 词
+面未建，全零输出实证），恢复 T60 "x64 区恒无 x87 词"定案。KsSession
+ks_asm 失败定位增强（逐行复测报真凶，LABEL/SYMBOL 滤除）。电池 +13
+（含硬件真值 15 编码/fcmov 八条件/fxch/ffree TOP 差值/超越 7 面/fninit
+复位面）。**验收 PASS**（agent_9cffbc5e；F1 fcmovu 用例行重写丢失→补回
+u_case 复活 + F2 fucomi VM 面 + F3 样本注释/常量面 + F4/F5 卫生）。
+**验证**：x86 电池 68/68（+fcmovu 行）；主树 ctest 23/23；全池 350/350
+（REQUIRE_REAL=1，x87l1 样本 ×5 seed）；x87l1/x87gate64 packed byte-exact。
+**挂账**：fucomi QNaN-IE 差异无 VM 级断言（F2）；fldl2t/fldl2e/fldlg2/
+fldln2 常量面无 VM 级用例（F3，handler 映射静态核对无误）；fldenv/fsave
+L4 内存块面维持永久 gate。

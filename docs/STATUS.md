@@ -1277,3 +1277,7 @@ asmgen 零触碰 → dump 锚不受影响（无换代）。
 ### MIT-509 (T61 · x87 L0 重启) ✅ 2026-09-13
 - 4C 修复 + 两深层真根因（farith mem aux 编码冲突 = T60 词流值错乱真因；fnstsw ax EAX 践踏 = seed 相关野写）+ 硬件真值表实测钉死（D8/DC r 位反转勘误）。lifter 单操作数路径 + FCOMPI 接入；x87l0 样本 9 面；验收 REJECT→PASS（F1 Fld87St 词域错位修复 + F2-F6 落账）。x86 电池 61/61、ctest 23/23、全池 345/345（REQUIRE_REAL）。
   证据链 GAPS MIT-509。
+
+### MIT-510 (T62 · x87 L1-L4 续延) ✅ 2026-09-14
+- +22 VmOp（kVmOpMax 141）+ 跳表 128→256（冻结契约批量前置条款）。fcom 族/fcmov（keystone 不装配→and掩码+jz/jnz+fld/fstp 组合模拟）/fxch/ffree/超越 12 词/fninit 族全虚拟化；x87 路由架构门（x64 区恢复 gate，回归实证）；keystone jcc rel8 短跳/逐行失败定位两项工具链入册。验收 PASS（F1 fcmovu 行补回）。电池 68/68、ctest 23/23、全池 350/350（REQUIRE_REAL，+x87l1 样本）。
+  证据链 GAPS MIT-510。
