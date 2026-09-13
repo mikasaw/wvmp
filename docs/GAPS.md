@@ -4025,7 +4025,13 @@ VZEROALL 含 EMMS 语义——x64 区无 x87 词空效）。物理发射使 AVX-
 + vextractf128/movq observer 实证物理清零与面一致性（AVX 缺失环境 SKIP）。
 **遗留 gate 面**（后续波次，非本单）：VEX.256 算术全谱（vaddps ymm 等
 20–30 op）、stub 全量 ymm 同步（wave2 ymm 写词落地时成为前置）、xmm/ymm
-双面混排一致性契约（AVX 融合规则）、EVEX 天然 gate。dump 门
+双面混排一致性契约（AVX 融合规则）、EVEX 天然 gate。**披露**：vzero 物理发射无 CPUID AVX gate（AVX 缺失宿主执行含 vzero 词
+产物将 #UD；与 MIT-432 G8b CPUID-gate 挂账同口径，wave2 立项时随 stub
+ymm 同步一并裁决）；验收 F2 注记：battery driver 修复后无 shadow space
+分配（严格 Win64 要求），实测安全——vm_entry/handler 仅写 ctx 相对与
+[rsp-0x80] 出口槽，从不写 caller shadow。（工具面：新增 scripts/build_clean.bat = vcvars + cmake --clean-first 包装，
+ABI 布局头改动后全量重建的持久入口，硬编码 VSDIR 同 build.bat/test.bat 既有
+惯例。）dump 门
 dump_handler_xmm_check.py 扩 VZERO_HANDLERS 专用形状检查（无槽位序文/
 pxor 零源/movups 面存数 ≥16|40/物理指令在场/add⊆{1}）。**验证**：主树
 ctest 全绿（新增 VzeroWordsHardwareTruth/VexVzeroCapstoneProbe，翻转
