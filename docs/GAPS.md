@@ -3923,3 +3923,11 @@ gate；② fldcw 分派行漏插；③ **handler 标签布局错乱（je x87mem_
 体顺序落在跳转下方 = Imm 形顺序掉入 mem 体）→ x87=3 错值**——分支布局
 必须"跳转目标体放标签后、顺序体放跳转不命中路径"。全部修复后：packed
 rc=0 byte-exact ✓。wvmpTest 双 arch LOG IDENTICAL 复验 ✓。
+
+**MIT-507/508 热修（D5 宁 gate 勿错，2026-09-13）**：词流 E2E 实测 x87 门
+批样例**值错乱**（x87gate fx 15.75→0.027344；x87l0 同域）——物理 FPU 驻
+留 handler 的电池层（手工 VmInsn 直执）全绿，错因定位在 **lifter 解码→
+translate→词流链路**（battery 绕过 lifter，覆盖盲区）。处置 = L0 激活开
+关置 false（translate_x87 首行 fail() → 全 x87 回退 gate-native，byte-
+exact 恢复），基建（22 VmOp/ir 枚举/asmgen handler/电池测/样本）保留
+dormant。重启前置 = cdb 词流级 FPU 栈追踪定位执行序缺陷。

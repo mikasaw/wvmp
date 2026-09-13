@@ -2705,6 +2705,13 @@ std::optional<u8> st87_index(x86_reg r) {
 } // namespace
 
 TranslateResult translate_x87(const cs_insn& ci, const cs_x86& x) {
+    // T60 热修（D5 宁 gate 勿错）：词流 E2E 实测 x87 门批样例值错乱
+    // （x87gate fx 15.75→0.027344，x87l0 同域错值）——物理 FPU 驻留 handler
+    // 的执行序存在未定位缺陷，L0 激活回退为 gate，基建（枚举/handler/
+    // 电池测）保留 dormant 待根因修复后重启。battery 层手工 VmInsn 真执行
+    // 全绿 = handler 本体语义正确；错因在 lifter 解码→词流链路。
+    const bool kX87L0Enabled = false;
+    if (!kX87L0Enabled) return unsupported(ci.address, ci.size);
     ir::Insn out;
     out.addr = ci.address;
     const auto fail = [&]() { return unsupported(ci.address, ci.size); };
