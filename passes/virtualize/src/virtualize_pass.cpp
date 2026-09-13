@@ -101,12 +101,13 @@ void VirtualizePass::run(ProtectionContext& ctx) {
                 const auto& bc = vf.program.bytecode;
                 for (size_t off = 32; off + 8 <= bc.size() && !(has_ymm && has_sse);
                      off += 8) {
-                    switch (static_cast<isa::VmOp>(bc[off])) {
-                    case isa::VmOp::YmmMov:
-                    case isa::VmOp::YmmLoad:
-                    case isa::VmOp::YmmStore:
+                    // 值域判据: Ymm* 词族从 YmmMov 起连续追加 (T64+T65+…)
+                    if (static_cast<int>(bc[off]) >=
+                        static_cast<int>(isa::VmOp::YmmMov)) {
                         has_ymm = true;
-                        break;
+                        continue;
+                    }
+                    switch (static_cast<isa::VmOp>(bc[off])) {
                     case isa::VmOp::Addss: case isa::VmOp::Addps:
                     case isa::VmOp::Addpd: case isa::VmOp::Addsd:
                     case isa::VmOp::Subss: case isa::VmOp::Subps:

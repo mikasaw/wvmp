@@ -4068,3 +4068,30 @@ vextractf128/vinsertf128 桥 / 混排契约（本单为 gate，落地后可翻�
 验收 F4 挂账：stub ymm 同步变体的 disp32 正确性无行为级读回样本钉住
 （现靠静态审查 + 硬件真值 + dump 门形状旁证），wave2 补 ctx.ymm 读回
 影子样本。
+**MIT-513 (T65) AVX 档B wave2② —— VEX.256 packed 算术全谱（2026-09-14，
+自主队列）**：+18 VmOp（kVmOpMax 146→164，165 < 256 跳表）——YmmAddps/
+YmmAddpd/YmmSubps/YmmSubpd/YmmMulps/YmmMulpd/YmmDivps/YmmDivpd/YmmXorps/
+YmmXorpd/YmmOrps/YmmOrpd/YmmAndps/YmmAndpd/YmmPxor/YmmPor/YmmPand/YmmPandn
+（18 id 全 packed 语义；可交换族 add/mul/xor/or/and/p*，非交换 sub/div/
+pandn）。**三地址折叠镜像 MIT-426**：d==s1 直走 2-op / 可交换 d==s2 swap /
+d 独立 extra YmmMov(dst←src1) 前置（32B 版 pre-Mov，wave2① 词复用）/
+非交换 d==s2 gate（D2 同款）；mem 源 handler 内 aux bit0 分支读 [addr]
+（零临时槽，与 SSE XmmLoad 折条路线分叉披露）。**handler**：参数化单
+builder build_ymm_arith(mn) 生成 18 实例（keystone jcc rel8 短 je 越过+
+jmp 惯用法）；**VEX.NDS 需全 3 操作数**（keystone 2-op 形 errno=512 实证
+→ `mn ymm0, ymm0, ymm1`，dst=dst op src 语义不变）。**混排 gate/uses_ymm
+判据改值域**（op ≥ YmmMov 连续追加，后续波次零维护）。dump 门 YMM_HANDLERS
+扩 18 名（形状检查同 wave2①）。**样本**：wvmp_ymm_data_sample 增 ⑤
+ymm_arith（load→vaddps d==s1 翻倍→vxorps 清零→vaddps d 独立→store，
+f32 lane 级对拍）。**开发实录三坑**：① translator dispatch 补丁吞掉 T64
+的 else-if 条件行（算术分支体内无条件串调 translate_ymm_mov 覆盖 ok，
+Ymm 三词落 default——op=110/111/112 取证定位，管线与单测形态差异的根因
+是分支条件丢失非构建陈旧）；② 样本 ⑤ want 数组 float[8] 用 i*4 字节索
+引越界写（RTC 栈腐蚀根因，T64 F1 同型索引混乱）；③ 测试手写 VEX vvvv
+位错（vsubps d==s2 编码 kstool 钉板 C5 F4 5C C0，FC 是 d==s1 合法形）。
+**验证**：主树 ctest 23/23（YmmArithFolds 九态 + YmmArithHardwareTruth
+mem 源翻倍对拍 + 426 位宽闸负例翻转 VexYmmWidthGateNowFolded）；样本
+standalone fails=0；全池 355/355（REQUIRE_REAL=1）；dump 门 ymm 21
+handler 全 PASS（119 handlers）；单 pack 对账 stub 4 + 混排 gate note 1
+（④ 设计内）。**遗留**（wave2③）：混排契约落地（本 gate 可翻面）、
+vextractf128/vinsertf128 桥、ctx.ymm 读回影子样本（T64 F4 挂账）。

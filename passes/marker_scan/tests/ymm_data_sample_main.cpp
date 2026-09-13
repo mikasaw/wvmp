@@ -9,10 +9,12 @@ extern "C" unsigned int      ymm_copy32(void* dst, const void* src);      // ①
 extern "C" unsigned int      ymm_chain32(void* dst, const void* src);     // ②
 extern "C" unsigned int      ymm_vzero_mix(void* dst, const void* src);   // ③
 extern "C" unsigned int      ymm_mix_neg(void* dst, const void* src);     // ④ gate
+extern "C" unsigned int      ymm_arith(void* dst, const void* src);       // ③' MIT-513
 
 namespace {
 alignas(32) unsigned char g_src[64];
 alignas(32) unsigned char g_dst[64];
+alignas(32) float g_want[8];  // MIT-513: 全局 — /RTC1 栈帧检查与手写 asm 交互隔离
 
 bool check32(const unsigned char* got, const unsigned char* want) {
     return std::memcmp(got, want, 32) == 0;
@@ -51,8 +53,28 @@ int main() {
     std::memset(g_dst, 0, sizeof(g_dst));
     const unsigned int r4 = ymm_mix_neg(g_dst, g_src);
     if (!check32(g_dst, g_src)) { std::printf("FAIL mix_neg (native)\n"); ++fails; }
+    // ③' packed 算术链: [rcx] = 2×src 逐 f32 lane (翻倍, d 独立三地址折叠)
+    fill(g_src, 0x40);
+    std::memset(g_dst, 0, sizeof(g_dst));
+    const unsigned int r5 = ymm_arith(g_dst, g_src);
+    {
+        for (int i = 0; i < 8; ++i) {
+            float v;
+            std::memcpy(&v, &g_src[i * 4], 4);
+            v = v + v;  // vaddps ymm0,ymm0,ymm0
+            std::memcpy(&g_want[i], &v, 4);  // g_want 是 float[8]: 按 float 索引
+        }
+        if (!check32(g_dst, reinterpret_cast<const unsigned char*>(g_want))) {
+            std::printf("FAIL arith 2x\n");
+            std::printf("  bytes:");
+            for (int i = 0; i < 32; ++i)
+                std::printf(" %02X/%02X", g_dst[i], reinterpret_cast<const unsigned char*>(g_want)[i]);
+            std::printf("\n");
+            ++fails;
+        }
+    }
 
-    std::printf("ymm_data r1=%u r2=%u r3=%u r4=%u fails=%d\n",
-                r1, r2, r3, r4, fails);
+    std::printf("ymm_data r1=%u r2=%u r3=%u r4=%u r5=%u fails=%d\n",
+                r1, r2, r3, r4, r5, fails);
     return fails == 0 ? 0 : 1;
 }

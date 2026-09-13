@@ -2911,14 +2911,17 @@ TEST_F(LifterTranslate, VexSubsdDstSrc2NoncommGate) {
     EXPECT_EQ(r.skipped_ranges[0].second, 4u);
 }
 
-TEST_F(LifterTranslate, VexYmmWidthGateNegative) {
-    // C5 FC 58 C1: vaddps ymm0, ymm0, ymm1 — **本单最大陷阱钉死** (B.4):
-    // 与 vaddps xmm 同 INS id (X86_INS_VADDPS 覆盖 128/256 两宽), 位宽闸
-    // 必须按操作数 32B 拒 — 放行 = 错误 lift 静默坏壳。
+TEST_F(LifterTranslate, VexYmmWidthGateNowFolded) {
+    // MIT-513 (档B wave2②) 翻转: C5 FC 58 C1 vaddps ymm0, ymm0, ymm1 —
+    // 426 时代位宽闸负例 (同 INS id 覆盖 128/256 双宽陷阱), 算术 ymm 通
+    // 路落地后折叠为 Op::YmmAddps (语义判定从 mnemonic 移到操作数宽度。
+    // 放行不再坏壳: ymm 词族 = 32B 全宽语义 handler, 混排 gate 兜底)。
     const wvmp::u8 b[] = {0xC5, 0xFC, 0x58, 0xC1};
     auto r = translate_bytes(x64, b, ir::Arch::X64);
-    EXPECT_EQ(r.status, lifter::TranslateStatus::Unsupported);
-    ASSERT_EQ(r.skipped_ranges.size(), 1u);
+    ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r.insn.op, ir::Op::YmmAddps);
+    EXPECT_EQ(static_cast<int>(r.insn.dst.reg), 0);
+    EXPECT_EQ(static_cast<int>(r.insn.src.reg), 1);
 }
 
 TEST_F(LifterTranslate, VexYmmMovapsNowFolded) {
@@ -3141,10 +3144,70 @@ TEST_F(LifterTranslate, YmmGatesHold) {
     r = translate_bytes(x64, movrr, ir::Arch::X86);
     EXPECT_EQ(r.status, lifter::TranslateStatus::Unsupported);
 
-    // vaddps ymm0, ymm0, ymm1 (C5 FC 58 C1): 算术 32B → 位宽闸拒
-    const wvmp::u8 addps_ymm[] = {0xC5, 0xFC, 0x58, 0xC1};
-    r = translate_bytes(x64, addps_ymm, ir::Arch::X64);
+}
+
+TEST_F(LifterTranslate, YmmArithFolds) {
+    // MIT-513 (档B wave2②): packed 算术全谱折叠 — kstool 钉板编码。
+    // ① d==s1 直走: vaddps ymm0, ymm0, ymm1 (C5 FC 58 C1)
+    const wvmp::u8 add_d_s1[] = {0xC5, 0xFC, 0x58, 0xC1};
+    auto r = translate_bytes(x64, add_d_s1, ir::Arch::X64);
+    ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r.insn.op, ir::Op::YmmAddps);
+    EXPECT_EQ(static_cast<int>(r.insn.dst.reg), 0);
+    EXPECT_EQ(static_cast<int>(r.insn.src.reg), 1);
+    EXPECT_TRUE(r.extra.empty());
+
+    // ② 可交换 d==s2 swap: vmulps ymm2, ymm0, ymm2 (C5 FC 59 D2)
+    const wvmp::u8 mul_d_s2[] = {0xC5, 0xFC, 0x59, 0xD2};
+    r = translate_bytes(x64, mul_d_s2, ir::Arch::X64);
+    ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r.insn.op, ir::Op::YmmMulps);
+    EXPECT_EQ(static_cast<int>(r.insn.dst.reg), 2);
+    EXPECT_EQ(static_cast<int>(r.insn.src.reg), 0);  // 交换后 src = s1
+
+    // ③ 非交换 d==s2 gate: vsubps ymm0, ymm1, ymm0 (C5 F4 5C C0, kstool
+    // 钉板 — vvvv=~ymm1=F4; 手写 FC 是 d==s1 合法形勿混)
+    const wvmp::u8 sub_d_s2[] = {0xC5, 0xF4, 0x5C, 0xC0};
+    r = translate_bytes(x64, sub_d_s2, ir::Arch::X64);
     EXPECT_EQ(r.status, lifter::TranslateStatus::Unsupported);
+
+    // ④ d 独立 → extra YmmMov 前置: vaddps ymm2, ymm0, ymm1 (C5 FC 58 D1)
+    const wvmp::u8 add_ind[] = {0xC5, 0xFC, 0x58, 0xD1};
+    r = translate_bytes(x64, add_ind, ir::Arch::X64);
+    ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+    ASSERT_EQ(r.extra.size(), static_cast<size_t>(1));
+    EXPECT_EQ(r.extra[0].op, ir::Op::YmmMov);
+    EXPECT_EQ(static_cast<int>(r.extra[0].dst.reg), 2);
+    EXPECT_EQ(static_cast<int>(r.extra[0].src.reg), 0);
+    EXPECT_EQ(r.insn.op, ir::Op::YmmAddps);
+    EXPECT_EQ(static_cast<int>(r.insn.src.reg), 1);
+
+    // ⑤ 整数族: vpxor ymm0, ymm0, ymm1 (C5 FD EF C1) → 清零惯用法
+    const wvmp::u8 pxor[] = {0xC5, 0xFD, 0xEF, 0xC1};
+    r = translate_bytes(x64, pxor, ir::Arch::X64);
+    ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r.insn.op, ir::Op::YmmPxor);
+
+    // ⑥ mem 源: vaddps ymm0, ymm0, [rcx] (C5 FC 58 01)
+    const wvmp::u8 add_mem[] = {0xC5, 0xFC, 0x58, 0x01};
+    r = translate_bytes(x64, add_mem, ir::Arch::X64);
+    ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r.insn.src.kind, ir::Operand::Kind::Mem);
+
+    // ⑦ ymm8..15 gate: vaddps ymm8, ymm0, ymm1 (C4 41 7C 58 C1)
+    const wvmp::u8 add_y8[] = {0xC4, 0x41, 0x7C, 0x58, 0xC1};
+    r = translate_bytes(x64, add_y8, ir::Arch::X64);
+    EXPECT_EQ(r.status, lifter::TranslateStatus::Unsupported);
+
+    // ⑧ x86 gate: 同 ① 字节 × arch=X86
+    r = translate_bytes(x64, add_d_s1, ir::Arch::X86);
+    EXPECT_EQ(r.status, lifter::TranslateStatus::Unsupported);
+
+    // ⑨ 128-bit xmm 形态不受影响: vaddps xmm0, xmm0, xmm1 (C5 F8 58 C1)
+    const wvmp::u8 add_xmm[] = {0xC5, 0xF8, 0x58, 0xC1};
+    r = translate_bytes(x64, add_xmm, ir::Arch::X64);
+    ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r.insn.op, ir::Op::Addps);
 }
 
 TEST_F(LifterTranslate, VexVpadddGate) {

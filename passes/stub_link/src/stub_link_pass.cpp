@@ -375,10 +375,9 @@ void StubLinkPass::run(ProtectionContext& ctx) {
             {
                 const auto& bc = vf.program.bytecode;
                 for (size_t off = 32; off + 8 <= bc.size(); off += 8) {
-                    const int op = static_cast<int>(bc[off]);
-                    if (op == static_cast<int>(isa::VmOp::YmmMov) ||
-                        op == static_cast<int>(isa::VmOp::YmmLoad) ||
-                        op == static_cast<int>(isa::VmOp::YmmStore)) {
+                    // 值域判据: Ymm* 词族从 YmmMov 起连续追加 (T64+T65+…)
+                    if (static_cast<int>(bc[off]) >=
+                        static_cast<int>(isa::VmOp::YmmMov)) {
                         uses_ymm = true;
                         break;
                     }

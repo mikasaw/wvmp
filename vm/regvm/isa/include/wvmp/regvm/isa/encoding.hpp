@@ -104,6 +104,15 @@ enum class FlagSem { kNone, kRead, kWrite, kWriteReadMerge, kWriteReadReg };
         case VmOp::Vzeroupper: case VmOp::Vzeroall:  // MIT-511: 无 flags 面
         case VmOp::YmmMov: case VmOp::YmmLoad:       // MIT-512: 同 (显式
         case VmOp::YmmStore:                         //   kNone，自文档)
+        case VmOp::YmmAddps: case VmOp::YmmAddpd:    // MIT-513: 算术全谱同
+        case VmOp::YmmSubps: case VmOp::YmmSubpd:
+        case VmOp::YmmMulps: case VmOp::YmmMulpd:
+        case VmOp::YmmDivps: case VmOp::YmmDivpd:
+        case VmOp::YmmXorps: case VmOp::YmmXorpd:
+        case VmOp::YmmOrps:  case VmOp::YmmOrpd:
+        case VmOp::YmmAndps: case VmOp::YmmAndpd:
+        case VmOp::YmmPxor:  case VmOp::YmmPor:
+        case VmOp::YmmPand:  case VmOp::YmmPandn:
             return FlagSem::kNone;
         default:
             return FlagSem::kNone;

@@ -1752,6 +1752,7 @@ TranslateResult translate_movd_movq(const cs_insn& ci, const cs_x86& x, ir::Arch
 // comiss QNaN 同级别的 v1 披露面, native handler 执行的仍是真 add*/mul*。
 
 TranslateResult translate_ymm_mov(const cs_insn& ci, const cs_x86& x, ir::Arch arch);
+TranslateResult translate_ymm_arith(const cs_insn& ci, const cs_x86& x, ir::Arch arch);
 
 // V-pair 家族描述: 全部复用既有 translate 函数 (零新 IR 语义)。
 struct VexDesc {
@@ -1845,18 +1846,54 @@ TranslateResult vex_invoke(const VexDesc& d, const cs_insn& ci, const cs_x86& x,
     return unsupported(ci.address, ci.size);
 }
 
+namespace {
+struct YmmArithDesc {
+    Op ir_op;
+    bool commutative;
+};
+// capstone id → IR op / 可交换性 (ps/pd/整数 p* 全 packed 语义)
+std::optional<YmmArithDesc> ymm_arith_desc_of(x86_insn id) {
+    switch (id) {
+    case X86_INS_VADDPS: return YmmArithDesc{Op::YmmAddps, true};
+    case X86_INS_VADDPD: return YmmArithDesc{Op::YmmAddpd, true};
+    case X86_INS_VSUBPS: return YmmArithDesc{Op::YmmSubps, false};
+    case X86_INS_VSUBPD: return YmmArithDesc{Op::YmmSubpd, false};
+    case X86_INS_VMULPS: return YmmArithDesc{Op::YmmMulps, true};
+    case X86_INS_VMULPD: return YmmArithDesc{Op::YmmMulpd, true};
+    case X86_INS_VDIVPS: return YmmArithDesc{Op::YmmDivps, false};
+    case X86_INS_VDIVPD: return YmmArithDesc{Op::YmmDivpd, false};
+    case X86_INS_VXORPS: return YmmArithDesc{Op::YmmXorps, true};
+    case X86_INS_VXORPD: return YmmArithDesc{Op::YmmXorpd, true};
+    case X86_INS_VORPS:  return YmmArithDesc{Op::YmmOrps, true};
+    case X86_INS_VORPD:  return YmmArithDesc{Op::YmmOrpd, true};
+    case X86_INS_VANDPS: return YmmArithDesc{Op::YmmAndps, true};
+    case X86_INS_VANDPD: return YmmArithDesc{Op::YmmAndpd, true};
+    case X86_INS_VPXOR:  return YmmArithDesc{Op::YmmPxor, true};
+    case X86_INS_VPOR:   return YmmArithDesc{Op::YmmPor, true};
+    case X86_INS_VPAND:  return YmmArithDesc{Op::YmmPand, true};
+    case X86_INS_VPANDN: return YmmArithDesc{Op::YmmPandn, false};
+    default: return std::nullopt;
+    }
+}
+} // namespace
+
+
 // VEX.128 V-pair 入口: 位宽闸 → 2-op 直通 / 3-op 三地址折叠 (见顶部说明块)。
 TranslateResult translate_vex128(const cs_insn& ci, const cs_x86& x, ir::Arch arch) {
     const auto desc = vex_desc_of(static_cast<x86_insn>(ci.id));
     if (!desc) return unsupported(ci.address, ci.size);  // 白名单外 (现状 gate 保持)
-    // ---- MIT-512 (T64): 32B (ymm) 传送形态 → ymm 数据通路 (位宽闸前置)。
-    // 仅 Fam::Mov 六 id (vmovaps/vmovupd/vmovups/vmovdqa/vmovdqu/vmovapd);
-    // 算术族 32B 仍被下方位宽闸拒 (wave2② 翻面)。 ----
-    if (desc->fam == VexDesc::Fam::Mov && x.op_count == 2) {
-        bool all32 = true;
+    // ---- MIT-512 (T64)/MIT-513 (T65): 32B (ymm) 形态 → ymm 数据通路
+    // (位宽闸前置)。wave2②: 算术族 18 id 一并翻面 (此前位宽闸拒)。 ----
+    {
+        bool all32 = x.op_count >= 2;
         for (u8 i = 0; i < x.op_count; ++i)
             if (x.operands[i].size != 32) all32 = false;
-        if (all32) return translate_ymm_mov(ci, x, arch);
+        if (all32) {
+            if (desc->fam == VexDesc::Fam::Mov && x.op_count == 2)
+                return translate_ymm_mov(ci, x, arch);
+            if (ymm_arith_desc_of(static_cast<x86_insn>(ci.id)))
+                return translate_ymm_arith(ci, x, arch);
+        }
     }
     // ---- B.4 位宽闸: 32B (ymm) 禁入 — 同 mnemonic 覆盖 128/256 两宽 ----
     // MIT-427 (G1c): Fam::Bridge (vmovd/vmovq) 混合宽度操作数 (r32=4/r64=8)
@@ -2022,6 +2059,91 @@ TranslateResult translate_ymm_mov(const cs_insn& ci, const cs_x86& x, ir::Arch a
         out.src = ir::Operand::reg_(static_cast<ir::Reg>(*si));
     }
     return ok(std::move(out));
+}
+// MIT-513 (T65 · 档B wave2②): VEX.256 packed 算术全谱 — 18 id (ps/pd 双宽
+// + 整数 p* 族)。三地址折叠镜像 MIT-426 (d==s1 直走 / 可交换 d==s2 swap /
+// d 独立 extra YmmMov(dst←s1) 前置 + 2-op；非交换 d==s2 gate)。mem 源经
+// aux bit0 = 1 传地址槽 (handler 内分支读 [addr]，零临时槽)。全 256-bit
+// 语义 = SDM packed 本义 (写全 ymm，无高位保持问题)。x86 gate + ymm8..15
+// gate 继承。
+
+TranslateResult translate_ymm_arith(const cs_insn& ci, const cs_x86& x, ir::Arch arch) {
+    if (arch != ir::Arch::X64) return unsupported(ci.address, ci.size);
+    const auto desc = ymm_arith_desc_of(static_cast<x86_insn>(ci.id));
+    if (!desc) return unsupported(ci.address, ci.size);  // 防御
+    auto ymm_idx = [](x86_reg r) -> std::optional<u8> {
+        if (r >= X86_REG_YMM0 && r <= X86_REG_YMM7)
+            return static_cast<u8>(r - X86_REG_YMM0);
+        return std::nullopt;  // ymm8..15 gate
+    };
+    // 形态: 3-op NDS (dst, src1, src2/reg|mem) 或 2-op 退化 (dst, src/mem)
+    const bool dst_reg = x.operands[0].type == X86_OP_REG;
+    if (!dst_reg) return unsupported(ci.address, ci.size);
+    auto di = ymm_idx(x.operands[0].reg);
+    if (!di) return unsupported(ci.address, ci.size);
+
+    auto make2 = [&](u8 d, const cs_x86_op& src) -> TranslateResult {
+        ir::Insn out;
+        out.op = desc->ir_op;
+        out.size = ir::Size::S64;
+        out.updates_flags = false;
+        out.addr = ci.address;
+        out.dst = ir::Operand::reg_(static_cast<ir::Reg>(d));
+        if (src.type == X86_OP_REG) {
+            auto si = ymm_idx(src.reg);
+            if (!si) return unsupported(ci.address, ci.size);
+            out.src = ir::Operand::reg_(static_cast<ir::Reg>(*si));
+        } else if (src.type == X86_OP_MEM) {
+            auto m = mem_operand(src.mem);
+            if (!m) return unsupported(ci.address, ci.size);
+            out.src = *m;
+        } else {
+            return unsupported(ci.address, ci.size);
+        }
+        return ok(std::move(out));
+    };
+
+    if (x.op_count == 2) return make2(*di, x.operands[1]);
+    if (x.op_count != 3) return unsupported(ci.address, ci.size);
+    auto s1i = ymm_idx(x.operands[1].reg);
+    if (!s1i) return unsupported(ci.address, ci.size);
+    const bool s2_reg = x.operands[2].type == X86_OP_REG;
+    const bool s2_mem = x.operands[2].type == X86_OP_MEM;
+    if (!s2_reg && !s2_mem) return unsupported(ci.address, ci.size);
+    std::optional<u8> s2i;
+    if (s2_reg) {
+        s2i = ymm_idx(x.operands[2].reg);
+        if (!s2i) return unsupported(ci.address, ci.size);
+    }
+    const bool d_eq_s1 = (*di == *s1i);
+    const bool d_eq_s2 = (s2_reg && *di == *s2i);
+
+    // D2 (426 同款): 非交换 d==s2 gate (swap 破坏语义: sub/div/pandn)。
+    if (d_eq_s2 && !desc->commutative) return unsupported(ci.address, ci.size);
+
+    // d==s1: 2-op 直走; 可交换 d==s2: 交换 src1 上位。
+    cs_x86 x0 = x;
+    if (d_eq_s1 || d_eq_s2) {
+        x0.op_count = 2;
+        x0.operands[1] = x.operands[d_eq_s1 ? 2 : 1];
+        return make2(*di, x0.operands[1]);
+    }
+    // dst 独立 → extra YmmMov(dst←src1) 前置 + 2-op (dst, src2)。32B 版
+    // pre-Mov (426 用 Op::Movaps 16B 同款), 与 VEX "dst 高 128 ← src1"
+    // 逐位等价 (packed 全 256 语义: 高半也参与运算, pre-Mov 供给 src1)。
+    x0.op_count = 2;
+    x0.operands[1] = x.operands[2];
+    TranslateResult r = make2(*di, x0.operands[1]);
+    if (r.status != TranslateStatus::Ok) return r;
+    ir::Insn pre;
+    pre.op = Op::YmmMov;
+    pre.size = ir::Size::S64;
+    pre.updates_flags = false;
+    pre.addr = ci.address;
+    pre.dst = ir::Operand::reg_(static_cast<ir::Reg>(*di));
+    pre.src = ir::Operand::reg_(static_cast<ir::Reg>(*s1i));
+    r.extra.push_back(std::move(pre));
+    return r;
 }
 
 TranslateResult translate_cmpxchg(const cs_insn& ci, const cs_x86& x, ir::Arch arch) {

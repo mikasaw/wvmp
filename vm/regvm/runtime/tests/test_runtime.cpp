@@ -1290,6 +1290,64 @@ TEST(Interpreter, YmmDataPathHardwareTruth) {
     EXPECT_EQ(std::memcmp(&buf[0], p1.data(), 32), 0) << "32B store (面)";
 }
 
+// MIT-513 (档B wave2②) 硬件真值: ymm packed 算术 — 精确 float lane 对拍。
+// 词链: YmmLoad src→ymm3 / YmmAddps ymm4←ymm3+ymm3 (翻倍, d 独立 src=mem
+// 形走 aux bit0) / YmmStore dst←ymm4。宿主用 float 精确值 (1.0/2.0 系)
+// 对拍 32B。
+TEST(Interpreter, YmmArithHardwareTruth) {
+    {
+        int info[4] = {};
+        __cpuid(info, 1);
+        if (!((info[2] & (1u << 28)) && (info[2] & (1u << 27))) ||
+            (_xgetbv(0) & 0x6) != 0x6)
+            GTEST_SKIP() << "host CPU/OS lacks AVX";
+    }
+    const u8 sz32 = isa::size_field(ir::Size::S32);
+    wvmp::Rng rng(20260916);
+    const auto result = rt::generate_runtime(rng);
+    RwxImage rwx(result.image.code);
+    auto entry = rwx.entry();
+
+    alignas(32) std::array<u8, 0x80> buf{};
+    std::array<u8, 32> want{};
+    const float src_lanes[8] = {1.0f, 2.0f, -1.5f, 4.25f, 0.5f, 8.0f, -2.0f, 16.0f};
+    for (int i = 0; i < 8; ++i) {
+        std::memcpy(&buf[i * 4], &src_lanes[i], 4);
+        const float doubled = src_lanes[i] + src_lanes[i];
+        std::memcpy(&want[i * 4], &doubled, 4);
+    }
+
+    std::vector<u8> s;
+    // 0: YmmLoad ymm3 ← [v5] (src 图案)
+    isa::append_insn(s, isa::make_insn(isa::VmOp::YmmLoad, isa::OpKind::Reg,
+                                       24 + 3, isa::OpKind::Reg, 5, 32, sz32));
+    // 0': YmmMov ymm4 ← ymm3 — pre-Mov (handler 语义 = dst_face op src,
+    //     与翻译器 d 独立折叠产出形状一致)
+    isa::append_insn(s, isa::make_insn(isa::VmOp::YmmMov, isa::OpKind::Reg,
+                                       24 + 4, isa::OpKind::Reg, 24 + 3, 0, sz32));
+    // 1: YmmAddps ymm4 ← ymm4 + [v5+0x40] — mem 源 (aux bit0=1, b=addr 槽 v6)
+    //    槽 v6 预置同一图案地址 → ymm4 = 2×lanes
+    isa::append_insn(s, isa::make_insn(isa::VmOp::YmmAddps, isa::OpKind::Reg,
+                                       24 + 4, isa::OpKind::Reg, 6, 1, sz32));
+    // 2: YmmStore [v5+0x40] ← ymm4
+    isa::append_insn(s, isa::make_insn(isa::VmOp::YmmStore, isa::OpKind::Reg, 6,
+                                       isa::OpKind::Reg, 24 + 4, 32, sz32));
+    isa::append_insn(s, halt());
+
+    rt::VmContext ctx;
+    ctx.bytecode = s.data();
+    ctx.pc = 0;
+    ctx.regs[5] = reinterpret_cast<u64>(buf.data());
+    ctx.regs[6] = reinterpret_cast<u64>(buf.data()) + 0x40;
+    std::memcpy(&buf[0x40], &buf[0], 32);  // mem 源图案 = src (在 +0x40 备份)
+    entry(&ctx);
+
+    // mem 源 buf[0x40] 已被 store 覆写为结果 — 结果 = 2×lanes
+    EXPECT_EQ(std::memcmp(&buf[0x40], want.data(), 32), 0) << "vaddps mem-src 2x";
+    // 面: ymm4 = 2×lanes
+    EXPECT_EQ(std::memcmp(&ctx.ymm[4].q[0], want.data(), 32), 0) << "addps 落面";
+}
+
 TEST(Interpreter, SemanticBattery) {
     wvmp::Rng rng(0xC0FFEE);
     const auto result = rt::generate_runtime(rng);

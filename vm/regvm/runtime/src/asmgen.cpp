@@ -2406,6 +2406,54 @@ public:
         o += advance(dispatch);
         return o;
     }
+    // MIT-513 (档B wave2②): ymm packed 算术 —— 参数化单 builder。aux
+    // bit0 = src 为 mem（b=addr 槽，handler 内读 [addr]）；否则 b=src
+    // ymm 槽。keystone jcc 仅 rel8 —— mem 分支用短 je 越过 + jmp 惯用法
+    // （T62 先例）。物理 ymm0/ymm1 = scratch（面为权威）。
+    std::string build_ymm_arith(u64 dispatch, const char* mn) const {
+        std::string o = decode_prelude();
+        const std::string tag = std::string(mn) + std::to_string(seq());
+        // dst → t9 → ymm0
+        o += ymm_offset_into_t9(t_[4]);
+        o += std::string("    vmovups ymm0, [") + r64(ctx_) + " + " + r64(t_[9]) + "]\n";
+        // src: aux bit0 → mem / reg 分支
+        o += std::string("    test ") + r64(t_[5]) + ", " + imm(1) + "\n";
+        o += std::string("    je ymmreg_") + tag + "\n";
+        o += std::string("    mov ") + r64(t_[1]) + ", qword ptr [" + r64(ctx_) + " + " +
+             r64(t_[7]) + "*8 + 0x10]\n";
+        o += std::string("    vmovups ymm1, [") + r64(t_[1]) + "]\n";
+        o += std::string("    jmp ymmop_") + tag + "\n";
+        o += std::string("ymmreg_") + tag + ":\n";
+        o += ymm_offset_into_t9(t_[7]);
+        o += std::string("    vmovups ymm1, [") + r64(ctx_) + " + " + r64(t_[9]) + "]\n";
+        o += std::string("ymmop_") + tag + ":\n";
+        // VEX.NDS 需全 3 操作数 (keystone 2-op 形 errno=512 实证):
+        // dst = dst op src 语义不变。
+        o += std::string("    ") + mn + " ymm0, ymm0, ymm1\n";
+        // 写回 dst
+        o += ymm_offset_into_t9(t_[4]);
+        o += std::string("    vmovups [") + r64(ctx_) + " + " + r64(t_[9]) + "], ymm0\n";
+        o += advance(dispatch);
+        return o;
+    }
+    std::string build_YmmAddps(u64 d) const { return build_ymm_arith(d, "vaddps"); }
+    std::string build_YmmAddpd(u64 d) const { return build_ymm_arith(d, "vaddpd"); }
+    std::string build_YmmSubps(u64 d) const { return build_ymm_arith(d, "vsubps"); }
+    std::string build_YmmSubpd(u64 d) const { return build_ymm_arith(d, "vsubpd"); }
+    std::string build_YmmMulps(u64 d) const { return build_ymm_arith(d, "vmulps"); }
+    std::string build_YmmMulpd(u64 d) const { return build_ymm_arith(d, "vmulpd"); }
+    std::string build_YmmDivps(u64 d) const { return build_ymm_arith(d, "vdivps"); }
+    std::string build_YmmDivpd(u64 d) const { return build_ymm_arith(d, "vdivpd"); }
+    std::string build_YmmXorps(u64 d) const { return build_ymm_arith(d, "vxorps"); }
+    std::string build_YmmXorpd(u64 d) const { return build_ymm_arith(d, "vxorpd"); }
+    std::string build_YmmOrps(u64 d) const { return build_ymm_arith(d, "vorps"); }
+    std::string build_YmmOrpd(u64 d) const { return build_ymm_arith(d, "vorpd"); }
+    std::string build_YmmAndps(u64 d) const { return build_ymm_arith(d, "vandps"); }
+    std::string build_YmmAndpd(u64 d) const { return build_ymm_arith(d, "vandpd"); }
+    std::string build_YmmPxor(u64 d) const { return build_ymm_arith(d, "vpxor"); }
+    std::string build_YmmPor(u64 d) const { return build_ymm_arith(d, "vpor"); }
+    std::string build_YmmPand(u64 d) const { return build_ymm_arith(d, "vpand"); }
+    std::string build_YmmPandn(u64 d) const { return build_ymm_arith(d, "vpandn"); }
 
     // ---- MIT-376: SSE 浮点位运算 xorps / orps / andps ----
     //
@@ -6953,6 +7001,25 @@ RuntimeGenResult generate_runtime_arch(wvmp::Rng& rng, AsmGen::HostArch arch,
         {int(VmOp::YmmMov), "ymmmov", &AsmGen::build_ymm_mov},
         {int(VmOp::YmmLoad), "ymmload", &AsmGen::build_ymm_load},
         {int(VmOp::YmmStore), "ymmstore", &AsmGen::build_ymm_store},
+        // MIT-513 (档B wave2②): ymm packed 算术全谱 (参数化单 builder)。
+        {int(VmOp::YmmAddps), "ymmaddps", &AsmGen::build_YmmAddps},
+        {int(VmOp::YmmAddpd), "ymmaddpd", &AsmGen::build_YmmAddpd},
+        {int(VmOp::YmmSubps), "ymmsubps", &AsmGen::build_YmmSubps},
+        {int(VmOp::YmmSubpd), "ymmsubpd", &AsmGen::build_YmmSubpd},
+        {int(VmOp::YmmMulps), "ymmmulps", &AsmGen::build_YmmMulps},
+        {int(VmOp::YmmMulpd), "ymmmulpd", &AsmGen::build_YmmMulpd},
+        {int(VmOp::YmmDivps), "ymmdivps", &AsmGen::build_YmmDivps},
+        {int(VmOp::YmmDivpd), "ymmdivpd", &AsmGen::build_YmmDivpd},
+        {int(VmOp::YmmXorps), "ymmxorps", &AsmGen::build_YmmXorps},
+        {int(VmOp::YmmXorpd), "ymmxorpd", &AsmGen::build_YmmXorpd},
+        {int(VmOp::YmmOrps), "ymmorps", &AsmGen::build_YmmOrps},
+        {int(VmOp::YmmOrpd), "ymmorpd", &AsmGen::build_YmmOrpd},
+        {int(VmOp::YmmAndps), "ymmandps", &AsmGen::build_YmmAndps},
+        {int(VmOp::YmmAndpd), "ymmandpd", &AsmGen::build_YmmAndpd},
+        {int(VmOp::YmmPxor), "ymmpxor", &AsmGen::build_YmmPxor},
+        {int(VmOp::YmmPor), "ymmpor", &AsmGen::build_YmmPor},
+        {int(VmOp::YmmPand), "ymmpand", &AsmGen::build_YmmPand},
+        {int(VmOp::YmmPandn), "ymmpandn", &AsmGen::build_YmmPandn},
         };
     }
     rng.shuffle(handlers.begin(), handlers.end());   // 码序随机

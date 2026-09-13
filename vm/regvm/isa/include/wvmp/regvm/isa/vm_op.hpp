@@ -661,9 +661,32 @@ enum class VmOp : u16 {
     YmmMov,         // ymm dst, ymm src — 32B 面到面拷贝 (vmovaps/vmovdqa 折叠)
     YmmLoad,        // ymm dst, [mem] — a=Reg(dst 槽) b=Reg(addr 槽) aux=32
     YmmStore,       // [mem], ymm src — a=Reg(addr 槽) b=Reg(src 槽) aux=32
+
+    // ---- MIT-513 (T65): AVX 档B wave2② —— VEX.256 packed 算术
+    //      全谱 (x64 host 专用; 槽位/惯例同 T64; aux bit0 = src
+      //     为 mem: b=addr 槽; 否则 b=src ymm 槽)。三地址折叠由
+      //      lifter 产出 (d 独立 = extra YmmMov 前置)。----
+    YmmAddps,       // vaddps (256-bit packed f32 加)
+    YmmAddpd,       // vaddpd (256-bit packed f64 加)
+    YmmSubps,       // vsubps (256-bit packed f32 减)
+    YmmSubpd,       // vsubpd (256-bit packed f64 减)
+    YmmMulps,       // vmulps (256-bit packed f32 乘)
+    YmmMulpd,       // vmulpd (256-bit packed f64 乘)
+    YmmDivps,       // vdivps (256-bit packed f32 除)
+    YmmDivpd,       // vdivpd (256-bit packed f64 除)
+    YmmXorps,       // vxorps (256-bit 按位异或)
+    YmmXorpd,       // vxorpd (256-bit 按位异或)
+    YmmOrps,       // vorps (256-bit 按位或)
+    YmmOrpd,       // vorpd (256-bit 按位或)
+    YmmAndps,       // vandps (256-bit 按位与)
+    YmmAndpd,       // vandpd (256-bit 按位与)
+    YmmPxor,       // vpxor (256-bit 整数异或)
+    YmmPor,       // vpor (256-bit 整数或)
+    YmmPand,       // vpand (256-bit 整数与)
+    YmmPandn,       // vpandn (256-bit dst=~dst&src, 非交换)
     };
 
-inline constexpr u16 kVmOpMax = static_cast<u16>(VmOp::YmmStore);  // MIT-512: 146
+inline constexpr u16 kVmOpMax = static_cast<u16>(VmOp::YmmPandn);  // MIT-513: 164
 inline constexpr u16 kVmOpLimit = 1u << 14;  // 14 位编码空间上限
 
 constexpr const char* to_string(VmOp op) {
@@ -808,6 +831,24 @@ constexpr const char* to_string(VmOp op) {
         case VmOp::YmmMov: return "ymmmov";
         case VmOp::YmmLoad: return "ymmload";
         case VmOp::YmmStore: return "ymmstore";
+        case VmOp::YmmAddps: return "ymmaddps";
+        case VmOp::YmmAddpd: return "ymmaddpd";
+        case VmOp::YmmSubps: return "ymmsubps";
+        case VmOp::YmmSubpd: return "ymmsubpd";
+        case VmOp::YmmMulps: return "ymmmulps";
+        case VmOp::YmmMulpd: return "ymmmulpd";
+        case VmOp::YmmDivps: return "ymmdivps";
+        case VmOp::YmmDivpd: return "ymmdivpd";
+        case VmOp::YmmXorps: return "ymmxorps";
+        case VmOp::YmmXorpd: return "ymmxorpd";
+        case VmOp::YmmOrps: return "ymmorps";
+        case VmOp::YmmOrpd: return "ymmorpd";
+        case VmOp::YmmAndps: return "ymmandps";
+        case VmOp::YmmAndpd: return "ymmandpd";
+        case VmOp::YmmPxor: return "ymmpxor";
+        case VmOp::YmmPor: return "ymmpor";
+        case VmOp::YmmPand: return "ymmpand";
+        case VmOp::YmmPandn: return "ymmpandn";
     }
     return "?";
 }

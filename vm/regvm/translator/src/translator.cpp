@@ -1161,6 +1161,17 @@ struct Translator {
                 // 是 xmm0..xmm7 编号 (lifter 借用 ir::Reg 值 0..7), 翻译期
                 // 加 24 偏移映射到 VmContext.regs[24..31] 保留槽位.
                 ok = translate_sse_mov(em, sc, in, current_rva, next_ip);
+            } else if (in.op == ir::Op::YmmAddps || in.op == ir::Op::YmmAddpd ||
+                       in.op == ir::Op::YmmSubps || in.op == ir::Op::YmmSubpd ||
+                       in.op == ir::Op::YmmMulps || in.op == ir::Op::YmmMulpd ||
+                       in.op == ir::Op::YmmDivps || in.op == ir::Op::YmmDivpd ||
+                       in.op == ir::Op::YmmXorps || in.op == ir::Op::YmmXorpd ||
+                       in.op == ir::Op::YmmOrps || in.op == ir::Op::YmmOrpd ||
+                       in.op == ir::Op::YmmAndps || in.op == ir::Op::YmmAndpd ||
+                       in.op == ir::Op::YmmPxor || in.op == ir::Op::YmmPor ||
+                       in.op == ir::Op::YmmPand || in.op == ir::Op::YmmPandn) {
+                // MIT-513 (档B wave2②): ymm packed 算术 dispatch。
+                ok = translate_ymm_arith(em, sc, in, current_rva, next_ip);
             } else if (in.op == ir::Op::YmmMov || in.op == ir::Op::YmmLoad ||
                        in.op == ir::Op::YmmStore) {
                 // MIT-512 (档B wave2①): ymm 传送 dispatch — REG-REG emit
@@ -1254,7 +1265,8 @@ struct Translator {
             } else if (is_unary(in.op)) {
                 ok = translate_unary(em, sc, in, current_rva, next_ip);
             } else {
-                ok = skip(in, "未支持的操作码", nullptr);
+                ok = skip(in, "未支持的操作码 op=" +
+                              std::to_string(static_cast<int>(in.op)), nullptr);
             }
             break;
         }
@@ -2941,6 +2953,54 @@ struct Translator {
             return skip(in, "ymm 索引越界 (仅支持 ymm0..ymm7)", nullptr);
         em.emit_rr(VmOp::YmmMov, ymm_idx_dst + 24u, ymm_idx_src + 24u,
                    isa::size_field(in.size));
+        return true;
+    }
+    // ---- MIT-513 (档B wave2②): ymm packed 算术全谱发射 ----
+    //
+    // 编码: a=Reg dst 槽 (v24..31), b=Reg src 槽 (aux bit0=0) 或 b=Reg
+    // addr 槽 (aux bit0=1, handler 内读 [addr]); pre-YmmMov extra 由
+    // lifter 产出经常规 dispatch 自动发射。
+    bool translate_ymm_arith(Emitter& em, Scratch& sc, const ir::Insn& in,
+                             u64 current_rva, u64 next_ip) {
+        static const std::unordered_map<ir::Op, VmOp> kMap = {
+            {ir::Op::YmmAddps, VmOp::YmmAddps},
+            {ir::Op::YmmAddpd, VmOp::YmmAddpd},
+            {ir::Op::YmmSubps, VmOp::YmmSubps},
+            {ir::Op::YmmSubpd, VmOp::YmmSubpd},
+            {ir::Op::YmmMulps, VmOp::YmmMulps},
+            {ir::Op::YmmMulpd, VmOp::YmmMulpd},
+            {ir::Op::YmmDivps, VmOp::YmmDivps},
+            {ir::Op::YmmDivpd, VmOp::YmmDivpd},
+            {ir::Op::YmmXorps, VmOp::YmmXorps},
+            {ir::Op::YmmXorpd, VmOp::YmmXorpd},
+            {ir::Op::YmmOrps, VmOp::YmmOrps},
+            {ir::Op::YmmOrpd, VmOp::YmmOrpd},
+            {ir::Op::YmmAndps, VmOp::YmmAndps},
+            {ir::Op::YmmAndpd, VmOp::YmmAndpd},
+            {ir::Op::YmmPxor, VmOp::YmmPxor},
+            {ir::Op::YmmPor, VmOp::YmmPor},
+            {ir::Op::YmmPand, VmOp::YmmPand},
+            {ir::Op::YmmPandn, VmOp::YmmPandn},
+        };
+        const auto it = kMap.find(in.op);
+        if (it == kMap.end()) return false;
+        if (in.dst.kind != ir::Operand::Kind::Reg ||
+            static_cast<u8>(in.dst.reg) > 7u)
+            return skip(in, "ymm 算术 操作数形态未支持", nullptr);
+        const u8 dst_slot = static_cast<u8>(in.dst.reg) + 24u;
+        if (in.src.kind == ir::Operand::Kind::Mem) {
+            u8 acc = 0;
+            if (!emit_sse_mem_addr(em, sc, in.src.mem, current_rva, next_ip, acc))
+                return skip(in, "ymm 算术 地址形态未支持", &in.src.mem);
+            em.emit(it->second, OpKind::Reg, dst_slot, OpKind::Reg, acc,
+                    1u, isa::size_field(in.size));  // aux bit0 = mem
+            return true;
+        }
+        if (in.src.kind != ir::Operand::Kind::Reg ||
+            static_cast<u8>(in.src.reg) > 7u)
+            return skip(in, "ymm 算术 操作数形态未支持", nullptr);
+        em.emit_rr(it->second, dst_slot,
+                   static_cast<u8>(in.src.reg) + 24u, isa::size_field(in.size));
         return true;
     }
 

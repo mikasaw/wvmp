@@ -117,7 +117,13 @@ VZERO_HANDLERS = {"vzeroupper", "vzeroall"}
 # plus pc advance add 1 and >= 2 vmovups with ymm operands (load/store
 # pair; ymmmov has 2 prologues, mem forms 1).  All face accesses must be
 # vmovups (ctx base only 16B-aligned -- MIT-511 F3), so no vmovaps allowed.
-YMM_HANDLERS = {"ymmmov", "ymmload", "ymmstore"}
+YMM_HANDLERS = {"ymmmov", "ymmload", "ymmstore",
+                # MIT-513 (wave2②): packed arithmetic full set
+                "ymmaddps", "ymmaddpd", "ymmsubps", "ymmsubpd",
+                "ymmmulps", "ymmmulpd", "ymmdivps", "ymmdivpd",
+                "ymmxorps", "ymmxorpd", "ymmorps", "ymmorpd",
+                "ymmandps", "ymmandpd", "ymmpxor", "ymmpor",
+                "ymmpand", "ymmpandn"}
 
 # MIT-408: mem-form primitives (XmmLoad / XmmStore).  Expected shape:
 #   - memory-operand FP instruction present (movss/movsd/movups with a

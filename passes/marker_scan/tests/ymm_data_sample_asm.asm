@@ -66,6 +66,26 @@ ymm_vzero_mix PROC
     ret
 ymm_vzero_mix ENDP
 
+; ---- ③' ymm_arith(dst=rcx, src=rdx): packed 算术链 (MIT-513 wave2②) ----
+; [rcx] = (2*src[0:32]) 逐 lane f32 翻倍；词流: load + vaddps(d==s1) +
+; vxorps 清零 ymm1 + vaddps(dst, ymm0, ymm1) d 独立三地址 (extra pre-Mov)。
+ymm_arith PROC
+    ; ===== marker region begin =====
+    sub   rsp, 28h
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
+    vmovups ymm0, [rdx]               ; YmmLoad
+    vaddps  ymm0, ymm0, ymm0          ; YmmAddps (d==s1 直走, 翻倍)
+    vxorps  ymm1, ymm1, ymm1          ; YmmXorps (清零)
+    vaddps  ymm2, ymm0, ymm1          ; YmmAddps (d 独立 → pre-Mov ymm0)
+    vmovups [rcx], ymm2               ; YmmStore
+    nop
+    call ?marker_end@sdk@wvmp@@YAXXZ
+    ; ===== marker region end =====
+    xor eax, eax
+    add   rsp, 28h
+    ret
+ymm_arith ENDP
+
 ; ---- ④ ymm_mix_neg(dst=rcx, src=rdx): ymm + legacy SSE 混排 → 原生 gate ----
 ; ⚠️ addps 置于 store 之后 (F1 修复): addps 破坏 xmm0 低半会随 32B store
 ; 落盘使拷贝非恒等 — 词流混排判据与指令序无关, gate 行为不变。

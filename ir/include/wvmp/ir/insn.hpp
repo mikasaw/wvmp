@@ -311,7 +311,13 @@ enum class Op : u16 { Mov, Lea, Add, Sub, Adc, Sbb, And, Or, Xor, Not, Neg, Inc,
                       // ymm8..15 与 x86 架构维持 gate。混排一致性由
                       // virtualize 函数级 gate 保证（含 Ymm* 词的函数
                       // 不得含 legacy SSE 词，否则整函数原生）。
-                      YmmMov, YmmLoad, YmmStore };
+                      YmmMov, YmmLoad, YmmStore,
+
+                      // MIT-513 (T65): wave2② —— VEX.256 packed
+                      // 算术全谱 (命名/惯例同 T64; 可交换族 =
+                      // add/mul/xor/or/and/p* 三地址 swap; sub/
+                      // div/pandn 非交换 d==s2 gate)。
+                      YmmAddps, YmmAddpd, YmmSubps, YmmSubpd, YmmMulps, YmmMulpd, YmmDivps, YmmDivpd, YmmXorps, YmmXorpd, YmmOrps, YmmOrpd, YmmAndps, YmmAndpd, YmmPxor, YmmPor, YmmPand, YmmPandn };
 enum class Size : u8 { S8, S16, S32, S64 };
 enum class Cond : u8 { O, No, B, Ae, E, Ne, Be, A, S, Ns, P, Np, L, Ge, Le, G };
 constexpr u64 bits(Size s) { return s==Size::S8?8: s==Size::S16?16: s==Size::S32?32:64; }

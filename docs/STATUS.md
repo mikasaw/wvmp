@@ -1288,3 +1288,6 @@ asmgen 零触碰 → dump 锚不受影响（无换代）。
 ### MIT-512 (T64 · AVX 档B wave2① — ymm 数据通路基础) ✅ 2026-09-14
 - +3 VmOp（kVmOpMax 146）：YmmMov/YmmLoad/YmmStore —— vmov* ymm 32B 传送折叠（v24..31 槽复用 = ymm0..7，VmOp 域消歧）；**按需 stub ymm 同步变体**（词流扫描含 Ymm* 词才启用，无 ymm 产物字节恒等，AVX 机器要求收窄到 ymm 类区域）；**混排 gate**（Ymm* + legacy SSE 同函数 → fail-closed 原生，wave2③ 前置保守面）；ymm8..15/x86 gate 继承。硬件真值 YmmDataPathHardwareTruth（32B 面/内存逐位）+ YmmSyncVariantBytes + 六编码 kstool 钉板；426/428 位宽闸负例翻正（VexYmmMovapsNowFolded 等）；dump 门扩 YMM_HANDLERS；样本 wvmp_ymm_data_sample（③正例 + 混排负例）。验证：ctest 23/23、全池 355/355 REQUIRE_REAL（池 71 样本）、dump 门 ymm 三 handler PASS（101 handlers）、单 pack stub 3 全 ymm 变体 + 混排 note 命中。
   证据链 GAPS MIT-512。
+### MIT-513 (T65 · AVX 档B wave2② — VEX.256 packed 算术全谱) ✅ 2026-09-14
+- +18 VmOp（kVmOpMax 164）：YmmAddps..YmmPandn 全 packed 算术（三地址折叠镜像 426：d==s1 直走 / 可交换 d==s2 swap / d 独立 YmmMov pre-Mov / 非交换 d==s2 gate；mem 源 handler aux bit0 分支零临时槽）。参数化单 builder×18（VEX.NDS 全 3 操作数，keystone 2-op errno=512 实证）。混排 gate/uses_ymm 判据改值域（op ≥ YmmMov）。dump 门 YMM_HANDLERS 扩 18。样本增 ⑤ ymm_arith（f32 lane 级对拍）。开发实录三坑（dispatch 条件行被补丁吞掉/float 数组字节索引越界/VEX vvvv 手写错——kstool 钉板）。验证：ctest 23/23（YmmArithFolds 九态 + YmmArithHardwareTruth）；样本 fails=0；全池 355/355 REQUIRE_REAL；dump 门 ymm 21 handler PASS；单 pack stub 4 + 混排 note 1。
+  证据链 GAPS MIT-513。
