@@ -1233,3 +1233,43 @@ asmgen 零触碰 → dump 锚不受影响（无换代）。
   333/335+2 环境项（div@99999 间歇删除/复验干净 + pushimm 抖动复跑 5/5
   排除）。
   证据链 GAPS MIT-494x。
+
+### MIT-495 (T48 · ASLR 探针 delta=0 抖动根因 + 探针加固) ✅ 2026-09-12
+- 受控实验：空闲 0/1000、18GB 压力 0/150（未复现）→ 环境偶发通道定性；基址"窗口内恒定"+ 按文件身份键控两发现（T32 per-boot 表述修正）。探针加固 = 4 次退避重试（仅首启 delta=0 门）+ cdb timeout + 残留 cdb 预检 + 抖动计数披露。返工：无条件重试幻影计数（335/335 误标）+ 验收 C1 假绿守卫缺失，均修。全池 335/335 jitter=0。
+  证据链 GAPS MIT-495。
+
+### MIT-496 (T49 · x87/AVX 剩余 gate 面复勘——决策备忘录) ✅ 2026-09-12
+- 9 面裁决：无 D 级可开面（append-only 裁决/冻结合同/频率门/永久红线四类）；三用户决策点（x87 L0 / ymm 档B / BMI G8b）入册待批。
+  证据链 GAPS MIT-496。
+
+### MIT-497 (T50 · mul64hi 复评翻案——esp-resync 前瞻落地) ✅ 2026-09-12
+- X5b 两前提反汇编推翻（__allmul stdcall 自清 / 尾声 mov esp,ebp 绝对恢复）；resync 前瞻三件套（lifter 扫窗 → FunctionRegion.resync_ok_exits → walk 规则 5 查表，ExitNative 协议零触碰）。翻面暴露 callgate 隐式 cl 参数面（__aullshr 错值实证）→ 邻接规则保守 gate。坑：ir/ 布局头改动必须 --clean-first（增量漏编 TU → CLI 全线 segfault）。
+  证据链 GAPS MIT-497。
+
+### MIT-498 (T51 · callgate 寄存器参数桥) ✅ 2026-09-13
+- asmgen step 2.6/2.7/5.5：目标转存（验收 C 修复：混合对分支恒选 callee-saved，seed 67 静默劫持实证）+ guest eax/ecx/edx 桥入 + edx 写回；cl 邻接 gate 撤销。x86 19 stubs。CallGateBridgeSeedSweep 34-seed 不变量钉。
+  证据链 GAPS MIT-498。
+
+### MIT-499 (T52 · fastcall 样本入池) ✅ 2026-09-13
+- 三 face 样本（fastcall 双参/cl 移位/edx:eax 返回对）+ 池 17→18（total 340）；附 arg_count 静态通路三路评估（MIT-499a）。
+  证据链 GAPS MIT-499/499a。
+
+### MIT-500 (T54 · callee 终态 ret N 扫描——mul64hi 翻面) ✅ 2026-09-13
+- callee_ret_imm 有界扫描 → callgate_cleanup 通道 → walk d-=imm + 合成 Add Rsp 词（mark_last_dead）。**x86 22/22 区全虚拟化首次达成**；x64 sha 恒等。验收 S-1/2/3（loop 族死代码/retf 漏判/冲突测试布局）全落实。
+  证据链 GAPS MIT-500。
+
+### MIT-501 (T55 · 性能基线刷新) ✅ 2026-09-13
+- hotloop：x64 61.6×（基线带内）、x86 131.1ms（−16.5% vs T35）；墙钟单发 x64 1.75×/x86 1.59×。measure_perf 环境挂死披露（工具层挂账→T57 修复）。
+  证据链 GAPS MIT-501。
+
+### MIT-502 (T56 · 2GB ImageBase 非 MSVC 面可达性评估) ✅ 2026-09-13
+- 手工构造 LAA 0xA0000000 镜像实验：loader 忽略高基址 + 放弃重定位 = moved-but-unfixed 必崩态 → 无可执行形态，T37④ 实证关闭。
+  证据链 GAPS MIT-502。
+
+### MIT-503 (T57 · measure_perf 挂死修复 + 环境元数据归一化) ✅ 2026-09-13
+- .NET 重定向死锁（stdout 4135B>4KB 管道缓冲）→ 双流 ReadToEndAsync 前置；image 路径行剥除归一化。双 arch ALL OK 1.56×/1.56×；验收 A/B 实测复现死锁 + 流归属勘误落实。
+  证据链 GAPS MIT-503。
+
+### MIT-504 (T58 · x86 受控口径墙钟刷新) ✅ 2026-09-13
+- x64 1.71×（基线带内）/ x86 1.66×（22/22 后首个受控口径）。解释器优化战役总账收口：hotloop −16.5% + 每词比税清零 + 墙钟 ~1.7× 与覆盖面 22/22 同步。
+  证据链 GAPS MIT-504。
