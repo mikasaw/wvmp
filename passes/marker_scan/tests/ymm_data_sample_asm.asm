@@ -67,13 +67,15 @@ ymm_vzero_mix PROC
 ymm_vzero_mix ENDP
 
 ; ---- ④ ymm_mix_neg(dst=rcx, src=rdx): ymm + legacy SSE 混排 → 原生 gate ----
+; ⚠️ addps 置于 store 之后 (F1 修复): addps 破坏 xmm0 低半会随 32B store
+; 落盘使拷贝非恒等 — 词流混排判据与指令序无关, gate 行为不变。
 ymm_mix_neg PROC
     ; ===== marker region begin =====
     sub   rsp, 28h
     call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
     vmovups ymm0, [rdx]               ; Ymm 词
+    vmovups [rcx], ymm0               ; 先 store (32B 恒等拷贝)
     addps   xmm0, xmm0                ; legacy SSE (混排判据命中 → gate)
-    vmovups [rcx], ymm0
     nop
     call ?marker_end@sdk@wvmp@@YAXXZ
     ; ===== marker region end =====

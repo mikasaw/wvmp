@@ -46,7 +46,7 @@ int main() {
     if (!check32(g_dst, g_src)) { std::printf("FAIL vzero_mix\n"); ++fails; }
 
     // ④ 混排负例: 整函数原生 (ymm+legacy SSE 同区), 行为 byte-exact —
-    // vmovups 32B 拷贝 + addps xmm0,xmm0 (xmm0 结果弃置)。
+    // vmovups 32B 拷贝 + addps xmm0,xmm0 (store 在前, addps 结果不落盘)。
     fill(g_src, 0xE0);
     std::memset(g_dst, 0, sizeof(g_dst));
     const unsigned int r4 = ymm_mix_neg(g_dst, g_src);

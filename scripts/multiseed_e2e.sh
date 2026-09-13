@@ -230,10 +230,10 @@ samples=(
     # vzeroupper 负例翻正例 (词入面真虚拟化, 输出 byte-exact 不变)。
     # 单边新增 2 样本 → 42 × 5 = 210 runs。
     "build/passes/marker_scan/tests/wvmp_vex128_sample.exe"
-    "build/passes/marker_scan/tests/wvmp_vex128_xmm_readback_sample.exe"    "build/passes/marker_scan/tests/wvmp_vex128_sample.exe"
     "build/passes/marker_scan/tests/wvmp_vex128_xmm_readback_sample.exe"
     # MIT-512 (档B wave2①): ymm 数据通路样本 — vmov* ymm 传送词真虚拟化
     # (stub ymm 同步变体) + 混排 gate 负例 (整函数原生 byte-exact)。
+    # 单边新增 1 样本 → 71 × 5 = 355 runs。
     "build/passes/marker_scan/tests/wvmp_ymm_data_sample.exe"
     # MIT-427 (G1c): movd/movq GP↔xmm 桥主样本 + ctx.xmm 读回影子样本 —
     # 桥四形 REG (66 0F 6E / 66 REX.W 0F 6E / 66 0F 7E / 66 REX.W 0F 7E,
