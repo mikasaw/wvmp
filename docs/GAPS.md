@@ -3931,3 +3931,14 @@ translate→词流链路**（battery 绕过 lifter，覆盖盲区）。处置 = 
 关置 false（translate_x87 首行 fail() → 全 x87 回退 gate-native，byte-
 exact 恢复），基建（22 VmOp/ir 枚举/asmgen handler/电池测/样本）保留
 dormant。重启前置 = cdb 词流级 FPU 栈追踪定位执行序缺陷。
+
+**T60 批次验收 REJECT（2026-09-13，独立验收 capstone/数理推演定位）**：
+四个 [C] 全部定位为 x87 L0 重启修复清单——① fdiv 四象限表错位（popnn
+应为 fdivp、poprev 应为 fsubrp；现状 fdivp 泄漏 FPU 栈位 = 热修前值错乱
+的直接根因）；② fsub/fdiv reg 树不消费 aux reverse 位（树位死绑定 →
+fsubr/fsubrp/fdivrp 序列符号翻转）；③ fcomip 双弹栈（fcomip 自带弹栈 +
+处理链补 fstp = 多弹一位）；④ Fnstsw87 发射/handler 判据冲突（恒发
+a_kind=Reg 被 handler 误入 AX 路径；AX 形无发射通路）。重启清单：修 4C
++ 补 fsub/fdiv/fcomip/fnstsw 虚拟化执行覆盖（battery 10/22 词覆盖断层）
++ E2E 接 REQUIRE_REAL + main.c face4 断言修正（&0x41 应为 &0x4100 语义）。
+D5 热修下现状安全（全 x87 gate-native byte-exact，池 345/345）。
