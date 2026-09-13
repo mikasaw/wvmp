@@ -4060,8 +4060,11 @@ YmmSyncVariantBytes（变体字节计数 + fail-closed throw）；426/428 时代
 断言翻转，434 §B.4 先例）。dump 门脚本扩 YMM_HANDLERS 形状检查（stride
 序文 / vmovups ymm ≥2 / 禁 vmovaps）。样本 wvmp_ymm_data_sample（①load/
 store ②全词链 ③vzeroupper 共存 ④混排负例，32B 逐位行为对拍）。**验证**：
-主树 ctest 23/23（YmmDataPathHardwareTruth 实跑非 SKIP）；全池 365/365
+主树 ctest 23/23（YmmDataPathHardwareTruth 实跑非 SKIP）；全池 355/355
 （REQUIRE_REAL=1，池 70→71 样本，ymm 样本 ×5 byte-exact）；单 pack 对账
 stub 3（全 ymm 变体）+ 混排 gate note 命中；dump 门 ymm 三 handler PASS
 （101 handlers）。**遗留**（wave2②③，未批不动）：VEX.256 算术全谱 /
-vextractf128/vinsertf128 桥 / 混排契约（本单为 gate，落地后可翻面）。
+vextractf128/vinsertf128 桥 / 混排契约（本单为 gate，落地后可翻面）；
+验收 F4 挂账：stub ymm 同步变体的 disp32 正确性无行为级读回样本钉住
+（现靠静态审查 + 硬件真值 + dump 门形状旁证），wave2 补 ctx.ymm 读回
+影子样本。
