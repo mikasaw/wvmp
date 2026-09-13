@@ -97,6 +97,10 @@ enum class FlagSem { kNone, kRead, kWrite, kWriteReadMerge, kWriteReadReg };
             // ZF/PF/CF → ctx flags 捕获链
         case VmOp::Div: case VmOp::Idiv:
             return FlagSem::kWrite;
+        case VmOp::Fcmov87:  // MIT-510: 读 guest EFLAGS 选条件传送 —
+                             // flag_sem=kRead（MIT-474 liveness：不建模则
+                             // 前驱 Fcomi87 写被死写消除，fcmov 读陈旧位）
+            return FlagSem::kRead;
         default:
             return FlagSem::kNone;
     }

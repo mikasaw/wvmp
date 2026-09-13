@@ -96,6 +96,7 @@
 #include <cinttypes>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <cstdlib>
 #include <map>
 #include <stdexcept>
@@ -149,6 +150,42 @@ public:
                     break;
                 }
             }
+            // ⚠️ keystone 失败时 count 恒 0 → 上面的定位不可信。补偿：逐行
+            // 单行复测（跳过标签/空行），报告第一条语法失败语句。单行装配
+            // 无法解析跨行标签引用（报 LABEL_INVALID 的行忽略——标签行本身
+            // 语法无害），对 INVALIDOPERAND/MNEMONICFAIL 类失效定位准确。
+            std::string per_line;
+            {
+                size_t p2 = 0;
+                int ln = 0;
+                while (p2 < src.size()) {
+                    const size_t nl = src.find('\n', p2);
+                    const std::string line = src.substr(p2, nl == std::string::npos ? nl : nl - p2);
+                    p2 = nl == std::string::npos ? src.size() : nl + 1;
+                    ++ln;
+                    const size_t s = line.find_first_not_of(" \t");
+                    if (s == std::string::npos) continue;
+                    std::string t = line.substr(s);
+                    if (t.back() == ':') continue;  // 标签行
+                    unsigned char* e2 = nullptr;
+                    size_t sz2 = 0, c2 = 0;
+                    if (ks_asm(ks_, t.c_str(), at, &e2, &sz2, &c2) != 0) {
+                        const ks_err e_line = ks_errno(ks_);
+                        if (e2) ks_free(e2);
+                        // 单行装配的预期失效：LABEL_INVALID (标签行语法) 与
+                        // SYMBOL_MISSING (引用跨行标签) — 跳过；其余
+                        // (INVALIDOPERAND/MNEMONICFAIL/UNSUPPORTED…) 为真失效。
+                        if (e_line == KS_ERR_ASM_LABEL_INVALID ||
+                            e_line == KS_ERR_ASM_SYMBOL_MISSING)
+                            continue;
+                        per_line = " [line " + std::to_string(ln) +
+                                   " ks_errno=" + std::to_string(int(e_line)) +
+                                   ": " + t + "]";
+                        break;
+                    }
+                    if (e2) ks_free(e2);
+                }
+            }
             // 调试：失败全文落盘（ks_asm 失败时 count 恒 0，逐行定位需外部二分）。
             char* dbg = nullptr;
             size_t dbg_len = 0;
@@ -162,7 +199,8 @@ public:
             std::free(dbg);
             throw std::runtime_error("regvm runtime: ks_asm failed (" + std::string(what) +
                                      "), ks_errno=" + std::to_string(int(err)) +
-                                     ", stmt#" + std::to_string(count) + ": [" + failing + "]");
+                                     ", stmt#" + std::to_string(count) + ": [" + failing + "]" +
+                                     per_line);
         }
         std::vector<u8> out(enc, enc + size);
         if (enc) ks_free(enc);
@@ -310,7 +348,11 @@ static_assert(kX86RspSlotOff == static_cast<u64>(isa::vm_reg_of(ir::Reg::Rsp)) *
 // 需要加宽的只有运行时的跳表与掩码。故 64 → 128（7 位，Divpd 之后还能再放
 // 61 个 op，覆盖 MIT-375/376 的 SSE 传送/位运算批次），并加 static_assert
 // 把"枚举越界"从**运行时空转**升级为**编译期失败**。
-constexpr u64 kTableEntries = 128;
+//
+// MIT-510 (T62)：x87 L1-L4 续延后 kVmOpMax=141 ≥ 128 → 按冻结契约的批量
+// 前置条款扩容 128 → 256（8 位掩码由 kTableEntries-1 自动导出）。表项追加
+// 使生成码尾表 +1KB（双 arch 均如此）——本批为有意变更，x64 dump 换代。
+constexpr u64 kTableEntries = 256;
 static_assert(isa::kVmOpMax < kTableEntries,
               "VmOp 枚举已越过 dispatch 跳表空间：新 opcode 会被掩码折叠到 halt "
               "并静默空转（MIT-374 根因）。请加宽 kTableEntries（2 的幂）并同步 "
@@ -5748,9 +5790,22 @@ public:
 
     std::string build_x87_fldconst(u64 dispatch) const {
         std::string o = decode_prelude_x86();
-        // aux = 1 → fld1; 0 → fldz。
-        o += std::string("    cmp dword ptr ") + xf(kX86FAux) + ", " + imm(1) + "\n    je x87one\n";
-        o += "    fldz\n    jmp x87end\nx87one:\n    fld1\nx87end:\n";
+        // MIT-510: aux 0..6 = fldz/fld1/fldpi/fldl2t/fldl2e/fldlg2/fldln2
+        // (T62 常量族并入既有 op, 零新词)。末变体直落。
+        o += std::string("    cmp dword ptr ") + xf(kX86FAux) + ", " + imm(0) + "\n    je x87c0\n";
+        o += std::string("    cmp dword ptr ") + xf(kX86FAux) + ", " + imm(1) + "\n    je x87c1\n";
+        o += std::string("    cmp dword ptr ") + xf(kX86FAux) + ", " + imm(2) + "\n    je x87c2\n";
+        o += std::string("    cmp dword ptr ") + xf(kX86FAux) + ", " + imm(3) + "\n    je x87c3\n";
+        o += std::string("    cmp dword ptr ") + xf(kX86FAux) + ", " + imm(4) + "\n    je x87c4\n";
+        o += std::string("    cmp dword ptr ") + xf(kX86FAux) + ", " + imm(5) + "\n    je x87c5\n";
+        o += "    fldln2\n    jmp x87end\n";
+        o += "x87c0:\n    fldz\n    jmp x87end\n";
+        o += "x87c1:\n    fld1\n    jmp x87end\n";
+        o += "x87c2:\n    fldpi\n    jmp x87end\n";
+        o += "x87c3:\n    fldl2t\n    jmp x87end\n";
+        o += "x87c4:\n    fldl2e\n    jmp x87end\n";
+        o += "x87c5:\n    fldlg2\n    jmp x87end\n";
+        o += "x87end:\n";
         o += advance_x86(dispatch);
         return o;
     }
@@ -5991,6 +6046,259 @@ public:
         return o;
     }
 
+    // ---- MIT-510 (T62): x87 L1-L4 handlers ----
+
+    // fcom/fcomp/fucom/fucomp: 助记符四变体由 aux(pop=bit0, u=bit1) 运行期
+    // 选择; mem 形 (a_kind==Reg) 宽度位图 bit2=dword/bit3=qword (farith 同
+    // 表); reg 形 (a_kind==Imm) a=0(dst st0) b=源位。FCOM 族只写 SW
+    // (C0/C2/C3) 不触 guest EFLAGS — 无捕获链。
+    std::string build_x87_fcom(u64 dispatch) const {
+        std::string o = decode_prelude_x86();
+        // ⚠️ keystone 的 jcc 只支持 rel8 短跳 (jmp 才自动选宽, T42 教训的
+        // 盲区延伸) — 跨远距的结构分支用 "短 je 越过 + jmp 自动宽" 惯用法
+        // (X86AllGatedEmitsNonEmptyDataSection 装配失败实证)。
+        o += std::string("    cmp dword ptr ") + xf(kX86FAKind) + ", " + imm(1) + "\n    je x87cmem\n    jmp x87creg\nx87cmem:\n";
+        o += x87_mem_addr();
+        const std::string t0 = r32x(t_[0]);
+        // mem: (u, pop) 四变体 × 宽度两分支。
+        o += std::string("    test dword ptr ") + xf(kX86FAux) + ", " + imm(2) + "\n    jnz x87cu\n";
+        o += std::string("    test dword ptr ") + xf(kX86FAux) + ", " + imm(1) + "\n    jnz x87cp\n";
+        o += std::string("    test dword ptr ") + xf(kX86FAux) + ", " + imm(4) + "\n    jnz x87cm4\n";
+        o += std::string("    fcom qword ptr [") + t0 + "]\n    jmp x87cend\n";
+        o += std::string("x87cm4:\n    fcom dword ptr [") + t0 + "]\n    jmp x87cend\n";
+        o += "x87cp:\n";
+        o += std::string("    test dword ptr ") + xf(kX86FAux) + ", " + imm(4) + "\n    jnz x87cpm4\n";
+        o += std::string("    fcomp qword ptr [") + t0 + "]\n    jmp x87cend\n";
+        o += std::string("x87cpm4:\n    fcomp dword ptr [") + t0 + "]\n    jmp x87cend\n";
+        o += "x87cu:\n";
+        o += std::string("    test dword ptr ") + xf(kX86FAux) + ", " + imm(1) + "\n    jnz x87cup\n";
+        o += std::string("    test dword ptr ") + xf(kX86FAux) + ", " + imm(4) + "\n    jnz x87cum4\n";
+        // ⚠️ mem+u (fucom/fucomp mem 形) 不发词 — keystone 不装配
+        // (INVALIDOPERAND 实证), lifter 对该组合 D5 gate (int3 防御)。
+        o += "    int3\n    jmp x87cend\n";
+        o += "x87cum4:\n    int3\n    jmp x87cend\n";
+        o += "x87cup:\n";
+        o += std::string("    test dword ptr ") + xf(kX86FAux) + ", " + imm(4) + "\n    jnz x87cupm4\n";
+        o += "    int3\n    jmp x87cend\n";
+        o += "x87cupm4:\n    int3\n    jmp x87cend\n";
+        // reg: 8 路 st(k) 树 × 助记符四变体。dst 恒 st0 (lifter 单操作数
+        // 路径固定 dst=0); t0 = FRegB。
+        o += "x87creg:\n";
+        o += std::string("    mov ") + r32x(t_[0]) + ", " + xf(kX86FRegB) + "\n";
+        o += std::string("    test dword ptr ") + xf(kX86FAux) + ", " + imm(2) + "\n    jnz x87cru\n";
+        o += std::string("    test dword ptr ") + xf(kX86FAux) + ", " + imm(1) + "\n    jnz x87crp\n";
+        o += x87_cmp_mnemonic_tree("fcom", "a");
+        o += "    jmp x87cend\n";
+        o += "x87crp:\n" + x87_cmp_mnemonic_tree("fcomp", "b") + "    jmp x87cend\n";
+        o += "x87cru:\n";
+        o += std::string("    test dword ptr ") + xf(kX86FAux) + ", " + imm(1) + "\n    jnz x87crup\n";
+        o += x87_cmp_mnemonic_tree("fucom", "c") + "    jmp x87cend\n";
+        o += "x87crup:\n" + x87_cmp_mnemonic_tree("fucomp", "d") + "x87cend:\n";
+        o += advance_x86(dispatch);
+        return o;
+    }
+
+    // 8 路 `mn st(k)` 树 (k=7 直落; t0 已载 FRegB)。build_x87_fcom 专用;
+    // tag 后缀保证四次实例化标签唯一。
+    std::string x87_cmp_mnemonic_tree(const char* mn, const char* tag) const {
+        std::string tree;
+        for (int k = 0; k < 8; ++k) {
+            tree += std::string("    cmp ") + r32x(t_[0]) + ", " + imm(k) +
+                    "\n    jne x87ct" + tag + std::to_string(k) + "\n    " + mn +
+                    " st(" + std::to_string(k) + ")\n    jmp x87cend\nx87ct" +
+                    tag + std::to_string(k) + ":\n";
+        }
+        tree += std::string("    ") + mn + " st(7)\n";
+        return tree;
+    }
+
+    std::string build_x87_fcompp(u64 dispatch) const {
+        std::string o = decode_prelude_x86();
+        o += "    fcompp\n";
+        o += advance_x86(dispatch);
+        return o;
+    }
+    std::string build_x87_ftst(u64 dispatch) const {
+        std::string o = decode_prelude_x86();
+        o += "    ftst\n";
+        o += advance_x86(dispatch);
+        return o;
+    }
+    std::string build_x87_fxam(u64 dispatch) const {
+        std::string o = decode_prelude_x86();
+        o += "    fxam\n";
+        o += advance_x86(dispatch);
+        return o;
+    }
+    // fcmovcc st, st(i): aux=cc 0..7 (b/e/be/u/nb/ne/nbe/nu)。分发链按 cc
+    // 物化条件位 t1 (edx, 0/1): mov edx,[ctx+0x98]; and edx,mask; setne/sete
+    // dl — 共享树内 test edx,1; jz skip; fld st(k); fstp st(1) (= 条件成立
+    // 时 st0 ← st(k), 栈深不变)。掩码: b=2(CF) e=1(ZF) be=3(CF|ZF) u=16(PF);
+    // 反形 (k>=4) sete (条件 = 掩码位全 0)。
+    // ⚠️ 不发真 fcmov — keystone 装配 fcmov 双操作数失败 (ks_errno=512 实
+    // 证)。flag_sem=kRead 建模不变。
+    std::string build_x87_fcmov(u64 dispatch) const {
+        std::string o = decode_prelude_x86();
+        const std::string fl = std::string("dword ptr [") + r32x(ctx_) + " + 0x98]";
+        static constexpr u32 kMask[8] = {2, 1, 3, 16, 2, 1, 3, 16};
+        for (int k = 0; k < 7; ++k)
+            o += std::string("    cmp dword ptr ") + xf(kX86FAux) + ", " +
+                 imm(k) + "\n    je x87cm" + std::to_string(k) + "\n";
+        // ⚠️ 块序: cm7 紧贴分发链末尾 (aux=7 的 je 全不中后直落 cm7;
+        // 首版按序发射使直落掉进 cm0 的 cf 物化 — nu 用例误 move 实证)。
+        const int kOrder[8] = {7, 0, 1, 2, 3, 4, 5, 6};
+        for (int idx = 0; idx < 8; ++idx) {
+            const int kk = kOrder[idx];
+            o += std::string("x87cm" + std::to_string(kk) + ":\n    mov ") +
+                 r32x(t_[1]) + ", " + fl + "\n    and " + r32x(t_[1]) + ", " +
+                 imm(kMask[kk]) + "\n    " +
+                 (kk >= 4 ? "sete" : "setne") + " " + rs(t_[1], 0) +
+                 "\n    jmp x87ctree\n";
+        }
+        o += "x87ctree:\n";
+        o += std::string("    mov ") + r32x(t_[0]) + ", " + xf(kX86FRegB) + "\n";
+        for (int k = 0; k < 8; ++k) {
+            o += std::string("    cmp ") + r32x(t_[0]) + ", " + imm(k) +
+                 "\n    jne x87cn" + std::to_string(k) +
+                 "\n    test " + r32x(t_[1]) + ", " + imm(1) +
+                 "\n    jz x87ce" + std::to_string(k) +
+                 "\n    fld st(" + std::to_string(k) + ")" +
+                 "\n    fstp st(1)\nx87ce" + std::to_string(k) +
+                 ":\n    jmp x87cmend\nx87cn" + std::to_string(k) + ":\n";
+        }
+        o += "x87cmend:\n";
+        o += advance_x86(dispatch);
+        return o;
+    }
+
+    std::string build_x87_fxch(u64 dispatch) const {
+        std::string o = decode_prelude_x86();
+        // 词域 = reg_b (b=Imm i, Fld87St 惯例 — MIT-509 验收 F1 教训)。
+        std::string tree;
+        for (int k = 0; k < 8; ++k) {
+            tree += std::string("    cmp dword ptr ") + xf(kX86FRegB) + ", " +
+                    imm(k) + "\n    jne x87cx" + std::to_string(k) +
+                    "\n    fxch st(" + std::to_string(k) + ")\n    jmp x87cxend\nx87cx" +
+                    std::to_string(k) + ":\n";
+        }
+        tree += "    fxch st(7)\nx87cxend:\n";
+        o += tree + advance_x86(dispatch);
+        return o;
+    }
+
+    std::string build_x87_ffree(u64 dispatch) const {
+        std::string o = decode_prelude_x86();
+        // 词域 = reg_b; aux bit0=pop (ffreep) → ffree st(k) + fstp st(0)
+        // 等价组合 (keystone ffreep 装配兜底风险规避)。
+        std::string tree;
+        for (int k = 0; k < 8; ++k) {
+            tree += std::string("    cmp dword ptr ") + xf(kX86FRegB) + ", " +
+                    imm(k) + "\n    jne x87cf" + std::to_string(k) +
+                    "\n    ffree st(" + std::to_string(k) + ")\n    jmp x87cfchk\nx87cf" +
+                    std::to_string(k) + ":\n";
+        }
+        tree += "    ffree st(7)\nx87cfchk:\n";
+        o += tree;
+        o += std::string("    test dword ptr ") + xf(kX86FAux) + ", " + imm(1) +
+             "\n    jz x87cfno\n    fstp st(0)\nx87cfno:\n";
+        o += advance_x86(dispatch);
+        return o;
+    }
+
+    std::string build_x87_fincdec(u64 dispatch) const {
+        std::string o = decode_prelude_x86();
+        o += std::string("    test dword ptr ") + xf(kX86FAux) + ", " + imm(1) +
+             "\n    jnz x87cinc\n    fdecstp\n    jmp x87cdd\nx87cinc:\n    fincstp\nx87cdd:\n";
+        o += advance_x86(dispatch);
+        return o;
+    }
+
+    std::string build_x87_f2xm1(u64 dispatch) const {
+        std::string o = decode_prelude_x86();
+        o += "    f2xm1\n";
+        o += advance_x86(dispatch);
+        return o;
+    }
+    std::string build_x87_fyl2x(u64 dispatch) const {
+        std::string o = decode_prelude_x86();
+        o += "    fyl2x\n";
+        o += advance_x86(dispatch);
+        return o;
+    }
+    std::string build_x87_fyl2xp1(u64 dispatch) const {
+        std::string o = decode_prelude_x86();
+        o += "    fyl2xp1\n";
+        o += advance_x86(dispatch);
+        return o;
+    }
+    std::string build_x87_fscale(u64 dispatch) const {
+        std::string o = decode_prelude_x86();
+        o += "    fscale\n";
+        o += advance_x86(dispatch);
+        return o;
+    }
+    std::string build_x87_fpatan(u64 dispatch) const {
+        std::string o = decode_prelude_x86();
+        o += "    fpatan\n";
+        o += advance_x86(dispatch);
+        return o;
+    }
+    std::string build_x87_fprem(u64 dispatch) const {
+        std::string o = decode_prelude_x86();
+        o += std::string("    test dword ptr ") + xf(kX86FAux) + ", " + imm(1) +
+             "\n    jnz x87cpr1\n    fprem\n    jmp x87cprd\nx87cpr1:\n    fprem1\nx87cprd:\n";
+        o += advance_x86(dispatch);
+        return o;
+    }
+    std::string build_x87_fsin(u64 dispatch) const {
+        std::string o = decode_prelude_x86();
+        o += "    fsin\n";
+        o += advance_x86(dispatch);
+        return o;
+    }
+    std::string build_x87_fcos(u64 dispatch) const {
+        std::string o = decode_prelude_x86();
+        o += "    fcos\n";
+        o += advance_x86(dispatch);
+        return o;
+    }
+    std::string build_x87_fsincos(u64 dispatch) const {
+        std::string o = decode_prelude_x86();
+        o += "    fsincos\n";
+        o += advance_x86(dispatch);
+        return o;
+    }
+    std::string build_x87_fptan(u64 dispatch) const {
+        std::string o = decode_prelude_x86();
+        o += "    fptan\n";
+        o += advance_x86(dispatch);
+        return o;
+    }
+    std::string build_x87_frndint(u64 dispatch) const {
+        std::string o = decode_prelude_x86();
+        o += "    frndint\n";
+        o += advance_x86(dispatch);
+        return o;
+    }
+    std::string build_x87_fxtract(u64 dispatch) const {
+        std::string o = decode_prelude_x86();
+        o += "    fxtract\n";
+        o += advance_x86(dispatch);
+        return o;
+    }
+    std::string build_x87_fnclex(u64 dispatch) const {
+        std::string o = decode_prelude_x86();
+        o += "    fnclex\n";
+        o += advance_x86(dispatch);
+        return o;
+    }
+    std::string build_x87_fninit(u64 dispatch) const {
+        std::string o = decode_prelude_x86();
+        o += "    fninit\n";
+        o += advance_x86(dispatch);
+        return o;
+    }
+
     std::string build_x86_fld87mem(u64 d) const { return build_x87_fldmem(d); }
     std::string build_x86_fld87st(u64 d) const { return build_x87_fldst(d); }
     std::string build_x86_fld87const(u64 d) const { return build_x87_fldconst(d); }
@@ -6013,6 +6321,32 @@ public:
     std::string build_x86_fldcw87(u64 d) const { return build_x87_fldcw(d); }
     std::string build_x86_fnstcw87(u64 d) const { return build_x87_fnstcw(d); }
     std::string build_x86_fnstsw87(u64 d) const { return build_x87_fnstsw(d); }
+
+    // MIT-510 (T62): L1-L4 wrappers。
+    std::string build_x86_fcom87(u64 d) const { return build_x87_fcom(d); }
+    std::string build_x86_fcompp87(u64 d) const { return build_x87_fcompp(d); }
+    std::string build_x86_ftst87(u64 d) const { return build_x87_ftst(d); }
+    std::string build_x86_fxam87(u64 d) const { return build_x87_fxam(d); }
+    std::string build_x86_fcmov87(u64 d) const { return build_x87_fcmov(d); }
+    std::string build_x86_fxch87(u64 d) const { return build_x87_fxch(d); }
+    std::string build_x86_ffree87(u64 d) const { return build_x87_ffree(d); }
+    std::string build_x86_fincdecstp87(u64 d) const {
+        return build_x87_fincdec(d);
+    }
+    std::string build_x86_f2xm187(u64 d) const { return build_x87_f2xm1(d); }
+    std::string build_x86_fyl2x87(u64 d) const { return build_x87_fyl2x(d); }
+    std::string build_x86_fyl2xp187(u64 d) const { return build_x87_fyl2xp1(d); }
+    std::string build_x86_fscale87(u64 d) const { return build_x87_fscale(d); }
+    std::string build_x86_fpatan87(u64 d) const { return build_x87_fpatan(d); }
+    std::string build_x86_fprem87(u64 d) const { return build_x87_fprem(d); }
+    std::string build_x86_fsin87(u64 d) const { return build_x87_fsin(d); }
+    std::string build_x86_fcos87(u64 d) const { return build_x87_fcos(d); }
+    std::string build_x86_fsincos87(u64 d) const { return build_x87_fsincos(d); }
+    std::string build_x86_fptan87(u64 d) const { return build_x87_fptan(d); }
+    std::string build_x86_frndint87(u64 d) const { return build_x87_frndint(d); }
+    std::string build_x86_fxtract87(u64 d) const { return build_x87_fxtract(d); }
+    std::string build_x86_fnclex87(u64 d) const { return build_x87_fnclex(d); }
+    std::string build_x86_fninit87(u64 d) const { return build_x87_fninit(d); }
 
     std::string build_x86_callgate(u64 d) const { return build_callgate_x86(d); }
 
@@ -6309,6 +6643,28 @@ std::vector<HandlerDef> x86_handler_table() {
         {int(VmOp::Fldcw87), "fldcw87", &AsmGen::build_x86_fldcw87},
         {int(VmOp::Fnstcw87), "fnstcw87", &AsmGen::build_x86_fnstcw87},
         {int(VmOp::Fnstsw87), "fnstsw87", &AsmGen::build_x86_fnstsw87},
+        {int(VmOp::Fcom87), "fcom87", &AsmGen::build_x86_fcom87},
+        {int(VmOp::Fcompp87), "fcompp87", &AsmGen::build_x86_fcompp87},
+        {int(VmOp::Ftst87), "ftst87", &AsmGen::build_x86_ftst87},
+        {int(VmOp::Fxam87), "fxam87", &AsmGen::build_x86_fxam87},
+        {int(VmOp::Fcmov87), "fcmov87", &AsmGen::build_x86_fcmov87},
+        {int(VmOp::Fxch87), "fxch87", &AsmGen::build_x86_fxch87},
+        {int(VmOp::Ffree87), "ffree87", &AsmGen::build_x86_ffree87},
+        {int(VmOp::Fincdecstp87), "fincdecstp87", &AsmGen::build_x86_fincdecstp87},
+        {int(VmOp::F2xm187), "f2xm187", &AsmGen::build_x86_f2xm187},
+        {int(VmOp::Fyl2x87), "fyl2x87", &AsmGen::build_x86_fyl2x87},
+        {int(VmOp::Fyl2xp187), "fyl2xp187", &AsmGen::build_x86_fyl2xp187},
+        {int(VmOp::Fscale87), "fscale87", &AsmGen::build_x86_fscale87},
+        {int(VmOp::Fpatan87), "fpatan87", &AsmGen::build_x86_fpatan87},
+        {int(VmOp::Fprem87), "fprem87", &AsmGen::build_x86_fprem87},
+        {int(VmOp::Fsin87), "fsin87", &AsmGen::build_x86_fsin87},
+        {int(VmOp::Fcos87), "fcos87", &AsmGen::build_x86_fcos87},
+        {int(VmOp::Fsincos87), "fsincos87", &AsmGen::build_x86_fsincos87},
+        {int(VmOp::Fptan87), "fptan87", &AsmGen::build_x86_fptan87},
+        {int(VmOp::Frndint87), "frndint87", &AsmGen::build_x86_frndint87},
+        {int(VmOp::Fxtract87), "fxtract87", &AsmGen::build_x86_fxtract87},
+        {int(VmOp::Fnclex87), "fnclex87", &AsmGen::build_x86_fnclex87},
+        {int(VmOp::Fninit87), "fninit87", &AsmGen::build_x86_fninit87},
     };
 }
 

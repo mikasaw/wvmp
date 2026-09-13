@@ -615,9 +615,40 @@ enum class VmOp : u16 {
     Fnstsw87,       // fnstsw: mem 形 (a_kind=Reg acc 槽) / AX 形 (a_kind=Imm
                     //   a=Rax 槽); aux 对 farith mem 为位图 (bit1=rev /
                     //   bit2=dword / bit3=qword), Fnstsw87 双形均 16
+
+    // ---- MIT-510 (T62): x87 L1-L4 续延 (同物理 FPU 驻留架构 append-only;
+    //      kVmOpMax 141 ≥ 128 → kTableEntries 256 扩容为本批前置) ----
+    // Fcom87: mem 形 a_kind=Reg(acc)+aux 位图 (bit0=pop/bit1=u/bit2=dword/
+    //   bit3=qword); reg 形 a_kind=Imm a=0 b=Imm i + aux bit0/bit1。
+    //   助记符四变体 fcom/fcomp/fucom/fucomp 由 (pop,u) 选; 只写 SW 不触
+    //   guest EFLAGS。
+    Fcom87,
+    Fcompp87,       // fcompp (无域, 双弹)
+    Ftst87,         // ftst (st0 vs 0.0 → SW)
+    Fxam87,         // fxam (st0 分类 → SW C0/C2/C3)
+    Fcmov87,        // fcmovcc st, st(i): a=Imm 0 b=Imm i; aux=cc 0..7
+                    //   (b/e/be/u/nb/ne/nbe/nu); flag_sem=kRead (读 guest
+                    //   EFLAGS, handler 自 ctx+0x98 物化)
+    Fxch87,         // fxch st(i) (b=Imm i, Fld87St 词域惯例)
+    Ffree87,        // ffree st(i) (b=Imm i; aux bit0=pop → +fstp st(0))
+    Fincdecstp87,   // fdecstp/fincstp (aux bit0: 0=dec 1=inc)
+    F2xm187,        // f2xm1 (st0 = 2^st0 − 1)
+    Fyl2x87,        // fyl2x (st1 × log2(st0), 弹)
+    Fyl2xp187,      // fyl2xp1 (st1 × log2(st0+1), 弹)
+    Fscale87,       // fscale (st0 ×= 2^⌊st1⌋, 弹 st1)
+    Fpatan87,       // fpatan (st1 = atan(st1/st0), 弹)
+    Fprem87,        // fprem/fprem1 (aux bit0: 0=prem 1=prem1)
+    Fsin87,         // fsin
+    Fcos87,         // fcos
+    Fsincos87,      // fsincos (压 sin, cos)
+    Fptan87,        // fptan (压 1.0)
+    Frndint87,      // frndint (按 CW RC 舍入)
+    Fxtract87,      // fxtract (st0=指数, 压有效位)
+    Fnclex87,       // fnclex (清 SW 异常标志)
+    Fninit87,       // fninit (FPU 全复位)
     };
 
-inline constexpr u16 kVmOpMax = static_cast<u16>(VmOp::Fnstsw87);  // MIT-507: 119
+inline constexpr u16 kVmOpMax = static_cast<u16>(VmOp::Fninit87);  // MIT-510: 141
 inline constexpr u16 kVmOpLimit = 1u << 14;  // 14 位编码空间上限
 
 constexpr const char* to_string(VmOp op) {
@@ -735,6 +766,28 @@ constexpr const char* to_string(VmOp op) {
         case VmOp::Fldcw87: return "fldcw87";
         case VmOp::Fnstcw87: return "fnstcw87";
         case VmOp::Fnstsw87: return "fnstsw87";
+        case VmOp::Fcom87: return "fcom87";
+        case VmOp::Fcompp87: return "fcompp87";
+        case VmOp::Ftst87: return "ftst87";
+        case VmOp::Fxam87: return "fxam87";
+        case VmOp::Fcmov87: return "fcmov87";
+        case VmOp::Fxch87: return "fxch87";
+        case VmOp::Ffree87: return "ffree87";
+        case VmOp::Fincdecstp87: return "fincdecstp87";
+        case VmOp::F2xm187: return "f2xm187";
+        case VmOp::Fyl2x87: return "fyl2x87";
+        case VmOp::Fyl2xp187: return "fyl2xp187";
+        case VmOp::Fscale87: return "fscale87";
+        case VmOp::Fpatan87: return "fpatan87";
+        case VmOp::Fprem87: return "fprem87";
+        case VmOp::Fsin87: return "fsin87";
+        case VmOp::Fcos87: return "fcos87";
+        case VmOp::Fsincos87: return "fsincos87";
+        case VmOp::Fptan87: return "fptan87";
+        case VmOp::Frndint87: return "frndint87";
+        case VmOp::Fxtract87: return "fxtract87";
+        case VmOp::Fnclex87: return "fnclex87";
+        case VmOp::Fninit87: return "fninit87";
     }
     return "?";
 }

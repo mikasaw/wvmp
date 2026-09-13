@@ -2350,9 +2350,56 @@ TEST(LifterX87, CapstoneProbeFaddpFcomiFldcw) {
         0xDF, 0xF1,                   // fcomip st, st(1)
         0xD9, 0x28,                   // fldcw [eax]
         0xDF, 0xE0,                   // fnstsw ax
-        0xD9, 0x38,                   // fnstsw word [eax]
+        0xD9, 0x38,                   // fnstcw [eax] (D9 /7)
         0xDD, 0x58, 0x10,             // fstp qword [eax+0x10]
         0xDF, 0x58, 0x10,             // fistp word [eax+0x10]
+        // ---- MIT-510 (T62) L1-L4 探针 ----
+        0xD8, 0xD1,                   // fcom st(1)
+        0xD8, 0x15, 0x00, 0x00, 0x00, 0x00,  // fcom dword [eax]
+        0xDC, 0x15, 0x00, 0x00, 0x00, 0x00,  // fcom qword [eax]
+        0xD8, 0xD9,                   // fcomp st(1)
+        0xD8, 0x1D, 0x00, 0x00, 0x00, 0x00,  // fcomp dword [eax]
+        0xDE, 0xD9,                   // fcompp
+        0xD9, 0xE4,                   // ftst
+        0xD9, 0xE5,                   // fxam
+        0xDD, 0xE1,                   // fucom st(1)
+        0xDD, 0xE9,                   // fucomp st(1)
+        0xDB, 0xE9,                   // fucomi st, st(1)
+        0xDF, 0xE9,                   // fucomip st, st(1)
+        0xD9, 0xC9,                   // fxch st(1)
+        0xDF, 0xC1,                   // ffree st(1)
+        0xD9, 0xF6,                   // fdecstp
+        0xD9, 0xF7,                   // fincstp
+        0xDB, 0xC1,                   // fcmovb st, st(1)
+        0xDB, 0xC9,                   // fcmove st, st(1)
+        0xDB, 0xD1,                   // fcmovbe st, st(1)
+        0xDB, 0xD9,                   // fcmovu st, st(1)
+        0xDA, 0xC1,                   // fcmovnb st, st(1)
+        0xDA, 0xC9,                   // fcmovne st, st(1)
+        0xDA, 0xD1,                   // fcmovnbe st, st(1)
+        0xDA, 0xD9,                   // fcmovnu st, st(1)
+        0xD9, 0xEB,                   // fldpi
+        0xD9, 0xE8,                   // fld1
+        0xD9, 0xEE,                   // fldz
+        0xD9, 0xE9,                   // fldl2t
+        0xD9, 0xEA,                   // fldl2e
+        0xD9, 0xEC,                   // fldlg2
+        0xD9, 0xED,                   // fldln2
+        0xD9, 0xF0,                   // f2xm1
+        0xD9, 0xF1,                   // fyl2x
+        0xD9, 0xF2,                   // fptan
+        0xD9, 0xF3,                   // fpatan
+        0xD9, 0xF4,                   // fxtract
+        0xD9, 0xF5,                   // fprem1
+        0xD9, 0xF8,                   // fprem
+        0xD9, 0xF9,                   // fyl2xp1
+        0xD9, 0xFB,                   // fsincos
+        0xD9, 0xFC,                   // frndint
+        0xD9, 0xFD,                   // fscale
+        0xD9, 0xFE,                   // fsin
+        0xD9, 0xFF,                   // fcos
+        0xDB, 0xE2,                   // fnclex
+        0xDB, 0xE3,                   // fninit
     };
     const wvmp::u8* p2 = code;
     size_t left = sizeof(code);

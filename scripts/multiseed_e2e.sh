@@ -345,6 +345,10 @@ x86_samples=(
     # x87 L0 faces through the physical-FPU-resident handlers: fld/fadd/
     # fstp m64, fild/faddp/fistp, fsqrt/fchs, fcomi+fnstsw, fldcw.
     "build/x86_samples/wvmp_x86_x87l0_sample.exe"
+    # MIT-510 (T62): x87l1 (x86 95 -> 100 runs, total 350).
+    # x87 L1-L4 faces: fcom/fcomp st(i), ftst+fnstsw ax, fxch, fcomi+fcmovnb,
+    # fldpi/fldl2e/fmulp/f2xm1/fld1/faddp, fprem, fninit.
+    "build/x86_samples/wvmp_x86_x87l1_sample.exe"
 )
 
 # Seeds: 1 (small), 12345 (default), 99999 (large), 0xDEADBEEF (magic), 0xCAFEBABE (magic).

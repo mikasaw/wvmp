@@ -276,7 +276,26 @@ enum class Op : u16 { Mov, Lea, Add, Sub, Adc, Sbb, And, Or, Xor, Not, Neg, Inc,
                       Fadd87, Fmul87, Fsub87, Fdiv87,
                       Fchs87, Fabs87, Fsqrt87,
                       Fcomi87, Fcomip87,
-                      Fldcw87, Fnstcw87, Fnstsw87 };
+                      Fldcw87, Fnstcw87, Fnstsw87,
+
+                      // MIT-510 (T62): x87 L1-L4 续延——同物理 FPU 驻留架构
+                      // append-only 续批（kVmOpMax 141 ≥ 128 → 跳表 256 扩
+                      // 容为本批前置，冻结契约允许的批量前置条款）。操作数
+                      // 约定沿 L0：mem 形 a_kind=Reg(acc 槽) + aux 位图
+                      // (bit0=pop / bit1=u 或 rev / bit2=dword / bit3=qword)；
+                      // st(i) 形 b=Imm(reg_b=i)（Fld87St 词域惯例）或
+                      // a=Imm 0 + b=Imm i；无域词全 None。FCOM 族只写 SW
+                      // (C0/C2/C3) 不触 guest EFLAGS → flag_sem kNone；
+                      // Fcmov87 读 guest EFLAGS → flag_sem kRead（MIT-474
+                      // liveness 必须建模，否则前驱 Fcomi 写被死写消除）。
+                      // L4 env/save 族（fldenv/fstenv/fsave/frstor）永久
+                      // gate（内存块布局面，罕见），披露 vm_op.hpp。
+                      Fcom87, Fcompp87, Ftst87, Fxam87, Fcmov87,
+                      Fxch87, Ffree87, Fincdecstp87,
+                      F2xm187, Fyl2x87, Fyl2xp187, Fscale87, Fpatan87,
+                      Fprem87, Fsin87, Fcos87, Fsincos87, Fptan87,
+                      Frndint87, Fxtract87,
+                      Fnclex87, Fninit87 };
 enum class Size : u8 { S8, S16, S32, S64 };
 enum class Cond : u8 { O, No, B, Ae, E, Ne, Be, A, S, Ns, P, Np, L, Ge, Le, G };
 constexpr u64 bits(Size s) { return s==Size::S8?8: s==Size::S16?16: s==Size::S32?32:64; }

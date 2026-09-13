@@ -1181,7 +1181,19 @@ struct Translator {
                        in.op == ir::Op::Fchs87 || in.op == ir::Op::Fabs87 ||
                        in.op == ir::Op::Fsqrt87 || in.op == ir::Op::Fcomi87 ||
                        in.op == ir::Op::Fcomip87 || in.op == ir::Op::Fldcw87 ||
-                       in.op == ir::Op::Fnstcw87 || in.op == ir::Op::Fnstsw87) {
+                       in.op == ir::Op::Fnstcw87 || in.op == ir::Op::Fnstsw87 ||
+                       in.op == ir::Op::Fcom87 || in.op == ir::Op::Fcompp87 ||
+                       in.op == ir::Op::Ftst87 || in.op == ir::Op::Fxam87 ||
+                       in.op == ir::Op::Fcmov87 || in.op == ir::Op::Fxch87 ||
+                       in.op == ir::Op::Ffree87 ||
+                       in.op == ir::Op::Fincdecstp87 ||
+                       in.op == ir::Op::F2xm187 || in.op == ir::Op::Fyl2x87 ||
+                       in.op == ir::Op::Fyl2xp187 || in.op == ir::Op::Fscale87 ||
+                       in.op == ir::Op::Fpatan87 || in.op == ir::Op::Fprem87 ||
+                       in.op == ir::Op::Fsin87 || in.op == ir::Op::Fcos87 ||
+                       in.op == ir::Op::Fsincos87 || in.op == ir::Op::Fptan87 ||
+                       in.op == ir::Op::Frndint87 || in.op == ir::Op::Fxtract87 ||
+                       in.op == ir::Op::Fnclex87 || in.op == ir::Op::Fninit87) {
                 // MIT-506/507 (T60): x87 L0 dispatch (物理 FPU 驻留直执行;
                 // x64 区恒无 x87 词——lifter 仅 x86 收录)。
                 ok = translate_x87(em, sc, in, current_rva, next_ip);
@@ -3094,6 +3106,127 @@ struct Translator {
             return true;
         case ir::Op::Fsqrt87:
             em.emit(VmOp::Fsqrt87, OpKind::None, 0, OpKind::None, 0, 0, 0);
+            return true;
+
+        // ---- MIT-510 (T62): x87 L1-L4 发射 ----
+        case ir::Op::Fcom87: {
+            // mem 形 aux 位图 (bit0=pop/bit1=u/bit2=dword/bit3=qword) 与
+            // farith 同表; reg 形 a=Imm 0(dst st0) b=Imm i。
+            const u32 aux = in.src2.kind == ir::Operand::Kind::Imm
+                                ? static_cast<u32>(in.src2.imm)
+                                : 0u;
+            if (in.src.kind == ir::Operand::Kind::Mem) {
+                u8 acc = 0;
+                if (!emit_address(em, sc, in.src.mem, current_rva, next_ip,
+                                  sz_step_, acc, image_base_, image_extent_,
+                                  arch_))
+                    return skip(in, "x87 地址形态未支持", &in.src.mem);
+                em.emit(VmOp::Fcom87, OpKind::Reg, acc, OpKind::None, 0, aux,
+                        isa::size_field(ir::Size::S64));
+                return true;
+            }
+            if (in.dst.kind != ir::Operand::Kind::Imm ||
+                in.src.kind != ir::Operand::Kind::Imm)
+                return skip(in, "x87 fcom 操作数形态未支持", nullptr);
+            em.emit(VmOp::Fcom87, OpKind::Imm,
+                    static_cast<u8>(in.dst.imm), OpKind::Imm,
+                    static_cast<u8>(in.src.imm), aux,
+                    isa::size_field(ir::Size::S32));
+            return true;
+        }
+        case ir::Op::Fcompp87:
+            em.emit(VmOp::Fcompp87, OpKind::None, 0, OpKind::None, 0, 0, 0);
+            return true;
+        case ir::Op::Ftst87:
+            em.emit(VmOp::Ftst87, OpKind::None, 0, OpKind::None, 0, 0, 0);
+            return true;
+        case ir::Op::Fxam87:
+            em.emit(VmOp::Fxam87, OpKind::None, 0, OpKind::None, 0, 0, 0);
+            return true;
+        case ir::Op::Fcmov87: {
+            // a=Imm 0(dst st0) b=Imm i; aux=cc 0..7。flag_sem=kRead —
+            // handler 自 ctx+0x98 物化物理 EFLAGS 后执行 fcmovcc。
+            if (in.dst.kind != ir::Operand::Kind::Imm ||
+                in.src.kind != ir::Operand::Kind::Imm)
+                return skip(in, "x87 fcmov 操作数形态未支持", nullptr);
+            em.emit(VmOp::Fcmov87, OpKind::Imm,
+                    static_cast<u8>(in.dst.imm), OpKind::Imm,
+                    static_cast<u8>(in.src.imm),
+                    in.src2.kind == ir::Operand::Kind::Imm
+                        ? static_cast<u32>(in.src2.imm)
+                        : 0u,
+                    isa::size_field(ir::Size::S32));
+            return true;
+        }
+        case ir::Op::Fxch87: {
+            // 词域 = b=Imm i (Fld87St 惯例, 验收 F1 教训: handler 读域必须
+            // 与发射域一致)。
+            if (in.src.kind != ir::Operand::Kind::Imm) return false;
+            em.emit(VmOp::Fxch87, OpKind::None, 0, OpKind::Imm,
+                    static_cast<u8>(in.src.imm), 0, 0);
+            return true;
+        }
+        case ir::Op::Ffree87:
+            if (in.src.kind != ir::Operand::Kind::Imm) return false;
+            em.emit(VmOp::Ffree87, OpKind::None, 0, OpKind::Imm,
+                    static_cast<u8>(in.src.imm),
+                    in.src2.kind == ir::Operand::Kind::Imm
+                        ? static_cast<u32>(in.src2.imm)
+                        : 0u,
+                    0);
+            return true;
+        case ir::Op::Fincdecstp87:
+            em.emit(VmOp::Fincdecstp87, OpKind::None, 0, OpKind::None, 0,
+                    in.src2.kind == ir::Operand::Kind::Imm
+                        ? static_cast<u32>(in.src2.imm)
+                        : 0u,
+                    0);
+            return true;
+        case ir::Op::F2xm187:
+            em.emit(VmOp::F2xm187, OpKind::None, 0, OpKind::None, 0, 0, 0);
+            return true;
+        case ir::Op::Fyl2x87:
+            em.emit(VmOp::Fyl2x87, OpKind::None, 0, OpKind::None, 0, 0, 0);
+            return true;
+        case ir::Op::Fyl2xp187:
+            em.emit(VmOp::Fyl2xp187, OpKind::None, 0, OpKind::None, 0, 0, 0);
+            return true;
+        case ir::Op::Fscale87:
+            em.emit(VmOp::Fscale87, OpKind::None, 0, OpKind::None, 0, 0, 0);
+            return true;
+        case ir::Op::Fpatan87:
+            em.emit(VmOp::Fpatan87, OpKind::None, 0, OpKind::None, 0, 0, 0);
+            return true;
+        case ir::Op::Fprem87:
+            em.emit(VmOp::Fprem87, OpKind::None, 0, OpKind::None, 0,
+                    in.src2.kind == ir::Operand::Kind::Imm
+                        ? static_cast<u32>(in.src2.imm)
+                        : 0u,
+                    0);
+            return true;
+        case ir::Op::Fsin87:
+            em.emit(VmOp::Fsin87, OpKind::None, 0, OpKind::None, 0, 0, 0);
+            return true;
+        case ir::Op::Fcos87:
+            em.emit(VmOp::Fcos87, OpKind::None, 0, OpKind::None, 0, 0, 0);
+            return true;
+        case ir::Op::Fsincos87:
+            em.emit(VmOp::Fsincos87, OpKind::None, 0, OpKind::None, 0, 0, 0);
+            return true;
+        case ir::Op::Fptan87:
+            em.emit(VmOp::Fptan87, OpKind::None, 0, OpKind::None, 0, 0, 0);
+            return true;
+        case ir::Op::Frndint87:
+            em.emit(VmOp::Frndint87, OpKind::None, 0, OpKind::None, 0, 0, 0);
+            return true;
+        case ir::Op::Fxtract87:
+            em.emit(VmOp::Fxtract87, OpKind::None, 0, OpKind::None, 0, 0, 0);
+            return true;
+        case ir::Op::Fnclex87:
+            em.emit(VmOp::Fnclex87, OpKind::None, 0, OpKind::None, 0, 0, 0);
+            return true;
+        case ir::Op::Fninit87:
+            em.emit(VmOp::Fninit87, OpKind::None, 0, OpKind::None, 0, 0, 0);
             return true;
         default:
             return false;

@@ -574,7 +574,8 @@ TEST(X86Battery, DisasmStaticGate) {
         cs_free(insn, n);
     }
 
-    // dispatch：and 0x7f（7 位掩码）+ 跳表 8B 表项读取（D3）+ jmp reg。
+    // dispatch：and 0xff（8 位掩码，MIT-510 跳表 256 扩容）+ 跳表 8B 表项
+    // 读取（D3）+ jmp reg。
     {
         cs_insn* insn = nullptr;
         const size_t n = cs_disasm(handle, gen.image.code.data() + dispatch_off,
@@ -583,7 +584,7 @@ TEST(X86Battery, DisasmStaticGate) {
         bool have_and = false, have_jmp_reg = false;
         for (size_t i = 0; i < n; ++i) {
             if (std::strcmp(insn[i].mnemonic, "and") == 0 &&
-                std::strstr(insn[i].op_str, "0x7f") != nullptr)
+                std::strstr(insn[i].op_str, "0xff") != nullptr)
                 have_and = true;
             if (std::strcmp(insn[i].mnemonic, "jmp") == 0 &&
                 insn[i].op_str[0] != '0' && std::strstr(insn[i].op_str, "e") != nullptr)
@@ -2687,6 +2688,7 @@ TEST(X86Battery, X87ControlWordRoundTrip) {
 alignas(8) static double g_ht_a = 0, g_ht_b = 0, g_ht_r0 = 0, g_ht_r1 = 0;
 alignas(1) static uint8_t g_ht_sw8 = 0;
 alignas(2) static uint16_t g_ht_sw16 = 0;
+alignas(2) static uint16_t g_ht_sw16b = 0;  // s2 暂存 (TOP 差值断言)
 
 // 裸 x87 双压栈序列: fld a(→st1); fld b(→st0); <enc 2 字节>; fstp r0; fstp r1。
 // 每用例栈配平; FPU 全掩码 (CW 默认) 无异常路径。32 位原生 (交叉树测试进程)。
@@ -3064,6 +3066,260 @@ TEST(X86Battery, X87StTreeIndexing) {
     EXPECT_EQ(o2, 20.0);
     EXPECT_EQ(o3, 10.0);
     EXPECT_EQ(o4, 4.0);
+}
+
+// ---------------------------------------------------------------------------
+// (31.10) MIT-510 (T62): x87 L1-L4 handler 电池 —— fcom 族 / fcmov / 栈管理
+// / 超越 / 状态控制。词构造与 translate_x87 发射约定逐位一致。
+// ---------------------------------------------------------------------------
+alignas(8) static double g_ht_nan =
+    std::numeric_limits<double>::quiet_NaN();
+
+// Fnstsw87 mem 形词 (a_kind=Reg + acc 槽): handler fnstsw word [acc 值]。
+static isa::VmInsn x87_fnstsw_mem(u8 addr_slot) {
+    return isa::make_insn(isa::VmOp::Fnstsw87, isa::OpKind::Reg, addr_slot,
+                          isa::OpKind::None, 0, 16,
+                          isa::size_field(ir::Size::S64));
+}
+
+TEST(X86Battery, X87L1FcomFamily) {
+    // fcom reg (dst=0, src=1): fld a(2.5) → st1; fld b(1.5) → st0=1.5;
+    // 1.5 < 2.5 → below → C0 (SW bit8)。
+    wvmp::Rng rng(12345);
+    const auto gen = rt::generate_runtime_x86(rng);
+    RwxImage rwx(gen.image.code);
+    g_ht_a = 2.5; g_ht_b = 1.5; g_ht_r0 = 0; g_ht_r1 = 0;
+    std::vector<u8> s;
+    isa::append_insn(s, mov_imm(5, static_cast<u32>(reinterpret_cast<uintptr_t>(&g_ht_a))));
+    isa::append_insn(s, x87_mem(5, isa::VmOp::Fld87Mem, 8));    // st0=2.5
+    isa::append_insn(s, mov_imm(6, static_cast<u32>(reinterpret_cast<uintptr_t>(&g_ht_b))));
+    isa::append_insn(s, x87_mem(6, isa::VmOp::Fld87Mem, 8));    // st0=1.5, st1=2.5
+    isa::append_insn(s, isa::make_insn(isa::VmOp::Fcom87, isa::OpKind::Imm, 0,
+                                       isa::OpKind::Imm, 1, 0,
+                                       isa::size_field(ir::Size::S32)));
+    isa::append_insn(s, mov_imm(7, static_cast<u32>(reinterpret_cast<uintptr_t>(&g_ht_sw16))));
+    isa::append_insn(s, x87_fnstsw_mem(7));                     // SW → sw16
+    isa::append_insn(s, mov_imm(5, static_cast<u32>(reinterpret_cast<uintptr_t>(&g_ht_r1))));
+    isa::append_insn(s, x87_mem(5, isa::VmOp::Fstp87Mem, 8));   // 存 SW 值
+    // 配平排水: fcom 不弹剩 2 值, 仅弹 1 → 泄漏累积推满物理栈 (后续用例
+    // fld 压制值全错) — 测试间零残留纪律。
+    isa::append_insn(s, mov_imm(6, static_cast<u32>(reinterpret_cast<uintptr_t>(&g_ht_r0))));
+    isa::append_insn(s, x87_mem(6, isa::VmOp::Fstp87Mem, 8));
+    isa::append_insn(s, halt());
+    rt::VmContext ctx;
+    ctx.bytecode = s.data();
+    ctx.pc = 0;
+    rwx.entry()(&ctx);
+    const std::uint16_t sw = static_cast<std::uint16_t>(g_ht_sw16);
+    EXPECT_EQ(sw & 0x0100, 0x0100);  // 1.5 < 2.5 → C0 (SW bit8)
+    EXPECT_EQ(sw & 0x4000, 0x0000);  // C3 = 0
+}
+
+TEST(X86Battery, X87L1FtstFxam) {
+    // ftst: st0=0 → equal → C3 (bit14); 后续 fxam 被 ftst 状态覆盖 (C2=0)。
+    wvmp::Rng rng(12345);
+    const auto gen = rt::generate_runtime_x86(rng);
+    RwxImage rwx(gen.image.code);
+    g_ht_sw16 = 0;
+    std::vector<u8> s;
+    isa::append_insn(s, isa::make_insn(isa::VmOp::Fld87Const, isa::OpKind::None,
+                                       0, isa::OpKind::None, 0, 0, 0));  // fldz
+    isa::append_insn(s, isa::make_insn(isa::VmOp::Ftst87, isa::OpKind::None,
+                                       0, isa::OpKind::None, 0, 0, 0));
+    isa::append_insn(s, isa::make_insn(isa::VmOp::Fxam87, isa::OpKind::None,
+                                       0, isa::OpKind::None, 0, 0, 0));
+    isa::append_insn(s, mov_imm(5, static_cast<u32>(reinterpret_cast<uintptr_t>(&g_ht_sw16))));
+    isa::append_insn(s, x87_fnstsw_mem(5));
+    // 配平: fldz 未弹 → fstp 排水 (测试间零残留纪律)。
+    isa::append_insn(s, mov_imm(6, static_cast<u32>(reinterpret_cast<uintptr_t>(&g_ht_r0))));
+    isa::append_insn(s, x87_mem(6, isa::VmOp::Fstp87Mem, 8));
+    isa::append_insn(s, halt());
+    rt::VmContext ctx;
+    ctx.bytecode = s.data();
+    ctx.pc = 0;
+    rwx.entry()(&ctx);
+    EXPECT_EQ(g_ht_sw16 & 0x4000, 0x4000);  // ftst equal → C3 (ftst 后 fxam
+    EXPECT_EQ(g_ht_sw16 & 0x0400, 0x0000);  // 的 z-type 分类保持 C3, C2=0)
+}
+
+TEST(X86Battery, X87L1FcmovAll) {
+    // fcmov 八条件面 (词 {a=Imm 0, b=Imm i, aux=cc})。flags 源 = Fcomi87
+    // 捕获链 (ctx+0x98)。⚠️ 压栈序: fld b(10) → st1; fld a(4) → st0=4;
+    // fcomi st, st(1) = 4 vs 10 → below (CF=1, ZF=0)。move = st0 ← st(1)
+    // = 10。NaN 面: st0=NaN → unordered → ZF=PF=CF=1。
+    struct Case {
+        const char* name;
+        double a, b;   // fld b → st1; fld a → st0 (⚠️ 序与直觉相反)
+        u32 cc;        // 0=b 1=e 2=be 3=u 4=nb 5=ne 6=nbe 7=nu
+        bool is_nan;   // a 用 NaN
+        double exp;    // fstp 期望 (move → st(1)=b=10; no-move → st0=a=4)
+    };
+    const Case cases[] = {
+        {"fcmovb  moves on CF", 4.0, 10.0, 0, false, 10.0},
+        {"fcmovnb skips on CF", 4.0, 10.0, 4, false, 4.0},
+        {"fcmove  skips !ZF",   4.0, 10.0, 1, false, 4.0},
+        {"fcmovne moves !ZF",   4.0, 10.0, 5, false, 10.0},
+        {"fcmovbe moves CF",    4.0, 10.0, 2, false, 10.0},
+        {"fcmovnbe skips CF",   4.0, 10.0, 6, false, 4.0},
+        {"fcmovnu skips on PF", 4.0, 10.0, 7, true, 4.0},
+    };
+    for (const auto& c : cases) {
+        const bool u_case = c.cc == 3;
+        wvmp::Rng rng(12345);
+        const auto gen = rt::generate_runtime_x86(rng);
+        RwxImage rwx(gen.image.code);
+        g_ht_a = c.a;
+        g_ht_b = c.is_nan ? g_ht_nan : c.b; g_ht_r0 = 0;
+        std::vector<u8> s;
+        // fld b → st1; fld a → st0 (fcomi 比较 st0 vs st(1))
+        isa::append_insn(s, mov_imm(6, static_cast<u32>(reinterpret_cast<uintptr_t>(&g_ht_b))));
+        isa::append_insn(s, x87_mem(6, isa::VmOp::Fld87Mem, 8));   // st0=10
+        isa::append_insn(s, mov_imm(5, static_cast<u32>(reinterpret_cast<uintptr_t>(&g_ht_a))));
+        isa::append_insn(s, x87_mem(5, isa::VmOp::Fld87Mem, 8));   // st0=4, st1=10
+        isa::append_insn(s, isa::make_insn(isa::VmOp::Fcomi87, isa::OpKind::None,
+                                           0, isa::OpKind::Imm, 1, 0,
+                                           isa::size_field(ir::Size::S32)));
+        isa::append_insn(s, isa::make_insn(isa::VmOp::Fcmov87, isa::OpKind::Imm,
+                                           0, isa::OpKind::Imm, 1, c.cc,
+                                           isa::size_field(ir::Size::S32)));
+        isa::append_insn(s, mov_imm(7, static_cast<u32>(reinterpret_cast<uintptr_t>(&g_ht_r0))));
+        isa::append_insn(s, x87_mem(7, isa::VmOp::Fstp87Mem, 8));
+        // 排水: st1 (b 值) 弹出 → 栈配平 (不配平则泄漏槽位污染后续用例,
+        // 栈满 masked 压栈失效 → indefinite)。
+        isa::append_insn(s, mov_imm(5, static_cast<u32>(reinterpret_cast<uintptr_t>(&g_ht_r1))));
+        isa::append_insn(s, x87_mem(5, isa::VmOp::Fstp87Mem, 8));
+        isa::append_insn(s, halt());
+        rt::VmContext ctx;
+        ctx.bytecode = s.data();
+        ctx.pc = 0;
+        rwx.entry()(&ctx);
+        if (u_case) {
+            // u 用例: move 后 st0 = st(1) = NaN (b 侧为 NaN)。
+            EXPECT_TRUE(std::isnan(g_ht_r0)) << c.name;
+        } else {
+            EXPECT_EQ(g_ht_r0, c.exp) << c.name;
+        }
+    }
+}
+
+TEST(X86Battery, X87L2FxchFfreep) {
+    // fxch (b=Imm 词域): 交换后 fstp 序 = 4.0 / 10.0。
+    // ffree (aux=0, 无 pop): TOP 不变 — 两次 fnstsw (s1/s2) 差 ≡ 0 (mod 8)。
+    wvmp::Rng rng(12345);
+    const auto gen = rt::generate_runtime_x86(rng);
+    RwxImage rwx(gen.image.code);
+    g_ht_a = 4.0; g_ht_b = 10.0; g_ht_r0 = g_ht_r1 = 0;
+    g_ht_sw16 = 0; g_ht_sw16b = 0;
+    std::vector<u8> s;
+    isa::append_insn(s, mov_imm(5, static_cast<u32>(reinterpret_cast<uintptr_t>(&g_ht_a))));
+    isa::append_insn(s, x87_mem(5, isa::VmOp::Fld87Mem, 8));
+    isa::append_insn(s, mov_imm(6, static_cast<u32>(reinterpret_cast<uintptr_t>(&g_ht_b))));
+    isa::append_insn(s, x87_mem(6, isa::VmOp::Fld87Mem, 8));    // st0=10, st1=4
+    isa::append_insn(s, isa::make_insn(isa::VmOp::Fxch87, isa::OpKind::None,
+                                       0, isa::OpKind::Imm, 1, 0, 0));  // st0=4
+    isa::append_insn(s, mov_imm(7, static_cast<u32>(reinterpret_cast<uintptr_t>(&g_ht_r0))));
+    isa::append_insn(s, x87_mem(7, isa::VmOp::Fstp87Mem, 8));   // r0=4
+    isa::append_insn(s, mov_imm(5, static_cast<u32>(reinterpret_cast<uintptr_t>(&g_ht_r1))));
+    isa::append_insn(s, x87_mem(5, isa::VmOp::Fstp87Mem, 8));   // r1=10
+    // ffree 面: 再压一对; s1 → sw16b, ffree st(1), s2 → sw16; TOP 差 ≡ 0。
+    isa::append_insn(s, mov_imm(6, static_cast<u32>(reinterpret_cast<uintptr_t>(&g_ht_b))));
+    isa::append_insn(s, x87_mem(6, isa::VmOp::Fld87Mem, 8));
+    isa::append_insn(s, mov_imm(5, static_cast<u32>(reinterpret_cast<uintptr_t>(&g_ht_a))));
+    isa::append_insn(s, x87_mem(5, isa::VmOp::Fld87Mem, 8));    // st0=4, st1=10
+    isa::append_insn(s, mov_imm(7, static_cast<u32>(reinterpret_cast<uintptr_t>(&g_ht_sw16b))));
+    isa::append_insn(s, x87_fnstsw_mem(7));                     // s1 → sw16b
+    isa::append_insn(s, isa::make_insn(isa::VmOp::Ffree87, isa::OpKind::None,
+                                       0, isa::OpKind::Imm, 1, 0, 0));  // ffree st(1)
+    isa::append_insn(s, mov_imm(7, static_cast<u32>(reinterpret_cast<uintptr_t>(&g_ht_sw16))));
+    isa::append_insn(s, x87_fnstsw_mem(7));                     // s2 → sw16
+    isa::append_insn(s, halt());
+    rt::VmContext ctx;
+    ctx.bytecode = s.data();
+    ctx.pc = 0;
+    rwx.entry()(&ctx);
+    EXPECT_EQ(g_ht_r0, 4.0);
+    EXPECT_EQ(g_ht_r1, 10.0);
+    EXPECT_EQ(((g_ht_sw16 >> 11) - (g_ht_sw16b >> 11)) & 7, 0u);
+}
+
+TEST(X86Battery, X87L3Transcendental) {
+    // f2xm1(1.0)=1.0 精确; fscale 3×2^2=12; fprem1 5 rem 3 = 2;
+    // frndint 2→2; fyl2x 3×log2(2)=3; fsin 0→0; fpatan atan(1)=π/4。
+    wvmp::Rng rng(12345);
+    const auto gen = rt::generate_runtime_x86(rng);
+    RwxImage rwx(gen.image.code);
+    alignas(8) static double t_v1 = 1.0, t_v3 = 3.0, t_v2 = 2.0, t_v5 = 5.0;
+    alignas(8) static double t_out = 0;
+    t_v1 = 1.0; t_v3 = 3.0; t_v2 = 2.0; t_v5 = 5.0; t_out = 0;
+    std::vector<u8> s;
+    const auto ld = [&](double* p) {
+        isa::append_insn(s, mov_imm(5, static_cast<u32>(reinterpret_cast<uintptr_t>(p))));
+        isa::append_insn(s, x87_mem(5, isa::VmOp::Fld87Mem, 8));
+    };
+    const auto st = [&]() {
+        isa::append_insn(s, mov_imm(6, static_cast<u32>(reinterpret_cast<uintptr_t>(&t_out))));
+        isa::append_insn(s, x87_mem(6, isa::VmOp::Fstp87Mem, 8));
+        isa::append_insn(s, halt());
+        rt::VmContext c;
+        c.bytecode = s.data();
+        c.pc = 0;
+        rwx.entry()(&c);
+        const double r = t_out;
+        t_out = 0;
+        s.clear();
+        return r;
+    };
+    ld(&t_v1);  // st0 = 1.0
+    isa::append_insn(s, isa::make_insn(isa::VmOp::F2xm187, isa::OpKind::None,
+                                       0, isa::OpKind::None, 0, 0, 0));
+    EXPECT_EQ(st(), 1.0);  // 2^1 − 1
+    ld(&t_v2); ld(&t_v3);  // st0=3, st1=2
+    isa::append_insn(s, isa::make_insn(isa::VmOp::Fscale87, isa::OpKind::None,
+                                       0, isa::OpKind::None, 0, 0, 0));
+    EXPECT_EQ(st(), 12.0);  // 3 × 2^2 (fscale 自弹 st1)
+    ld(&t_v3); ld(&t_v5);   // st0=5, st1=3
+    isa::append_insn(s, isa::make_insn(isa::VmOp::Fprem87, isa::OpKind::None,
+                                       0, isa::OpKind::None, 0, 0, 0));  // fprem (aux=0: 截断余数)
+    EXPECT_EQ(st(), 2.0);   // fprem: 5 mod 3 = 2 (截断)
+    ld(&t_v2);              // st0=2.0
+    isa::append_insn(s, isa::make_insn(isa::VmOp::Frndint87, isa::OpKind::None,
+                                       0, isa::OpKind::None, 0, 0, 0));
+    EXPECT_EQ(st(), 2.0);
+    ld(&t_v3); ld(&t_v2);   // st0=2, st1=3
+    isa::append_insn(s, isa::make_insn(isa::VmOp::Fyl2x87, isa::OpKind::None,
+                                       0, isa::OpKind::None, 0, 0, 0));
+    EXPECT_EQ(st(), 3.0);   // 3 × log2(2)
+    isa::append_insn(s, isa::make_insn(isa::VmOp::Fld87Const, isa::OpKind::None,
+                                       0, isa::OpKind::None, 0, 0, 0));  // fldz
+    isa::append_insn(s, isa::make_insn(isa::VmOp::Fsin87, isa::OpKind::None,
+                                       0, isa::OpKind::None, 0, 0, 0));
+    EXPECT_EQ(st(), 0.0);
+    ld(&t_v1); ld(&t_v1);   // st0=1, st1=1
+    isa::append_insn(s, isa::make_insn(isa::VmOp::Fpatan87, isa::OpKind::None,
+                                       0, isa::OpKind::None, 0, 0, 0));
+    EXPECT_NEAR(st(), 0.785398163397448309616, 1e-12);  // atan(1) = π/4
+}
+
+TEST(X86Battery, X87L4Fninit) {
+    // fninit: SW=0x0000 + CW=0x037F (硬件复位面)。
+    wvmp::Rng rng(12345);
+    const auto gen = rt::generate_runtime_x86(rng);
+    RwxImage rwx(gen.image.code);
+    g_x87_cwo = 0; g_ht_sw16 = 0xFFFF;
+    std::vector<u8> s;
+    isa::append_insn(s, isa::make_insn(isa::VmOp::Fninit87, isa::OpKind::None,
+                                       0, isa::OpKind::None, 0, 0, 0));
+    isa::append_insn(s, mov_imm(5, static_cast<u32>(reinterpret_cast<uintptr_t>(&g_x87_cwo))));
+    isa::append_insn(s, x87_mem(5, isa::VmOp::Fnstcw87, 16));
+    isa::append_insn(s, mov_imm(6, static_cast<u32>(reinterpret_cast<uintptr_t>(&g_ht_sw16))));
+    isa::append_insn(s, x87_fnstsw_mem(6));
+    isa::append_insn(s, halt());
+    rt::VmContext ctx;
+    ctx.bytecode = s.data();
+    ctx.pc = 0;
+    rwx.entry()(&ctx);
+    EXPECT_EQ(g_x87_cwo, 0x037F);       // fninit CW
+    EXPECT_EQ(g_ht_sw16, 0x0000);       // fninit SW 全清
 }
 
 // ---------------------------------------------------------------------------

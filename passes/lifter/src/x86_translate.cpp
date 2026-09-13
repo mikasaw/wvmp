@@ -2908,6 +2908,185 @@ TranslateResult translate_x87(const cs_insn& ci, const cs_x86& x) {
     case X86_INS_FNOP:
         out.op = Op::Nop;
         return ok(out);
+
+        // ---- MIT-510 (T62): x87 L1-L4 续延 ----
+    case X86_INS_FCOM:  // fcom/fcomp: 单操作数报告 (reg=st(i) 源 / mem);
+    case X86_INS_FCOMP: // DC mem 形不反转; pop 按 id。aux 位图:
+    case X86_INS_FUCOM: // bit0=pop, bit1=u, bit2=dword, bit3=qword。
+    case X86_INS_FUCOMP: {
+        u32 aux = 0;
+        if (ci.id == X86_INS_FCOMP || ci.id == X86_INS_FUCOMP) aux |= 0x1;
+        if (ci.id == X86_INS_FUCOM || ci.id == X86_INS_FUCOMP) aux |= 0x2;
+        if (x.op_count == 1 && x.operands[0].type == X86_OP_MEM) {
+            auto m = mem_operand(x.operands[0].mem);
+            if (!m) return fail();
+            // ⚠️ keystone 不装配 fucom/fucomp mem 形 (INVALIDOPERAND 实证)
+            // → mem+u 组合 D5 gate (罕见面, native 保字节精确)。
+            if (aux & 0x2) return fail();
+            const unsigned w = x.operands[0].size;
+            if (w != 4 && w != 8) return fail();
+            out.op = Op::Fcom87;
+            out.src = *m;
+            set_width(out, w);
+            out.src2 = ir::Operand::imm_(aux | (w == 4 ? 0x4u : 0x8u));
+            return ok(out);
+        }
+        const auto si = (x.op_count >= 1 && x.operands[0].type == X86_OP_REG)
+                            ? st87_index(x.operands[0].reg)
+                            : std::nullopt;
+        if (!si) return fail();
+        out.op = Op::Fcom87;
+        out.dst = ir::Operand::imm_(0);  // fcom st(0), st(i) — 显式位=源
+        out.src = ir::Operand::imm_(*si);
+        out.src2 = ir::Operand::imm_(aux);
+        return ok(out);
+    }
+    case X86_INS_FCOMPP:
+        out.op = Op::Fcompp87;
+        return ok(out);
+    case X86_INS_FTST:
+        out.op = Op::Ftst87;
+        return ok(out);
+    case X86_INS_FXAM:
+        out.op = Op::Fxam87;
+        return ok(out);
+    case X86_INS_FUCOMI:  // 写 EFLAGS (ZF/PF/CF, NaN → ZF=PF=1) — 沿用
+    case X86_INS_FUCOMPI: {  // Fcomi87/Fcomip87 词, aux bit0=u 选助记符。
+        const bool pop = ci.id == X86_INS_FUCOMPI;
+        const auto si = (x.op_count >= 1 && x.operands[0].type == X86_OP_REG)
+                            ? st87_index(x.operands[0].reg)
+                            : std::nullopt;
+        if (!si) return fail();
+        out.op = pop ? Op::Fcomip87 : Op::Fcomi87;
+        out.src = ir::Operand::imm_(*si);
+        out.src2 = ir::Operand::imm_(0x1);  // u 助记符位 (handler 选 fucomi)
+        out.updates_flags = true;
+        return ok(out);
+    }
+    case X86_INS_FXCH: {
+        // capstone 报双操作数 (op0=st0, op1=st(i)) — fxch st, st(i)。
+        if (x.op_count != 2 || x.operands[1].type != X86_OP_REG) return fail();
+        const auto sj = st87_index(x.operands[1].reg);
+        if (!sj) return fail();
+        out.op = Op::Fxch87;
+        out.src = ir::Operand::imm_(*sj);  // Fxch87 词域 = b=Imm i
+        return ok(out);
+    }
+    case X86_INS_FFREE:
+    case X86_INS_FFREEP: {  // DF C0+i = ffreep (capstone 实证); pop 变体
+        // 由 handler 发 ffree st(k) + fstp st(0) 等价组合 (keystone 装配
+        // ffreep 兜底风险)。
+        const auto si = (x.op_count >= 1 && x.operands[0].type == X86_OP_REG)
+                            ? st87_index(x.operands[0].reg)
+                            : std::nullopt;
+        if (!si) return fail();
+        out.op = Op::Ffree87;
+        out.src = ir::Operand::imm_(*si);
+        out.src2 = ir::Operand::imm_(ci.id == X86_INS_FFREEP ? 0x1u : 0x0u);
+        return ok(out);
+    }
+    case X86_INS_FDECSTP:
+        out.op = Op::Fincdecstp87;
+        out.src2 = ir::Operand::imm_(0x0);
+        return ok(out);
+    case X86_INS_FINCSTP:
+        out.op = Op::Fincdecstp87;
+        out.src2 = ir::Operand::imm_(0x1);
+        return ok(out);
+    case X86_INS_FCMOVB: case X86_INS_FCMOVE: case X86_INS_FCMOVBE:
+    case X86_INS_FCMOVU: case X86_INS_FCMOVNB: case X86_INS_FCMOVNE:
+    case X86_INS_FCMOVNBE: case X86_INS_FCMOVNU: {
+        // ⚠️ 宿主实测 (T62 探针): **DA 段=正形 (b/e/be/u), DB 段=反形
+        // (nb/ne/nbe/nu)** — dbc1 报 fcmovnb。cc 序 0..7 = b/e/be/u/
+        // nb/ne/nbe/nu。capstone 报双操作数 (op0=st0 dst, op1=st(i) 源)。
+        u32 cc;
+        switch (ci.id) {
+        case X86_INS_FCMOVB: cc = 0; break;
+        case X86_INS_FCMOVE: cc = 1; break;
+        case X86_INS_FCMOVBE: cc = 2; break;
+        case X86_INS_FCMOVU: cc = 3; break;
+        case X86_INS_FCMOVNB: cc = 4; break;
+        case X86_INS_FCMOVNE: cc = 5; break;
+        case X86_INS_FCMOVNBE: cc = 6; break;
+        case X86_INS_FCMOVNU: cc = 7; break;
+        default: return fail();
+        }
+        if (x.op_count != 2 || x.operands[1].type != X86_OP_REG) return fail();
+        const auto sj = st87_index(x.operands[1].reg);
+        if (!sj) return fail();
+        out.op = Op::Fcmov87;
+        out.dst = ir::Operand::imm_(0);
+        out.src = ir::Operand::imm_(*sj);
+        out.src2 = ir::Operand::imm_(cc);
+        return ok(out);
+    }
+    case X86_INS_FLDPI:
+        out.op = Op::Fld87Const;
+        out.src = ir::Operand::imm_(2);
+        return ok(out);
+    case X86_INS_FLDL2T:
+        out.op = Op::Fld87Const;
+        out.src = ir::Operand::imm_(3);
+        return ok(out);
+    case X86_INS_FLDL2E:
+        out.op = Op::Fld87Const;
+        out.src = ir::Operand::imm_(4);
+        return ok(out);
+    case X86_INS_FLDLG2:
+        out.op = Op::Fld87Const;
+        out.src = ir::Operand::imm_(5);
+        return ok(out);
+    case X86_INS_FLDLN2:
+        out.op = Op::Fld87Const;
+        out.src = ir::Operand::imm_(6);
+        return ok(out);
+    case X86_INS_F2XM1:
+        out.op = Op::F2xm187;
+        return ok(out);
+    case X86_INS_FYL2X:
+        out.op = Op::Fyl2x87;
+        return ok(out);
+    case X86_INS_FYL2XP1:
+        out.op = Op::Fyl2xp187;
+        return ok(out);
+    case X86_INS_FSCALE:
+        out.op = Op::Fscale87;
+        return ok(out);
+    case X86_INS_FPATAN:
+        out.op = Op::Fpatan87;
+        return ok(out);
+    case X86_INS_FPREM:
+        out.op = Op::Fprem87;
+        out.src2 = ir::Operand::imm_(0x0);
+        return ok(out);
+    case X86_INS_FPREM1:
+        out.op = Op::Fprem87;
+        out.src2 = ir::Operand::imm_(0x1);
+        return ok(out);
+    case X86_INS_FSIN:
+        out.op = Op::Fsin87;
+        return ok(out);
+    case X86_INS_FCOS:
+        out.op = Op::Fcos87;
+        return ok(out);
+    case X86_INS_FSINCOS:
+        out.op = Op::Fsincos87;
+        return ok(out);
+    case X86_INS_FPTAN:
+        out.op = Op::Fptan87;
+        return ok(out);
+    case X86_INS_FRNDINT:
+        out.op = Op::Frndint87;
+        return ok(out);
+    case X86_INS_FXTRACT:
+        out.op = Op::Fxtract87;
+        return ok(out);
+    case X86_INS_FNCLEX:
+        out.op = Op::Fnclex87;
+        return ok(out);
+    case X86_INS_FNINIT:
+        out.op = Op::Fninit87;
+        return ok(out);
     default:
         return fail();
     }
@@ -3291,10 +3470,30 @@ TranslateResult translate_insn(const cs_insn& ci, ir::Arch arch) {
     case X86_INS_FCHS: case X86_INS_FABS: case X86_INS_FSQRT:
     case X86_INS_FCOMI:
     case X86_INS_FCOMPI:  // fcomip 独立 id (T61 探针: dff1 报 fcompi)
+    case X86_INS_FCOM: case X86_INS_FCOMP: case X86_INS_FCOMPP:
+    case X86_INS_FTST: case X86_INS_FXAM:
+    case X86_INS_FUCOM: case X86_INS_FUCOMP: case X86_INS_FUCOMI:
+    case X86_INS_FUCOMPI:
+    case X86_INS_FXCH: case X86_INS_FFREE: case X86_INS_FFREEP:
+    case X86_INS_FDECSTP: case X86_INS_FINCSTP:
+    case X86_INS_FCMOVB: case X86_INS_FCMOVE: case X86_INS_FCMOVBE:
+    case X86_INS_FCMOVU: case X86_INS_FCMOVNB: case X86_INS_FCMOVNE:
+    case X86_INS_FCMOVNBE: case X86_INS_FCMOVNU:
+    case X86_INS_FLDPI: case X86_INS_FLDL2T: case X86_INS_FLDL2E:
+    case X86_INS_FLDLG2: case X86_INS_FLDLN2:
+    case X86_INS_F2XM1: case X86_INS_FYL2X: case X86_INS_FYL2XP1:
+    case X86_INS_FSCALE: case X86_INS_FPATAN: case X86_INS_FPREM:
+    case X86_INS_FPREM1: case X86_INS_FSIN: case X86_INS_FCOS:
+    case X86_INS_FSINCOS: case X86_INS_FPTAN: case X86_INS_FRNDINT:
+    case X86_INS_FXTRACT: case X86_INS_FNCLEX: case X86_INS_FNINIT:
     case X86_INS_FLDCW:
     case X86_INS_FNSTCW:  // 含 fstcw (9B 前缀折叠, 无 FSTCW id)
     case X86_INS_FNSTSW:  // 含 fstsw ax/m16 (9B 前缀折叠, 无 FSTSW id)
     case X86_INS_FNOP:
+        // ⚠️ x87 词仅 x86 收录 (T60 架构定案: x64 运行时无 x87 词面,
+        // handler 帧语义 x86 专属) — x64 区维持 gate。MIT-510 回归修复:
+        // T62 新增 case 使 x64 x87_gate 样本误入虚拟化 (全零输出实证)。
+        if (arch != ir::Arch::X86) return unsupported(ci.address, ci.size);
         return translate_x87(ci, x);
     default:
         return unsupported(ci.address, ci.size);
