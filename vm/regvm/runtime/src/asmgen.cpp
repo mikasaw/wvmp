@@ -386,7 +386,7 @@ std::string hex(u64 v) {
 //     kCallgateSpRollback = kCalleeSavedPushBytes + kCtxSize + kCallRetBytes
 //                           + kCalleeSavedPushBytes + kCtxPushBytes
 //                           - kWinShadowBytes
-//     = kCtxSize + 0x68 （kCtxSize=0x1C8 → 0x230；0x140 时代 → 0x1A8 ✓）
+//     = kCtxSize + 0x68 （kCtxSize=0x3C8 → 0x430；0x1C8 时代 → 0x230；0x140 时代 → 0x1A8 ✓）
 //
 // MIT-371 把 kCtxSize 0x140→0x1C8 时本处曾硬编码 0x1A8 未跟随：push/pop ctx
 // 槽错开 0x88，pop 读到 stub VmContext 帧内宿主 RBP(=0) → ctx_=0 → 下一指令
@@ -465,9 +465,9 @@ constexpr u64 kCallgateAlignShift = 4;  // 2^4 = 16 对齐
 // 段（一字未动）——写/读/预写三处按各自 rsp 基准落到同一地址。
 // ---------------------------------------------------------------------------
 constexpr u64 kHostRspDepth = kCalleeSavedPushBytes + kCtxSize + kCallRetBytes +
-                              kCalleeSavedPushBytes;  // 0x250（与文件头推导一致）
-static_assert(kHostRspDepth == 0x250, "host_rsp depth regressed");
-constexpr u64 kExitSlotFromHostRsp = kExitSlotDepth - kHostRspDepth;  // 0x288-0x250 = 0x38
+                              kCalleeSavedPushBytes;  // 0x450 (MIT-511 档B wave1; 0x1C8 时代 0x250)
+static_assert(kHostRspDepth == 0x450, "host_rsp depth regressed");
+constexpr u64 kExitSlotFromHostRsp = kExitSlotDepth - kHostRspDepth;  // 0x488-0x450 = 0x38
 static_assert(kExitSlotFromHostRsp == 0x38, "exit slot must sit 0x38 below host_rsp");
 
 // MIT-438 (X1b)：Ret 清栈返回出口的两组派生常量（build_ret 专用，见函数注释）。
@@ -479,10 +479,10 @@ static_assert(kExitSlotFromHostRsp == 0x38, "exit slot must sit 0x38 below host_
 //   kRetGuestRspFromNs：终态 `mov rsp,[rsp-...]` 的偏移 = ns 到 ctx+0x30
 //     （guest rsp 槽）。stub 8 pop 之后 rsp = ns，该读取发生于 rsp 变更前。
 constexpr u64 kRetFrameDiscard =
-    kCalleeSavedPushBytes + kCallRetBytes + kCtxSize;  // 0x40+0x8+0x1C8 = 0x210
-static_assert(kRetFrameDiscard == 0x210, "ret exit frame discard regressed");
-constexpr u64 kRetGuestRspFromNs = kCalleeSavedPushBytes + kCtxSize - 0x30;  // 0x1D8
-static_assert(kRetGuestRspFromNs == 0x1D8, "ret exit guest-rsp slot offset regressed");
+    kCalleeSavedPushBytes + kCallRetBytes + kCtxSize;  // 0x40+0x8+0x3C8 = 0x410 (MIT-511)
+static_assert(kRetFrameDiscard == 0x410, "ret exit frame discard regressed");
+constexpr u64 kRetGuestRspFromNs = kCalleeSavedPushBytes + kCtxSize - 0x30;  // 0x3D8 (MIT-511)
+static_assert(kRetGuestRspFromNs == 0x3D8, "ret exit guest-rsp slot offset regressed");
 
 // ---------------------------------------------------------------------------
 // 生成器主体。
@@ -2318,6 +2318,46 @@ public:
     // MIT-408: movsd (F2 0F 10, scalar double) — 8B 搬, 高 64 位保持不变
     // (寄存器形式; 内存源清零语义由 XmmLoad 的 native movsd 直产)。
     std::string build_movsd(u64 d)  const { return build_xmm_transfer(d, "movsd"); }
+
+    // ---- MIT-511 (档B wave1): vzeroupper / vzeroall ABI 词 (x64 专用;
+    //      x86 host 不注册 — x86 架构在 lifter 侧 gate, 词流不可达) ----
+    //
+    // 无操作数词: 物理发射 + ctx 面一致性回写。
+    //   vzeroupper: YMM0-15 上位 128-bit 清零 (物理发射使 AVX-SSE 过渡态
+    //     与 guest 逐位一致); ctx.ymm[i] 上半 16B×16 槽显式清零 — 面/物理
+    //     一致性纪律: wave2 ymm 写词落地后 "guest 上位已清" 必须能从 ctx
+    //     面读出, 不依赖 wave1 面恒零先验。
+    //   vzeroall: 全部 YMM 清零 (含低位 → ctx.xmm[8] 面同步清零; SDM 载
+    //     VZEROALL 附带 EMMS 语义 — x64 区无 x87 词, 对 guest 空效) +
+    //     ctx.ymm[16] 全 512B 清零 + 物理发射。
+    // pxor xmm0, xmm0 作零源: handler 间物理 xmm 为 scratch (ctx 面是权威
+    // 存续, MIT-371 模板同款约定), 下一 SSE 词从面重载, 无脏读风险。
+    std::string build_vzeroupper(u64 dispatch) const {
+        std::string o = decode_prelude();
+        o += "    pxor xmm0, xmm0\n";
+        for (int i = 0; i < 16; ++i)
+            o += std::string("    movups [") + r64(ctx_) + " + " +
+                 imm(kCtxYmmBase + u64(32) * i + 16) + "], xmm0\n";
+        o += "    vzeroupper\n";
+        o += advance(dispatch);
+        return o;
+    }
+    std::string build_vzeroall(u64 dispatch) const {
+        std::string o = decode_prelude();
+        o += "    pxor xmm0, xmm0\n";
+        for (int i = 0; i < 8; ++i)
+            o += std::string("    movups [") + r64(ctx_) + " + " +
+                 imm(kCtxXmmBase + u64(16) * i) + "], xmm0\n";
+        for (int i = 0; i < 16; ++i) {
+            o += std::string("    movups [") + r64(ctx_) + " + " +
+                 imm(kCtxYmmBase + u64(32) * i) + "], xmm0\n";
+            o += std::string("    movups [") + r64(ctx_) + " + " +
+                 imm(kCtxYmmBase + u64(32) * i + 16) + "], xmm0\n";
+        }
+        o += "    vzeroall\n";
+        o += advance(dispatch);
+        return o;
+    }
 
     // ---- MIT-376: SSE 浮点位运算 xorps / orps / andps ----
     //
@@ -6856,6 +6896,10 @@ RuntimeGenResult generate_runtime_arch(wvmp::Rng& rng, AsmGen::HostArch arch,
         // BRIDGE_HANDLERS 注册表同步, scripts/verifier/dump_handler_xmm_check.py)。
         {int(VmOp::XmmFromGp), "xmmfromgp", &AsmGen::build_xmm_from_gp},
         {int(VmOp::GpFromXmm), "gpfromxmm", &AsmGen::build_gp_from_xmm},
+        // MIT-511 (档B wave1): vzeroupper/vzeroall ABI 词 (x64 host 专用;
+        // 无操作数, flag_sem kNone; ctx.ymm 面一致性回写见 handler 注释)。
+        {int(VmOp::Vzeroupper), "vzeroupper", &AsmGen::build_vzeroupper},
+        {int(VmOp::Vzeroall), "vzeroall", &AsmGen::build_vzeroall},
         };
     }
     rng.shuffle(handlers.begin(), handlers.end());   // 码序随机

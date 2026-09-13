@@ -428,12 +428,13 @@ TEST(StubGen, StubBytesStartWithPushesAndSubRsp) {
     // 首字节必为 push（0x50-0x57 或 REX 0x41 前缀）。
     EXPECT_TRUE((stub[0] >= 0x50 && stub[0] <= 0x57) ||
                 (stub[0] == 0x41 && stub[1] >= 0x50 && stub[1] <= 0x57));
-    // 序言后应有 sub rsp, 0x1C8（48 81 EC C8 01 00 00）—— MIT-371 xmm 跟踪区扩 8 个
-    // XmmSlot (各 16B) 后 VmContext 从 0x138 扩到 0x1C0，kCtxSize = 0x1C8。
+    // 序言后应有 sub rsp, 0x3C8（48 81 EC C8 03 00 00）—— MIT-371 xmm 跟踪区
+    // 0x1C8 之后，MIT-511 档B wave1 加 ymm[16] (512B) → VmContext 0x3C0，
+    // kCtxSize = 0x3C8。
     bool found_sub = false;
     for (size_t i = 0; i + 7 <= stub.size(); ++i) {
         if (stub[i] == 0x48 && stub[i + 1] == 0x81 && stub[i + 2] == 0xEC &&
-            stub[i + 3] == 0xC8 && stub[i + 4] == 0x01) {
+            stub[i + 3] == 0xC8 && stub[i + 4] == 0x03) {
             found_sub = true;
             break;
         }

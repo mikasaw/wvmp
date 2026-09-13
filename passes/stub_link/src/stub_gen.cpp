@@ -75,7 +75,7 @@ static_assert(kCtxSize % 4 == 0, "x86 stub ctx zero-fill must be dword-granular"
 // 的槽偏移。guard 下移后 esp 与槽同步位移，差值恒 0x80（disp8 编码边界纪律
 // 不变；keystone 大负 disp 截断坑规避）。
 constexpr u64 kExitSlotFromStubEntry = kExitSlotDepth - kStubPushBytes - kCtxSize;
-// x86 同构换算（kX86ExitSlotDepth - G - 0x10 - 0x1C8 = 0x80）。
+// x86 同构换算（kX86ExitSlotDepth - G - 0x10 - kCtxSize = 0x80；MIT-511 起 0x4D8-0x80-0x10-0x3C8）.
 constexpr u64 kX86ExitSlotFromStubEntry =
     kX86ExitSlotDepth - kX86GuardBytes - kStubPushBytesX86 - kCtxSize;
 static_assert(kX86ExitSlotFromStubEntry == 0x80,
@@ -307,7 +307,7 @@ std::string build_stub_asm_x64(u64 rt_entry_rva, u64 resume_rva, u64 image_base,
         }
     }
     // v4 = 原始 rsp（区域代码按原函数帧的 rsp 相对寻址）：当前 rsp 比原始值
-    // 低 kStubPushBytes(0x40) + kCtxSize(0x1C8) = 0x208，用 lea 还原。rax 的原值已在
+    // 低 kStubPushBytes(0x40) + kCtxSize(MIT-511 起 0x3C8) = 0x408，用 lea 还原。rax 的原值已在
     // slot0 保存，可复用。同一份原始 rsp 同时写到 native_sp（M2-9 call gate
     // 需要稳定的 caller frame 基址——v4 会被 VM 自身 push/pop 改写，native_sp
     // 跨指令不变，供 callgate handler 把 rsp 切回 caller frame 跑 native）。
@@ -327,7 +327,7 @@ std::string build_stub_asm_x64(u64 rt_entry_rva, u64 resume_rva, u64 image_base,
     // （不是裸 resume_rva——v1 崩溃根因，cdb 实证 rip=裸 RVA；直跳
     // `jmp <resume_rva>` 能工作是 keystone 以链接期为装配基址算 rel32 的
     // RVA 差自洽，间接跳的槽值是绝对 VA，两套地址体系不可混用）。
-    // 槽地址 = [rsp - 0x80]（rsp = ns - 0x208 → ns - kExitSlotDepth）。
+    // 槽地址 = [rsp - 0x80]（rsp = ns - 0x408 → ns - kExitSlotDepth）。
     // imm64 同样必须经 rax 中转（>0x7FFFFFFF 不可走 imm32）。
     o += "mov rax, " + hex(image_base + resume_rva) + "\n";
     o += "mov qword ptr [rsp - " + hex(kExitSlotFromStubEntry) + "], rax\n";
@@ -470,7 +470,7 @@ std::string build_stub_asm_x86(u64 rt_entry_rva, u64 blob_stream_rva,
          hex(kCtxSize + kStubPushBytesX86 - 4 * 4) + "]\n";  // 原 edi（第 4 push）
     o += "mov [esp + " + hex(kCtxRegs + 7 * 8) + "], eax\n";
     // v4 = 原始 rsp（区域代码按原函数帧的 rsp 相对寻址）：当前 esp 比原始
-    // 值低 kX86GuardBytes + kStubPushBytesX86(0x10) + kCtxSize(0x1C8)，用 lea
+    // 值低 kX86GuardBytes + kStubPushBytesX86(0x10) + kCtxSize(MIT-511 起 0x3C8)，用 lea
     // 还原（X5b：lea 补 guard 项——v4 恒 = ns，与 guard 深度无关）。同一
     // 原始 esp 写 native_sp（callgate 窗口锚/ExitNative 槽基准，跨指令
     // 不变）。eax 原值已在 slot0 保存，可复用。

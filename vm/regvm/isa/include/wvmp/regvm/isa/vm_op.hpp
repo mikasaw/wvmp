@@ -646,9 +646,17 @@ enum class VmOp : u16 {
     Fxtract87,      // fxtract (st0=指数, 压有效位)
     Fnclex87,       // fnclex (清 SW 异常标志)
     Fninit87,       // fninit (FPU 全复位)
+
+    // ---- MIT-511 (T63): AVX 档B wave1 —— kCtxSize 冻结合同 bump
+    //      (0x1C8→0x3C8, ctx.ymm[16] 512B 面) + vzeroupper/vzeroall ABI
+    //      词 (x64 host 专用; 无操作数; flag_sem kNone)。VEX.256 算术词
+    //      属后续波次。kVmOpMax+1=144 < 256 跳表, 余量 112。 ----
+    Vzeroupper,     // vzeroupper (物理发射 + ctx.ymm[0..15] 上位 16B 清零)
+    Vzeroall,       // vzeroall (物理发射 + ctx.xmm[8] 与 ctx.ymm[16] 全零;
+                    //   注意 VZEROALL 含 EMMS 语义 — x64 区无 x87 词, 空效)
     };
 
-inline constexpr u16 kVmOpMax = static_cast<u16>(VmOp::Fninit87);  // MIT-510: 141
+inline constexpr u16 kVmOpMax = static_cast<u16>(VmOp::Vzeroall);  // MIT-511: 143
 inline constexpr u16 kVmOpLimit = 1u << 14;  // 14 位编码空间上限
 
 constexpr const char* to_string(VmOp op) {
@@ -788,6 +796,8 @@ constexpr const char* to_string(VmOp op) {
         case VmOp::Fxtract87: return "fxtract87";
         case VmOp::Fnclex87: return "fnclex87";
         case VmOp::Fninit87: return "fninit87";
+        case VmOp::Vzeroupper: return "vzeroupper";
+        case VmOp::Vzeroall: return "vzeroall";
     }
     return "?";
 }

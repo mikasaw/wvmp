@@ -20,9 +20,10 @@
 ;                        只能 db 直写 — 与 419 lock mov db 先例同纪律)
 ;   负例区 (每函数一条, C1 gate 整函数原生, 可调用, 行为 byte-exact):
 ;     ymm 同 mnemonic (B.4 位宽闸) / FMA (双舍入红线) / rorx (VEX-GP,
-;     G8) / vzeroupper (档B ABI) / vpaddd (G1c 镜像) / vsubsd d==s2
+;     G8) / vpaddd (G1c 镜像) / vsubsd d==s2
 ;     (非交换) / vmulsd d==s2 (标量可交换族 — 高位语义不相容) /
 ;     vmovsd 插入 d≠s1 (§F.4 "假 Mov")
+;   MIT-511 (档B wave1): vzeroupper ABI 词入面, 原 ⑯ 负例翻正例。
 ;
 ; Win64 ABI: 整型参数 rcx/rdx/r8; 返回值 rax/xmm0。
 ; ⚠️ rax 跨 marker_end/marker_begin 调用会被 clobber (SDK `mov rax, imm64`
@@ -349,13 +350,16 @@ vex_rorx_neg PROC
     ret
 vex_rorx_neg ENDP
 
-; ---- ⑯ vex_vzeroupper_neg(): 档B ABI 面 (upper-half dirty) → gate ----
-vex_vzeroupper_neg PROC
+; ---- ⑯ vex_vzeroupper_pos(): 档B wave1 入面 (MIT-511, 原负例翻正) ----
+; vzeroupper 词: 物理 YMM 上位清零 + ctx.ymm 面上位回写。SSE-only 观察者
+; 语义透明 (返回值恒 7), 虚拟化证明面 = stub 计数 +1 与 dump 出 vzeroupper
+; handler 词流。
+vex_vzeroupper_pos PROC
 
     ; ===== marker region begin =====
     sub   rsp, 28h                    ; MIT-475: shadow space + alignment (x64 ABI)
     call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
-    vzeroupper                       ; gate (原生执行, 行为等价 no-op)
+    vzeroupper                       ; 入面词 (物理发射, 行为等价 no-op)
     nop
     nop
     call ?marker_end@sdk@wvmp@@YAXXZ
@@ -364,7 +368,7 @@ vex_vzeroupper_neg PROC
     mov eax, 7
     add   rsp, 28h                    ; MIT-475
     ret
-vex_vzeroupper_neg ENDP
+vex_vzeroupper_pos ENDP
 
 ; ---- ⑰ vex_vpaddd_neg(u64 a, u64 b): SSE2 整数加法族 (G1c 镜像) → gate ----
 ; 0x1 + 0x2 = 0x3

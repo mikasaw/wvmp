@@ -3039,10 +3039,47 @@ TEST_F(LifterTranslate, VexUcomissTwoOpFlags) {
 }
 
 TEST_F(LifterTranslate, VexVzeroupperGate) {
-    // C5 F8 77: vzeroupper — 白名单外 (档B ABI 面) → 现状 gate 保持。
-    const wvmp::u8 b[] = {0xC5, 0xF8, 0x77};
-    auto r = translate_bytes(x64, b, ir::Arch::X64);
+    // MIT-511 (档B wave1) 翻转 (434 §B.4 gate 负例翻正先例): C5 F8 77
+    // vzeroupper / C5 FC 77 vzeroall — 无操作数 ABI 词入面 (Op::Vzeroupper/
+    // Vzeroall, 无 flags); x86 架构维持 gate (MSVC x86 语料无 VEX 发射面)。
+    const wvmp::u8 vu[] = {0xC5, 0xF8, 0x77};
+    auto r = translate_bytes(x64, vu, ir::Arch::X64);
+    ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r.insn.op, ir::Op::Vzeroupper);
+    EXPECT_FALSE(r.insn.updates_flags);
+    EXPECT_TRUE(r.extra.empty());
+
+    const wvmp::u8 va[] = {0xC5, 0xFC, 0x77};
+    r = translate_bytes(x64, va, ir::Arch::X64);
+    ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r.insn.op, ir::Op::Vzeroall);
+    EXPECT_FALSE(r.insn.updates_flags);
+
+    // x86 (32 位) 架构 gate: 词流不可达, 整函数原生保持。
+    r = translate_bytes(x64, vu, ir::Arch::X86);
     EXPECT_EQ(r.status, lifter::TranslateStatus::Unsupported);
+    r = translate_bytes(x64, va, ir::Arch::X86);
+    EXPECT_EQ(r.status, lifter::TranslateStatus::Unsupported);
+}
+
+TEST_F(LifterTranslate, VexVzeroCapstoneProbe) {
+    // capstone 5.0.6 解码形态钉板: VEX 前缀吸收进 id (prefix 吸收, 与
+    // MIT-426 V-pair 口径一致), op_count=0, size=3。
+    lifter::CapstoneSession session(ir::Arch::X64);
+    const wvmp::u8 b[] = {0xC5, 0xF8, 0x77, 0xC5, 0xFC, 0x77};
+    const wvmp::u8* p = b;
+    size_t left = sizeof(b);
+    wvmp::u64 addr = 0x1000;
+    const cs_insn* ci = session.next(p, left, addr);
+    ASSERT_NE(ci, nullptr);
+    EXPECT_EQ(ci->id, static_cast<unsigned>(X86_INS_VZEROUPPER));
+    EXPECT_EQ(ci->detail->x86.op_count, 0u);
+    EXPECT_EQ(ci->size, 3u);
+    ci = session.next(p, left, addr);
+    ASSERT_NE(ci, nullptr);
+    EXPECT_EQ(ci->id, static_cast<unsigned>(X86_INS_VZEROALL));
+    EXPECT_EQ(ci->detail->x86.op_count, 0u);
+    EXPECT_EQ(ci->size, 3u);
 }
 
 TEST_F(LifterTranslate, VexVpadddGate) {

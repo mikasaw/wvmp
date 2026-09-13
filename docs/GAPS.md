@@ -264,7 +264,7 @@
 | x87 全族（D8-DF） | ⛔ 永久 gate（文档化不保护） | x64 MSVC 世界频率 ≈0（0.0000–0.0032%）；含 x87 标记函数整函数原生 byte-identical | MIT-416 / MIT-418 (G5r/R3)，`.multica/mit-G5r-triage.md` |
 | SIMD 尾族三行（pmovmskb / pcmpeq/pcmpgt / punpck 系） | ⛔ gate（分层定稿） | 频率分层：客户态新抽 14 exe 全零 vs SIMD/CRT 域 punpck 0.06–0.074% / pmovmskb 0.015–0.055% 密度；punpck 粒度分裂 d/q 88–100% hash/安全域 vs b/w 73% codec 域；lqdq/hqdq D1 拍板 gate 不折 | MIT-432 §1/§1.4（`.multica/mit-G9r-triage.md`）+ MIT-GZ D1 |
 | G8b 三条（mulx/pdep/pext）+ blsr 族四条（blsr/blsi/blsmsk/bextr） | ⛔ gate（挂账/永久） | mulx/pdep/pext = G8b 档 native 直执行 + CPUID gate 基建挂账，mulx CF Zen5 实测不写 vs SDM 厂商分叉待决；blsr 族 27 文件语料 0 永久 gate | MIT-432 §2/§6.4 + MIT-GZ B.1 |
-| ymm / EVEX / FMA / 加密（AES 等） | ⛔ gate（档B） | xmm 跟踪区 kCtxSize 0x1C8 冻结面；档B 立项即触发跳表扩容评估 | MIT-424 (档B) |
+| ymm 算术 / EVEX / FMA / 加密（AES 等） | ⛔ gate（档B 后续波次） | MIT-511 wave1 已落 ctx.ymm[16] 面（kCtxSize 0x3C8）+ vzeroupper/vzeroall 入面；VEX.256 算术词与 stub ymm 全量同步属后续波次 | MIT-424 (档B) / MIT-511 (wave1) |
 | x86 (PE32) 平台（MIT-446 (X4) 翻正，MIT-450 (X5) 收口扩证，MIT-454 (X6) SSE+push-imm 翻正，MIT-455 (X7) Div 族+重扫收官，MIT-456 (push-mem) 第一大非 x87 shape gate 翻正） | ✅ 支持 | 全管道：D1 解禁 + stub x86 cdecl + cdecl callgate 参数窗（X5 裁决 = 可见参数桥，8 dword）+ x86 白名单 gate；样本池 17 族级样本 byte-exact（X6 池 14→15 pushimm，X7 15→16 div，MIT-456 16→17 pushmem）；ExitNative x86 上界接线已翻正（X5c F1）；SSE 32 op x86 全入面 + push-imm x86 开面（X6）+ Div/Idiv x86 真 handler（X7 批二：cdq x86 开面随之）+ push [mem] x86 开面（MIT-456：地址槽+Load+Push/Reg 折条，asmgen 零 diff，native 序 = 地址读值先于减 esp）；wvmpTest 103-kernel 14 标记区真虚拟化 **12 = 85.7%**（靶标无 push [mem] 位点；全 103 面 11.7%）；残余 gate 面 = 间接 jmp 1（aebb）+ 栈深 1（mul64hi，X5b 永久 gate）（X7 起 3→2 维持）；X7 客户态重扫：x64 direct 99.26% / x86 95.15%（形级口径，留样入仓；MIT-456 后 push_mem 1.845% 面出 gate 入 direct） | MIT-446 (X4) / MIT-450 (X5) / MIT-453 (X5c) / MIT-454 (X6) / MIT-455 (X7) / MIT-456 (push-mem) |
 | 16-bit 目标 | ⛔ 不可行 | PE 格式白名单只收 0x014C/0x8664 | MIT-412（GAPS C5 交叉引用） |
 
@@ -363,7 +363,7 @@ shlx/pdep/bzhi）不在 SIMD 档A 内**——VEX id 但 GP 域，独立缺口（
 §6.2，真实二进制高频如 ClipUp rorx:288）；② ymm/zmm（档B，kCtxSize 冻结
 面 + 跳表扩容前置）；③ FMA 族（双舍入红线，永不拆 mul+add，triage §6.5）；
 ④ vpaddd/vpaddq/psubq 系（MIT-427 实测砍面：paddq 16/854k、psubq 0、vpaddd 0——本体与 V-对镜像均 gate，见 G1c 节）；
-⑤ vzeroupper/vzeroall（档B ABI 面）；⑥ 加密 vaes/vpclmulqdq（直执行另议）；
+⑤ vzeroupper/vzeroall（MIT-511 wave1 已入面）；⑥ 加密 vaes/vpclmulqdq（直执行另议）；
 ⑦ EVEX/AVX-512 全谱（62 前缀独立 INS 空间，天然不入白名单）。
 
 **回归样本**：`wvmp_vex128_sample`（正例 12 区真虚拟化 + 负例 8 族各自
@@ -4008,3 +4008,26 @@ u_case 复活 + F2 fucomi VM 面 + F3 样本注释/常量面 + F4/F5 卫生）�
 **挂账**：fucomi QNaN-IE 差异无 VM 级断言（F2）；fldl2t/fldl2e/fldlg2/
 fldln2 常量面无 VM 级用例（F3，handler 映射静态核对无误）；fldenv/fsave
 L4 内存块面维持永久 gate。
+
+**MIT-511 (T63) AVX 档B wave1 —— kCtxSize 合同 bump + ctx.ymm[16] 面 +
+vzeroupper/vzeroall ABI 词入面（2026-09-14，用户批准档B 立项）**：冻结契约
+kCtxSize 0x1C8→0x3C8（VmContext 0x1C0→0x3C0：新增 alignas(32) YmmSlot
+ymm[16] 512B 面 @0x1C0，kCtxYmmBase 派生常量 + offsetof 钉死断言；
+sizeof(kCtxSize) 派生式全消费方自动跟随——stub sub rsp/lea/出口槽/
+kX86ExitSlotDepth 0x2D8→0x4D8/x86 dword 清零循环，MIT-B2 单一事实来源
+纪律零字面量第二份）。**vzeroupper/vzeroall 入面**（+2 VmOp，kVmOpMax
+141→143，144 < 256 跳表；x64 专属——x86 架构 gate，MSVC x86 语料无 VEX
+发射面披露）：无操作数词，物理发射 + ctx 面一致性回写（vzeroupper=上位
+半区 16×16B 清零；vzeroall=xmm[8] 面 + ymm[16] 面全清 + 物理发射；SDM 载
+VZEROALL 含 EMMS 语义——x64 区无 x87 词空效）。物理发射使 AVX-SSE 过渡
+态与 guest 逐位一致；wave1 无 ymm 写词 → 上位脏态仅宿主可造，硬件真值
+测试（VzeroWordsHardwareTruth）以 keystone 装配 vpcmpeqd ymm0 脏位 thunk
++ vextractf128/movq observer 实证物理清零与面一致性（AVX 缺失环境 SKIP）。
+**遗留 gate 面**（后续波次，非本单）：VEX.256 算术全谱（vaddps ymm 等
+20–30 op）、stub 全量 ymm 同步（wave2 ymm 写词落地时成为前置）、xmm/ymm
+双面混排一致性契约（AVX 融合规则）、EVEX 天然 gate。dump 门
+dump_handler_xmm_check.py 扩 VZERO_HANDLERS 专用形状检查（无槽位序文/
+pxor 零源/movups 面存数 ≥16|40/物理指令在场/add⊆{1}）。**验证**：主树
+ctest 全绿（新增 VzeroWordsHardwareTruth/VexVzeroCapstoneProbe，翻转
+VexVzeroupperGate）；vex128 样本 vzeroupper 负例翻正例（输出 byte-exact）；
+全池 REQUIRE_REAL 回归见 STATUS。

@@ -102,7 +102,15 @@ SSE_HANDLERS = {"addss", "addps", "addpd", "subss", "subps", "subpd",
 #   - >= 1 movups touching ctx,
 #   - width-chain cmp imm in {4, 8} (aux width dispatch).
 # xmmfromgp has 2 prologues (src-xmm read path + dst write); gpfromxmm has 1.
-BRIDGE_HANDLERS = {"xmmfromgp", "gpfromxmm"}
+BRIDGE_HANDLERS = {"xmmfromgp", "gpfromxmm"}
+
+# MIT-511 (T63 · AVX 档B wave1): vzeroupper/vzeroall ABI words.  Shape
+# asserted (check_vzero_handler): no slot-offset prologue (operand-free
+# words), pxor xmm0, xmm0 zero source, >= 16 movups face stores (upper
+# halves; vzeroall has 8 xmm-face + 32 ymm-face = 40), physical
+# vzeroupper/vzeroall instruction present, pc advance add 1, and no
+# immediate-bearing sub/shl (the MIT-371 slot bug shape cannot occur here).
+VZERO_HANDLERS = {"vzeroupper", "vzeroall"}
 
 # MIT-408: mem-form primitives (XmmLoad / XmmStore).  Expected shape:
 #   - memory-operand FP instruction present (movss/movsd/movups with a
@@ -393,6 +401,83 @@ def check_mem_handler(name: str, code: bytes, base_va: int, md) -> tuple[bool, l
     return ok, lines
 
 
+def check_vzero_handler(name: str, code: bytes, base_va: int, md) -> tuple[bool, list[str]]:
+    """Return (ok, evidence) for one MIT-511 vzero ABI word handler."""
+    lines: list[str] = []
+    ok = True
+
+    vzero_hits: list[str] = []
+    pxor_zero = False
+    sub_imms: list[tuple[str, int]] = []
+    shl_imms: list[tuple[str, int]] = []
+    add_imms: list[tuple[str, int]] = []
+    movups_count = 0
+
+    for ins in md.disasm(code, base_va):
+        ops = ins.op_str
+        if ins.mnemonic == name:
+            vzero_hits.append(f"{ins.mnemonic} {ops}")
+        if ins.mnemonic == "pxor" and ops == "xmm0, xmm0":
+            pxor_zero = True
+        if ins.mnemonic in ("sub", "shl", "add"):
+            reg = gpr_name(ins, 0)
+            if reg is not None and ins.operands[1].type == capstone.x86.X86_OP_IMM:
+                immv = parse_imm(str(ins.operands[1].imm))
+                if ins.mnemonic == "sub":
+                    sub_imms.append((reg, immv))
+                elif ins.mnemonic == "shl":
+                    shl_imms.append((reg, immv))
+                else:
+                    add_imms.append((reg, immv))
+        if ins.mnemonic == "movups" and ops and "xmm" in ops:
+            movups_count += 1
+
+    if not vzero_hits:
+        ok = False
+        lines.append(f"    FAIL: physical `{name}` instruction missing")
+    else:
+        lines.append(f"    ok: physical `{vzero_hits[0]}` present")
+    if not pxor_zero:
+        ok = False
+        lines.append("    FAIL: `pxor xmm0, xmm0` zero source missing")
+    else:
+        lines.append("    ok: pxor xmm0, xmm0 zero source present")
+    if sub_imms or shl_imms:
+        ok = False
+        lines.append(
+            "    FAIL: immediate-bearing sub/shl in operand-free handler: "
+            + ", ".join(f"{r},{hex(v)}" for r, v in sub_imms + shl_imms)
+        )
+    else:
+        lines.append("    ok: no sub/shl immediates (no slot prologue)")
+    bad_add = [(r, v) for (r, v) in add_imms if v != 1]
+    if bad_add:
+        ok = False
+        lines.append(
+            "    FAIL: add immediates outside {1}: "
+            + ", ".join(f"{r},{hex(v)}" for r, v in bad_add)
+        )
+    else:
+        lines.append(
+            "    ok: add immediates = "
+            + ", ".join(f"{r},{hex(v)}" for r, v in add_imms)
+            + ("" if add_imms else "  (none)")
+        )
+    if not any(v == 1 for (_, v) in add_imms):
+        ok = False
+        lines.append("    FAIL: pc advance add 1 missing")
+    min_movups = 16 if name == "vzeroupper" else 40
+    if movups_count < min_movups:
+        ok = False
+        lines.append(
+            f"    FAIL: movups xmm face-store count {movups_count} < {min_movups}"
+        )
+    else:
+        lines.append(f"    ok: movups xmm count = {movups_count}")
+
+    return ok, lines
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[1])
     ap.add_argument("--asm", required=True, help="WVMP_RUNTIME_DUMP text file")
@@ -465,6 +550,14 @@ def main() -> int:
             ok, lines = check_mem_handler(name, code, off, md)
             verdict = "PASS" if ok else "FAIL"
             print(f"  [{verdict}] handler {name} @ +{hex(off)} ({len(code)} bytes, mem-form)")
+            for ln in lines:
+                print(ln)
+            (passed if ok else failed).append(name)
+            all_ok = all_ok and ok
+        elif name in VZERO_HANDLERS:
+            ok, lines = check_vzero_handler(name, code, off, md)
+            verdict = "PASS" if ok else "FAIL"
+            print(f"  [{verdict}] handler {name} @ +{hex(off)} ({len(code)} bytes, vzero-form)")
             for ln in lines:
                 print(ln)
             (passed if ok else failed).append(name)

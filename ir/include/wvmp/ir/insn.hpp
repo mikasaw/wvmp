@@ -295,7 +295,14 @@ enum class Op : u16 { Mov, Lea, Add, Sub, Adc, Sbb, And, Or, Xor, Not, Neg, Inc,
                       F2xm187, Fyl2x87, Fyl2xp187, Fscale87, Fpatan87,
                       Fprem87, Fsin87, Fcos87, Fsincos87, Fptan87,
                       Frndint87, Fxtract87,
-                      Fnclex87, Fninit87 };
+                      Fnclex87, Fninit87,
+
+                      // MIT-511 (T63): AVX 档B wave1 —— kCtxSize 冻结合同
+                      // bump (0x1C8→0x3C8, ctx.ymm[16] 512B 面) + vzero
+                      // ABI 词。x64 专属 (x86 架构 gate: MSVC x86 语料无
+                      // VEX 发射面, 保持 gate 披露)；无操作数词，不写
+                      // guest EFLAGS。
+                      Vzeroupper, Vzeroall };
 enum class Size : u8 { S8, S16, S32, S64 };
 enum class Cond : u8 { O, No, B, Ae, E, Ne, Be, A, S, Ns, P, Np, L, Ge, Le, G };
 constexpr u64 bits(Size s) { return s==Size::S8?8: s==Size::S16?16: s==Size::S32?32:64; }

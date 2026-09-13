@@ -10,9 +10,11 @@
 //   vaddsd mem 源); vpxor 清零惯用法 (425 整数位运算镜像); vucomiss+seta
 //   flags 通路; D5 C4 全前缀 db 直写 (vaddsd)。
 //   负例区 (各族全 gate, 可调用, 原生执行行为 byte-exact): ymm 同
-//   mnemonic (B.4 位宽闸) / FMA (双舍入) / rorx (VEX-GP) / vzeroupper
-//   (档B) / vpaddd (G1c 镜像) / vsubsd 非交换 d==s2 (D2 裁决) /
-//   vmulsd 标量 d==s2 (高位语义不相容) / vmovsd 插入 d≠s1 (§F.4 假 Mov)。
+//   mnemonic (B.4 位宽闸) / FMA (双舍入) / rorx (VEX-GP) / vpaddd
+//   (G1c 镜像) / vsubsd 非交换 d==s2 (D2 裁决) / vmulsd 标量 d==s2
+//   (高位语义不相容) / vmovsd 插入 d≠s1 (§F.4 假 Mov)。
+//   MIT-511 (档B wave1): 原 vzeroupper 负例 (档B ABI) 翻正例 —— 词入面
+//   真虚拟化, 行为语义不变 (SSE-only 观察者透明), stub 计数 +1。
 //
 // 区域只含白名单 (VEX V-pair + mov/lea/setcc/movzx/nop), printf 在 main
 // 区域外。REQUIRE_REAL: 正例区域真虚拟化 (stub ≥1), 负例函数 gate 由
@@ -42,7 +44,7 @@ extern "C" unsigned long long vex_c4_enc_addsd(unsigned long long a, unsigned lo
 extern "C" unsigned long long vex_ymm_neg(unsigned long long a, unsigned long long b);   // ⑬ gate
 extern "C" unsigned long long vex_fma_neg(unsigned long long a, unsigned long long b, unsigned long long c); // ⑭ gate
 extern "C" unsigned int      vex_rorx_neg(unsigned int x);                        // ⑮ gate
-extern "C" unsigned int      vex_vzeroupper_neg();                                // ⑯ gate
+extern "C" unsigned int      vex_vzeroupper_pos();                                // ⑯ MIT-511 入面
 extern "C" unsigned long long vex_vpaddd_neg(unsigned long long a, unsigned long long b); // ⑰ gate
 extern "C" unsigned long long vex_noncomm_ds2_neg(unsigned long long s1, unsigned long long d); // ⑱ gate
 extern "C" unsigned long long vex_movsd_insert_neg(unsigned long long s1, unsigned long long s2); // ⑲ gate
@@ -83,7 +85,7 @@ int main() {
                                                0x4004000000000000ull,
                                                0x3FF0000000000000ull);
     const unsigned int rorx = vex_rorx_neg(0x80000001u);                     // ror3 = 0x30000000
-    const unsigned int vzero = vex_vzeroupper_neg();                         // = 7
+    const unsigned int vzero = vex_vzeroupper_pos();                         // = 7 (MIT-511 入面)
     const unsigned long long paddr = vex_vpaddd_neg(0x0000000100000001ull,   // +0x2 → 0x3
                                                     0x0000000200000002ull);
     const unsigned long long ds2 = vex_noncomm_ds2_neg(0x4018000000000000ull, // 6.0-2.0=4.0

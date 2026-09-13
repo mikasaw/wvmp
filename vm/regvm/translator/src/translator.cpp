@@ -1084,6 +1084,15 @@ struct Translator {
             em.emit(VmOp::Nop, OpKind::None, 0, OpKind::None, 0, 0,
                     isa::size_field(in.size));
             break;
+        case ir::Op::Vzeroupper:
+        case ir::Op::Vzeroall:
+            // MIT-511 (档B wave1): 无操作数 ABI 词 (x64 lifter 专属发射;
+            // x86 词流因 lifter 架构 gate 不可达, 此处仅透传)。
+            em.emit(in.op == ir::Op::Vzeroupper ? VmOp::Vzeroupper
+                                                : VmOp::Vzeroall,
+                    OpKind::None, 0, OpKind::None, 0, 0,
+                    isa::size_field(in.size));
+            break;
         default:
             if (in.op == ir::Op::Imul) {
                 ok = translate_imul(em, sc, in, current_rva, next_ip);

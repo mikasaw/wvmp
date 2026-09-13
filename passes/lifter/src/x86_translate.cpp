@@ -1944,6 +1944,22 @@ TranslateResult translate_vex128(const cs_insn& ci, const cs_x86& x, ir::Arch ar
     return r;
 }
 
+// MIT-511 (T63 · AVX 档B wave1): vzeroupper/vzeroall ABI 词 — 无操作数
+// VEX 词 (C5 F8 77 / C5 FC 77, capstone 吸收前缀后 id 独立, op_count=0)。
+// 只写 YMM 状态不触 guest EFLAGS。**x64 专属**: x86 架构 gate (MSVC x86
+// 语料无 VEX 发射面, 频率≈0 — 与 GAPS G6a "VEX = x64 面" 口径一致);
+// x86 区出现 → 现状 gate 整函数原生保持。
+TranslateResult translate_vzero(const cs_insn& ci, const cs_x86& x, ir::Arch arch) {
+    if (arch != ir::Arch::X64) return unsupported(ci.address, ci.size);
+    if (x.op_count != 0) return unsupported(ci.address, ci.size);  // 防御
+    ir::Insn out;
+    out.op = (ci.id == X86_INS_VZEROUPPER) ? Op::Vzeroupper : Op::Vzeroall;
+    out.size = ir::Size::S32;
+    out.updates_flags = false;
+    out.addr = ci.address;
+    return ok(std::move(out));
+}
+
 TranslateResult translate_cmpxchg(const cs_insn& ci, const cs_x86& x, ir::Arch arch) {
     if (x.op_count != 2) return unsupported(ci.address, ci.size);
     // dst 必为 r/m (REG 或 MEM); src 必为 REG
@@ -3404,6 +3420,10 @@ TranslateResult translate_insn(const cs_insn& ci, ir::Arch arch) {
     case X86_INS_VANDNPS: case X86_INS_VANDNPD: case X86_INS_VPANDN:
     case X86_INS_VUCOMISS: case X86_INS_VUCOMISD: case X86_INS_VCOMISS: case X86_INS_VCOMISD:
         return translate_vex128(ci, x, arch);
+    // MIT-511 (档B wave1): vzeroupper/vzeroall ABI 词入面 (translate_vzero
+    // 内 x64 架构 gate + op_count=0 防御; VexVzeroupperGate 先例翻转)。
+    case X86_INS_VZEROUPPER: case X86_INS_VZEROALL:
+        return translate_vzero(ci, x, arch);
     case X86_INS_BSWAP: return translate_bswap(ci, x, arch);
     case X86_INS_XCHG: return translate_xchg(ci, x, arch);
     // MIT-336: setcc 16 variants (0F 90+cc+rm, mod=11 REG / mod=00 MEM).

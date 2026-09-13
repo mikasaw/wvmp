@@ -1281,3 +1281,7 @@ asmgen 零触碰 → dump 锚不受影响（无换代）。
 ### MIT-510 (T62 · x87 L1-L4 续延) ✅ 2026-09-14
 - +22 VmOp（kVmOpMax 141）+ 跳表 128→256（冻结契约批量前置条款）。fcom 族/fcmov（keystone 不装配→and掩码+jz/jnz+fld/fstp 组合模拟）/fxch/ffree/超越 12 词/fninit 族全虚拟化；x87 路由架构门（x64 区恢复 gate，回归实证）；keystone jcc rel8 短跳/逐行失败定位两项工具链入册。验收 PASS（F1 fcmovu 行补回）。电池 68/68、ctest 23/23、全池 350/350（REQUIRE_REAL，+x87l1 样本）。
   证据链 GAPS MIT-510。
+
+### MIT-511 (T63 · AVX 档B wave1 — kCtxSize 合同 bump + vzero ABI 词) ✅ 2026-09-14
+- 冻结契约 kCtxSize 0x1C8→0x3C8（VmContext +YmmSlot ymm[16] 512B @0x1C0，kCtxYmmBase + offsetof 钉死；MIT-B2 派生式全消费方自动跟随，kX86ExitSlotDepth 0x2D8→0x4D8）。+2 VmOp（kVmOpMax 143）：Vzeroupper/Vzeroall——x64 专属（x86 架构 gate，MSVC x86 无 VEX 发射面披露），无操作数词物理发射 + ctx 面一致性回写（vzeroupper 上位半区 16×16B；vzeroall 面+物理全清，SDM EMMS 附带语义 x64 区空效）。硬件真值测试 VzeroWordsHardwareTruth（keystone vpcmpeqd ymm0 脏位 thunk + vextractf128 observer，AVX 缺失 SKIP）；lifter VexVzeroupperGate 翻正 + capstone 解码探针；dump 门脚本扩 VZERO_HANDLERS 形状检查；vex128 样本 vzeroupper 负例翻正例（byte-exact）。遗留 gate 面：VEX.256 算术全谱 / stub ymm 全量同步（wave2 前置）/ xmm-ymm 双面混排契约 / EVEX 天然 gate。**验证**：主树 ctest 23/23（+VzeroWordsHardwareTruth 硬件真值/VexVzeroCapstoneProbe 探针，VexVzeroupperGate 翻正，x86 架构 gate 钉死）；全池 350/350（REQUIRE_REAL=1，vex128 翻正样本 ×5 byte-exact，翻正区 stub 真实执行）；单 pack 对账 stub 13→14、gate note 7→6；dump 门脚本扩 VZERO_HANDLERS 形状检查实测 PASS（98 handlers）。**潜伏缺陷修复**：battery block (g) keystone driver 裸写 rbp 不恢复（Win64 ABI 违约）——ctx 扩容改变测试函数代码 gen 使 rbp 相对寻址恰好落到 (g) 之后引爆 AV；driver 改 push/pop 保护 8 callee-saved。
+  证据链 GAPS MIT-511。

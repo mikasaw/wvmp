@@ -56,6 +56,13 @@ inline constexpr std::array<int, 8> kCalleeSavedIdx = {2, 3, 4, 5, 10, 11, 12, 1
 //                             出口再同步回宿主 xmm。8 个槽位 = 128 字节;
 //                             偏移 0x138..0x1B8。
 //
+//   +0x1C0  u256 ymm[16]      MIT-511: AVX 档B wave1 —— ymm 跟踪面 (16 槽
+//                             × 32B = 512B)。wave1 只落存储面 + vzeroupper/
+//                             vzeroall ABI 词 (上位清零/全零, 见 asmgen);
+//                             VEX.256 算术词与 stub 全量 ymm 同步属后续波
+//                             次 (GAPS 档B 蓝图)。kCtxSize 0x1C8→0x3C8
+//                             (冻结契约, 用户批准的档B 立项前置)。
+//
 // v4 = Rsp（Push/Pop 操作的栈指针，相对 scratch_mem 的偏移）。
 // v17 偏移 = 0x10 + 17*8 = 0x98；v4 偏移 = 0x30。
 // =============================================================================
@@ -63,12 +70,20 @@ inline constexpr std::array<int, 8> kCalleeSavedIdx = {2, 3, 4, 5, 10, 11, 12, 1
 // layout (8 字节 lo + 8 字节 hi)。asmgen handler 用 movups 全 16B 读写。
 // 不引入 <emmintrin.h> 头依赖（emmintrin.h 链路较重）。vm_entry 调度 push 之前
 // VmContext 自身需 16 字节对齐以保证 movups 不产生 #GP 异常（与 x64 ABI 对齐
-// 约定一致；本 struct 总大小 0x1C0, sizeof 已 16B 对齐）。
+// 对齐约定一致；本 struct 总大小 0x3C0 (MIT-511 档B wave1 起, 含 ymm[16]),
+// sizeof 已 32B 对齐）。
 #pragma warning(push)
 #pragma warning(disable : 4324)  // XmmSlot struct padded due to alignas(16)
 struct alignas(16) XmmSlot { u64 xmm_lo, xmm_hi; };
 #pragma warning(pop)
 static_assert(sizeof(XmmSlot) == 16, "XmmSlot must be 16B (mimic __m128 layout)");
+// MIT-511 (档B wave1): 32B ymm 槽 (模拟 __m256 layout)。alignas(32) 保证
+// 未来 vmovaps ymm 全 32B 访问不 #GP；VmContext 总对齐随之升到 32。
+#pragma warning(push)
+#pragma warning(disable : 4324)  // YmmSlot struct padded due to alignas(32)
+struct alignas(32) YmmSlot { u64 q[4]; };
+#pragma warning(pop)
+static_assert(sizeof(YmmSlot) == 32, "YmmSlot must be 32B (mimic __m256 layout)");
 #pragma warning(push)
 #pragma warning(disable : 4324)  // VmContext padded due to XmmSlot alignas(16) member
 struct VmContext {
@@ -81,13 +96,17 @@ struct VmContext {
     u64 host_rsp = 0;         // +0x128
     u64 base_save = 0;        // +0x130
     XmmSlot xmm[8] = {};      // +0x140 (xmm0..xmm7, 各 16B; movups 全 16B 读写)
+    YmmSlot ymm[16] = {};     // +0x1C0 (ymm0..ymm15, 各 32B; MIT-511 档B wave1)
 };
 #pragma warning(pop)
 // MIT-371: VmContext 大小从 0x138 扩到 0x1C0（加 0x80 = xmm[8] 128B）。
+// MIT-511: 0x1C0 扩到 0x3C0（加 0x200 = ymm[16] 512B；kCtxSize 0x1C8→0x3C8）。
 // 实际 sizeof 由编译器保证与 offset 一致。
-static_assert(sizeof(VmContext) >= 0x1C0, "VmContext must include xmm[8] (128B)");
+static_assert(sizeof(VmContext) >= 0x3C0, "VmContext must include xmm[8] + ymm[16]");
 inline constexpr u64 kCtxXmmBase = 0x140;  // VmContext.xmm[0] RVA 偏移 = 0x140
 static_assert(offsetof(VmContext, xmm) == 0x140, "xmm must be 16-aligned at 0x140");
+inline constexpr u64 kCtxYmmBase = 0x1C0;  // VmContext.ymm[0] RVA 偏移 = 0x1C0
+static_assert(offsetof(VmContext, ymm) == 0x1C0, "ymm must be 32-aligned at 0x1C0");
 
 // MIT-B2: kCtxSize 单一事实来源——stub 的 `sub rsp` 上下文区大小。
 // 此前定义在 stub_gen.cpp（匿名 namespace），asmgen.cpp 的 callgate step 7

@@ -1,7 +1,7 @@
 ; MIT-406 (MIT-E1): callee 专用栈窗口 E2E 样本的 MASM helper — 深 call 递归链。
 ;
 ; 背景 (派活单 §A): callgate 的 native callee 树原本从 native_sp-0x28 向下
-; 生长, 与驻留同栈的 VmContext (kCtxSize=0x1C8, 驻留 [native_sp-0x208,
+; 生长, 与驻留同栈的 VmContext (kCtxSize=0x3C8, MIT-511 档B wave1; 驻留 [native_sp-0x408,
 ; native_sp-0x40)) 只隔 0x1D8 预算 — wvmpTest sha256 (调用树深 ~0x250B)
 ; 砸穿 ctx → packed.exe 0xC0000005。既有 call_gate 样本 callee 全浅帧
 ; (<=0x30B), 从未测过预算边界。本样本提供**静态可核算**的深递归链:

@@ -31,10 +31,11 @@ namespace wvmp::regvm::runtime {
 // x64 侧由 translator 栈深 walk budget=0 兜底（D4 双 arch 对称纪律）。
 inline constexpr u64 kX86GuardBytes = 128;
 // 派生式：guard + 4 callee-saved push + ctx + 0x80 余量（余量含义不变：槽位
-// 落在 host 帧一切栈活动之下）。B.1 前原值 0x258 = 0x10+0x1C8+0x80。
+// 落在 host 帧一切栈活动之下）。B.1 前原值 0x258 = 0x10+0x1C8+0x80；
+// MIT-511 档B wave1 kCtxSize 0x1C8→0x3C8 → 深度 0x2D8→0x4D8。
 inline constexpr u64 kX86ExitSlotDepth =
     kX86GuardBytes + 4 * 4 + kCtxSize + 0x80;
-static_assert(kX86ExitSlotDepth == 0x2D8, "x86 exit slot depth regressed");
+static_assert(kX86ExitSlotDepth == 0x4D8, "x86 exit slot depth regressed");
 
 // =============================================================================
 // MIT-443 (X3a)：x86 (KS_MODE_32) 解释器码体生成入口 —— asmgen 双模的 32 位面。
