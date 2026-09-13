@@ -3860,3 +3860,39 @@ T44 方法学复刻（perf_counter 单进程包裹 subprocess、native/protected
 **解释器优化战役总账（T41-T44 + T51-T54 复验）**：x86 hotloop 131ms
 （−16.5% vs T35）+ x86/x64 每词比 0.99-1.02×（税清零）+ 墙钟双侧 ~1.7×
 ——性能与覆盖面（22/22）同步收口。
+
+## MIT-506（T60 · x87 L0 立案——架构定案：物理 FPU 驻留直执行，2026-09-13）
+
+**立项**：用户批复 x87 L0（MIT-496 决策点①）。triage §4 L0 = ST 栈模型 +
+fld/fstp/fild/fistp（m32/64/80 宽链）+ fadd/fsub/fmul/fdiv/fabs/fchs/fsqrt
++ fld1/fldz + fldcw/fnstcw/fstsw/fnstsw + fcomi/fcomip + stub 出口同步
+（XL，~30 handler）。
+
+**架构定案（与蓝图分歧，D 级披露）**：蓝图方案 (a) = ST 槽区落 VmContext
+（kCtxSize 0x1C8→0x248 契约破坏 + ctx 寻址 handler ×30 + 跳表扩容三重成
+本）——写作于 x86 解释器诞生前。本单定案 = **物理 FPU 驻留直执行**：
+- guest ST 栈 = **物理 st0-st7**（x86 解释器即真 x86 代码，宿主 FPU 天然
+  存在）；x87 handler 直发真实 x87 指令（mem 形经 emit_address 翻译寻址，
+  寄存器形逐字重发射）；
+- **native-exact 免费获得**：native callee 看到 guest 真实 x87 状态（CW/
+  异常掩码/精度模式全物理镜像——与 native 执行逐位一致）；callgate 零新
+  桥（x86 cdecl FP 返回 = st0，物理 FPU 跨 callgate 自然携带，区域内的
+  fstp 直接消费；FP 实参 = 栈字节经既有参数窗桥接 ✓）；真实代码 x87 栈
+  跨 call 恒空（编译器清理纪律）→ 无状态冲突面；
+- **kCtxSize 零触碰**（冻结合约完整保全）；TOP/标记字/CW/SW 状态 = FPU
+  物理寄存器，零 ctx 槽；
+- **L0 VmOp 预算 ~20-28**（kVmOpMax 97+28=125 ≤ 127）——**跳表扩容不需
+  要**（蓝图 ~80 op 系全族估计；L1-L4 落地时再触发 G9r §3.4 前置）；
+- 蓝图 ctx 方案的唯一优势（状态可检查性）由 x86 电池真执行面覆盖（电池
+  即真 FPU，fld 预置 + 结果断言可测）。
+
+**L0 形组 → VmOp 清单（草案，实现期定稿）**：fld（m32/m64/tbyte/st(i)/
+常数）/ fst+fstp（m32/m64/tbyte/st(i)）/ fild+fist+fistp（m32/m64）/
+fadd+fmul（st(i) 矩阵 + m32/m64，pop 变体 aux 编位）/ fsub±r/fdiv±r（同
+矩阵）/ fchs+fabs（st0）/ fsqrt / fcomi+fcomip / fldcw+fnstcw+fnstsw+
+fstsw / fnop——合计 ~22-28。
+
+**实施分批**：MIT-506 立案（本单）→ MIT-507 L0 核心落地（lifter 解码 +
+translate + asmgen handler + 单测，全门）→ MIT-508 E2E（新
+wvmp_x86_x87l0_sample 真实 IA32 FP 代码；x87gate fixture 的 L1/L2 面
+fsin/fcomip 维持 gate、fixture 有效性披露）→ 双池 + 验收。
