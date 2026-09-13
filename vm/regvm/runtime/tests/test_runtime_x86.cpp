@@ -3162,6 +3162,7 @@ TEST(X86Battery, X87L1FcmovAll) {
         {"fcmovbe moves CF",    4.0, 10.0, 2, false, 10.0},
         {"fcmovnbe skips CF",   4.0, 10.0, 6, false, 4.0},
         {"fcmovnu skips on PF", 4.0, 10.0, 7, true, 4.0},
+        {"fcmovu  moves on PF", 4.0, 10.0, 3, true, 10.0},
     };
     for (const auto& c : cases) {
         const bool u_case = c.cc == 3;
