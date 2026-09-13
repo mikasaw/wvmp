@@ -2678,6 +2678,351 @@ TEST(X86Battery, X87ControlWordRoundTrip) {
 }
 
 // ---------------------------------------------------------------------------
+// (31.8) MIT-509 (T61): x87 矩阵编码硬件真值 —— 本机 CPU 实测裁决 rev 位。
+// 背景: capstone 5.0.6 对 D8/DC fsub/fdiv 族 R 助记符命名不可信 (探针实证
+// dce1 报 "fsubr", Intel SDM DC /4 = FSUB st(i),st(0); d8e1 同 reg 位却报
+// "fsub")。rev/pop 判据必须钉在编码字节上; 本探针在宿主 CPU 跑裸编码,
+// 落槽方向与值即 ISA 真值, 同时作为 handler 四象限的永固规范测试。
+// ---------------------------------------------------------------------------
+alignas(8) static double g_ht_a = 0, g_ht_b = 0, g_ht_r0 = 0, g_ht_r1 = 0;
+alignas(1) static uint8_t g_ht_sw8 = 0;
+alignas(2) static uint16_t g_ht_sw16 = 0;
+
+// 裸 x87 双压栈序列: fld a(→st1); fld b(→st0); <enc 2 字节>; fstp r0; fstp r1。
+// 每用例栈配平; FPU 全掩码 (CW 默认) 无异常路径。32 位原生 (交叉树测试进程)。
+struct HwTruth {
+    double r0, r1;
+};
+alignas(4) static u32 g_ht_prog = 0;  // blob 进度哨兵 (1=压栈后 2=运算后 3=r0 存 4=r1 存)
+
+static HwTruth run_x87_native(u8 opc, u8 modrm, double a, double b, bool op_pops) {
+    g_ht_a = a; g_ht_b = b; g_ht_r0 = g_ht_r1 = 0;
+    u8 code[40];
+    u8* p = code;
+    auto put = [&](const void* src, size_t n) {
+        std::memcpy(p, src, n);
+        p += n;
+    };
+    const u32 ra = static_cast<u32>(reinterpret_cast<uintptr_t>(&g_ht_a)),
+              rb = static_cast<u32>(reinterpret_cast<uintptr_t>(&g_ht_b)),
+              rd = static_cast<u32>(reinterpret_cast<uintptr_t>(&g_ht_r0)),
+              rf = static_cast<u32>(reinterpret_cast<uintptr_t>(&g_ht_r1));
+    // ⚠️ 仅用 eax/ecx/edx (32 位 cdecl caller-saved); edi/esi/ebx/ebp 是
+    // callee-saved, blob 覆写会破坏调用者 (实证: 循环变量被分配在 edi,
+    // 覆写后循环读野指针 — 挂起假死)。
+    // ⚠️ FSTP m64 = DD /3: [eax]=DD 18, [edx]=DD 1A。首版误写 DD 20/22
+    // (reg 位=4 = FRSTOR!) — cdb 反汇编实证, FRSTOR 从零内存"恢复"出病态
+    // FPU 状态 → 全部下游怪象 (存值恒 0/printf log10 断言/偶发 SEH)。
+    // 布局: mov eax@0(imm@1..4) | mov ecx@5(imm@6..9) | fninit@10 |
+    //       fld [eax]@12 | fld [ecx]@14 | enc@16 | mov eax@18(imm@19..22) |
+    //       fstp [eax]@23 | mov edx@25(imm@26..29) | fstp [edx]@30 | ret@32
+    *p++ = 0xB8; std::memcpy(p, &ra, 4); p += 4;   // mov eax, &a
+    *p++ = 0xB9; std::memcpy(p, &rb, 4); p += 4;   // mov ecx, &b
+    const u8 body[] = {0xDB, 0xE3,          // fninit (测试进程 FPU 状态不定 —
+                                            // 前置重置 → 空栈/CW=0x037F 确定基)
+                       0xDD, 0x00,          // fld qword [eax]  → st0=a
+                       0xDD, 0x01,          // fld qword [ecx]  → st0=b, st1=a
+                       opc, modrm,          // 被测编码
+                       0xB8, 0, 0, 0, 0,    // mov eax, &r0 (fld 后 eax 空闲, 重载)
+                       0xDD, 0x18,          // fstp qword [eax] → r0
+                       0xBA, 0, 0, 0, 0,    // mov edx, &r1
+                       0xDD, 0x1A,          // fstp qword [edx] → r1 (op_pops 时省略)
+                       0xC3};
+    put(body, sizeof(body));
+    std::memcpy(code + 1, &ra, 4);
+    std::memcpy(code + 6, &rb, 4);
+    std::memcpy(code + 19, &rd, 4);
+    std::memcpy(code + 26, &rf, 4);
+    if (op_pops) {
+        p = code + 25;         // 省略 fstp [edx] (弹栈编码后栈仅剩 1 值, 二次 fstp 下溢)
+        *p++ = 0xC3;
+    }
+    RwxImage img(std::vector<u8>(code, p));
+    img.entry()(nullptr);
+    return {g_ht_r0, g_ht_r1};
+}
+
+TEST(X86Battery, X87NativeBlobSmoke) {
+    // 机制验证: 32 位原生 blob 经 RwxImage 调用 + 内存写回通路。
+    static u32 v = 0;
+    v = 0;
+    u8 code[16];
+    u8* q = code;
+    const u32 rv = static_cast<u32>(reinterpret_cast<uintptr_t>(&v));
+    *q++ = 0xB8; std::memcpy(q, &rv, 4); q += 4;   // mov eax, &v
+    *q++ = 0xC7; *q++ = 0x00;                       // mov dword [eax], 42
+    const u32 imm = 42;
+    std::memcpy(q, &imm, 4); q += 4;
+    *q++ = 0xC3;                                    // ret
+    RwxImage img(std::vector<u8>(code, q));
+    img.entry()(nullptr);
+    EXPECT_EQ(v, 42u);
+
+    // x87 通路验证: fninit; fld qword [eax] → fstp qword [ecx]。
+    g_ht_a = 4.0; g_ht_r0 = 0;
+    u8 f[18];
+    u8* p = f;
+    const u32 ra2 = static_cast<u32>(reinterpret_cast<uintptr_t>(&g_ht_a)),
+              rr2 = static_cast<u32>(reinterpret_cast<uintptr_t>(&g_ht_r0));
+    *p++ = 0xDB; *p++ = 0xE3;                      // fninit
+    *p++ = 0xB8; std::memcpy(p, &ra2, 4); p += 4;  // mov eax, &a
+    *p++ = 0xB9; std::memcpy(p, &rr2, 4); p += 4;  // mov ecx, &r0
+    *p++ = 0xDD; *p++ = 0x00;                      // fld qword [eax]
+    *p++ = 0xDD; *p++ = 0x19;                      // fstp qword [ecx]
+    *p++ = 0xC3;
+    RwxImage img2(std::vector<u8>(f, p));
+    img2.entry()(nullptr);
+    EXPECT_EQ(g_ht_r0, 4.0);
+}
+
+TEST(X86Battery, X87MatrixHardwareTruthFull) {
+    struct Case {
+        const char* name;
+        u8 opc, modrm;
+        double exp_r0, exp_r1;  // Intel SDM 真值 (a=4 → st1, b=10 → st0)
+    };
+    // 非弹 (D8/DC): st0=b 不动 → r0=10, r1=st1 运算结果。
+    // 弹 (DE): 结果进新 st0 → r0=结果, r1=4。
+    // 硬件真值 (宿主 CPU 实测 + 本 harness 复验): fld a(4)→st1, fld b(10)→st0。
+    // ⚠️ Intel 真表 (**本机实测钉死**): D8 /r = st(0) op← st(rm) (显式位=源);
+    // DC /r = st(rm) op← st(0); **r 位反转在 D8 与 DC 之间**: DC /4=FSUBR、
+    // /5=FSUB、/6=FDIVR、/7=FDIV (D8 相反); DE 沿用 DC 方向 + 弹栈
+    // (/4=FSUBRP、/5=FSUBP、/6=FDIVRP、/7=FDIVP)。capstone 5.0.6 命名与
+    // 硬件全程一致 (dce1 报 fsubr = 实测 FSUBR 方向 ✓)。
+    // 非弹 D8: st0=运算结果 → r0=结果, r1=st1(=4)。
+    // 非弹 DC: st1=运算结果, st0=10 不动 → r0=10, r1=结果。
+    // 弹栈 DE: 结果为新 st0 → r0=结果; harness 省略二次 fstp → r1=0 (未写)。
+    const Case cases[] = {
+        // D8 矩阵 (单操作数报告面 — capstone 5.0.6; op0=st(i) 是 **源**)
+        {"d8c1 fadd st0,st1", 0xD8, 0xC1, 14.0, 4.0},
+        {"d8e1 fsub st0,st1", 0xD8, 0xE1, 6.0, 4.0},
+        {"d8e9 fsubr st0,st1", 0xD8, 0xE9, -6.0, 4.0},
+        {"d8f1 fdiv st0,st1", 0xD8, 0xF1, 2.5, 4.0},
+        {"d8f9 fdivr st0,st1", 0xD8, 0xF9, 0.4, 4.0},
+        // DC 矩阵 (双操作数报告面; op0=st(rm) 是 **目的**; r 位反转 vs D8)
+        {"dce1 fsubr st1,st0", 0xDC, 0xE1, 10.0, 6.0},
+        {"dce9 fsub st1,st0", 0xDC, 0xE9, 10.0, -6.0},
+        {"dcf1 fdivr st1,st0", 0xDC, 0xF1, 10.0, 2.5},
+        {"dcf9 fdiv st1,st0", 0xDC, 0xF9, 10.0, 0.4},
+        // DE 弹栈矩阵 (= DC 方向 + pop)
+        {"dec1 faddp st1,st0", 0xDE, 0xC1, 14.0, 0.0},
+        {"dec9 fmulp st1,st0", 0xDE, 0xC9, 40.0, 0.0},
+        {"dee1 fsubrp st1,st0", 0xDE, 0xE1, 6.0, 0.0},
+        {"dee9 fsubp st1,st0", 0xDE, 0xE9, -6.0, 0.0},
+        {"def1 fdivrp st1,st0", 0xDE, 0xF1, 2.5, 0.0},
+        {"def9 fdivp st1,st0", 0xDE, 0xF9, 0.4, 0.0},
+    };
+    for (const auto& c : cases) {
+        const auto r = run_x87_native(c.opc, c.modrm, 4.0, 10.0, c.opc == 0xDE);
+        EXPECT_EQ(r.r0, c.exp_r0) << c.name << " r0";
+        EXPECT_EQ(r.r1, c.exp_r1) << c.name << " r1";
+    }
+}
+
+TEST(X86Battery, X87FcomipFnstswHwTruth) {
+    // fcomi (dbf1) / fcomip (dff1) EFLAGS 面: lahf 捕获 AH (SF ZF 0 AF 0
+    // PF 1 CF)。fcomip 自弹一次 (T61 [C]③ 规范): 双压栈后剩 1 值可弹。
+    // fnstsw ax (dfe0): SW 低 16 位 → C0=bit8。
+    auto run_cmp = [&](u8 opc, u8 modrm, double a, double b) {
+        g_ht_a = a; g_ht_b = b; g_ht_r1 = 0; g_ht_sw8 = 0xAA;
+        u8 code[32];
+        u8* q = code;
+        const u32 ra = static_cast<u32>(reinterpret_cast<uintptr_t>(&g_ht_a)),
+                  rb = static_cast<u32>(reinterpret_cast<uintptr_t>(&g_ht_b)),
+                  rs = static_cast<u32>(reinterpret_cast<uintptr_t>(&g_ht_sw8));
+        *q++ = 0xB8; std::memcpy(q, &ra, 4); q += 4;   // mov eax, &a
+        *q++ = 0xB9; std::memcpy(q, &rb, 4); q += 4;   // mov ecx, &b
+        *q++ = 0xBA; std::memcpy(q, &rs, 4); q += 4;   // mov edx, &sw
+        const u8 body[] = {0xDB, 0xE3,       // fninit 钉空栈/全掩码基线
+                                           // (测试进程 FPU 状态实测不定)
+                           0xDD, 0x00,       // fld [eax] st0=a
+                           0xDD, 0x01,       // fld [ecx] st0=b st1=a
+                           opc, modrm,       // fcomi/fcomip st, st(1)
+                           0x9F,             // lahf
+                           0x88, 0x22,       // mov [edx], ah
+                           0xDD, 0x19,       // fstp [ecx] 清栈
+                           0xC3};
+        std::memcpy(q, body, sizeof(body));
+        q += sizeof(body);
+        RwxImage img(std::vector<u8>(code, q));
+        img.entry()(nullptr);
+        return g_ht_sw8;
+    };
+    // st0=10 (b) vs st1=4 (a): above → CF=0/ZF=0 → AH 低 7 位全 0 (bit1 恒 1)。
+    EXPECT_EQ(run_cmp(0xDB, 0xF1, 4.0, 10.0) & 0x41, 0x00);       // fcomi above
+    EXPECT_EQ(run_cmp(0xDF, 0xF1, 4.0, 10.0) & 0x41, 0x00);       // fcomip above
+    // st0=4 vs st1=10: below → CF=1 → bit0。
+    EXPECT_EQ(run_cmp(0xDB, 0xF1, 10.0, 4.0) & 0x41, 0x01);
+    EXPECT_EQ(run_cmp(0xDF, 0xF1, 10.0, 4.0) & 0x41, 0x01);
+    // 相等: ZF=bit6。a=b=4。
+    EXPECT_EQ(run_cmp(0xDB, 0xF1, 4.0, 4.0) & 0x41, 0x40);
+    EXPECT_EQ(run_cmp(0xDF, 0xF1, 4.0, 4.0) & 0x41, 0x40);
+    // fnstsw ax (dfe0): SW→AX, C0=bit8 面 + guest Rax 高位保持 (handler RMW)。
+    // ⚠️ 用 FCOMP (d8d1) 而非 FCOMI 实测锁定: FCOMI 只写 EFLAGS, **不更新
+    // SW 的 C0** (上面 lahf 断言已证 CF 面); SW C0 面归 FCOM/FCOMP 族。
+    {
+        g_ht_a = 10.0; g_ht_b = 4.0; g_ht_sw16 = 0;
+        u8 code[40];
+        u8* q = code;
+        const u32 ra = static_cast<u32>(reinterpret_cast<uintptr_t>(&g_ht_a)),
+                  rb = static_cast<u32>(reinterpret_cast<uintptr_t>(&g_ht_b)),
+                  rs = static_cast<u32>(reinterpret_cast<uintptr_t>(&g_ht_sw16));
+        *q++ = 0xB8; std::memcpy(q, &ra, 4); q += 4;   // mov eax, &a
+        *q++ = 0xB9; std::memcpy(q, &rb, 4); q += 4;   // mov ecx, &b
+        *q++ = 0xBA; std::memcpy(q, &rs, 4); q += 4;   // mov edx, &sw16
+        const u8 body[] = {0xDB, 0xE3,              // fninit 钉基线
+                           0xDD, 0x00, 0xDD, 0x01,  // fld a; fld b
+                           0xD8, 0xD1,              // fcomp st(1): 4 vs 10 → C0
+                           0xDF, 0xE0,              // fnstsw ax
+                           0x66, 0x89, 0x02,        // mov [edx], ax (reg=AX=0)
+                           0xDD, 0x19, 0xC3};       // fstp 清剩余栈
+        std::memcpy(q, body, sizeof(body));
+        q += sizeof(body);
+        RwxImage img(std::vector<u8>(code, q));
+        img.entry()(nullptr);
+        EXPECT_EQ(g_ht_sw16 & 0x0100, 0x0100);  // 4 < 10 → C0 (SW bit8) —
+                                                // main.c face-4 断言语义基准
+    }
+}
+
+// ---------------------------------------------------------------------------
+// (31.9) MIT-509 (T61): farith 四象限 × 双布局 handler 虚拟化执行 —— 直构
+// VmInsn 矩阵词驱动 build_x87_farith 生成的树; 期望值 = X87MatrixHardware
+// TruthFull 钉死的硬件真值 (fld a(4)→st1, fld b(10)→st0)。
+// ---------------------------------------------------------------------------
+static isa::VmInsn x87_matrix(isa::VmOp op, u8 dst, u8 src, u32 aux) {
+    return isa::make_insn(op, isa::OpKind::Imm, dst, isa::OpKind::Imm, src,
+                          aux, isa::size_field(ir::Size::S32));
+}
+
+static void run_matrix_vm(const char* name, isa::VmOp op, u8 dst, u8 src,
+                          u32 aux, bool pops, double exp_r0, double exp_r1) {
+    wvmp::Rng rng(12345);
+    const auto gen = rt::generate_runtime_x86(rng);
+    RwxImage rwx(gen.image.code);
+    g_ht_a = 4.0; g_ht_b = 10.0; g_ht_r0 = g_ht_r1 = 0;
+    std::vector<u8> s;
+    isa::append_insn(s, mov_imm(5, static_cast<u32>(reinterpret_cast<uintptr_t>(&g_ht_a))));
+    isa::append_insn(s, x87_mem(5, isa::VmOp::Fld87Mem, 8));    // st0=4
+    isa::append_insn(s, mov_imm(6, static_cast<u32>(reinterpret_cast<uintptr_t>(&g_ht_b))));
+    isa::append_insn(s, x87_mem(6, isa::VmOp::Fld87Mem, 8));    // st0=10, st1=4
+    isa::append_insn(s, x87_matrix(op, dst, src, aux));
+    isa::append_insn(s, mov_imm(7, static_cast<u32>(reinterpret_cast<uintptr_t>(&g_ht_r0))));
+    isa::append_insn(s, x87_mem(7, isa::VmOp::Fstp87Mem, 8));   // r0
+    if (!pops) {
+        isa::append_insn(s, mov_imm(5, static_cast<u32>(reinterpret_cast<uintptr_t>(&g_ht_r1))));
+        isa::append_insn(s, x87_mem(5, isa::VmOp::Fstp87Mem, 8));  // r1
+    }
+    isa::append_insn(s, halt());
+    rt::VmContext ctx;
+    ctx.bytecode = s.data();
+    ctx.pc = 0;
+    rwx.entry()(&ctx);
+    EXPECT_EQ(g_ht_r0, exp_r0) << name;
+    EXPECT_EQ(g_ht_r1, exp_r1) << name << " r1";
+}
+
+TEST(X86Battery, X87FarithQuadrantsVm) {
+    constexpr u32 kRev = 2, kPop = 1;
+    const isa::VmOp sub = isa::VmOp::Fsub87, div = isa::VmOp::Fdiv87;
+    // 期望值推导见 X87MatrixHardwareTruthFull;助记符→编码映射:
+    //   st(k) 形 → DC/DE (f: sub=5/subr=4/div=7/divr=6), st, st(k) 形 → D8。
+    run_matrix_vm("sub  st1-=st0",      sub, 1, 0, 0, false, 10.0, -6.0);
+    run_matrix_vm("subr st1=st0-st1",   sub, 1, 0, kRev, false, 10.0, 6.0);
+    run_matrix_vm("fsubp  st1-=st0,p",  sub, 1, 0, kPop, true, -6.0, 0.0);
+    run_matrix_vm("fsubrp  st1,p",      sub, 1, 0, kRev | kPop, true, 6.0, 0.0);
+    run_matrix_vm("sub  st0-=st1",      sub, 0, 1, 0, false, 6.0, 4.0);
+    run_matrix_vm("subr st0 =st1-st0",  sub, 0, 1, kRev, false, -6.0, 4.0);
+    run_matrix_vm("div  st1/=st0",      div, 1, 0, 0, false, 10.0, 0.4);
+    run_matrix_vm("divr st1=st0/st1",   div, 1, 0, kRev, false, 10.0, 2.5);
+    run_matrix_vm("fdivp  st1/=st0,p",  div, 1, 0, kPop, true, 0.4, 0.0);
+    run_matrix_vm("fdivrp  st1,p",      div, 1, 0, kRev | kPop, true, 2.5, 0.0);
+    run_matrix_vm("div  st0/=st1",      div, 0, 1, 0, false, 2.5, 4.0);
+    run_matrix_vm("divr st0 =st1/st0",  div, 0, 1, kRev, false, 0.4, 4.0);
+    // fadd/fmul 弹栈象限抽检 (add/mul rev 助记符恒等, 象限退化)。
+    run_matrix_vm("faddp st1+=st0,p", isa::VmOp::Fadd87, 1, 0, kPop, true, 14.0, 0.0);
+    run_matrix_vm("fmulp st1*=st0,p", isa::VmOp::Fmul87, 1, 0, kPop, true, 40.0, 0.0);
+}
+
+TEST(X86Battery, X87GateChainVm) {
+    // x87gate 样本序列复现 (MIT-450 面序): fld/fadd/fmul mem 形 + fld/fdiv
+    // mem 形 + D8 单操作数 fadd (dst=0 布局) + fstp mem。native 真值 15.75。
+    wvmp::Rng rng(12345);
+    const auto gen = rt::generate_runtime_x86(rng);
+    RwxImage rwx(gen.image.code);
+    alignas(4) static float fx = 2.0f, fy = 3.5f, fx_out = 0.0f;
+    fx = 2.0f; fy = 3.5f; fx_out = 0.0f;
+    std::vector<u8> s;
+    isa::append_insn(s, mov_imm(5, static_cast<u32>(reinterpret_cast<uintptr_t>(&fx))));
+    isa::append_insn(s, x87_mem(5, isa::VmOp::Fld87Mem, 4));    // st0 = 2.0
+    isa::append_insn(s, x87_mem(5, isa::VmOp::Fadd87, 4));      // st0 += 2.0
+    isa::append_insn(s, mov_imm(6, static_cast<u32>(reinterpret_cast<uintptr_t>(&fy))));
+    isa::append_insn(s, x87_mem(6, isa::VmOp::Fmul87, 4));      // st0 *= 3.5 = 14
+    isa::append_insn(s, x87_mem(6, isa::VmOp::Fld87Mem, 4));    // st0 = 3.5, st1 = 14
+    isa::append_insn(s, x87_mem(5, isa::VmOp::Fdiv87, 4));      // st0 /= 2.0 = 1.75
+    // 样本实字节 = DE C1 (MASM 无操作数 fadd = faddp st(1),st(0) 弹栈形)
+    // → 词 {a=dst 1, b=src 0, aux=pop}。
+    isa::append_insn(s, x87_matrix(isa::VmOp::Fadd87, 1, 0, 1));  // st1+=st0, pop
+    isa::append_insn(s, mov_imm(7, static_cast<u32>(reinterpret_cast<uintptr_t>(&fx_out))));
+    isa::append_insn(s, x87_mem(7, isa::VmOp::Fstp87Mem, 4));   // out = 15.75
+    isa::append_insn(s, halt());
+    rt::VmContext ctx;
+    ctx.bytecode = s.data();
+    ctx.pc = 0;
+    rwx.entry()(&ctx);
+    EXPECT_EQ(fx_out, 15.75f);
+}
+
+TEST(X86Battery, X87FarithMemRevBitmap) {
+    // mem 形 rev 位图: aux=6 (bit1=rev | bit2=dword) → "fsubr dword [addr]"
+    // = st0 ← [addr] − st0 (D8 /5)。原编码 (aux=宽度等值) 无法承载 rev。
+    // 判别值: fld 2.0 → fsubr [10.0] = 8.0 (非 rev 的 fsub = −8.0)。
+    wvmp::Rng rng(12345);
+    const auto gen = rt::generate_runtime_x86(rng);
+    RwxImage rwx(gen.image.code);
+    alignas(4) static float mv = 2.0f, mc = 10.0f, mout = 0.0f;
+    mv = 2.0f; mc = 10.0f; mout = 0.0f;
+    std::vector<u8> s;
+    isa::append_insn(s, mov_imm(5, static_cast<u32>(reinterpret_cast<uintptr_t>(&mv))));
+    isa::append_insn(s, x87_mem(5, isa::VmOp::Fld87Mem, 4));             // st0 = 2.0
+    isa::append_insn(s, mov_imm(6, static_cast<u32>(reinterpret_cast<uintptr_t>(&mc))));
+    isa::append_insn(s, isa::make_insn(isa::VmOp::Fsub87, isa::OpKind::Reg, 6,
+                                       isa::OpKind::None, 0, 6,
+                                       isa::size_field(ir::Size::S64)));  // aux=6
+    isa::append_insn(s, mov_imm(7, static_cast<u32>(reinterpret_cast<uintptr_t>(&mout))));
+    isa::append_insn(s, x87_mem(7, isa::VmOp::Fstp87Mem, 4));            // out = 8.0
+    isa::append_insn(s, halt());
+    rt::VmContext ctx;
+    ctx.bytecode = s.data();
+    ctx.pc = 0;
+    rwx.entry()(&ctx);
+    EXPECT_EQ(mout, 8.0f);  // rev: [m] − st0 = 10 − 2
+}
+
+TEST(X86Battery, X87FnstswAxVm) {
+    wvmp::Rng rng(12345);
+    const auto gen = rt::generate_runtime_x86(rng);
+    RwxImage rwx(gen.image.code);
+    g_x87_a = 1.5; g_x87_b = 2.5;
+    std::vector<u8> s;
+    isa::append_insn(s, mov_imm(5, static_cast<u32>(reinterpret_cast<uintptr_t>(&g_x87_a))));
+    isa::append_insn(s, x87_mem(5, isa::VmOp::Fld87Mem, 8));
+    // FNSTSW AX 词 = (a_kind=Imm, a=0=Rax 槽) — 与 translate_x87 AX 形发射一致。
+    isa::append_insn(s, isa::make_insn(isa::VmOp::Fnstsw87, isa::OpKind::Imm,
+                                       0, isa::OpKind::None, 0, 16,
+                                       isa::size_field(ir::Size::S16)));
+    isa::append_insn(s, halt());
+    rt::VmContext ctx;
+    ctx.regs[0] = 0xABCD'0000'0000'1234ull;  // guest Rax 预置
+    ctx.bytecode = s.data();
+    ctx.pc = 0;
+    rwx.entry()(&ctx);
+    // RMW: 高 48 位保持。⚠️ 不断言 SW 低 8 位 == 0 — 掩码异常标志 (IE 等)
+    // 是进程级粘滞位, 顺序依赖前面测试的 FPU 足迹 (D5: 测试也宁缺勿错)。
+    EXPECT_EQ(ctx.regs[0] >> 16, 0xABCD'0000'0000ull);
+}
+
+// ---------------------------------------------------------------------------
 // (27) X3b 批次六：RVA 族（LoadRva/StoreRva/LeaRva —— base+RVA 公式钉，非
 //      identity：base ≠ 0 时 VA ≠ RVA）
 // ---------------------------------------------------------------------------

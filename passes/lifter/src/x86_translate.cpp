@@ -2705,12 +2705,12 @@ std::optional<u8> st87_index(x86_reg r) {
 } // namespace
 
 TranslateResult translate_x87(const cs_insn& ci, const cs_x86& x) {
-    // T60 热修（D5 宁 gate 勿错）：词流 E2E 实测 x87 门批样例值错乱
-    // （x87gate fx 15.75→0.027344，x87l0 同域错值）——物理 FPU 驻留 handler
-    // 的执行序存在未定位缺陷，L0 激活回退为 gate，基建（枚举/handler/
-    // 电池测）保留 dormant 待根因修复后重启。battery 层手工 VmInsn 真执行
-    // 全绿 = handler 本体语义正确；错因在 lifter 解码→词流链路。
-    const bool kX87L0Enabled = false;
+    // T61 重启（4C 修复 + 硬件真值表）：T60 热修回退的根因 = 词流链路三处
+    // 缺陷 —— ① farith rev/pop/目的方向未按编码字节推导（D8/DC r 位反转
+    // 与 D8/DE 单操作数报告面，X87MatrixHardwareTruthFull 宿主实测钉表）；
+    // ② fcomip handler 双弹栈；③ Fnstsw87 AX 形发射/判据冲突。修复后
+    // handler 电池（X87FarithQuadrantsVm 等）+ 样本 E2E 复验。
+    const bool kX87L0Enabled = true;
     if (!kX87L0Enabled) return unsupported(ci.address, ci.size);
     ir::Insn out;
     out.addr = ci.address;
@@ -2791,30 +2791,37 @@ TranslateResult translate_x87(const cs_insn& ci, const cs_x86& x) {
     case X86_INS_FMUL: case X86_INS_FMULP:
     case X86_INS_FSUB: case X86_INS_FSUBP: case X86_INS_FSUBR: case X86_INS_FSUBRP:
     case X86_INS_FDIV: case X86_INS_FDIVP: case X86_INS_FDIVR: case X86_INS_FDIVRP: {
-        // mem 形 op_count==1 (单 MEM 操作数); reg 矩阵形 op_count==2。
+        // ** rev/pop 与目的方向从编码字节推导 ** (硬件真表, X86Battery.
+        // X87MatrixHardwareTruthFull 宿主实测钉死):
+        //   D8 reg: dst=st(0), 显式位=源; f=4 fsub, 5 fsubr, 6 fdiv, 7 fdivr
+        //   DC reg: dst=st(rm), 显式位=目的; f=4 fsubr, 5 fsub, 6 fdivr,
+        //           7 fdiv —— **r 位反转在 D8 与 DC 之间** (首版 Intel 表
+        //           记忆误置 DE, 实测推翻)
+        //   DE reg: 沿用 DC 方向 + pop; f=4 fsubrp, 5 fsubp, 6 fdivrp,
+        //           7 fdivp
+        //   mem 形: f=4 sub/6 div, f=5 subr/7 divr (mem 表**不**反转)
+        // capstone 5.0.6 对 D8/DE reg 报**单操作数** (op0=st(rm)), DC reg
+        // 报双操作数 (op0=st(rm)=dst, op1=st(0)); 命名与硬件全程一致。
+        const u8 opc = ci.bytes[0];
+        const u8 modrm = ci.bytes[1];  // cs_insn::bytes 定长 16, 矩阵形必有 modrm
+        const u8 f = (modrm >> 3) & 7;  // modrm reg 字段
+        const bool is_de = opc == 0xDE;
+        const bool is_mem = x.operands[0].type == X86_OP_MEM;
+        const bool rev = is_mem ? (f == 5 || f == 7)
+                        : opc == 0xD8 ? (f == 5 || f == 7)
+                                      : (f == 4 || f == 6);
         u32 aux = 0;
-        if (ci.id == X86_INS_FSUBR || ci.id == X86_INS_FSUBRP ||
-            ci.id == X86_INS_FDIVR || ci.id == X86_INS_FDIVRP)
-            aux |= 0x2;  // reverse 位 (R 助记符)
-        // capstone 5.0.6 无 FADDP id——faddp (DE /0) 折叠进 X86_INS_FADD,
-        // pop 位按首操作码字节判定 (D8/DC=不弹, DE=弹); FMULP/FSUBP 等有
-        // 独立 id, id 判定照旧。
-        if (ci.bytes[0] == 0xDE ||
-            ci.id == X86_INS_FMULP || ci.id == X86_INS_FSUBP ||
-            ci.id == X86_INS_FSUBRP || ci.id == X86_INS_FDIVP ||
-            ci.id == X86_INS_FDIVRP)
-            aux |= 0x1;  // pop 位
+        if (rev) aux |= 0x2;  // reverse 位
+        if (is_de) aux |= 0x1;  // pop 位
         Op base;
-        if (ci.id == X86_INS_FADD) base = Op::Fadd87;  // 含 faddp (DE 折叠)
-        else if (ci.id == X86_INS_FMUL || ci.id == X86_INS_FMULP) base = Op::Fmul87;
-        else if (ci.id == X86_INS_FSUB || ci.id == X86_INS_FSUBR ||
-                 ci.id == X86_INS_FSUBP || ci.id == X86_INS_FSUBRP)
-            base = Op::Fsub87;
+        if (f == 0) base = Op::Fadd87;
+        else if (f == 1) base = Op::Fmul87;
+        else if (f == 4 || f == 5) base = Op::Fsub87;
         else base = Op::Fdiv87;
-        if (x.operands[0].type == X86_OP_MEM) {
-            // mem 形: st0 ±×÷ [mem], 无 pop (faddp 无 mem 形)。
+        if (is_mem) {
+            // mem 形: st0 ±×÷ [mem], 无 pop (DE mod≠11 非算术矩阵)。
             if (x.op_count != 1) return fail();
-            if (aux & 0x1) return fail();
+            if (is_de) return fail();
             auto m = mem_operand(x.operands[0].mem);
             if (!m) return fail();
             const unsigned w = x.operands[0].size;
@@ -2825,23 +2832,26 @@ TranslateResult translate_x87(const cs_insn& ci, const cs_x86& x) {
             out.src2 = ir::Operand::imm_(aux);
             return ok(out);
         }
-        // T60 实测: faddp (DE C1) capstone 报**单 REG 操作数** (op0=st(i),
-        // 隐式 st(0)) → Fadd87{a=Imm(i), b=Imm(0), pop}。
-        if (x.op_count == 1 && x.operands[0].type == X86_OP_REG &&
-            ci.id == X86_INS_FADD) {
-            const auto di = st87_index(x.operands[0].reg);
-            if (!di) return fail();
-            out.op = Op::Fadd87;
-            out.dst = ir::Operand::imm_(*di);
-            out.src = ir::Operand::imm_(0);
-            out.src2 = ir::Operand::imm_(1);  // pop
+        if (x.op_count == 1 && x.operands[0].type == X86_OP_REG) {
+            // 单操作数报告 (D8/DE reg): op0=st(rm)。
+            const auto si = st87_index(x.operands[0].reg);
+            if (!si) return fail();
+            out.op = base;
+            if (is_de) {
+                out.dst = ir::Operand::imm_(*si);  // DE: 目的 = st(rm)
+                out.src = ir::Operand::imm_(0);
+            } else {
+                out.dst = ir::Operand::imm_(0);    // D8: 目的 = st(0)
+                out.src = ir::Operand::imm_(*si);
+            }
+            out.src2 = ir::Operand::imm_(aux);
             return ok(out);
         }
-        // (reg, reg) 矩阵: op0 = dst st(i), op1 = src st(j) (capstone 直读)。
+        // 双操作数报告 (DC reg): op0 = dst st(rm), op1 = src st(0)。
         if (x.op_count != 2) return fail();
         const auto di = st87_index(x.operands[0].reg);
         const auto sj = st87_index(x.operands[1].reg);
-        if (!di || !sj) return fail();
+        if (!di || !sj || *sj != 0) return fail();
         out.op = base;
         out.dst = ir::Operand::imm_(*di);
         out.src = ir::Operand::imm_(*sj);
@@ -2857,9 +2867,11 @@ TranslateResult translate_x87(const cs_insn& ci, const cs_x86& x) {
     case X86_INS_FSQRT:
         out.op = Op::Fsqrt87;
         return ok(out);
-    case X86_INS_FCOMI: {  // 含 fcomip (DF F0+i 折叠; pop 按首字节判定)
+    case X86_INS_FCOMI:  // fcomip = X86_INS_FCOMPI (T61 探针: dff1 报 fcompi)
+    case X86_INS_FCOMPI: {  // pop 按首字节判定 (DF)
         // capstone 实测: fcomi/fcomip 报**单 REG 操作数** (op0=st(i), 隐式
-        // st0); 双操作数形式保留兼容分支。
+        // st0); 双操作数形式保留兼容分支。FCOMI 只写 EFLAGS (不更新 SW
+        // C0) — handler 捕获链走物理 EFLAGS (setz/setp/setc)。
         const bool pop = ci.bytes[0] == 0xDF;
         const auto si = (x.op_count == 1 && x.operands[0].type == X86_OP_REG)
                             ? st87_index(x.operands[0].reg)
@@ -3277,7 +3289,8 @@ TranslateResult translate_insn(const cs_insn& ci, ir::Arch arch) {
     case X86_INS_FSUB: case X86_INS_FSUBP: case X86_INS_FSUBR: case X86_INS_FSUBRP:
     case X86_INS_FDIV: case X86_INS_FDIVP: case X86_INS_FDIVR: case X86_INS_FDIVRP:
     case X86_INS_FCHS: case X86_INS_FABS: case X86_INS_FSQRT:
-    case X86_INS_FCOMI:  // 含 fcomip (DF F0+i, capstone 无 FCOMIP id)
+    case X86_INS_FCOMI:
+    case X86_INS_FCOMPI:  // fcomip 独立 id (T61 探针: dff1 报 fcompi)
     case X86_INS_FLDCW:
     case X86_INS_FNSTCW:  // 含 fstcw (9B 前缀折叠, 无 FSTCW id)
     case X86_INS_FNSTSW:  // 含 fstsw ax/m16 (9B 前缀折叠, 无 FSTSW id)

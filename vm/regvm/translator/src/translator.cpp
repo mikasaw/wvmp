@@ -2997,11 +2997,22 @@ struct Translator {
             return emit_mem_op(VmOp::Fistp87Mem, in.src.mem, mem_width(in));
         case ir::Op::Fldcw87:
         case ir::Op::Fnstcw87:
-        case ir::Op::Fnstsw87:
             return emit_mem_op(in.op == ir::Op::Fldcw87 ? VmOp::Fldcw87
-                                : in.op == ir::Op::Fnstcw87 ? VmOp::Fnstcw87
-                                                              : VmOp::Fnstsw87,
+                                                        : VmOp::Fnstcw87,
                                in.src.mem, 16);
+        case ir::Op::Fnstsw87:
+            // [C]④ 修复: AX 形 (lifter: dst=reg Rax) 发 a_kind=Imm(2) +
+            // a=Rax 槽 — handler 以 a_kind==2 走 AX 路 (RMW guest Rax 槽);
+            // mem 形照旧 emit_mem_op (a_kind=Reg(1) + acc 槽)。原实现 AX
+            // 形无发射分支 (落入 mem 路径, in.src 非法) 且 handler 判据
+            // a_kind==1 与 mem 形发射冲突。
+            if (in.dst.kind == ir::Operand::Kind::Reg) {
+                em.emit(VmOp::Fnstsw87, OpKind::Imm,
+                        static_cast<u8>(in.dst.reg), OpKind::None, 0, 16,
+                        isa::size_field(ir::Size::S16));
+                return true;
+            }
+            return emit_mem_op(VmOp::Fnstsw87, in.src.mem, 16);
         case ir::Op::Fld87St:
         case ir::Op::Fst87St:
         case ir::Op::Fstp87St:
@@ -3040,8 +3051,21 @@ struct Translator {
                                 ? static_cast<u32>(in.src2.imm)
                                 : 0u;
             if (in.src.kind == ir::Operand::Kind::Mem) {
+                // mem 形 aux 位图: bit1=rev (lifter 按编码字节推导),
+                // bit2=dword / bit3=qword (宽度; 与 handler 位图表一致)。
+                // ⚠️ 不可用 mem_width(in) — lifter 把 rev 位放 src2.imm,
+                // mem_width 见 Imm 即当宽度 (原实现 aux=0 → handler 误走
+                // qword 分支, 4 字节 float 按 8 字节读 — T60 值错乱根因)。
                 if (aux & 0x1) return skip(in, "x87 mem 形无 pop 变体", nullptr);
-                return emit_mem_op(vop, in.src.mem, mem_width(in));
+                u8 acc = 0;
+                if (!emit_address(em, sc, in.src.mem, current_rva, next_ip,
+                                  sz_step_, acc, image_base_, image_extent_,
+                                  arch_))
+                    return skip(in, "x87 地址形态未支持", &in.src.mem);
+                const u32 w = in.size == ir::Size::S32 ? 4u : 8u;
+                em.emit(vop, OpKind::Reg, acc, OpKind::None, 0,
+                        (aux & 0x2u) | w, isa::size_field(ir::Size::S64));
+                return true;
             }
             if (in.dst.kind != ir::Operand::Kind::Imm ||
                 in.src.kind != ir::Operand::Kind::Imm)

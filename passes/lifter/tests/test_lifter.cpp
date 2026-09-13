@@ -2331,10 +2331,28 @@ TEST(LifterCleanup, NoTerminalRejected) {
 
 TEST(LifterX87, CapstoneProbeFaddpFcomiFldcw) {
     lifter::CapstoneSession session(ir::Arch::X86);
+    // T61 全矩阵探针: D8/DC 非弹 + DE 弹四象限 (fsub/fdiv 的 DE r 位反转)
+    // + faddp/fmulp + fcomi/fcomip。实证 capstone 5.0.6 助记符命名与
+    // (op0,op1) 报告序 —— rev 位判定的 ground truth。
     const wvmp::u8 code[] = {
+        0xD8, 0xE1,                   // fsub st(1), st(0)
+        0xD8, 0xE9,                   // fsubr st(1), st(0)
+        0xD8, 0xF1,                   // fdiv st(1), st(0)
+        0xD8, 0xF9,                   // fdivr st(1), st(0)
+        0xDC, 0xE1,                   // fsub st(1), st(0)
         0xDE, 0xC1,                   // faddp st(1), st(0)
+        0xDE, 0xC9,                   // fmulp st(1), st(0)
+        0xDE, 0xE1,                   // fsubrp st(1), st(0)  (DE r 位反转)
+        0xDE, 0xE9,                   // fsubp st(1), st(0)
+        0xDE, 0xF1,                   // fdivrp st(1), st(0)
+        0xDE, 0xF9,                   // fdivp st(1), st(0)
         0xDB, 0xF1,                   // fcomi st, st(1)
+        0xDF, 0xF1,                   // fcomip st, st(1)
         0xD9, 0x28,                   // fldcw [eax]
+        0xDF, 0xE0,                   // fnstsw ax
+        0xD9, 0x38,                   // fnstsw word [eax]
+        0xDD, 0x58, 0x10,             // fstp qword [eax+0x10]
+        0xDF, 0x58, 0x10,             // fistp word [eax+0x10]
     };
     const wvmp::u8* p2 = code;
     size_t left = sizeof(code);
@@ -2344,10 +2362,17 @@ TEST(LifterX87, CapstoneProbeFaddpFcomiFldcw) {
         std::printf("[T60-CAP] %s op_count=%u", ci->mnemonic,
                     ci->detail ? ci->detail->x86.op_count : 99u);
         if (ci->detail)
-            for (unsigned k = 0; k < ci->detail->x86.op_count; ++k)
-                std::printf(" op%u:type=%d", k,
-                            static_cast<int>(ci->detail->x86.operands[k].type));
-        std::printf("\n");
+            for (unsigned k = 0; k < ci->detail->x86.op_count; ++k) {
+                const auto& op = ci->detail->x86.operands[k];
+                std::printf(" op%u:type=%d", k, static_cast<int>(op.type));
+                if (op.type == X86_OP_REG)
+                    std::printf("(reg=%d,size=%u)", static_cast<int>(op.reg),
+                                op.size);
+                else if (op.type == X86_OP_MEM)
+                    std::printf("(base=%d,size=%u)", static_cast<int>(op.mem.base),
+                                op.size);
+            }
+        std::printf(" bytes=%02x%02x\n", ci->bytes[0], ci->bytes[1]);
     }
 }
 

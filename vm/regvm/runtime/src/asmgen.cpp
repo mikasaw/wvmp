@@ -5836,64 +5836,64 @@ public:
         return o;
     }
 
-    // 四则矩阵 (fadd/fmul/fsub[r]/fdiv[r]): 变体表 = 助记符按
-    // reverse(aux bit1)/pop(aux bit0) 选择; reg 形 (dst_i, src_j) 恒有
-    // dst==0 或 src==0 (translate 侧 gate; native 只编码 st(i),st 与
-    // st,st(i) 两形)。
+    // 四则矩阵 (fadd/fmul/fsub[r]/fdiv[r]): 助记符四象限 = f(pop=aux bit0,
+    // rev=aux bit1); reg 矩阵双布局 = (src==0: st(k) ⊕ st / dst==0: st ⊕
+    // st(k)) —— D8 编码目的恒 st0 (显式位=源), DC/DE 目的=st(rm), 两者皆
+    // 可达 (X86Battery.X87MatrixHardwareTruthFull 实测钉表)。mem 形无 pop:
+    // nn/rev 按助记符选。fisub/fidivr 整数实参族 = L0 范围外 (gate)。
     std::string build_x87_farith(u64 dispatch, const char* nn, const char* rev,
                                  const char* popnn, const char* poprev) const {
-        // 助记符四象限: (pop × reverse)。reg 树分支:
-        //   src==0 → st(dst) ⊕= st(0): nn / popnn (助记符 p 由 pop 位定)
-        //   dst==0 → st ⊕= st(src):    rev / poprev (R 语义 = 操作数反向)
-        // mem 形无 pop: nn / rev 按助记符选。fisub/fidivr 整数实参族 =
-        // L0 范围外 (gate)。
         std::string o = decode_prelude_x86();
         o += std::string("    mov ") + r32x(t_[0]) + ", " + xf(kX86FRegA) + "\n";
         o += std::string("    mov ") + r32x(t_[1]) + ", " + xf(kX86FRegB) + "\n";
         const std::string tag = std::string(nn);
-        // mem 形 (a_kind==Reg==1): st0 ±×÷ [mem]; reverse 助记符按 aux bit1。
-        // ⚠️ 判据 = a_kind==Reg (原 a_kind==0 判 None 误把 mem 形送进 reg
-        // 矩阵——packed x87=3 实证)。reg 形 (a_kind==Imm==2): aux bit0=pop,
-        // t0=dst_i, t1=src_i。
+        // mem 形 (a_kind==Reg==1): st0 ±×÷ [mem]。aux 位图: bit1=reverse,
+        // bit2=dword, bit3=qword (translator 侧同表装配; 原实现 aux=宽度
+        // 等值比较, 与 lifter 的 rev 位承载冲突 → mem 形误走 qword 分支,
+        // 4 字节 float 按 8 字节读 — T60 词流值错乱真根因)。
+        // reg 形 (a_kind==Imm==2): aux bit0=pop, t0=dst_i, t1=src_i。
         o += std::string("    cmp dword ptr ") + xf(kX86FAKind) + ", " + imm(1) + "\n    jne x87reg_" + tag + "\n";
         o += x87_mem_addr();
         o += std::string("    test dword ptr ") + xf(kX86FAux) + ", " + imm(2) + "\n    jnz x87rev_" + tag + "\n";
-        o += std::string("    cmp dword ptr ") + xf(kX86FAux) + ", " + imm(4) + "\n    je x87m4_" + tag + "\n";
+        o += std::string("    test dword ptr ") + xf(kX86FAux) + ", " + imm(4) + "\n    jnz x87m4_" + tag + "\n";
         o += std::string("    ") + nn + " qword ptr [" + r32x(t_[0]) + "]\n    jmp x87end_" + tag + "\n";
         o += std::string("x87m4_" + tag + ":\n    ") + nn + " dword ptr [" + r32x(t_[0]) + "]\n    jmp x87end_" + tag + "\n";
-        o += std::string("x87rev_" + tag + ":\n    cmp dword ptr ") + xf(kX86FAux) + ", " + imm(4) + "\n    je x87r4_" + tag + "\n";
+        o += std::string("x87rev_" + tag + ":\n    test dword ptr ") + xf(kX86FAux) + ", " + imm(4) + "\n    jnz x87r4_" + tag + "\n";
         o += std::string("    ") + rev + " qword ptr [" + r32x(t_[0]) + "]\n    jmp x87end_" + tag + "\n";
         o += std::string("x87r4_" + tag + ":\n    ") + rev + " dword ptr [" + r32x(t_[0]) + "]\n    jmp x87end_" + tag + "\n";
-        // reg 矩阵: (dst,src) 恒有 src==0 (st(i) ⊕ st(0) 形, 8 路 dst) 或
-        // dst==0 (st ⊕ st(src) 形, 8 路 src)。两树互斥由 src==0 守卫选择
-        // (首版缺守卫: 第一棵树对任意 t1 命中某 k 执行错分支——X87Comi
-        // 电池 2.5 实证)。pop 形按 pop 位选 p 助记符; dst==0+pop 仅
-        // fsubrp/fdivrp (faddp/fmulp 无 dst==0 形 → int3 防御不可达)。
-        o += std::string("x87reg_" + tag + ":\n    test dword ptr ") + xf(kX86FAux) + ", " + imm(1) + "\n    jnz x87pop_" + tag + "\n";
-        // —— 无 pop: src==0 守卫 → 8 路 dst (nn st(k), st) ——
-        o += std::string("    cmp dword ptr ") + xf(kX86FRegB) + ", " + imm(0) + "\n    jne x87second_" + tag + "\n";
-        for (int k = 0; k < 8; ++k)
-            o += std::string("    cmp ") + r32x(t_[0]) + ", " + imm(k) + "\n    jne x87s" + std::to_string(k) + "_" + tag + "\n" +
-                 std::string("    ") + nn + " st(" + std::to_string(k) + "), st\n    jmp x87end_" + tag + "\nx87s" + std::to_string(k) + "_" + tag + ":\n";
-        // —— 无 pop: dst==0 → 8 路 src (rev st, st(k)) ——
-        o += std::string("x87second_" + tag + ":\n    cmp dword ptr ") + xf(kX86FRegA) + ", " + imm(0) + "\n    jne x87bad_" + tag + "\n";
-        for (int k = 1; k < 8; ++k)
-            o += std::string("    cmp dword ptr ") + xf(kX86FRegB) + ", " + imm(k) + "\n    je x87u" + std::to_string(k) + "_" + tag + "\n";
-        o += "    int3\n    jmp x87end_" + tag + "\n";
-        for (int k = 1; k < 8; ++k)
-            o += std::string("x87u" + std::to_string(k) + "_" + tag + ":\n    ") + rev + " st, st(" + std::to_string(k) + ")\n    jmp x87end_" + tag + "\n";
-        // —— pop: src==0 → popnn st(k), st 8 路 dst ——
-        o += std::string("x87pop_" + tag + ":\n    cmp dword ptr ") + xf(kX86FRegB) + ", " + imm(0) + "\n    jne x87pz_" + tag + "\n";
-        for (int k = 0; k < 8; ++k)
-            o += std::string("    cmp ") + r32x(t_[0]) + ", " + imm(k) + "\n    jne x87p" + std::to_string(k) + "_" + tag + "\n" +
-                 std::string("    ") + popnn + " st(" + std::to_string(k) + "), st\n    jmp x87end_" + tag + "\nx87p" + std::to_string(k) + "_" + tag + ":\n";
-        // —— pop: dst==0 → poprev st, st(k) 8 路 src (仅 fsubrp/fdivrp) ——
-        o += std::string("x87pz_" + tag + ":\n    cmp dword ptr ") + xf(kX86FRegA) + ", " + imm(0) + "\n    jne x87bad_" + tag + "\n";
-        for (int k = 0; k < 8; ++k)
-            o += std::string("    cmp dword ptr ") + xf(kX86FRegB) + ", " + imm(k) + "\n    je x87q" + std::to_string(k) + "_" + tag + "\n";
-        o += "    int3\n    jmp x87end_" + tag + "\n";
-        for (int k = 0; k < 8; ++k)
-            o += std::string("x87q" + std::to_string(k) + "_" + tag + ":\n    ") + poprev + " st(" + std::to_string(k) + "), st\n    jmp x87end_" + tag + "\n";
+        // reg 矩阵: 四象限 (pop × rev) × 双布局 (src==0 → <M> st(k), st;
+        // dst==0 → <M> st, st(k))。助记符按 aux 位运行期选择 (首版按树位
+        // 绑定 → fsubr/fdivr 系方向错 — T60 验收 [C]②)。rev 助记符经装配
+        // 器映射: <rev> st(k), st → DC E8+k (st(k)←st0−st(k)),
+        // <rev> st, st(k) → D8 E8+k (st0←st(k)−st0), 语义各归其位。
+        // ⚠️ FSTP m64 = DD /3 ([eax]=DD 18 / [edx]=DD 1A); DD 20 系 FRSTOR
+        // (T61 探针实测踩雷)。
+        struct Quad { const char* mn; const char* label; };
+        const Quad quads[] = {{nn, "nn"}, {rev, "rv"}, {popnn, "pn"}, {poprev, "pr"}};
+        o += std::string("x87reg_" + tag + ":\n    test dword ptr ") + xf(kX86FAux) + ", " + imm(1) + "\n    jnz x87q_pop_" + tag + "\n";
+        o += std::string("    test dword ptr ") + xf(kX86FAux) + ", " + imm(2) + "\n    jnz x87q_rv_" + tag + "\n    jmp x87q_nn_" + tag + "\n";
+        o += std::string("x87q_pop_" + tag + ":\n    test dword ptr ") + xf(kX86FAux) + ", " + imm(2) + "\n    jnz x87q_pr_" + tag + "\n    jmp x87q_pn_" + tag + "\n";
+        for (const auto& qd : quads) {
+            const std::string ql = std::string("x87q_") + qd.label + "_" + tag;
+            const bool is_pop = qd.label[0] == 'p';  // pn/pr
+            // 布局 B (dst==0 → D8 形) 仅非弹象限可编码 (DE 目的恒 st(rm),
+            // lifter 字节表不产出 pop+dst==0); pop 象限布局 B 直落 int3。
+            const std::string dl =
+                is_pop ? std::string("x87bad_") + tag : ql + "_d0";
+            // —— 布局 A: src==0 → st(k) ⊕ st (DC/DE 形, dst=st(rm)) ——
+            o += ql + ":\n    cmp dword ptr " + xf(kX86FRegB) + ", " + imm(0) + "\n    jne " + dl + "\n";
+            for (int k = 0; k < 8; ++k)
+                o += std::string("    cmp ") + r32x(t_[0]) + ", " + imm(k) + "\n    jne " + ql + "s" + std::to_string(k) + "\n" +
+                     std::string("    ") + qd.mn + " st(" + std::to_string(k) + "), st\n    jmp x87end_" + tag + "\n" + ql + "s" + std::to_string(k) + ":\n";
+            o += std::string("    jmp x87end_") + tag + "\n";
+            if (is_pop) continue;
+            // —— 布局 B: dst==0 → st ⊕ st(k) (D8 形, 源=显式位) ——
+            o += dl + ":\n    cmp dword ptr " + xf(kX86FRegA) + ", " + imm(0) + "\n    jne x87bad_" + tag + "\n";
+            for (int k = 0; k < 8; ++k)
+                o += std::string("    cmp dword ptr ") + xf(kX86FRegB) + ", " + imm(k) + "\n    jne " + dl + "s" + std::to_string(k) + "\n" +
+                     std::string("    ") + qd.mn + " st, st(" + std::to_string(k) + ")\n    jmp x87end_" + tag + "\n" + dl + "s" + std::to_string(k) + ":\n";
+            o += std::string("    jmp x87end_") + tag + "\n";
+        }
         o += std::string("x87bad_" + tag + ":\n    int3\nx87end_" + tag + ":\n");
         o += advance_x86(dispatch);
         return o;
@@ -5909,7 +5909,10 @@ public:
         return build_x87_farith(d, "fsub", "fsubr", "fsubp", "fsubrp");
     }
     std::string build_x87_fdiv(u64 d) const {
-        return build_x87_farith(d, "fdiv", "fdivr", "fdiv", "fdivp");
+        // [C]① 修复: popnn/poprev 原误填 "fdiv"/"fdivp" → fdivp 不弹栈
+        // (泄漏槽位) + fdivrp 方向错。DE 表: F9=FDIVP (st(i)←st(i)/st0, pop),
+        // F1=FDIVRP (st(i)←st0/st(i), pop)。
+        return build_x87_farith(d, "fdiv", "fdivr", "fdivp", "fdivrp");
     }
 
     std::string build_x87_fchs(u64 dispatch) const {
@@ -5956,10 +5959,9 @@ public:
         o += std::string("    shl ") + r32x(t_[1]) + ", " + imm(4) + "\n";
         o += std::string("    or ") + r32x(t_[0]) + ", " + r32x(t_[1]) + "\n";
         o += std::string("    mov dword ptr [") + r32x(ctx_) + " + 0x98], " + r32x(t_[0]) + "\n";
-        if (pop) {
-            // fcomip 弹栈: 物理弹 + 无需模型维护 (物理驻留)。
-            o += "    fstp st(0)\n";
-        }
+        // [C]③ 修复: fcomip (DF F0+i) 自带弹栈 — 原实现误补 fstp st(0) 双弹
+        // (TOP 多进一位, 后续 st(i) 索引全错)。FCOMI 只写 EFLAGS 不动 SW
+        // C0 (X86Battery.X87FcomipFnstswHwTruth 实测), 无需 SW 清理。
         o += advance_x86(dispatch);
         return o;
     }
@@ -5980,17 +5982,24 @@ public:
     }
     std::string build_x87_fnstsw(u64 dispatch) const {
         std::string o = decode_prelude_x86();
-        // AX 形 (a_kind=Reg reg_a=Rax 槽): 物理 fnstsw ax → RMW guest Rax
-        // 槽低 16 位; mem 形 (aux=16): fnstsw [acc]。
-        o += std::string("    cmp dword ptr ") + xf(kX86FAKind) + ", " + imm(1) + "\n    je x87ax\n";
+        // [C]④ 修复: 判据对齐 translate 发射 — mem 形 = a_kind Reg(1)
+        // (emit_mem_op, reg_a=acc 槽 → x87_mem_addr); AX 形 = a_kind Imm(2)
+        // (reg_a = guest Rax 槽)。原判据 a_kind==1→AX 把 mem 形误送 AX 路。
+        o += std::string("    cmp dword ptr ") + xf(kX86FAKind) + ", " + imm(2) + "\n    je x87ax\n";
         o += x87_mem_addr();
         o += std::string("    fnstsw word ptr [") + r32x(t_[0]) + "]\n    jmp x87end\n";
-        o += std::string("x87ax:\n    mov ") + r32x(t_[1]) + ", " + xf(kX86FRegA) + "\n";
-        o += "    fnstsw ax\n";
+        o += std::string("x87ax:\n    fnstsw ax\n");
+        // ⚠️ fnstsw ax 覆写宿主 EAX — 违反 "FPU 不触 GP" handler 契约。
+        // SW 先溢出到帧 FCC 捕获区空闲字节 (+3/+4, 本 handler 独占不与
+        // fcomi 捕获链并发), 后续不再依赖 AX 存活 — 否则种子相关的临时
+        // 寄存器分配把 t_[N] 映到 EAX 时, 槽索引被 SW 覆写 → ctx 野写
+        // (DEADBEEF seed 实证 AV)。
+        o += std::string("    mov word ptr ") + xf(kX86FCC + 3) + ", ax\n";
+        o += std::string("    mov ") + r32x(t_[1]) + ", " + xf(kX86FRegA) + "\n";
         o += std::string("    mov ") + r32x(t_[0]) + ", dword ptr [" + r32x(ctx_) +
              " + " + r32x(t_[1]) + "*8 + 0x10]\n";
         o += std::string("    and ") + r32x(t_[0]) + ", " + imm(0xFFFF0000ull) + "\n";
-        o += std::string("    movzx ") + r32x(t_[2]) + ", ax\n";
+        o += std::string("    movzx ") + r32x(t_[2]) + ", word ptr " + xf(kX86FCC + 3) + "\n";
         o += std::string("    or ") + r32x(t_[0]) + ", " + r32x(t_[2]) + "\n";
         o += std::string("    mov dword ptr [") + r32x(ctx_) + " + " + r32x(t_[1]) +
              "*8 + 0x10], " + r32x(t_[0]) + "\nx87end:\n";
