@@ -77,8 +77,10 @@ inline constexpr std::array<int, 8> kCalleeSavedIdx = {2, 3, 4, 5, 10, 11, 12, 1
 struct alignas(16) XmmSlot { u64 xmm_lo, xmm_hi; };
 #pragma warning(pop)
 static_assert(sizeof(XmmSlot) == 16, "XmmSlot must be 16B (mimic __m128 layout)");
-// MIT-511 (档B wave1): 32B ymm 槽 (模拟 __m256 layout)。alignas(32) 保证
-// 未来 vmovaps ymm 全 32B 访问不 #GP；VmContext 总对齐随之升到 32。
+// MIT-511 (档B wave1): 32B ymm 槽 (模拟 __m256 layout)。alignas(32) 使
+// struct 布局偏移/宿主对象 32B 对齐；注意 stub 内 ctx 驻留宿主栈, 基址仅
+// 16B 对齐 (入口 rsp ≡ 8 mod 16) —— 面访问一律 movups (对齐安全); wave2
+// 若上 vmovaps 须先解决 ctx 基址对齐, 勿依赖本 struct 的 alignas 口径。
 #pragma warning(push)
 #pragma warning(disable : 4324)  // YmmSlot struct padded due to alignas(32)
 struct alignas(32) YmmSlot { u64 q[4]; };
