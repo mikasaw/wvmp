@@ -341,6 +341,10 @@ x86_samples=(
     # 2.6/2.7/5.5): fastcall ecx/edx args, custom-convention cl-count shift
     # helper (__aullshr pattern), edx:eax pair return storeback.
     "build/x86_samples/wvmp_x86_fastcall_sample.exe"
+    # MIT-508 (T60): x87l0 (pool 18 -> 19, x86 90 -> 95 runs, total 345).
+    # x87 L0 faces through the physical-FPU-resident handlers: fld/fadd/
+    # fstp m64, fild/faddp/fistp, fsqrt/fchs, fcomi+fnstsw, fldcw.
+    "build/x86_samples/wvmp_x86_x87l0_sample.exe"
 )
 
 # Seeds: 1 (small), 12345 (default), 99999 (large), 0xDEADBEEF (magic), 0xCAFEBABE (magic).

@@ -2328,6 +2328,29 @@ TEST(LifterCleanup, NoTerminalRejected) {
 }
 
 // ==================== MIT-506/507 (T60): x87 L0 解码 ====================
+
+TEST(LifterX87, CapstoneProbeFaddpFcomiFldcw) {
+    lifter::CapstoneSession session(ir::Arch::X86);
+    const wvmp::u8 code[] = {
+        0xDE, 0xC1,                   // faddp st(1), st(0)
+        0xDB, 0xF1,                   // fcomi st, st(1)
+        0xD9, 0x28,                   // fldcw [eax]
+    };
+    const wvmp::u8* p2 = code;
+    size_t left = sizeof(code);
+    wvmp::u64 addr = 0x1000;
+    const cs_insn* ci;
+    while ((ci = session.next(p2, left, addr)) != nullptr) {
+        std::printf("[T60-CAP] %s op_count=%u", ci->mnemonic,
+                    ci->detail ? ci->detail->x86.op_count : 99u);
+        if (ci->detail)
+            for (unsigned k = 0; k < ci->detail->x86.op_count; ++k)
+                std::printf(" op%u:type=%d", k,
+                            static_cast<int>(ci->detail->x86.operands[k].type));
+        std::printf("\n");
+    }
+}
+
 TEST(LifterX87, RegionDecodesX87Sequence) {
     // 真 x87 字节序列（fld m64; fadd m64; fstp m64; fchs; fnop）经
     // LifterPass 全管道 → IR 断言（物理 FPU 驻留架构的解码层验证）。

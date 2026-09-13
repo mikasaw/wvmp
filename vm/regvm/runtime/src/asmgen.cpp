@@ -5851,8 +5851,11 @@ public:
         o += std::string("    mov ") + r32x(t_[0]) + ", " + xf(kX86FRegA) + "\n";
         o += std::string("    mov ") + r32x(t_[1]) + ", " + xf(kX86FRegB) + "\n";
         const std::string tag = std::string(nn);
-        // mem 形 (a_kind==0): st0 ±×÷ [mem]; reverse 助记符按 aux bit1。
-        o += std::string("    cmp dword ptr ") + xf(kX86FAKind) + ", " + imm(0) + "\n    jne x87reg_" + tag + "\n";
+        // mem 形 (a_kind==Reg==1): st0 ±×÷ [mem]; reverse 助记符按 aux bit1。
+        // ⚠️ 判据 = a_kind==Reg (原 a_kind==0 判 None 误把 mem 形送进 reg
+        // 矩阵——packed x87=3 实证)。reg 形 (a_kind==Imm==2): aux bit0=pop,
+        // t0=dst_i, t1=src_i。
+        o += std::string("    cmp dword ptr ") + xf(kX86FAKind) + ", " + imm(1) + "\n    jne x87reg_" + tag + "\n";
         o += x87_mem_addr();
         o += std::string("    test dword ptr ") + xf(kX86FAux) + ", " + imm(2) + "\n    jnz x87rev_" + tag + "\n";
         o += std::string("    cmp dword ptr ") + xf(kX86FAux) + ", " + imm(4) + "\n    je x87m4_" + tag + "\n";
@@ -5862,27 +5865,36 @@ public:
         o += std::string("    ") + rev + " qword ptr [" + r32x(t_[0]) + "]\n    jmp x87end_" + tag + "\n";
         o += std::string("x87r4_" + tag + ":\n    ") + rev + " dword ptr [" + r32x(t_[0]) + "]\n    jmp x87end_" + tag + "\n";
         // reg 矩阵: (dst,src) 恒有 src==0 (st(i) ⊕ st(0) 形, 8 路 dst) 或
-        // dst==0 (st ⊕ st(src) 形, 8 路 src)。pop 形: src==0 → popnn 8 路;
-        // dst==0 → 仅 fsubrp/fdivrp (faddp/fmulp 无 dst==0 形 → int3 防御,
-        // translate 侧不可达)。
+        // dst==0 (st ⊕ st(src) 形, 8 路 src)。两树互斥由 src==0 守卫选择
+        // (首版缺守卫: 第一棵树对任意 t1 命中某 k 执行错分支——X87Comi
+        // 电池 2.5 实证)。pop 形按 pop 位选 p 助记符; dst==0+pop 仅
+        // fsubrp/fdivrp (faddp/fmulp 无 dst==0 形 → int3 防御不可达)。
         o += std::string("x87reg_" + tag + ":\n    test dword ptr ") + xf(kX86FAux) + ", " + imm(1) + "\n    jnz x87pop_" + tag + "\n";
+        // —— 无 pop: src==0 守卫 → 8 路 dst (nn st(k), st) ——
+        o += std::string("    cmp dword ptr ") + xf(kX86FRegB) + ", " + imm(0) + "\n    jne x87second_" + tag + "\n";
         for (int k = 0; k < 8; ++k)
-            o += std::string("    cmp ") + r32x(t_[1]) + ", " + imm(k) + "\n    jne x87s" + std::to_string(k) + "_" + tag + "\n" +
+            o += std::string("    cmp ") + r32x(t_[0]) + ", " + imm(k) + "\n    jne x87s" + std::to_string(k) + "_" + tag + "\n" +
                  std::string("    ") + nn + " st(" + std::to_string(k) + "), st\n    jmp x87end_" + tag + "\nx87s" + std::to_string(k) + "_" + tag + ":\n";
+        // —— 无 pop: dst==0 → 8 路 src (rev st, st(k)) ——
+        o += std::string("x87second_" + tag + ":\n    cmp dword ptr ") + xf(kX86FRegA) + ", " + imm(0) + "\n    jne x87bad_" + tag + "\n";
         for (int k = 1; k < 8; ++k)
-            o += std::string("    cmp ") + r32x(t_[1]) + ", " + imm(k) + "\n    jne x87t" + std::to_string(k) + "_" + tag + "\n" +
-                 std::string("    ") + rev + " st, st(" + std::to_string(k) + ")\n    jmp x87end_" + tag + "\nx87t" + std::to_string(k) + "_" + tag + ":\n";
-        o += std::string("    ") + rev + " st, st\n    jmp x87end_" + tag + "\n";
-        o += std::string("x87pop_" + tag + ":\n    cmp ") + r32x(t_[1]) + ", " + imm(0) + "\n    je x87pz_" + tag + "\n";
-        o += std::string("    ") + poprev + " st, st\n    jmp x87end_" + tag + "\n";
+            o += std::string("    cmp dword ptr ") + xf(kX86FRegB) + ", " + imm(k) + "\n    je x87u" + std::to_string(k) + "_" + tag + "\n";
+        o += "    int3\n    jmp x87end_" + tag + "\n";
         for (int k = 1; k < 8; ++k)
-            o += std::string("    cmp ") + r32x(t_[1]) + ", " + imm(k) + "\n    jne x87p" + std::to_string(k) + "_" + tag + "\n" +
-                 std::string("    ") + popnn + " st, st(" + std::to_string(k) + ")\n    jmp x87end_" + tag + "\nx87p" + std::to_string(k) + "_" + tag + ":\n";
-        o += std::string("x87pz_" + tag + ":\n");
+            o += std::string("x87u" + std::to_string(k) + "_" + tag + ":\n    ") + rev + " st, st(" + std::to_string(k) + ")\n    jmp x87end_" + tag + "\n";
+        // —— pop: src==0 → popnn st(k), st 8 路 dst ——
+        o += std::string("x87pop_" + tag + ":\n    cmp dword ptr ") + xf(kX86FRegB) + ", " + imm(0) + "\n    jne x87pz_" + tag + "\n";
         for (int k = 0; k < 8; ++k)
-            o += std::string("    cmp ") + r32x(t_[0]) + ", " + imm(k) + "\n    jne x87q" + std::to_string(k) + "_" + tag + "\n" +
-                 std::string("    ") + popnn + " st(" + std::to_string(k) + "), st\n    jmp x87end_" + tag + "\nx87q" + std::to_string(k) + "_" + tag + ":\n";
-        o += std::string("x87end_" + tag + ":\n");
+            o += std::string("    cmp ") + r32x(t_[0]) + ", " + imm(k) + "\n    jne x87p" + std::to_string(k) + "_" + tag + "\n" +
+                 std::string("    ") + popnn + " st(" + std::to_string(k) + "), st\n    jmp x87end_" + tag + "\nx87p" + std::to_string(k) + "_" + tag + ":\n";
+        // —— pop: dst==0 → poprev st, st(k) 8 路 src (仅 fsubrp/fdivrp) ——
+        o += std::string("x87pz_" + tag + ":\n    cmp dword ptr ") + xf(kX86FRegA) + ", " + imm(0) + "\n    jne x87bad_" + tag + "\n";
+        for (int k = 0; k < 8; ++k)
+            o += std::string("    cmp dword ptr ") + xf(kX86FRegB) + ", " + imm(k) + "\n    je x87q" + std::to_string(k) + "_" + tag + "\n";
+        o += "    int3\n    jmp x87end_" + tag + "\n";
+        for (int k = 0; k < 8; ++k)
+            o += std::string("x87q" + std::to_string(k) + "_" + tag + ":\n    ") + poprev + " st(" + std::to_string(k) + "), st\n    jmp x87end_" + tag + "\n";
+        o += std::string("x87bad_" + tag + ":\n    int3\nx87end_" + tag + ":\n");
         o += advance_x86(dispatch);
         return o;
     }

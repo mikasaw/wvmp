@@ -163,6 +163,13 @@ cl /nologo /utf-8 /O1 /MD /c "%~dp0x86_fastcall_main.c" || goto :fail
 link /nologo /SUBSYSTEM:CONSOLE /MACHINE:X86 x86_fastcall_main.obj x86_fastcall_sample.obj /OUT:"%~1\wvmp_x86_fastcall_sample.exe" || goto :fail
 .\wvmp_x86_fastcall_sample.exe || goto :fail
 
+rem (19) x87l0: x87 L0 faces (MIT-506/507 T60 bridge) -- fld/fadd/fstp m64,
+rem fild/faddp/fistp, fsqrt/fchs, fcomi+fnstsw, fldcw round trip.
+ml /nologo /c /Coff "%~dp0x86_x87l0_sample.asm" || goto :fail
+cl /nologo /utf-8 /O1 /MD /c "%~dp0x86_x87l0_main.c" || goto :fail
+link /nologo /SUBSYSTEM:CONSOLE /MACHINE:X86 x86_x87l0_main.obj x86_x87l0_sample.obj /OUT:"%~1\wvmp_x86_x87l0_sample.exe" || goto :fail
+.\wvmp_x86_x87l0_sample.exe || goto :fail
+
 rem ---- MIT-494m (T35): interpreter-dense microbenchmark (x86 dispatch
 rem throughput; QPC-timed region loop, checksum sentinel). Measured by
 rem scripts/measure_hotloop.sh; NOT in the byte-exact pools (ms line).

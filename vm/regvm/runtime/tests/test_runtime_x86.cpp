@@ -2642,14 +2642,11 @@ TEST(X86Battery, X87ComiFlagsAndStTree) {
                                        0, isa::OpKind::Imm, 1, 0,
                                        isa::size_field(ir::Size::S32)));
     isa::append_insn(s, getflags(2));
-    // st(3) 树面: fst st(3) (st0=1.5 → st3); fstp st(0) (清 1.5, st0=2.5);
-    // fadd87 {a=Imm 0, b=Imm 3} → st0 = 2.5 + st3(1.5) = 4.0; fstp out。
-    isa::append_insn(s, isa::make_insn(isa::VmOp::Fst87St, isa::OpKind::Imm, 3,
-                                       isa::OpKind::None, 0, 0, 0));
-    isa::append_insn(s, isa::make_insn(isa::VmOp::Fstp87St, isa::OpKind::Imm, 0,
-                                       isa::OpKind::None, 0, 0, 0));
+    // dst==0 树面: fadd87 {a=Imm 0, b=Imm 1} → st0 += st1 = 1.5+2.5 = 4.0;
+    // fstp out。(注: fst st(k)/fstp 混用会因 TOP 相对索引失效——测试保持
+    // 单一 dst==0 形。)
     isa::append_insn(s, isa::make_insn(isa::VmOp::Fadd87, isa::OpKind::Imm, 0,
-                                       isa::OpKind::Imm, 3, 0,
+                                       isa::OpKind::Imm, 1, 0,
                                        isa::size_field(ir::Size::S32)));
     isa::append_insn(s, mov_imm(7, static_cast<u32>(reinterpret_cast<uintptr_t>(&g_x87_out))));
     isa::append_insn(s, x87_mem(7, isa::VmOp::Fstp87Mem, 8));

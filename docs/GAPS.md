@@ -3912,3 +3912,14 @@ translator 发射（计数式断言，emit_address 前置 Mov 词）+ x86 电池
 执行 4 测（mem 算术往返/fchs+fsqrt/fild-fistp/fcomi flags+st 树/控制字
 往返）。全门：ctest 23/23、x86 电池、x64 sha f8b0ebd6 恒等、x86 结构门
 116 登记项。
+
+**MIT-508 E2E 记录（2026-09-13）**：新样本 `wvmp_x86_x87l0_sample`（asm 五
+face：fld/fadd/fstp m64（reg 形 faddp 变体）、fild/faddp/fistp 整链、
+fsqrt/fchs、fcomi+fnstsw、fldcw/fnstcw 往返）入 bat (19) + CMakeLists +
+multiseed 池（19→20? no: 18→19, x86 90→95, total 345）。native rc=0 五值
+全中；packed 真虚拟化 byte-exact PASS。**调试战实录（三连坑）**：①
+faddp/fcomi capstone 单 REG 操作数（隐式 st0）首版按双操作数解码 → 全
+gate；② fldcw 分派行漏插；③ **handler 标签布局错乱（je x87mem_ 后 mem
+体顺序落在跳转下方 = Imm 形顺序掉入 mem 体）→ x87=3 错值**——分支布局
+必须"跳转目标体放标签后、顺序体放跳转不命中路径"。全部修复后：packed
+rc=0 byte-exact ✓。wvmpTest 双 arch LOG IDENTICAL 复验 ✓。

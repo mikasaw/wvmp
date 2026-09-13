@@ -2818,6 +2818,18 @@ TranslateResult translate_x87(const cs_insn& ci, const cs_x86& x) {
             out.src2 = ir::Operand::imm_(aux);
             return ok(out);
         }
+        // T60 实测: faddp (DE C1) capstone 报**单 REG 操作数** (op0=st(i),
+        // 隐式 st(0)) → Fadd87{a=Imm(i), b=Imm(0), pop}。
+        if (x.op_count == 1 && x.operands[0].type == X86_OP_REG &&
+            ci.id == X86_INS_FADD) {
+            const auto di = st87_index(x.operands[0].reg);
+            if (!di) return fail();
+            out.op = Op::Fadd87;
+            out.dst = ir::Operand::imm_(*di);
+            out.src = ir::Operand::imm_(0);
+            out.src2 = ir::Operand::imm_(1);  // pop
+            return ok(out);
+        }
         // (reg, reg) 矩阵: op0 = dst st(i), op1 = src st(j) (capstone 直读)。
         if (x.op_count != 2) return fail();
         const auto di = st87_index(x.operands[0].reg);
@@ -2839,14 +2851,21 @@ TranslateResult translate_x87(const cs_insn& ci, const cs_x86& x) {
         out.op = Op::Fsqrt87;
         return ok(out);
     case X86_INS_FCOMI: {  // 含 fcomip (DF F0+i 折叠; pop 按首字节判定)
-        if (x.op_count != 2) return fail();
-        const auto si = st87_index(x.operands[1].reg);
+        // capstone 实测: fcomi/fcomip 报**单 REG 操作数** (op0=st(i), 隐式
+        // st0); 双操作数形式保留兼容分支。
+        const bool pop = ci.bytes[0] == 0xDF;
+        const auto si = (x.op_count == 1 && x.operands[0].type == X86_OP_REG)
+                            ? st87_index(x.operands[0].reg)
+                            : (x.op_count == 2 && x.operands[1].type == X86_OP_REG)
+                                  ? st87_index(x.operands[1].reg)
+                                  : std::nullopt;
         if (!si) return fail();
-        out.op = ci.bytes[0] == 0xDF ? Op::Fcomip87 : Op::Fcomi87;
+        out.op = pop ? Op::Fcomip87 : Op::Fcomi87;
         out.src = ir::Operand::imm_(*si);
         out.updates_flags = true;  // 物理 ZF/PF/CF → ctx flags 捕获链
         return ok(out);
     }
+    case X86_INS_FLDCW:
     case X86_INS_FNSTCW:  // 含 fstcw (9B 前缀折叠, 无 FSTCW id)
     case X86_INS_FNSTSW: {  // 含 fstsw ax/m16 (9B 折叠, 无 FSTSW id)
         if (x.op_count != 1) return fail();
@@ -3252,6 +3271,7 @@ TranslateResult translate_insn(const cs_insn& ci, ir::Arch arch) {
     case X86_INS_FDIV: case X86_INS_FDIVP: case X86_INS_FDIVR: case X86_INS_FDIVRP:
     case X86_INS_FCHS: case X86_INS_FABS: case X86_INS_FSQRT:
     case X86_INS_FCOMI:  // 含 fcomip (DF F0+i, capstone 无 FCOMIP id)
+    case X86_INS_FLDCW:
     case X86_INS_FNSTCW:  // 含 fstcw (9B 前缀折叠, 无 FSTCW id)
     case X86_INS_FNSTSW:  // 含 fstsw ax/m16 (9B 前缀折叠, 无 FSTSW id)
     case X86_INS_FNOP:

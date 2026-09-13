@@ -106,6 +106,8 @@ if(WIN32 AND MSVC AND EXISTS "${WVMP_VS_DIR}/VC/Auxiliary/Build/vcvarsamd64_x86.
                 "${CMAKE_CURRENT_SOURCE_DIR}/x86_pushmem_main.c"
                 "${CMAKE_CURRENT_SOURCE_DIR}/x86_fastcall_sample.asm"
                 "${CMAKE_CURRENT_SOURCE_DIR}/x86_fastcall_main.c"
+                "${CMAKE_CURRENT_SOURCE_DIR}/x86_x87l0_sample.asm"
+                "${CMAKE_CURRENT_SOURCE_DIR}/x86_x87l0_main.c"
                 "${CMAKE_CURRENT_SOURCE_DIR}/x86_hotloop_sample.asm"
                 "${CMAKE_CURRENT_SOURCE_DIR}/x86_hotloop_main.c"
                 "${CMAKE_CURRENT_SOURCE_DIR}/build_x86_e2e_samples.bat"
