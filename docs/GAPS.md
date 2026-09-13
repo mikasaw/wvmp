@@ -3828,3 +3828,20 @@ CPU 0.1s 计算完成后进程不退出 20+ 分钟，前台直跑同程序 0.075
 （loader 层双重拒绝：基址忽略 + 重定位放弃），防御深度定位维持，无后续
 工程项。本实验为破坏性输入诊断（非产品路径），T37 单测族（0x80000000
 折叠断言等）保持有效。
+
+## MIT-503（T57 · measure_perf 采样层挂死修复 + 环境元数据归一化，2026-09-13）
+
+**死锁根因（MIT-501 披露项收口）**：采样 ps1 经典 .NET 重定向死锁——父
+进程 `HasExited` 轮询期间不读管道，子进程写满匿名管道缓冲（默认 4KB）即
+永久阻塞写端；wvmpTest x86 test_target 的 stderr（105 条 [RUN] 行）恰跨
+阈值（snake 历史未爆纯因子进程输出极小）。**修复 = 双流 ReadToEndAsync
+前置**（轮询期间异步吸收，WaitForExit 后 GetResult 兜底）。
+
+**byte-exact 归一化**：修复死锁后暴露第二层——test_target 环境横幅自报
+image 路径行，native/protected 文件名天然不同 → 比对必差。修复 = 比对前
+剥除 `^image   :` 行（装载元数据非程序语义），其余字节严格 cmp。
+
+**实测（修复后全链）**：x64/x86 wvmpTest 双 sample 全测 **ALL OK**——
+RuntimeOverhead 对称 **1.56×/1.56×**（polling 口径 ExitTime−StartTime；
+与 T44 受控口径 1.74×/1.59× 差异 = polling 粒度 + 启动占比，趋势一致）；
+byte-exact 归一化后双侧 PASS。

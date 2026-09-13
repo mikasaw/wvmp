@@ -77,7 +77,11 @@ measure_one() {
 
     # -NoNewWindow + RedirectStandardOutput + CreateNoWindow: 避免弹窗与控制台缓冲.
     # -Wait 不可靠 (子进程太快, Wait-Process 偶发 timeout). 用 .NET Process 类 polling.
-    # Stdout: redirect pipe + sync ReadToEnd (snake 输出极少, 不会 deadlock).
+    # MIT-503 (T57): 双流 ReadToEnd **异步前置**——旧实现退出后才同步
+    # ReadToEnd，子进程写满管道缓冲（匿名管道默认 4KB）即永久阻塞写端 =
+    # 经典 .NET 重定向死锁（wvmpTest x86 test_target stderr 105 条 [RUN]
+    # 行恰跨阈值两轮实证；snake 历史未爆纯因子进程输出极小）。异步任务在
+    # 轮询期间持续吸收两流，WaitForExit 后 GetResult 兜底收尾。
     cat > "$script" <<'PWSH'
 param([string]$Exe, [string]$RcFile, [string]$MetricsFile, [string]$StdoutFile)
 $ErrorActionPreference = 'Stop'
@@ -90,6 +94,8 @@ $psi.CreateNoWindow = $true
 $p = New-Object System.Diagnostics.Process
 $p.StartInfo = $psi
 $null = $p.Start()
+$stdoutTask = $p.StandardOutput.ReadToEndAsync()
+$stderrTask = $p.StandardError.ReadToEndAsync()
 $peakWS = 0; $peakPriv = 0; $peakPage = 0
 while (-not $p.HasExited) {
     try { $p.Refresh() } catch { break }
@@ -99,9 +105,9 @@ while (-not $p.HasExited) {
     if ($p.PeakPagedMemorySize64 -gt $peakPage) { $peakPage = $p.PeakPagedMemorySize64 }
     Start-Sleep -Milliseconds 2
 }
-$stdoutText = $p.StandardOutput.ReadToEnd()
-$stderrText = $p.StandardError.ReadToEnd()
 $p.WaitForExit()
+$stdoutText = $stdoutTask.GetAwaiter().GetResult()
+$stderrText = $stderrTask.GetAwaiter().GetResult()
 $runtimeMs = [Math]::Round(($p.ExitTime - $p.StartTime).TotalMilliseconds, 2)
 # PowerShell 5.1 Set-Content -Encoding UTF8 写 BOM, 与 bash read 冲突. 用 .NET File.WriteAllText + UTF8Encoding($false).
 $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
@@ -304,12 +310,16 @@ for sample in "${samples[@]}"; do
 
     # 验证 native vs protected stdout 一致 (MVP P0 #1 byte-exact 退化检测).
     # 先各跑 1 次取 stdout 比较, 不一致直接判失败, 跳过本 sample 余下测量.
+    # MIT-503 (T57): 环境元数据归一化——样本自报的 image 路径行（wvmpTest
+    # test_target 环境横幅）native/protected 文件名天然不同，属装载元数据
+    # 非程序语义，比对前剥除（^image   : 前缀行）；其余字节严格 cmp。
     native_out_file="$tmp/${base}.native.stdout.check"
     protected_out_file="$tmp/${base}.protected.stdout.check"
     measure_one "$sample_abs" "${base}.native.check" "$native_out_file" "$tmp" >/dev/null || {
         echo "[measure] native stdout 采样失败 ($sample)" >&2; overall_fail=1; rm -rf "$tmp"; continue; }
     measure_one "$protected" "${base}.protected.check" "$protected_out_file" "$tmp" >/dev/null || {
         echo "[measure] protected stdout 采样失败 ($sample)" >&2; overall_fail=1; rm -rf "$tmp"; continue; }
+    sed -i '/^image   :/d' "$native_out_file" "$protected_out_file" 2>/dev/null || true
     if ! cmp -s "$native_out_file" "$protected_out_file"; then
         echo "[measure] FAIL byte-exact 退化 ($sample): native vs protected stdout 不一致" >&2
         diff "$native_out_file" "$protected_out_file" | head -5 >&2
