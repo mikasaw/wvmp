@@ -1161,6 +1161,13 @@ struct Translator {
                 // 是 xmm0..xmm7 编号 (lifter 借用 ir::Reg 值 0..7), 翻译期
                 // 加 24 偏移映射到 VmContext.regs[24..31] 保留槽位.
                 ok = translate_sse_mov(em, sc, in, current_rva, next_ip);
+            } else if (in.op == ir::Op::YmmMov || in.op == ir::Op::YmmLoad ||
+                       in.op == ir::Op::YmmStore) {
+                // MIT-512 (档B wave2①): ymm 传送 dispatch — REG-REG emit
+                // YmmMov (32B 面拷贝); MEM load/store emit YmmLoad/YmmStore
+                // (aux=32)。槽位复用 v24..31 = ymm0..7 (VmOp 域消歧);
+                // handler 面访问 vmovups (ctx 基址 16B 对齐)。
+                ok = translate_ymm_mov(em, sc, in, current_rva, next_ip);
             } else if (in.op == ir::Op::Xorps || in.op == ir::Op::Orps || in.op == ir::Op::Andps) {
                 // MIT-376: SSE 浮点位运算 dispatch — REG-REG 形式 emit 单条
                 // VmOp::Xorps/Orps/Andps; MEM 源 (MIT-408) 折条同 add。
@@ -2879,6 +2886,61 @@ struct Translator {
                    (in.op == ir::Op::Movapd) ? VmOp::Movapd :
                    (in.op == ir::Op::Movups) ? VmOp::Movups : VmOp::Movupd;
         em.emit_rr(vop, xmm_idx_dst + 24u, xmm_idx_src + 24u, sz);
+        return true;
+    }
+    // ---- MIT-512 (档B wave2①): ymm 传送 ymmmov/ymmload/ymmstore ----
+    //
+    // 与 translate_sse_mov (MIT-375/408) 同构: lifter 用 IR.dst.reg /
+    // IR.src.reg 借用 ir::Reg 值 0..7 代表 ymm0..7, 翻译期加 24 偏移映射
+    // 到 v24..31 槽位 (槽复用, VmOp 域语义消歧); 真正 32B 搬运在 handler
+    // (build_ymm_mov/load/store) 用 vmovups 读写 ctx.ymm[16] @ +0x1C0。
+    // 对齐变体 (aps/dqa vs ups/dqu) 在 lifter 已折叠, aux 恒 32。
+    //
+    // 编码: YmmMov a=Reg dst 槽 b=Reg src 槽; YmmLoad a=Reg dst 槽
+    // b=Reg addr 槽; YmmStore a=Reg addr 槽 b=Reg src 槽; aux=32。
+    bool translate_ymm_mov(Emitter& em, Scratch& sc, const ir::Insn& in,
+                           u64 current_rva, u64 next_ip) {
+        constexpr u8 kYmmWidth = 32;
+        if (in.dst.kind == ir::Operand::Kind::Mem) {
+            // store 方向: [mem], ymm — src 必为 ymm REG.
+            if (in.op != ir::Op::YmmStore)
+                return skip(in, "ymm 传送 操作数形态未支持", nullptr);
+            if (in.src.kind != ir::Operand::Kind::Reg)
+                return skip(in, "ymm 传送 操作数形态未支持", nullptr);
+            const u8 ymm_idx_src = static_cast<u8>(in.src.reg);
+            if (ymm_idx_src > 7u)
+                return skip(in, "ymm 索引越界 (仅支持 ymm0..ymm7)", nullptr);
+            u8 acc = 0;
+            if (!emit_sse_mem_addr(em, sc, in.dst.mem, current_rva, next_ip, acc))
+                return skip(in, "ymm 传送 地址形态未支持", &in.dst.mem);
+            em.emit(VmOp::YmmStore, OpKind::Reg, acc, OpKind::Reg,
+                    ymm_idx_src + 24u, kYmmWidth, isa::size_field(in.size));
+            return true;
+        }
+        if (in.dst.kind != ir::Operand::Kind::Reg)
+            return skip(in, "ymm 传送 操作数形态未支持", nullptr);
+        const u8 ymm_idx_dst = static_cast<u8>(in.dst.reg);
+        if (ymm_idx_dst > 7u)
+            return skip(in, "ymm 索引越界 (仅支持 ymm0..ymm7)", nullptr);
+        if (in.op == ir::Op::YmmLoad) {
+            if (in.src.kind != ir::Operand::Kind::Mem)
+                return skip(in, "ymm 传送 操作数形态未支持", nullptr);
+            u8 acc = 0;
+            if (!emit_sse_mem_addr(em, sc, in.src.mem, current_rva, next_ip, acc))
+                return skip(in, "ymm 传送 地址形态未支持", &in.src.mem);
+            em.emit(VmOp::YmmLoad, OpKind::Reg, ymm_idx_dst + 24u, OpKind::Reg,
+                    acc, kYmmWidth, isa::size_field(in.size));
+            return true;
+        }
+        if (in.op != ir::Op::YmmMov)
+            return skip(in, "ymm 传送 操作数形态未支持", nullptr);
+        if (in.src.kind != ir::Operand::Kind::Reg)
+            return skip(in, "ymm 传送 操作数形态未支持", nullptr);
+        const u8 ymm_idx_src = static_cast<u8>(in.src.reg);
+        if (ymm_idx_src > 7u)
+            return skip(in, "ymm 索引越界 (仅支持 ymm0..ymm7)", nullptr);
+        em.emit_rr(VmOp::YmmMov, ymm_idx_dst + 24u, ymm_idx_src + 24u,
+                   isa::size_field(in.size));
         return true;
     }
 

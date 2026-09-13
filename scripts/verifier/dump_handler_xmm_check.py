@@ -110,7 +110,14 @@ BRIDGE_HANDLERS = {"xmmfromgp", "gpfromxmm"}
 # halves; vzeroall has 8 xmm-face + 32 ymm-face = 40), physical
 # vzeroupper/vzeroall instruction present, pc advance add 1, and no
 # immediate-bearing sub/shl (the MIT-371 slot bug shape cannot occur here).
-VZERO_HANDLERS = {"vzeroupper", "vzeroall"}
+VZERO_HANDLERS = {"vzeroupper", "vzeroall"}
+# MIT-512 (T64 · AVX 档B wave2①): ymm data-path words (ymmmov/ymmload/
+# ymmstore).  Shape asserted (check_ymm_handler): slot-offset prologue is
+#   shl 5 / sub 0x300 (24*32) / add 0x1C0 (kCtxYmmBase) -- stride 32 face,
+# plus pc advance add 1 and >= 2 vmovups with ymm operands (load/store
+# pair; ymmmov has 2 prologues, mem forms 1).  All face accesses must be
+# vmovups (ctx base only 16B-aligned -- MIT-511 F3), so no vmovaps allowed.
+YMM_HANDLERS = {"ymmmov", "ymmload", "ymmstore"}
 
 # MIT-408: mem-form primitives (XmmLoad / XmmStore).  Expected shape:
 #   - memory-operand FP instruction present (movss/movsd/movups with a
@@ -401,6 +408,74 @@ def check_mem_handler(name: str, code: bytes, base_va: int, md) -> tuple[bool, l
     return ok, lines
 
 
+def check_ymm_handler(name: str, code: bytes, base_va: int, md) -> tuple[bool, list[str]]:
+    """Return (ok, evidence) for one MIT-512 ymm data-path word handler."""
+    lines: list[str] = []
+    ok = True
+
+    sub_imms: list[tuple[str, int]] = []
+    shl_imms: list[tuple[str, int]] = []
+    add_imms: list[tuple[str, int]] = []
+    vmovups_count = 0
+
+    for ins in md.disasm(code, base_va):
+        ops = ins.op_str
+        if ins.mnemonic in ("sub", "shl", "add"):
+            reg = gpr_name(ins, 0)
+            if reg is not None and ins.operands[1].type == capstone.x86.X86_OP_IMM:
+                immv = parse_imm(str(ins.operands[1].imm))
+                if ins.mnemonic == "sub":
+                    sub_imms.append((reg, immv))
+                elif ins.mnemonic == "shl":
+                    shl_imms.append((reg, immv))
+                else:
+                    add_imms.append((reg, immv))
+        if ins.mnemonic == "vmovups" and ops and "ymm" in ops:
+            vmovups_count += 1
+        if ins.mnemonic in ("vmovaps", "vmovapd", "vmovdqa", "vmovdqu"):
+            ok = False
+            lines.append(f"    FAIL: aligned ymm access `{ins.mnemonic} {ops}` (vmovups only)")
+
+    bad_sub = [(r, v) for (r, v) in sub_imms if v != 0x300]
+    bad_shl = [(r, v) for (r, v) in shl_imms if v != 5]
+    bad_add = [(r, v) for (r, v) in add_imms if v not in (0x1C0, 1)]
+    if bad_sub or bad_shl or bad_add:
+        ok = False
+        lines.append(
+            "    FAIL: immediates outside expected sets "
+            "sub{0x300} shl{5} add{0x1c0,1}: "
+            + ", ".join(f"{r},{hex(v)}" for r, v in bad_sub + bad_shl + bad_add)
+        )
+    else:
+        lines.append(
+            "    ok: sub/shl/add immediates = "
+            + ", ".join(f"{r},{hex(v)}" for r, v in sub_imms + shl_imms + add_imms)
+        )
+    if not any(v == 0x300 for (_, v) in sub_imms):
+        ok = False
+        lines.append("    FAIL: ymm stride prologue (sub 0x300) missing")
+    if not any(v == 5 for (_, v) in shl_imms):
+        ok = False
+        lines.append("    FAIL: ymm stride prologue (shl 5) missing")
+    n_add1c0 = sum(1 for (_, v) in add_imms if v == 0x1C0)
+    n_add1 = sum(1 for (_, v) in add_imms if v == 1)
+    if n_add1c0 < 1 or n_add1 < 1:
+        ok = False
+        lines.append(
+            f"    FAIL: prologue counts: add 0x1c0 x{n_add1c0} (<1?) "
+            f"or pc advance add 1 x{n_add1} (<1?)"
+        )
+    else:
+        lines.append(f"    ok: prologue add 0x1c0 x{n_add1c0}, add 1 x{n_add1}")
+    if vmovups_count < 2:
+        ok = False
+        lines.append(f"    FAIL: vmovups ymm count {vmovups_count} < 2")
+    else:
+        lines.append(f"    ok: vmovups ymm count = {vmovups_count}")
+
+    return ok, lines
+
+
 def check_vzero_handler(name: str, code: bytes, base_va: int, md) -> tuple[bool, list[str]]:
     """Return (ok, evidence) for one MIT-511 vzero ABI word handler."""
     lines: list[str] = []
@@ -558,6 +633,14 @@ def main() -> int:
             ok, lines = check_vzero_handler(name, code, off, md)
             verdict = "PASS" if ok else "FAIL"
             print(f"  [{verdict}] handler {name} @ +{hex(off)} ({len(code)} bytes, vzero-form)")
+            for ln in lines:
+                print(ln)
+            (passed if ok else failed).append(name)
+            all_ok = all_ok and ok
+        elif name in YMM_HANDLERS:
+            ok, lines = check_ymm_handler(name, code, off, md)
+            verdict = "PASS" if ok else "FAIL"
+            print(f"  [{verdict}] handler {name} @ +{hex(off)} ({len(code)} bytes, ymm-form)")
             for ln in lines:
                 print(ln)
             (passed if ok else failed).append(name)

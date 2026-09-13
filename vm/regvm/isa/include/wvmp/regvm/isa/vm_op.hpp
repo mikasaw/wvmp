@@ -654,9 +654,16 @@ enum class VmOp : u16 {
     Vzeroupper,     // vzeroupper (物理发射 + ctx.ymm[0..15] 上位 16B 清零)
     Vzeroall,       // vzeroall (物理发射 + ctx.xmm[8] 与 ctx.ymm[16] 全零;
                     //   注意 VZEROALL 含 EMMS 语义 — x64 区无 x87 词, 空效)
+
+    // ---- MIT-512 (T64): AVX 档B wave2① —— ymm 数据通路 (x64 host 专用;
+    //      槽位 v24..31 复用为 ymm0..7, 由 VmOp 域语义消歧; 面访问一律
+    //      vmovups 32B —— ctx 栈基址仅 16B 对齐, vmovaps 禁用)。 ----
+    YmmMov,         // ymm dst, ymm src — 32B 面到面拷贝 (vmovaps/vmovdqa 折叠)
+    YmmLoad,        // ymm dst, [mem] — a=Reg(dst 槽) b=Reg(addr 槽) aux=32
+    YmmStore,       // [mem], ymm src — a=Reg(addr 槽) b=Reg(src 槽) aux=32
     };
 
-inline constexpr u16 kVmOpMax = static_cast<u16>(VmOp::Vzeroall);  // MIT-511: 143
+inline constexpr u16 kVmOpMax = static_cast<u16>(VmOp::YmmStore);  // MIT-512: 146
 inline constexpr u16 kVmOpLimit = 1u << 14;  // 14 位编码空间上限
 
 constexpr const char* to_string(VmOp op) {
@@ -798,6 +805,9 @@ constexpr const char* to_string(VmOp op) {
         case VmOp::Fninit87: return "fninit87";
         case VmOp::Vzeroupper: return "vzeroupper";
         case VmOp::Vzeroall: return "vzeroall";
+        case VmOp::YmmMov: return "ymmmov";
+        case VmOp::YmmLoad: return "ymmload";
+        case VmOp::YmmStore: return "ymmstore";
     }
     return "?";
 }

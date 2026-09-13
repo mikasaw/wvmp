@@ -368,10 +368,26 @@ void StubLinkPass::run(ProtectionContext& ctx) {
             // scratch_mem 槽：运行时 Load/Store/Push/Pop 的访存汇编即
             // `[addr + image_base]`. 翻译期算的 RVA（rip-relative 转绝对）
             // + 此基址 = 实际 VA. ASLR 下基址变化不影响 RVA, 槽值不变.
+            // MIT-512 (档B wave2①): 词流含 Ymm* 词 → 本区 stub 启用宿主
+            // ymm0..7 全量同步变体（无 ymm 产物 stub 字节恒等 = 零回踩）。
+            // 词流布局 = 32B 头 + 8xN 词，词首字节 = VmOp。
+            bool uses_ymm = false;
+            {
+                const auto& bc = vf.program.bytecode;
+                for (size_t off = 32; off + 8 <= bc.size(); off += 8) {
+                    const int op = static_cast<int>(bc[off]);
+                    if (op == static_cast<int>(isa::VmOp::YmmMov) ||
+                        op == static_cast<int>(isa::VmOp::YmmLoad) ||
+                        op == static_cast<int>(isa::VmOp::YmmStore)) {
+                        uses_ymm = true;
+                        break;
+                    }
+                }
+            }
             stub = generate_entry_stub(stub_rva, blob_stream_rva, rt_entry, vf.end_rva,
                                        pe->image_base,
                                        is_x86 ? StubArch::X86 : StubArch::X64,
-                                       crypt_ptr, adb_ptr, &stub_abs_vas);
+                                       crypt_ptr, adb_ptr, &stub_abs_vas, uses_ymm);
         } catch (const std::exception& e) {
             ctx.diag.report(Severity::Error, name(),
                             "函数 " + vf.name + " stub 生成失败（保持原生）: " + e.what());

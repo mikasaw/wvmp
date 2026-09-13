@@ -2921,12 +2921,16 @@ TEST_F(LifterTranslate, VexYmmWidthGateNegative) {
     ASSERT_EQ(r.skipped_ranges.size(), 1u);
 }
 
-TEST_F(LifterTranslate, VexYmmMovapsGateNegative) {
-    // C5 FC 28 C8: vmovaps ymm1, ymm0 — ymm 2-op 拷贝同拒 (D4 注意
-    // "vmovaps 在 AVX 有 ymm 变体", 派活单 §E)。
+TEST_F(LifterTranslate, VexYmmMovapsNowFolded) {
+    // MIT-512 (档B wave2①) 翻转 (434 §B.4 先例): C5 FC 28 C8 vmovaps
+    // ymm1, ymm0 — 原 426 时代 gate 负例, ymm 传送通路落地后折叠为
+    // Op::YmmMov (对齐语义不模拟)。
     const wvmp::u8 b[] = {0xC5, 0xFC, 0x28, 0xC8};
     auto r = translate_bytes(x64, b, ir::Arch::X64);
-    EXPECT_EQ(r.status, lifter::TranslateStatus::Unsupported);
+    ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r.insn.op, ir::Op::YmmMov);
+    EXPECT_EQ(static_cast<int>(r.insn.dst.reg), 1);
+    EXPECT_EQ(static_cast<int>(r.insn.src.reg), 0);
 }
 
 TEST_F(LifterTranslate, VexXmm8UnmappedGate) {
@@ -3080,6 +3084,67 @@ TEST_F(LifterTranslate, VexVzeroCapstoneProbe) {
     EXPECT_EQ(ci->id, static_cast<unsigned>(X86_INS_VZEROALL));
     EXPECT_EQ(ci->detail->x86.op_count, 0u);
     EXPECT_EQ(ci->size, 3u);
+}
+TEST_F(LifterTranslate, YmmMovFolds) {
+    // MIT-512 (档B wave2①): vmov* ymm 32B 传送折叠 — 编码经 kstool 钉板。
+    // vmovups ymm0, ymm1 (C5 FC 10 C1, VEX.256.0F10 reg-reg) → Op::YmmMov
+    const wvmp::u8 movrr[] = {0xC5, 0xFC, 0x10, 0xC1};
+    auto r = translate_bytes(x64, movrr, ir::Arch::X64);
+    ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r.insn.op, ir::Op::YmmMov);
+    EXPECT_EQ(static_cast<int>(r.insn.dst.reg), 0);
+    EXPECT_EQ(static_cast<int>(r.insn.src.reg), 1);
+    EXPECT_FALSE(r.insn.updates_flags);
+
+    // vmovaps ymm0, ymm1 (C5 FC 28 C1) → 同折叠 (对齐语义不模拟, MIT-428 D2)
+    const wvmp::u8 aps[] = {0xC5, 0xFC, 0x28, 0xC1};
+    r = translate_bytes(x64, aps, ir::Arch::X64);
+    ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r.insn.op, ir::Op::YmmMov);
+
+    // vmovdqa ymm0, ymm1 (C5 FD 6F C1) → 同折叠
+    const wvmp::u8 dqa[] = {0xC5, 0xFD, 0x6F, 0xC1};
+    r = translate_bytes(x64, dqa, ir::Arch::X64);
+    ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r.insn.op, ir::Op::YmmMov);
+
+    // vmovups ymm0, [rcx] (C5 FC 10 01) → Op::YmmLoad (src = Mem)
+    const wvmp::u8 ld[] = {0xC5, 0xFC, 0x10, 0x01};
+    r = translate_bytes(x64, ld, ir::Arch::X64);
+    ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r.insn.op, ir::Op::YmmLoad);
+    EXPECT_EQ(r.insn.src.kind, ir::Operand::Kind::Mem);
+
+    // vmovups [rcx], ymm0 (C5 FC 11 01) → Op::YmmStore (src = ymm0)
+    const wvmp::u8 st[] = {0xC5, 0xFC, 0x11, 0x01};
+    r = translate_bytes(x64, st, ir::Arch::X64);
+    ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r.insn.op, ir::Op::YmmStore);
+    EXPECT_EQ(static_cast<int>(r.insn.src.reg), 0);
+
+    // vmovupd ymm3, [rcx] (C5 FD 10 19) → YmmLoad dst=3
+    const wvmp::u8 upd[] = {0xC5, 0xFD, 0x10, 0x19};
+    r = translate_bytes(x64, upd, ir::Arch::X64);
+    ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r.insn.op, ir::Op::YmmLoad);
+    EXPECT_EQ(static_cast<int>(r.insn.dst.reg), 3);
+}
+
+TEST_F(LifterTranslate, YmmGatesHold) {
+    // ymm8..15 gate (xmm8..15 同款) / x86 架构 gate / 算术族 32B 仍拒
+    // (wave2② 翻面)。
+    const wvmp::u8 ymm8[] = {0xC5, 0x7C, 0x10, 0xC1};  // vmovups ymm8, ymm1
+    auto r = translate_bytes(x64, ymm8, ir::Arch::X64);
+    EXPECT_EQ(r.status, lifter::TranslateStatus::Unsupported);
+
+    const wvmp::u8 movrr[] = {0xC5, 0xFC, 0x10, 0xC1};
+    r = translate_bytes(x64, movrr, ir::Arch::X86);
+    EXPECT_EQ(r.status, lifter::TranslateStatus::Unsupported);
+
+    // vaddps ymm0, ymm0, ymm1 (C5 FC 58 C1): 算术 32B → 位宽闸拒
+    const wvmp::u8 addps_ymm[] = {0xC5, 0xFC, 0x58, 0xC1};
+    r = translate_bytes(x64, addps_ymm, ir::Arch::X64);
+    EXPECT_EQ(r.status, lifter::TranslateStatus::Unsupported);
 }
 
 TEST_F(LifterTranslate, VexVpadddGate) {
@@ -3572,14 +3637,20 @@ TEST_F(LifterTranslate, VexVmovdqaVmovdquMirror) {
     const wvmp::u8 vdqa_x8[] = {0xC4, 0x41, 0xF9, 0x6F, 0xC0};
     EXPECT_EQ(translate_bytes(x64, vdqa_x8, ir::Arch::X64).status,
               lifter::TranslateStatus::Unsupported);
-    // ymm 位宽闸: C5 FD 6F C1 (vmovdqa ymm0, ymm1 — op.size=32, 同 mnemonic
-    // 覆盖 128/256 两宽, B.4 陷阱) → gate; vmovdqu ymm 同
+    // MIT-512 (档B wave2①) 翻转 (434 §B.4 先例): C5 FD 6F C1 (vmovdqa
+    // ymm0, ymm1 — op.size=32) 原位宽闸负例 → YmmMov 折叠; vmovdqu ymm 同
     const wvmp::u8 vdqa_ymm[] = {0xC5, 0xFD, 0x6F, 0xC1};
-    EXPECT_EQ(translate_bytes(x64, vdqa_ymm, ir::Arch::X64).status,
-              lifter::TranslateStatus::Unsupported);
+    {
+        auto rf = translate_bytes(x64, vdqa_ymm, ir::Arch::X64);
+        ASSERT_EQ(rf.status, lifter::TranslateStatus::Ok);
+        EXPECT_EQ(rf.insn.op, ir::Op::YmmMov);
+    }
     const wvmp::u8 vdqu_ymm[] = {0xC5, 0xFE, 0x6F, 0xC1};
-    EXPECT_EQ(translate_bytes(x64, vdqu_ymm, ir::Arch::X64).status,
-              lifter::TranslateStatus::Unsupported);
+    {
+        auto rf = translate_bytes(x64, vdqu_ymm, ir::Arch::X64);
+        ASSERT_EQ(rf.status, lifter::TranslateStatus::Ok);
+        EXPECT_EQ(rf.insn.op, ir::Op::YmmMov);
+    }
     // EVEX 不入面 (独立 INS id 天然 gate, 426 §F.3 同款): 62 F1 7D 08 6F C1
     // (vmovdqa32 xmm0, xmm1 — probe 实测 id=1026) / vmovdqa64 id=1027
     const wvmp::u8 evex32[] = {0x62, 0xF1, 0x7D, 0x08, 0x6F, 0xC1};

@@ -72,6 +72,12 @@ struct StubCrypt {
                                                   // MIT-494：非空时回填本 stub
                                                   // 内嵌的全部绝对 VA（.reloc
                                                   // 扩展站点登记源，精确零假阳）。
-                                                  std::vector<u64>* abs_vas = nullptr);
+                                                  std::vector<u64>* abs_vas = nullptr,
+                                                  // MIT-512 (档B wave2①): true 时
+                                                  // stub 入口/出口做宿主
+                                                  // ymm0..7 全量同步（仅
+                                                  // x64；区域词流含
+                                                  // Ymm* 词才置位）。
+                                                  bool ymm_sync = false);
 
 } // namespace wvmp::passes

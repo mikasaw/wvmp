@@ -302,7 +302,16 @@ enum class Op : u16 { Mov, Lea, Add, Sub, Adc, Sbb, And, Or, Xor, Not, Neg, Inc,
                       // ABI 词。x64 专属 (x86 架构 gate: MSVC x86 语料无
                       // VEX 发射面, 保持 gate 披露)；无操作数词，不写
                       // guest EFLAGS。
-                      Vzeroupper, Vzeroall };
+                      Vzeroupper, Vzeroall,
+
+                      // MIT-512 (T64): AVX 档B wave2① —— ymm 数据通路。
+                      // 寄存器编码沿用 SSE 惯例：IR.dst/src.reg 借用
+                      // ir::Reg 值 0..7 代表 ymm0..7（翻译器 +24 映射到
+                      // v24..31 槽位，VmOp 已含 ymm 域语义，无编码歧义）。
+                      // ymm8..15 与 x86 架构维持 gate。混排一致性由
+                      // virtualize 函数级 gate 保证（含 Ymm* 词的函数
+                      // 不得含 legacy SSE 词，否则整函数原生）。
+                      YmmMov, YmmLoad, YmmStore };
 enum class Size : u8 { S8, S16, S32, S64 };
 enum class Cond : u8 { O, No, B, Ae, E, Ne, Be, A, S, Ns, P, Np, L, Ge, Le, G };
 constexpr u64 bits(Size s) { return s==Size::S8?8: s==Size::S16?16: s==Size::S32?32:64; }

@@ -1751,6 +1751,8 @@ TranslateResult translate_movd_movq(const cs_insn& ci, const cs_x86& x, ir::Arch
 // 逐位等价; NaN 载荷传播顺序 (src1 优先) 理论上可差 — 与 MIT-411
 // comiss QNaN 同级别的 v1 披露面, native handler 执行的仍是真 add*/mul*。
 
+TranslateResult translate_ymm_mov(const cs_insn& ci, const cs_x86& x, ir::Arch arch);
+
 // V-pair 家族描述: 全部复用既有 translate 函数 (零新 IR 语义)。
 struct VexDesc {
     enum class Fam : u8 { Add, Sub, Div, Mul, Bit, Andn, Mov, Ucomis,
@@ -1847,6 +1849,15 @@ TranslateResult vex_invoke(const VexDesc& d, const cs_insn& ci, const cs_x86& x,
 TranslateResult translate_vex128(const cs_insn& ci, const cs_x86& x, ir::Arch arch) {
     const auto desc = vex_desc_of(static_cast<x86_insn>(ci.id));
     if (!desc) return unsupported(ci.address, ci.size);  // 白名单外 (现状 gate 保持)
+    // ---- MIT-512 (T64): 32B (ymm) 传送形态 → ymm 数据通路 (位宽闸前置)。
+    // 仅 Fam::Mov 六 id (vmovaps/vmovupd/vmovups/vmovdqa/vmovdqu/vmovapd);
+    // 算术族 32B 仍被下方位宽闸拒 (wave2② 翻面)。 ----
+    if (desc->fam == VexDesc::Fam::Mov && x.op_count == 2) {
+        bool all32 = true;
+        for (u8 i = 0; i < x.op_count; ++i)
+            if (x.operands[i].size != 32) all32 = false;
+        if (all32) return translate_ymm_mov(ci, x, arch);
+    }
     // ---- B.4 位宽闸: 32B (ymm) 禁入 — 同 mnemonic 覆盖 128/256 两宽 ----
     // MIT-427 (G1c): Fam::Bridge (vmovd/vmovq) 混合宽度操作数 (r32=4/r64=8)
     // 是合法形态 — 寄存器 16B 防御检查仅约束 SIMD 家族; 桥的形状/宽度判据
@@ -1957,6 +1968,59 @@ TranslateResult translate_vzero(const cs_insn& ci, const cs_x86& x, ir::Arch arc
     out.size = ir::Size::S32;
     out.updates_flags = false;
     out.addr = ci.address;
+    return ok(std::move(out));
+}
+
+// MIT-512 (T64 · 档B wave2①): ymm 传送通路 — vmovaps/vmovups/vmovapd/
+// vmovupd/vmovdqa/vmovdqu 的 32B (ymm) 形态。寄存器映射沿用 SSE 惯例:
+// IR.dst/src.reg 借用 ir::Reg 值 0..7 代表 ymm0..7 (翻译器 +24 → v24..31
+// 槽位); ymm8..15 维持 xmm8..15 同款 gate。三形式:
+//   (Reg,Reg) → Op::YmmMov / (Reg,Mem) → Op::YmmLoad / (Mem,Reg) → Op::YmmStore
+// 对齐语义差异 (aps vs ups / dqa vs dqu) 不模拟 (#GP 不模拟, MIT-428 D2
+// 先例 — face 访问一律 vmovups, ctx 栈基址仅 16B 对齐)。x86 架构 gate。
+TranslateResult translate_ymm_mov(const cs_insn& ci, const cs_x86& x, ir::Arch arch) {
+    if (arch != ir::Arch::X64) return unsupported(ci.address, ci.size);
+    if (x.op_count != 2) return unsupported(ci.address, ci.size);
+    const bool dst_reg = x.operands[0].type == X86_OP_REG;
+    const bool dst_mem = x.operands[0].type == X86_OP_MEM;
+    const bool src_reg = x.operands[1].type == X86_OP_REG;
+    const bool src_mem = x.operands[1].type == X86_OP_MEM;
+    if (dst_mem && src_mem) return unsupported(ci.address, ci.size);
+    if (!dst_reg && !dst_mem) return unsupported(ci.address, ci.size);
+    if (!src_reg && !src_mem) return unsupported(ci.address, ci.size);
+    auto ymm_idx = [&](x86_reg r) -> std::optional<u8> {
+        if (r >= X86_REG_YMM0 && r <= X86_REG_YMM7)
+            return static_cast<u8>(r - X86_REG_YMM0);
+        return std::nullopt;  // ymm8..15 gate (双保险: 位宽闸外层已拒一次)
+    };
+    ir::Insn out;
+    out.size = ir::Size::S64;   // 32B 整体读写 (与 SSE mov 族 tag 惯例一致)
+    out.updates_flags = false;
+    out.addr = ci.address;
+    if (dst_mem) {
+        auto si = ymm_idx(x.operands[1].reg);
+        if (!si) return unsupported(ci.address, ci.size);
+        auto m = mem_operand(x.operands[0].mem);
+        if (!m) return unsupported(ci.address, ci.size);
+        out.op = Op::YmmStore;
+        out.dst = *m;
+        out.src = ir::Operand::reg_(static_cast<ir::Reg>(*si));
+        return ok(std::move(out));
+    }
+    auto di = ymm_idx(x.operands[0].reg);
+    if (!di) return unsupported(ci.address, ci.size);
+    out.dst = ir::Operand::reg_(static_cast<ir::Reg>(*di));
+    if (src_mem) {
+        auto m = mem_operand(x.operands[1].mem);
+        if (!m) return unsupported(ci.address, ci.size);
+        out.op = Op::YmmLoad;
+        out.src = *m;
+    } else {
+        auto si = ymm_idx(x.operands[1].reg);
+        if (!si) return unsupported(ci.address, ci.size);
+        out.op = Op::YmmMov;
+        out.src = ir::Operand::reg_(static_cast<ir::Reg>(*si));
+    }
     return ok(std::move(out));
 }
 

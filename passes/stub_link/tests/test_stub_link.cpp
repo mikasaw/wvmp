@@ -442,4 +442,32 @@ TEST(StubGen, StubBytesStartWithPushesAndSubRsp) {
     EXPECT_TRUE(found_sub);
 }
 
+TEST(StubGen, YmmSyncVariantBytes) {
+    // MIT-512 (档B wave2①): ymm_sync 变体 = 既有 stub + 入口 8×vmovups
+    // store (C5 FD 11 84 24 disp32) + 出口 8×vmovups load (C5 FD 10 84 24
+    // disp32)。默认 false = 字节恒等（既有产物零回踩）。
+    const auto plain = wvmp::passes::generate_entry_stub(
+        0x9000, 0x9100, 0x9040, 0x1100, 0x140000000ull);
+    const auto ymm = wvmp::passes::generate_entry_stub(
+        0x9000, 0x9100, 0x9040, 0x1100, 0x140000000ull,
+        wvmp::passes::StubArch::X64, nullptr, nullptr, nullptr, true);
+    ASSERT_GT(ymm.size(), plain.size());
+    auto count = [](const std::vector<u8>& b, const u8* pat, size_t n) {
+        int c = 0;
+        for (size_t i = 0; i + n <= b.size(); ++i)
+            if (std::memcmp(b.data() + i, pat, n) == 0) ++c;
+        return c;
+    };
+    static const u8 st_pat[] = {0xC5, 0xFC, 0x11};  // vmovups [mem], ymm (kstool 钉板: 无 66 前缀)
+    static const u8 ld_pat[] = {0xC5, 0xFC, 0x10};  // vmovups ymm, [mem]
+    EXPECT_EQ(count(ymm, st_pat, sizeof(st_pat)), 8);
+    EXPECT_EQ(count(ymm, ld_pat, sizeof(ld_pat)), 8);
+    EXPECT_EQ(count(plain, st_pat, sizeof(st_pat)), 0);
+    EXPECT_EQ(count(plain, ld_pat, sizeof(ld_pat)), 0);
+    // x86 + ymm_sync → fail-closed throw
+    EXPECT_ANY_THROW((static_cast<void>(wvmp::passes::generate_entry_stub(
+        0x9000, 0x9100, 0x9040, 0x1100, 0x140000000ull,
+        wvmp::passes::StubArch::X86, nullptr, nullptr, nullptr, true))));
+}
+
 } // namespace

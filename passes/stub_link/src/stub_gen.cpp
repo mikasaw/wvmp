@@ -33,6 +33,7 @@ constexpr u64 kCtxNativeSp = 0x120; // M2-9 call gate: caller 原始 frame 基�
 // step 7 栈回退）都是消费方，禁止再各持硬编码副本（MIT-371 漂移根因）。
 using wvmp::regvm::runtime::kCtxSize;
 using wvmp::regvm::runtime::kCtxXmmBase;
+using wvmp::regvm::runtime::kCtxYmmBase;
 // MIT-407: ExitNative 退出槽深度（距 native_sp 的单一事实来源，runtime.hpp）。
 // 槽地址 = native_sp - kExitSlotDepth；本文件两处消费点按各自 rsp 基准换算：
 //   入口预写（rsp = ns - kStubPushBytes - kCtxSize）→ [rsp - 0x80]
@@ -275,7 +276,8 @@ std::string build_adb_asm_x86(u32 techniques) {
 // x64 stub 汇编（MIT-446 (X4) B.1 起更名 x64 专形；D2 恒等铁约束：函数体
 // 逐字保留，x64 asm_dump sha ffd47289(旧, MIT-474 换代→67cfa727)… 恒等是机器证明项）。
 std::string build_stub_asm_x64(u64 rt_entry_rva, u64 resume_rva, u64 image_base,
-                               const StubCrypt* crypt, const StubAntiDebug* adb) {
+                               const StubCrypt* crypt, const StubAntiDebug* adb,
+                               bool ymm_sync) {
     std::string o;
     // MIT-458: 加密函数在序言之前织入 one-shot 解密块（nullptr = 无加密，
     // 本函数体其余部分逐字节不变）。
@@ -343,6 +345,16 @@ std::string build_stub_asm_x64(u64 rt_entry_rva, u64 resume_rva, u64 image_base,
         o += std::string("movups [rsp + ") + hex(kCtxXmmBase + u64(i) * 16) +
              "], xmm" + std::to_string(i) + "\n";
     }
+    // MIT-512 (档B wave2①): ymm 变体 — 宿主 ymm0..7 全量同步到 ctx.ymm
+    // (8 槽 × 32B = 256B; vmovups 非对齐安全)。仅含 Ymm* 词的区域启用 —
+    // 无 ymm 产物保持零 AVX 机器要求 (MIT-511 F4 的 CPUID 面收窄到
+    // ymm 类区域)。低位在两语义面重复 (SSE 面权威不变, 出口先 xmm 后 ymm)。
+    if (ymm_sync) {
+        for (int i = 0; i < 8; ++i) {
+            o += std::string("vmovups [rsp + ") + hex(kCtxYmmBase + u64(i) * 32) +
+                 "], ymm" + std::to_string(i) + "\n";
+        }
+    }
     o += "mov rcx, rsp\n";                                   // Win64 第一参数 = ctx
     o += "call " + hex(rt_entry_rva) + "\n";
     // HALT 返回：回写易失寄存器（callee-saved 由 pop 恢复）。
@@ -363,6 +375,14 @@ std::string build_stub_asm_x64(u64 rt_entry_rva, u64 resume_rva, u64 image_base,
     for (int i = 0; i < 8; ++i) {
         o += std::string("movups xmm") + std::to_string(i) + ", [rsp + " +
              hex(kCtxXmmBase + u64(i) * 16) + "]\n";
+    }
+    // MIT-512: ymm 变体出口 — 后于 xmm 面回写 (ymm 类区域已 gate 掉
+    // legacy SSE 词, 两面无竞争; ymm 面低半 = 区域 ymm 词写终值)。
+    if (ymm_sync) {
+        for (int i = 0; i < 8; ++i) {
+            o += std::string("vmovups ymm") + std::to_string(i) + ", [rsp + " +
+                 hex(kCtxYmmBase + u64(i) * 32) + "]\n";
+        }
     }
     o += "add rsp, " + hex(kCtxSize) + "\n";
     o += "pop r15\n pop r14\n pop r13\n pop r12\n";
@@ -535,7 +555,11 @@ std::string build_stub_asm_x86(u64 rt_entry_rva, u64 blob_stream_rva,
 std::vector<u8> generate_entry_stub(u64 stub_rva, u64 blob_stream_rva, u64 rt_entry_rva,
                                     u64 resume_rva, u64 image_base, StubArch arch,
                                     const StubCrypt* crypt, const StubAntiDebug* adb,
-                                    std::vector<u64>* abs_vas) {
+                                    std::vector<u64>* abs_vas, bool ymm_sync) {
+    // MIT-512: ymm 同步变体仅 x64 有意义（x86 词流不可能含 Ymm* 词 —
+    // x86 白名单 gate 在前）。防御性 fail-closed。
+    if (ymm_sync && arch == StubArch::X86)
+        throw std::runtime_error("stub_link: ymm_sync is x64-only");
     ks_engine* ks = nullptr;
     if (ks_open(KS_ARCH_X86, arch == StubArch::X86 ? KS_MODE_32 : KS_MODE_64, &ks) !=
         KS_ERR_OK)
@@ -561,7 +585,8 @@ std::vector<u8> generate_entry_stub(u64 stub_rva, u64 blob_stream_rva, u64 rt_en
     const std::string src =
         arch == StubArch::X86
             ? build_stub_asm_x86(rt_entry_rva, blob_stream_rva, resume_rva, image_base, crypt, adb)
-            : build_stub_asm_x64(rt_entry_rva, resume_rva, image_base, crypt, adb);
+            : build_stub_asm_x64(rt_entry_rva, resume_rva, image_base, crypt, adb,
+                                 ymm_sync);
     // 调试钩子（排查用）：WVMP_STUB_DUMP=<win 路径> 时落盘汇编文本。
     {
         char* dp = nullptr;

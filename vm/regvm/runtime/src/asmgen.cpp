@@ -2358,6 +2358,54 @@ public:
         o += advance(dispatch);
         return o;
     }
+    // ---- MIT-512 (档B wave2①): ymm 数据通路 (x64 专用) ----
+    //
+    // 槽位公式: ymmN 槽 v24+N → 面偏移 kCtxYmmBase + N*32。
+    //   mov t9, slot; shl t9, 5; sub t9, 0x300 (24*32); add t9, 0x1C0
+    // 面访问一律 vmovups (ctx 栈基址仅 16B 对齐, F3 口径); vmovaps 禁用。
+    // 物理 ymm0 = handler scratch (面为权威, stub 出口回写)。
+    std::string ymm_offset_into_t9(int slot_t) const {
+        std::string o;
+        o += std::string("    mov ") + r64(t_[9]) + ", " + r64(slot_t) + "\n";
+        o += std::string("    shl ") + r64(t_[9]) + ", " + imm(5) + "\n";
+        o += std::string("    sub ") + r64(t_[9]) + ", " + imm(0x300) + "\n";
+        o += std::string("    add ") + r64(t_[9]) + ", " + imm(kCtxYmmBase) + "\n";
+        return o;
+    }
+    std::string build_ymm_mov(u64 dispatch) const {
+        std::string o = decode_prelude();
+        // 源 (reg_b) → t9 → ymm0
+        o += ymm_offset_into_t9(t_[7]);
+        o += std::string("    vmovups ymm0, [") + r64(ctx_) + " + " + r64(t_[9]) + "]\n";
+        // 目的 (reg_a) → t9 ← ymm0
+        o += ymm_offset_into_t9(t_[4]);
+        o += std::string("    vmovups [") + r64(ctx_) + " + " + r64(t_[9]) + "], ymm0\n";
+        o += advance(dispatch);
+        return o;
+    }
+    std::string build_ymm_load(u64 dispatch) const {
+        std::string o = decode_prelude();
+        // 地址 ← GP 槽 reg_b ([ctx + b*8 + 0x10])
+        o += std::string("    mov ") + r64(t_[1]) + ", qword ptr [" + r64(ctx_) + " + " +
+             r64(t_[7]) + "*8 + 0x10]\n";
+        o += std::string("    vmovups ymm0, [") + r64(t_[1]) + "]\n";
+        o += ymm_offset_into_t9(t_[4]);
+        o += std::string("    vmovups [") + r64(ctx_) + " + " + r64(t_[9]) + "], ymm0\n";
+        o += advance(dispatch);
+        return o;
+    }
+    std::string build_ymm_store(u64 dispatch) const {
+        std::string o = decode_prelude();
+        // 地址 ← GP 槽 reg_a ([ctx + a*8 + 0x10])
+        o += std::string("    mov ") + r64(t_[1]) + ", qword ptr [" + r64(ctx_) + " + " +
+             r64(t_[4]) + "*8 + 0x10]\n";
+        // 源 (reg_b) → t9 → ymm0
+        o += ymm_offset_into_t9(t_[7]);
+        o += std::string("    vmovups ymm0, [") + r64(ctx_) + " + " + r64(t_[9]) + "]\n";
+        o += std::string("    vmovups [") + r64(t_[1]) + "], ymm0\n";
+        o += advance(dispatch);
+        return o;
+    }
 
     // ---- MIT-376: SSE 浮点位运算 xorps / orps / andps ----
     //
@@ -6900,6 +6948,11 @@ RuntimeGenResult generate_runtime_arch(wvmp::Rng& rng, AsmGen::HostArch arch,
         // 无操作数, flag_sem kNone; ctx.ymm 面一致性回写见 handler 注释)。
         {int(VmOp::Vzeroupper), "vzeroupper", &AsmGen::build_vzeroupper},
         {int(VmOp::Vzeroall), "vzeroall", &AsmGen::build_vzeroall},
+        // MIT-512 (档B wave2①): ymm 传送词 (x64 host 专用; 槽 v24..31 =
+        // ymm0..7 复用; 混排 gate 见 virtualize_pass)。
+        {int(VmOp::YmmMov), "ymmmov", &AsmGen::build_ymm_mov},
+        {int(VmOp::YmmLoad), "ymmload", &AsmGen::build_ymm_load},
+        {int(VmOp::YmmStore), "ymmstore", &AsmGen::build_ymm_store},
         };
     }
     rng.shuffle(handlers.begin(), handlers.end());   // 码序随机

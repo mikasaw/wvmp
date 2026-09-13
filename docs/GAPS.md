@@ -4037,3 +4037,31 @@ pxor 零源/movups 面存数 ≥16|40/物理指令在场/add⊆{1}）。**验证
 ctest 全绿（新增 VzeroWordsHardwareTruth/VexVzeroCapstoneProbe，翻转
 VexVzeroupperGate）；vex128 样本 vzeroupper 负例翻正例（输出 byte-exact）；
 全池 REQUIRE_REAL 回归见 STATUS。
+
+**MIT-512 (T64) AVX 档B wave2① —— ymm 数据通路基础（2026-09-14，自主队列
+授权持续开发）**：+3 VmOp（kVmOpMax 143→146，147 < 256 跳表）——YmmMov/
+YmmLoad/YmmStore（vmovups/vmovaps/vmovdqa/vmovdqu 的 ymm 32B 形态折叠，
+对齐语义不模拟 = MIT-428 D2 先例；槽位 v24..31 复用为 ymm0..7，由 VmOp
+域语义消歧，5 位 reg 编码零改动；handler 面偏移公式 shl 5 / sub 0x300 /
+add kCtxYmmBase）。**按需 stub ymm 同步变体**：stub_link 扫描函数词流
+（32B 头 + 8×N 词首字节 = VmOp）含 Ymm* 词才置 ymm_sync——该区 stub 入口/
+出口做宿主 ymm0..7 全量同步（8×32B vmovups，出口后于 xmm 面回写）；无
+ymm 产物 stub 字节恒等 = 零回踩，且 AVX 机器要求收窄到 ymm 类区域
+（MIT-511 F4 CPUID 披露面收窄）。**xmm/ymm 混排 gate**（virtualize 函数
+级）：含 Ymm* 词且含 legacy SSE 词的函数 fail-closed 整函数原生——两面
+低半区各自权威，交错写 = 静默错值，wave2③ 混排契约落地前的保守 gate；
+vzeroupper/vzeroall 不在判据内（T63 handler 面一致性回写，无低半区竞争）。
+x86 架构 gate 继承（x86 词流不可能含 Ymm* 词——x86 白名单 gate 兜底 +
+stub_gen ymm_sync 仅 x64 fail-closed throw）。**测试**：YmmMovFolds（六
+编码 kstool 钉板）/ YmmGatesHold（ymm8..15 + x86 + vaddps ymm 算术仍拒）/
+YmmDataPathHardwareTruth（面/内存 32B 逐位对拍，AVX 缺失 SKIP）/
+YmmSyncVariantBytes（变体字节计数 + fail-closed throw）；426/428 时代
+位宽闸负例翻正（VexYmmMovapsNowFolded / VexVmovdqaVmovdquMirror 内 ymm
+断言翻转，434 §B.4 先例）。dump 门脚本扩 YMM_HANDLERS 形状检查（stride
+序文 / vmovups ymm ≥2 / 禁 vmovaps）。样本 wvmp_ymm_data_sample（①load/
+store ②全词链 ③vzeroupper 共存 ④混排负例，32B 逐位行为对拍）。**验证**：
+主树 ctest 23/23（YmmDataPathHardwareTruth 实跑非 SKIP）；全池 365/365
+（REQUIRE_REAL=1，池 70→71 样本，ymm 样本 ×5 byte-exact）；单 pack 对账
+stub 3（全 ymm 变体）+ 混排 gate note 命中；dump 门 ymm 三 handler PASS
+（101 handlers）。**遗留**（wave2②③，未批不动）：VEX.256 算术全谱 /
+vextractf128/vinsertf128 桥 / 混排契约（本单为 gate，落地后可翻面）。

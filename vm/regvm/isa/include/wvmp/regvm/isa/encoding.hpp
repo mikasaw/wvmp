@@ -102,7 +102,8 @@ enum class FlagSem { kNone, kRead, kWrite, kWriteReadMerge, kWriteReadReg };
                              // 前驱 Fcomi87 写被死写消除，fcmov 读陈旧位）
             return FlagSem::kRead;
         case VmOp::Vzeroupper: case VmOp::Vzeroall:  // MIT-511: 无 flags 面
-                                                     // （显式 kNone，自文档）
+        case VmOp::YmmMov: case VmOp::YmmLoad:       // MIT-512: 同 (显式
+        case VmOp::YmmStore:                         //   kNone，自文档)
             return FlagSem::kNone;
         default:
             return FlagSem::kNone;

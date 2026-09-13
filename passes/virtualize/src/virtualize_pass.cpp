@@ -5,6 +5,7 @@
 #include "wvmp/framework/protect_levels.hpp"
 #include "wvmp/framework/registry.hpp"
 #include "wvmp/regvm/backend/regvm_backend.hpp"
+#include "wvmp/regvm/isa/vm_op.hpp"  // MIT-512 混排 gate VmOp 词域
 #include "wvmp/vm/backend.hpp"
 
 #include <cstdio>
@@ -13,6 +14,8 @@
 #include <vector>
 
 namespace wvmp::passes {
+
+namespace isa = wvmp::regvm::isa;  // MIT-512 混排 gate 词域
 namespace {
 
 // 引用 regvm 的具名工厂符号，确保其翻译单元（含静态注册）进入链接——
@@ -86,6 +89,54 @@ void VirtualizePass::run(ProtectionContext& ctx) {
                                     "函数 " + fn.name + " 含不可翻译指令，跳过虚拟化" +
                                         "（保持原生）: " + n);
                 continue;
+            }
+
+
+            // MIT-512 (档B wave2①): xmm/ymm 混排 gate —— 含 Ymm* 词的函数
+            // 不得含 legacy SSE 词（两面低半区各自权威，交错写 = 静默错值；
+            // wave2③ 混排契约落地前 fail-closed 整函数原生）。vzeroupper/
+            // vzeroall 不在判据内（T63 handler 已做面一致性回写）。
+            {
+                bool has_ymm = false, has_sse = false;
+                const auto& bc = vf.program.bytecode;
+                for (size_t off = 32; off + 8 <= bc.size() && !(has_ymm && has_sse);
+                     off += 8) {
+                    switch (static_cast<isa::VmOp>(bc[off])) {
+                    case isa::VmOp::YmmMov:
+                    case isa::VmOp::YmmLoad:
+                    case isa::VmOp::YmmStore:
+                        has_ymm = true;
+                        break;
+                    case isa::VmOp::Addss: case isa::VmOp::Addps:
+                    case isa::VmOp::Addpd: case isa::VmOp::Addsd:
+                    case isa::VmOp::Subss: case isa::VmOp::Subps:
+                    case isa::VmOp::Subpd: case isa::VmOp::Subsd:
+                    case isa::VmOp::Divss: case isa::VmOp::Divps:
+                    case isa::VmOp::Divpd: case isa::VmOp::Divsd:
+                    case isa::VmOp::Mulss: case isa::VmOp::Mulsd:
+                    case isa::VmOp::Mulps: case isa::VmOp::Mulpd:
+                    case isa::VmOp::Movss: case isa::VmOp::Movsd:
+                    case isa::VmOp::Movaps: case isa::VmOp::Movapd:
+                    case isa::VmOp::Movups: case isa::VmOp::Movupd:
+                    case isa::VmOp::Xorps: case isa::VmOp::Orps:
+                    case isa::VmOp::Andps: case isa::VmOp::Andnps:
+                    case isa::VmOp::Ucomiss: case isa::VmOp::Ucomisd:
+                    case isa::VmOp::XmmLoad: case isa::VmOp::XmmStore:
+                    case isa::VmOp::XmmFromGp: case isa::VmOp::GpFromXmm:
+                        has_sse = true;
+                        break;
+                    default:
+                        break;
+                    }
+                }
+                if (has_ymm && has_sse) {
+                    ctx.diag.report(
+                        Severity::Note, name(),
+                        "函数 " + fn.name +
+                            " 含 ymm/legacy SSE 混排词流，跳过虚拟化（保持原生，"
+                            "档B wave2① 混排契约未落地前的保守 gate）");
+                    continue;
+                }
             }
 
             virtualized.push_back(std::move(vf));

@@ -1234,6 +1234,61 @@ TEST(Interpreter, VzeroWordsHardwareTruth) {
                 EXPECT_EQ(ctx->ymm[i].q[q], 0ull) << "ymm face " << i << "." << q;
     }
 }
+// MIT-512 (档B wave2①) 硬件真值: ymm 传送通路 — 面/内存 32B 逐位对拍。
+// 词链: YmmLoad buf→ymm3 / YmmMov ymm5←ymm3 / YmmStore buf2←ymm5 /
+//       YmmStore buf0←预载面 ymm1。
+TEST(Interpreter, YmmDataPathHardwareTruth) {
+    {
+        int info[4] = {};
+        __cpuid(info, 1);
+        const bool avx = (info[2] & (1u << 28)) != 0;
+        const bool osxsave = (info[2] & (1u << 27)) != 0;
+        if (!avx || !osxsave) GTEST_SKIP() << "host CPU/OS lacks AVX";
+        if ((_xgetbv(0) & 0x6) != 0x6) GTEST_SKIP() << "OS XCR0 not AVX-enabled";
+    }
+    const u8 sz32 = isa::size_field(ir::Size::S32);
+    wvmp::Rng rng(20260915);
+    const auto result = rt::generate_runtime(rng);
+    RwxImage rwx(result.image.code);
+    auto entry = rwx.entry();
+
+    alignas(32) std::array<u8, 0x80> buf{};
+    std::array<u8, 32> p1{}, p2{};
+    for (int i = 0; i < 32; ++i) {
+        p2[i] = static_cast<u8>(0x30 + i);
+        p1[i] = static_cast<u8>(0xA0 + i);
+        buf[i] = p2[i];                                   // buf[0x00] = P2 (load 源)
+        buf[0x40 + i] = 0xEE;                             // buf2 初始非零 (覆写必须全 32B)
+    }
+
+    std::vector<u8> s;
+    isa::append_insn(s, isa::make_insn(isa::VmOp::YmmLoad, isa::OpKind::Reg,
+                                       24 + 3, isa::OpKind::Reg, 5, 32, sz32));
+    isa::append_insn(s, isa::make_insn(isa::VmOp::YmmMov, isa::OpKind::Reg,
+                                       24 + 5, isa::OpKind::Reg, 24 + 3, 0, sz32));
+    isa::append_insn(s, isa::make_insn(isa::VmOp::YmmStore, isa::OpKind::Reg, 6,
+                                       isa::OpKind::Reg, 24 + 5, 32, sz32));
+    isa::append_insn(s, isa::make_insn(isa::VmOp::YmmStore, isa::OpKind::Reg, 5,
+                                       isa::OpKind::Reg, 24 + 1, 32, sz32));
+    isa::append_insn(s, halt());
+
+    rt::VmContext ctx;
+    ctx.bytecode = s.data();
+    ctx.pc = 0;
+    ctx.regs[5] = reinterpret_cast<u64>(buf.data());
+    ctx.regs[6] = reinterpret_cast<u64>(buf.data()) + 0x40;
+    for (int q = 0; q < 4; ++q)
+        ctx.ymm[1].q[q] = 0xAAAA'AAAA'AAAA'AAAull + static_cast<u64>(q);  // P1 面
+    std::memcpy(p1.data(), &ctx.ymm[1].q[0], 32);  // p1 = 面图案逐字节镜像
+    entry(&ctx);
+
+    // 面断言: load 落 ymm3 = P2; mov 落 ymm5 = P2
+    EXPECT_EQ(std::memcmp(&ctx.ymm[3].q[0], p2.data(), 32), 0) << "load 落面";
+    EXPECT_EQ(std::memcmp(&ctx.ymm[5].q[0], p2.data(), 32), 0) << "mov 落面";
+    // 内存断言: buf2 = P2 (load→mov→store 链); buf0 = P1 (预载面 → store)
+    EXPECT_EQ(std::memcmp(&buf[0x40], p2.data(), 32), 0) << "32B store (链)";
+    EXPECT_EQ(std::memcmp(&buf[0], p1.data(), 32), 0) << "32B store (面)";
+}
 
 TEST(Interpreter, SemanticBattery) {
     wvmp::Rng rng(0xC0FFEE);
