@@ -5972,20 +5972,32 @@ public:
         return o;
     }
 
+    // 8 路 `mn st(k)` 树 (k=7 直落; 标签后缀 tag 保证 u/fcomi 双实例唯一)。
+    std::string x87_comi_tree(const std::string& mn, const char* tag) const {
+        std::string tree;
+        for (int k = 0; k < 8; ++k) {
+            tree += std::string("    cmp dword ptr ") + xf(kX86FRegB) + ", " +
+                    imm(k) + "\n    jne x87cn" + tag + std::to_string(k) +
+                    "\n    " + mn + std::to_string(k) + ")\n    jmp x87cap\nx87cn" +
+                    tag + std::to_string(k) + ":\n";
+        }
+        tree += "    " + mn + "7)\n";
+        return tree;
+    }
+
     // fcomi/fcomip: 8 路 `fcomi st, st(k)` (+ pop 变体 fstp st(0)) → 物理
     // EFLAGS 捕获链 (setz/setp/setc → 帧字节 → 组装 ZF|CF<<1|PF<<4 →
     // [ctx+0x98]; OF/SF 位写 0 — native 保持旧值, 编译器不产 fcomi 后读
-    // OF/SF 序列, 披露面 MIT-509 验收 F6)。
+    // OF/SF 序列, 披露面 MIT-509 验收 F6)。aux bit0 = u 助记符
+    // (fucomi/fucomip — QNaN 静默比较, 不置 SW IE; MIT-510 FUCOMI 面)。
     std::string build_x87_fcomi(u64 dispatch, bool pop) const {
         std::string o = decode_prelude_x86();
+        o += std::string("    test dword ptr ") + xf(kX86FAux) + ", " + imm(1) +
+             "\n    jnz x87cu\n";
         const std::string mn = pop ? "fcomip st, st(" : "fcomi st, st(";
-        for (int k = 0; k < 8; ++k) {
-            o += std::string("    cmp dword ptr ") + xf(kX86FRegB) + ", " +
-                 imm(k) + "\n    jne x87ne" + std::to_string(k) + "\n    " +
-                 mn + std::to_string(k) + ")\n    jmp x87cap\nx87ne" +
-                 std::to_string(k) + ":\n";
-        }
-        o += std::string("    ") + mn + "7)\nx87cap:\n";
+        const std::string mun = pop ? "fucomip st, st(" : "fucomi st, st(";
+        o += x87_comi_tree(mn, "a") + "    jmp x87cap\n";
+        o += "x87cu:\n" + x87_comi_tree(mun, "b") + "x87cap:\n";
         // 捕获链 (帧 setcc 捕获区 0x1C..0x1E 复用): ZF/PF/CF → t_[0] 组装。
         o += std::string("    setz byte ptr ") + xf(kX86FCC) + "\n";
         o += std::string("    setp byte ptr ") + xf(kX86FCC + 1) + "\n";
