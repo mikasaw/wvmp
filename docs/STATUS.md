@@ -1300,3 +1300,6 @@ asmgen 零触碰 → dump 锚不受影响（无换代）。
 ### MIT-516 (T68 · wvmpTest 语料扩面批次) ✅ 2026-09-14
 - wvmpTest 仓 2657f86：+5 内核（LCG/CRC32 步进/Bezier Q8/Hadamard8/dot4f——标志/位运算/分支/数组/SSE 词面，全 32 位安全确定性驱动）。native 双 arch 105/105；双管道双跑 byte-exact（x64/x86 native vs packed 均 IDENTICAL）；stub x64=26/x86=26 全真虚拟化。t68 打包 toml 入库（顺带收编 T50 untracked toml）。
   证据链 GAPS MIT-516。
+### MIT-518 (T70 · 打包期 require_avx 配置开关) ✅ 2026-09-14
+- config 顶层 `[avx] require`（默认 true 零变化；false 时含 AVX 词流的函数整函数 gate——部署非 AVX 机器安全开关；G8b require_bmi2 同位预留）。实现 = ProtectRules 哨兵对 + config 解析（严格 schema 白名单同步）+ virtualize 值域扫描 gate。验证：ctest 23/23（+3 配置测试）；false 态管线 7 gate note + 0 stub；默认态全池 355/355 零回踩。开发实录：新顶层键三处同步（白名单/解析/消费），白名单最易漏。
+  证据链 GAPS MIT-518。

@@ -72,6 +72,11 @@ struct ProtectRules {
     bool has_pe_aslr = false;
     bool pe_aslr = true;                 // MIT-494: ASLR 兼容（保留 DYNAMIC_BASE
                                          // + .reloc 扩展；native 未 opt-in 时保守清除）
+    bool has_require_avx = false;
+    bool require_avx = true;             // MIT-518: AVX 词面开关（false 时
+                                         // ymm/vzero 词函数级 gate——部署非
+                                         // AVX 机器安全开关；G8b require_bmi2
+                                         // 同位预留）
 
     // 解析某函数的档位：显式规则覆盖缺省；index 规则先评、rva 规则后评
     // （rva 是跨重编译唯一较稳的选择器，后评 = 与 index 规则同时命中时

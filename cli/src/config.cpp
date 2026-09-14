@@ -122,6 +122,7 @@ ConfigResult parse_config(const std::filesystem::path& file) {
     // 必须响，不能静默吞。
     constexpr std::string_view kTopLevelKeys[] = {"input", "output", "seed", "arch",
                                                   "default_level", "functions", "passes",
+                                                  "avx",
                                                   "mutate", "anti_debug", "tls", "crypt",
                                                   "import", "pe"};
     for (const auto& [key, value] : tbl) {
@@ -430,6 +431,24 @@ ConfigResult parse_config(const std::filesystem::path& file) {
             return fail("config [import] 'skip_backfill' 必须是布尔值");
         result.value.rules.has_import_skip_backfill = true;
         result.value.rules.import_skip_backfill = *skip;
+    }
+
+    // [avx] require（MIT-518；默认 true；false = ymm/vzero 词函数级 gate
+    // ——部署非 AVX 机器的安全开关。require_bmi2 同位预留）。
+    if (const toml::node* avx_node = tbl.get("avx")) {
+        const toml::table* at = avx_node->as_table();
+        if (!at) return fail("config 字段 'avx' 必须是表（[avx]）");
+        for (const auto& [key, value] : *at)
+            if (key.str() != "require")
+                return fail("config [avx] 未知子键 '" + std::string(key.str()) +
+                            "'（允许: require）");
+        const toml::node* rq = at->get("require");
+        if (rq == nullptr) return fail("config [avx] 缺少子键 'require'");
+        auto req = rq->value<bool>();
+        if (!req)
+            return fail("config [avx] 'require' 必须是布尔值");
+        result.value.rules.has_require_avx = true;
+        result.value.rules.require_avx = *req;
     }
 
     // [pe] aslr（默认 true；true = 保留 native DYNAMIC_BASE + .reloc 扩展

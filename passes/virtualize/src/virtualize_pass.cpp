@@ -92,6 +92,30 @@ void VirtualizePass::run(ProtectionContext& ctx) {
             }
 
 
+            // MIT-518: require_avx 开关（默认 true = 现行为零变化）。
+            // false 时含 AVX 词（Vzeroupper 起的连续值域 = vzero + ymm 全族）
+            // 的函数整函数 gate——部署非 AVX 机器的安全开关。
+            if (rules != nullptr && rules->has_require_avx &&
+                !rules->require_avx) {
+                bool has_avx = false;
+                const auto& bc0 = vf.program.bytecode;
+                for (size_t off = 32; off + 8 <= bc0.size(); off += 8) {
+                    if (static_cast<int>(bc0[off]) >=
+                        static_cast<int>(isa::VmOp::Vzeroupper)) {
+                        has_avx = true;
+                        break;
+                    }
+                }
+                if (has_avx) {
+                    ctx.diag.report(
+                        Severity::Note, name(),
+                        "函数 " + fn.name +
+                            " 含 AVX 词流且 config require_avx=false，跳过虚拟化"
+                            "（保持原生，非 AVX 机器部署安全开关）");
+                    continue;
+                }
+            }
+
             // MIT-512 (档B wave2①): xmm/ymm 混排 gate —— 含 Ymm* 词的函数
             // 不得含 legacy SSE 词（两面低半区各自权威，交错写 = 静默错值；
             // wave2③ 混排契约落地前 fail-closed 整函数原生）。vzeroupper/

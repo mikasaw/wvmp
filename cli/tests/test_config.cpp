@@ -664,6 +664,42 @@ TEST(ConfigParse, MutateJunkDensityNonIntFails) {
     EXPECT_TRUE(contains(result.error, "junk_density"));
 }
 
+TEST(ConfigParse, AvxRequireParses) {
+    // MIT-518: [avx] require 开关（部署非 AVX 机器安全开关）。
+    const TempToml toml(
+        "input  = \"target.exe\"\n"
+        "output = \"out.exe\"\n"
+        "[avx]\n"
+        "require = false\n");
+    const auto result = wvmp::cli::parse_config(toml.path());
+    ASSERT_TRUE(result.ok) << result.error;
+    EXPECT_TRUE(result.value.rules.has_require_avx);
+    EXPECT_FALSE(result.value.rules.require_avx);
+}
+
+TEST(ConfigParse, AvxUnknownSubkeyFails) {
+    const TempToml toml(
+        "input  = \"target.exe\"\n"
+        "output = \"out.exe\"\n"
+        "[avx]\n"
+        "require = true\n"
+        "wat = 1\n");
+    const auto result = wvmp::cli::parse_config(toml.path());
+    ASSERT_FALSE(result.ok);
+    EXPECT_TRUE(contains(result.error, "wat"));
+}
+
+TEST(ConfigParse, AvxRequireMustBeBool) {
+    const TempToml toml(
+        "input  = \"target.exe\"\n"
+        "output = \"out.exe\"\n"
+        "[avx]\n"
+        "require = \"yes\"\n");
+    const auto result = wvmp::cli::parse_config(toml.path());
+    ASSERT_FALSE(result.ok);
+    EXPECT_TRUE(contains(result.error, "require"));
+}
+
 TEST(ConfigParse, PeAslrParses) {
     const TempToml toml(
         "input  = \"target.exe\"\n"

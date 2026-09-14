@@ -4191,3 +4191,24 @@ legacy-xmm 域翻转次数=混排共现密度）。
 持价值、待 T72 真实语料实测受影响函数密度后定；② vextractf128/vinsert
 f128 桥 = 零证据，维持频率门；③ BMI2 词 = 本画像不涉（BMI2 为 VEX-GP
 整数面，需专门 intrinsic 语料），维持 MIT-515 备忘录推荐。
+
+## MIT-518 (T70) 打包期 require_avx 配置开关（2026-09-14，自主队列；config 扩展小单）
+
+**做什么**：config 顶层新增 `[avx] require`（默认 true = 现行为零变化；
+严格 schema 白名单同步加 "avx" 键）。false 时 virtualize 对含 AVX 词流的
+函数（词 op ≥ VmOp::Vzeroupper 连续值域 = vzero + ymm 全族）整函数 gate
+（保持原生，Note 披露）——部署非 AVX 机器的安全开关；G8b require_bmi2
+同位预留（MIT-515 通路 A 的开关基建）。实现 = ProtectRules 加
+has_require_avx/require_avx 哨兵对（MIT-468 三态模式）+ config.cpp [avx]
+表解析 + virtualize 词流扫描 gate（混排 gate 同款机制，位于其之前）。
+
+**开发实录**：config 严格 schema（MIT-457 验收加固）的顶层键白名单漏加
+"avx" → 全部 [avx] 配置被"未知顶层字段"拒绝——首版仅加了解析块；症状 =
+单测 3 连败 + 管线静默走默认路径（gate note=0）。修复 = 白名单同步。
+**教训**：加新顶层配置键 = 白名单 + 解析块 + 消费方三处同步（白名单最易
+漏）。
+
+**验证**：ctest 23/23（+AvxRequireParses/AvxUnknownSubkeyFails/
+AvxRequireMustBeBool 三测试）；require_avx=false 管线实测：ymm 样本
+7 gate note + 0 stub（全部 AVX 函数原生保持）；默认态零回踩 = 全池
+355/355（REQUIRE_REAL=1）。
