@@ -4157,13 +4157,13 @@ x87 仅 MASM 样本面——主仓 x87l0/x87l1 样本已覆盖）；ymm 词面 x
 **方法**：`scripts/verifier/mit_517_avx_profile/`（8 算法集：字节拷贝/float
 点积/axpy/RGBX 灰度/s16 钳位/表驱动 CRC/u64 归约/AoS 字段整理；/O2 双变
 体 /arch:AVX vs /arch:SSE2；capstone 线性反汇编分类统计——VEX256=ymm 操
-作数 VEX 词、LEGACY_SSE=非 VEX xmm 词、switches=相邻 SIMD 指令 ymm↔
+作数 VEX 词、LEGACY_SSE=非 VEX/EVEX 的 xmm 词、EVEX=0x62 前缀（VS18 AVX10 clone 面，验收 F1 修正：误入 legacy 会虚高 switches——13→7）、switches=相邻 SIMD 指令 ymm↔
 legacy-xmm 域翻转次数=混排共现密度）。
 
-| 变体 | insns | VEX256 | VEX128 | LEG_SSE | VZERO | BRIDGE | switches |
-|---|---|---|---|---|---|---|---|
-| /arch:AVX | 20805 | 18 | 250 | 247 | 4 | 0 | 13 |
-| /arch:SSE2 | 20895 | 18 | 3 | 561 | 3 | 0 | 14 |
+| 变体 | insns | VEX256 | VEX128 | LEG_SSE | EVEX | VZERO | BRIDGE | switches |
+|---|---|---|---|---|---|---|---|---|
+| /arch:AVX | 20805 | 18 | 250 | 239 | 8 | 4 | 0 | 7 |
+| /arch:SSE2 | 20895 | 18 | 3 | 553 | 8 | 3 | 0 | 14 |
 
 **发现与挂账供数**：
 1. **/arch:AVX 下 VEX.128 大量出现（250 条）**——128 位向量化整体切 VEX
@@ -4173,14 +4173,17 @@ legacy-xmm 域翻转次数=混排共现密度）。
 3. **BRIDGE（vextractf128/vinsertf128 等）= 0**：MSVC 自动向量化不生成
    ——仅 intrinsic 面可产 → **桥维持频率门**（触发条件 = 真实语料出现，
    intrinsic 重度用户单独立项）。
-4. **混排 switches = 13/14 次/exe**：真实 codegen 中 ymm↔legacy-xmm 域
+4. **混排 switches = 7/14 次/exe（EVEX 修正口径）**：真实 codegen 中 ymm↔legacy-xmm 域
    切换高频存在（CRT 启动/标量尾循环/不可向量化段）——混排协议翻面的
    价值数据支持为正，但受益前提 = 切换点落在受保护函数区内；当前 marker
    区粒度（函数级、纯计算内核）下实际受影响函数密度待 T72 语料实测。
-5. **意外发现（披露）**：/arch:SSE2 产物亦含 18 条 VEX256——静态 CRT 的
-   memcpy CPU 派发面（运行时 isa 检测后选 AVX 路径）自带 ymm 指令与
-   vzeroupper → "纯 SSE2 编译产物零 ymm 依赖"的假设不成立于静态 CRT 场
-   景（CRT 派发自带运行时检测，安全；但 dump 门/词流审计口径需知悉）。
+5. **意外发现（披露，验收 F2 归因修正）**：/arch:SSE2 产物亦含 18 条
+   VEX256——定位实证：12 条 = **用户代码 k_grey 的 VS18 多版本自动向量化
+   AVX10/256 clone**（main 内 `__isa_available>=6` 运行时检查保护），
+   6 条 = CRT strnlen/memchr 族字符串函数派发（`__isa_available>=5` +
+   自带 vzeroupper）→ "纯 SSE2 编译产物零 ymm 依赖"的假设不成立（两路
+   均自带运行时检测，安全；但 dump 门/词流审计口径需知悉——新版工具链
+   会对用户代码产 ymm clone）。
    开发实录：avx_kernels.cpp 含中文注释未加 /utf-8 → CP936 尾字节吞换
    行假性 C2065（T63 教训再现，build_avx.bat 已加 /utf-8）。
 

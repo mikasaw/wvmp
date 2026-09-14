@@ -27,13 +27,18 @@ VEX = {0xC4, 0xC5}
 def classify(ins):
     mn = ins.mnemonic
     ops = ins.op_str
-    is_vex = bytes(ins.bytes)[0] in VEX
+    b0 = bytes(ins.bytes)[0]
+    is_vex = b0 in VEX
+    is_evex = b0 == 0x62  # MIT-517 验收 F1: EVEX 独立分类 (VS18 可产
+                          # AVX10/256 clone, 计入 legacy SSE 会虚高)
     has_ymm = "ymm" in ops or "ymm" in mn
     has_xmm = "xmm" in ops or "xmm" in mn
     if mn in ("vzeroupper", "vzeroall"):
         return "VZERO"
     if mn.startswith(("vextractf128", "vextracti128", "vinsertf128", "vinserti128")):
         return "BRIDGE"
+    if is_evex:
+        return "EVEX"
     if is_vex:
         return "VEX256" if has_ymm else ("VEX128" if has_xmm else "VEX_OTHER")
     if has_xmm:

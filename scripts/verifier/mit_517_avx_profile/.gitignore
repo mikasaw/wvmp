@@ -1,0 +1,4 @@
+avx_build.exe
+sse2_build.exe
+*.obj
+*.pdb
