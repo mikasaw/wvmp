@@ -1,12 +1,11 @@
 # WVmp（中文）
 
-一个自研的 PE 虚拟机保护壳。将 x86/x64 Windows 可执行文件中的标记区域翻译为自研的寄存器式虚拟机（97 ops，跳表调度），通过 stub-link 派发回原 native 代码。
+一个自研的 PE 虚拟机保护壳。将 x86/x64 Windows 可执行文件中的标记区域翻译为自研的寄存器式虚拟机（164 ops，跳表调度），通过 stub-link 派发回原 native 代码。
 
 ![x64 direct](https://img.shields.io/badge/x64_direct-99.26%25-brightgreen)
 ![x86 direct](https://img.shields.io/badge/x86_direct-95.15%25-green)
 ![wvmpTest x86](https://img.shields.io/badge/wvmpTest_x86-85.7%25-yellowgreen)
-![main](https://img.shields.io/badge/main-0b6c5ba-blue)
-![baseline](https://img.shields.io/badge/baseline-330%2F330-brightgreen)
+![baseline](https://img.shields.io/badge/baseline-355%2F355-brightgreen)
 
 > **语言**： [English](README.md) | **简体中文**
 
@@ -17,20 +16,42 @@
 | **x64 (PE32+)** | 0x8664 | **生产可用** |
 | **x86 (PE32)** | 0x14C | **生产可用**（WOW64 已验证）|
 
-Native 客户端代码路径不变。被标记的区域（两段连续 8 字节 magic）翻译为自研寄存器式虚拟机（97 ops，跳表 128 项）。输出在 `byte-exact` 校验下保持行为字节级一致——完整支持矩阵见 [docs/GAPS.md](docs/GAPS.md)。
+Native 客户端代码路径不变。被标记的区域（两段连续 8 字节 magic）翻译为自研寄存器式虚拟机（164 ops，跳表 256 项）。输出在 `byte-exact` 校验下保持行为字节级一致——完整支持矩阵见 [docs/GAPS.md](docs/GAPS.md)。
 
-## 永久 gate 边界（已文档化，非缺陷）
+指令面亮点（2026-09）：**AVX/VEX.256**——x64 侧完整 ymm 数据通路（`vmov*` + 18 条 packed 算术、`vzeroupper`/`vzeroall`、按需 stub ymm 同步）；**x87 FPU**——x86 侧虚拟化（L0–L4：load/store、比较、fcmov、超越函数）。两者在另一侧架构均按架构 gate 处理——见下方 Gate 边界。
 
-WVmp 把下列指令族**显式标记为永久 gate**——含这些指令的区域保持 native 执行，输出字节级一致，但**不进行虚拟化**：
+## Gate 边界（已文档化，非缺陷）
+
+含被 gate 指令的区域保持 native 执行、输出字节级一致，但不做虚拟化。Gate 分三类：
+
+**架构 gate**（该架构的代码生成不产生该指令族）：
+
+| 指令族 | 范围 | 说明 |
+|---|---|---|
+| x87 FPU (D8-DF) | x64 区域 | MSVC x64 浮点默认走 SSE；x87 在 x86 侧已虚拟化（MIT-509/510）。|
+| ymm / VEX.256 | x86 区域 | MSVC x86 无 VEX 发射面（MIT-511）。|
+| EVEX（0x62 前缀）| 双架构 | 尚未 lift。|
+
+**频率 gate**（证据驱动翻面；挂账追踪 MIT-521）：
+
+| 指令族 | 重审触发条件 |
+|---|---|
+| legacy SSE 与 ymm 同函数混排 | 整函数保持 native；出现真实保护样本需要混排协议时翻面（MIT-514）。|
+| `vextractf128`/`vinsertf128` 水平操作 | +2 VmOp 桥；已在 intrinsic 归约代码中实证存在（MIT-520），同一触发条件入面。|
+| VEX-GP BMI2（`mulx`/`pdep`/`pext`）| 待 BMI2 最低机器产品决策；`mulx` 不修改 CF/ZF 已在 Zen5 实测钉死（MIT-515）。|
+
+**永久**：
 
 | 指令族 | 为何永久 |
 |---|---|
-| **x87 FPU (D8-DF)** | MSVC 默认对浮点用 SSE ，x87 仅出现在 legacy 或 `/arch:IA32` 构建中。实现 x87 handler 会为极罕见的真实场景占用跳表槽位。（MIT-418 R3、MIT-445 §6 B 路线、MIT-455 B 路线关闭。）|
-| **间接 jmp（`jmp [mem]`/`jmp reg`）** | 静态可分析的"表形"在 System32 / SysWOW64 全语料中占比 < 0.001%。主导形态（任意 mem/reg）需要 L 级运行时分析。（MIT-455 §3.2 关闭——维护销案。）|
-| **mul64hi 类栈深边界** | x86 栈帧保存区是有限的。外层依赖需要前瞻式 ESP 同步——延后处理。|
-| **SEH（`fs:[...]`）/段覆盖** | 需要与 Windows 异常派发器协作，超出当前研究线范围。 |
+| 间接 jmp（`jmp [mem]`/`jmp reg`）| 静态可分析的"表形"在 System32 / SysWOW64 全语料中占比 < 0.001%；主导形态需要 L 级运行时分析。（MIT-455 §3.2、MIT-494x。）|
+| SEH（`fs:[...]`）/段覆盖 | 需要与 Windows 异常派发器协作，超出当前研究线范围。|
 
-完整图景见 [docs/GAPS.md](docs/GAPS.md) §X7 收口节与 §Gate 分布表。
+历史注记：x87 与 mul64hi 栈深边界曾是永久 gate——两者均已翻案（x87 → 分架构虚拟化，MIT-509/510；mul64hi → esp-resync 前瞻 + callee `ret N` 扫描，MIT-497/500，x86 22/22 区域全虚拟化）。当前状态表见 [docs/GAPS.md](docs/GAPS.md)。
+
+## 配置（TOML）
+
+打包行为经 TOML 配置：每函数保护档位（`default_level` + `[[functions]]` 规则，MIT-457）与 `[avx] require`（默认 `true`；置 `false` 时含 AVX 词的函数保持 native，使打包产物可在非 AVX 机器上运行，MIT-518）。
 
 ## 构建（Windows / MSVC / Ninja，需 VS 18 Insiders）
 
@@ -68,6 +89,8 @@ tests\wvmpTest\smoke_test.bat
 
 ## 覆盖率（X7 重扫，2026-09-03）
 
+*2026-09-03 全量重扫快照。此后指令面继续扩展（x86 侧 x87、x64 侧 ymm/AVX——见 Gate 边界），本重扫先于该扩展。*
+
 | 指标 | 数值 |
 |---|---|
 | **x64 助记符级 direct 覆盖率**（System32 103 文件 / 17.6M clean 指令）| **99.26%** |
@@ -87,11 +110,13 @@ python scripts\verifier\mit_x7_rescan.py
 
 WVmp 自 2026-08-29 起通过 [multica](https://github.com/multica-ai/multica) 驱动开发——每一次能力扩展都是一条带项目主验证的派活单。
 
-**24 单全部 ACCEPTED，0 拒绝 / 0 取消，覆盖两个里程碑：**
-- **M2.5-G（指令虚拟化阶段）**——MIT-419 至 MIT-435，基线 240/240，已收官
-- **M2.5-X（多目标平台阶段）**——MIT-436 至 MIT-455，基线 330/330，已收官
+**同一派单纪律自 MIT-419 起连续执行至 MIT-521：**
+- **M2.5-G（指令虚拟化阶段，x64）**——MIT-419 至 MIT-435，基线 240/240
+- **M2.5-X（多目标平台阶段，x86 生产可用）**——MIT-436 至 MIT-455，基线 330/330
+- **M3 保护表面（工作流 1-5）**——自 MIT-456 起：五个保护 pass 全部交付 v1 及一波加固（配置系统、TLS-hook 初始化、dr*/RDTSC 检查、导入引用重写）
+- **指令面扩展（x86 侧 x87 / x64 侧 ymm+AVX）**——MIT-509 至 MIT-521，含两波自主离线批次（2026-09-14）
 
-完整工单目录、纪律沉淀、累积教训见 [docs/MULTICA_ISSUES.md](docs/MULTICA_ISSUES.md)。
+[docs/MULTICA_ISSUES.md](docs/MULTICA_ISSUES.md) 收录 M2.5 时期的工单目录与纪律沉淀；之后的批次记录在 [docs/STATUS.md](docs/STATUS.md)。
 
 **原始 multica 工件**（155 文件 /451KB）单独打包供下载：`docs/multica-archive.tar.gz`。**此文件不入 git**，**（保持仓轻量）**。日常运营以 multica 面板为权威源。
 
@@ -101,78 +126,44 @@ WVmp 自 2026-08-29 起通过 [multica](https://github.com/multica-ai/multica) �
 |---|---|
 | M2.5-G 指令虚拟化（x64） | 已完成（2026-08-31）|
 | M2.5-X 多目标平台（x86 生产可用）| 已完成（2026-09-03）|
-| M3 保护表面（下方工作流 1-5）| 六条工作流排队待派（见后续开发计划）|
-| 扩展表面（下方工作流 7-9）| 三条工作流 park，等触发（见后续开发计划）|
-| 产品表面（下方工作流 6）| 一条工作流，依赖工作流 1-5（见后续开发计划）|
+| M3 保护表面（工作流 1–5）| **v1 已交付**（2026-09，MIT-456 波次）——见后续开发计划 |
+| 指令面扩展（x86 x87 / x64 ymm+AVX / BMI2 备忘录）| 已完成（2026-09-14，MIT-509–521）|
+| 频率 gate 指令积压 | 开放，样本驱动（SSE+ymm 混排、`vextractf128` 桥、BMI2 契约——MIT-521）|
+| 产品表面（工作流 6 GUI）| 未开始，已被工作流 1–5 解锁 |
+| 扩展表面（工作流 7–9）| park，等触发 |
 
 ## 后续开发计划
 
-M2.5-G + M2.5-X 收官后，还排有 **9 条能力工作流**。它们是 WVmp 的**独立产品**（不是 M2.5-X 的"阶段"）——每条都有自己的范围、前置条件、派单计划。按**路线图顺序**（数据侧 → 产品表面）排序，而非优先级。
+九条能力工作流规划于 M2.5-G + M2.5-X 收官之后，是 WVmp 的**独立产品**。**工作流 1–5 已于 2026 年 9 月交付 v1**（MIT-456 波次）：五个保护 pass 全部实体化、接入流水线、可按函数配置。工作流 6（GUI）与工作流 7–9 维持后续工作。当前开放积压 = Gate 边界节列出的频率 gate 指令集——SSE+ymm 混排协议、`vextractf128`/`vinsertf128` 桥、BMI2 最低机器决策——全部证据驱动（MIT-521）。
 
-`passes/` 下五个保护 pass（`anti_debug` / `crypt` / `integrity_crc` / `import_protect` / `mutate`）以及 `vm/regvm/codecs/` 模块当前都是占位（见 `docs/STATUS.md`「M3 插件池 ⏳ 未开始」）。工作流 1-5 是这些占位如何变成实产品的路径。工作流 7-9 把保护表面扩展到更宽范围（驱动 / VM 检测 / 主机 OS 表层）并显式 park 等外部触发。
+### 工作流 1：字节码密码学混淆 —— v1 已交付（MIT-458）
 
-### 工作流 1：字节码密码学混淆
+xor-chain codec 在虚拟化后对 VM 字节码 blob 加密；stub 入口一次性解密，marker magic 与 VM 程序和运行时解码器不可分割。MIT-462 回归加固；工作流 5 在其上收尾防篡改环。
 
-填实 `passes/crypt/src/crypt_pass.cpp` 的占位，并实现 `vm/regvm/codecs/` 中的 codec 接口占位。
+### 工作流 2：指令级代码变异 —— v1 已交付（MIT-459）
 
-- **做什么**：虚拟化后对 VM 字节码流加密，把解密元数据嵌入 stub，入口处按需解码。marker-pair magic 与 VM 程序与运行时解码器不可分割。
-- **为何排第一**：爆炸半径最小（一个 pass + 一个 codec 模块）、无跨 pass 依赖、可端到端验证 codec / 往返契约。
-- **派单前需锁定的开放设计决策**：
-  - **密码原语**——AES-NI（快、可识别签名）/ 自研 S-box（无签名、较慢）/ VM 仿真（与现有保护同态、最慢）。
-  - **密钥包**——每目标嵌入（当前 marker-magic 方式、离线运行时）/ 服务端拉取（防篡改、需在线运行时）。
-  - **威胁模型**——交互式调试器 / 自动污点分析 / 大规模扫描器——不同模型偏向不同密码选择。
-- **工作量**：1 张单架构派活单，2-3 天。
+字节码产出前的种子确定性 IR 级变异。v1 落地 Nop 插入；junk-Mov 替换在 flags 活性 gate 下跟进（MIT-474、MIT-478/479），变异词流语义钉死。
 
-### 工作流 2：指令级代码变异
+### 工作流 3：反调试 / 反插桩加固 —— v1 已交付（MIT-463）
 
-填实 `passes/mutate/src/mutate_pass.cpp` 的占位。
+PEB.BeingDebugged + NtGlobalFlag 检查 + FailFast 响应（MIT-463），经 TLS hook 初始化（MIT-465/467）；硬件断点（dr*）与 RDTSC 时序检查于 MIT-470/471 补齐。
 
-- **做什么**：在 VM 字节码产出**之前**改写 lifted IR——死码插入、等价替换、伪控制流——以 `ctx.seed` 为种子确定性执行。提升反语义成本但不变更语义。
-- **为何排第二**：低风险（纯 IR 变换、无运行时依赖），复用现有冻结的 IR 载体域。
-- **开放问题**：
-  - **强度/成本权衡**——变异密度同时影响运行时性能与反语义难度；需校准到目标比值。
-  - **确定性**——种子可复现是硬要求（测试基线稳定性）。
-- **工作量**：1 张单架构派活单，2-3 天。
+### 工作流 4：导入保护（IAT 加固）—— v1 已交付（MIT-466）
 
-### 工作流 3：反调试 / 反插桩加固
+导入调用经保护 stub 路由，含导入引用重写（MIT-477）。
 
-填实 `passes/anti_debug/src/anti_debug_pass.cpp` 的占位。
+### 工作流 5：运行时完整性校验 —— v1 已交付（MIT-464）
 
-- **做什么**：产出反调试检查（PEB.BeingDebugged、硬件断点、NtQuery 变体、时序攻击）与反插桩护栏（ProcessInstrumentationCallback、debug break-in hooks），写入保护镜像。
-- **为何排第三**：与密码/变异独立，但需要**运行时 stub 表面**——当前 `stub_link` 接口尚未提供。在 pass 有意义前需要先做一次小扩展。
-- **开放问题**：
-  - **仅用户态** vs **用户态 + 内核态**——内核 hook 需要独立的 SYS 运行时；当前范围仅用户态。
-  - **反 DBI 策略**——ProcessInstrumentationCallback 是 Win10+ 特性；XP/Vista 覆盖需要替代方案。
-- **工作量**：2 张子派活单（stub 扩展 + pass 实施），合计 3-4 天。
+对每条密文流算 IEEE CRC32 存入尾区保留槽；stub 解密前校验，不匹配即 FailFast（篡改实验：翻转 1 字节密文 → 确定性崩溃 rc=139）。
 
-### 工作流 4：导入保护（IAT 加固）
-
-填实 `passes/import_protect/src/import_protect_pass.cpp` 的占位。
-
-- **做什么**：改写导入目录，让 API 调用通过保护 stub 路由。IAT 项加密、首次调用惰性解析、每函数独立密钥。
-- **为何排第四**：与字节码密码（工作流 1）互补——合在一起防止 VM 程序与 API 调用面被静态提取。复用现有 `passes/stub_link/` 基础设施。
-- **开放问题**：
-  - **惰性 vs 即时解析**——即时更简单但泄露"含哪些导入"；惰性需 stub 内的运行时解码器。
-  - **SDK API 分离**——SDK 函数（加载期辅助）需与用户导入 API 走独立代码路径。
-- **工作量**：1 张单架构派活单，2-3 天。
-
-### 工作流 5：运行时完整性校验
-
-填实 `passes/integrity_crc/src/integrity_crc_pass.cpp` 的占位。
-
-- **做什么**：构建时对保护段算摘要、嵌入校验数据；运行时加载期自检（含防篡改响应）。
-- **为何排第五**：收尾防篡改环——即使工作流 1-4 被绕过，运行时仍可检测到保护镜像构建后被修改。
-- **开放问题**：
-  - **校验粒度**——整段 / 每函数 / 每 VM 区域。每区域最强但开销最大。
-  - **触发策略**——仅加载期 / 周期性 / 敏感调用时检测。各有不同性能/防篡改权衡。
-- **工作量**：1 张单架构派活单，1-2 天。
+五个 pass 均接入 TOML 配置系统（MIT-457）：每函数保护档位与 pass 专属开关。
 
 ### 工作流 6：独立 GUI
 
 全新顶层交付物。当前 CLI（`cli/src/main.cpp`）是唯一接口。工作流 6 在 CLI 子进程基础上增加独立 GUI。
 
 - **做什么**：项目管理（加载/保存 WVmp 项目文件）、保护区域选择可视化、按 pass 配置面板、实时编译日志、带 marker 高亮的代码预览。
-- **为何排第六**：依赖工作流 1-5 都有可配置的真实选项。无真实 pass 选项的 GUI 只是 CLI 的 chrome 壳。
+- **为何现在**：工作流 1–5 已交付真实可配置选项（MIT-456+），GUI 有实料可暴露。没有它们，GUI 只是 CLI 的 chrome 壳。
 - **派单前需锁定的范围决策**：
   - **GUI 框架**——Qt（工业标准，商业用途付费许可）/ wxWidgets（宽松许可、生态较小）/ Dear ImGui + 原生窗口（开发者友好、不够精致）。每种选择需检查与 WVmp MIT 许可的兼容性。
   - **OS 目标**——先 Windows-only，跨平台延后（与当前 WVmp 范围匹配）。
@@ -228,29 +219,15 @@ M2.5-G + M2.5-X 收官后，还排有 **9 条能力工作流**。它们是 WVmp 
   - 内部决定硬化 OS 表层（产品线决策）。
 - **工作量**：2-3 周设计 + 3-4 派活单循环。**注意**：与工作流 1-5 全部加起来量级相当——是重大承诺。
 
-### 排序原则
+### 排序
 
-9 条工作流按**路线图顺序**（而非优先级）排序：
+**当前顺序**：
 
-**主动表面（工作流 1-5）**：用户态 PE 可执行文件的保护 pass。
+1. **频率 gate 指令积压**——样本驱动（MIT-521）：SSE+ymm 混排协议翻面、`vextractf128`/`vinsertf128` 桥（+2 VmOp）、BMI2 最低机器产品决策（技术侧无阻塞，MIT-515）。
+2. **工作流 6（GUI）**——已被交付的工作流 1–5 解锁。
+3. **工作流 7–9**——park，等各自外部触发，不变。
 
-1. **工作流 1（crypt）**——执行侧范围最小；codec 占位可验证往返契约。
-2. **工作流 2（mutate）**——IR 层、无运行时依赖，与工作流 1 的 codec 共享发射形态时协同。
-3. **工作流 3（anti_debug）**——需 stub 表面扩展，搭在工作流 1+2 的发射器之上。
-4. **工作流 4（import_protect）**——依赖工作流 1 的惰性解析 codec，搭在 `passes/stub_link/` 之上。
-5. **工作流 5（integrity_crc）**——最后一道保护层，收尾防篡改环。
-
-**产品表面（工作流 6）**：独立 GUI 消费工作流 1-5。
-
-6. **工作流 6（GUI）**——完全依赖工作流 1-5 提供可暴露的真实选项。
-
-**扩展表面（工作流 7-9）**：park，需外部触发。
-
-7. **工作流 7（kernel-driver）**——独立运行时；需客户拉动。
-8. **工作流 8（anti-VM/anti-sandbox）**——部分覆盖；需针对特定对手决策。
-9. **工作流 9（virtual FS / virtual registry）**——主机 OS 表层；量级巨大，需产品线决策。
-
-若团队收到外部新优先级（如客户紧急需要反调试），工作流 1-5 可前跳；若客户明确拉动工作流 7-9，那些可前跳。每条工作流的前置条件应被尊重。**工作流 1-5**组成 **M3 保护表面**；**工作流 6**是 **M3 产品表面**；**工作流 7-9**组成 **扩展表面**，park 等外部触发。
+工作流 1–5 交付时的内部排序（crypt → mutate → anti_debug → import_protect → integrity_crc）遵循前置链；加固跟进按波次落地。**工作流 6**是 **M3 产品表面**；**工作流 7–9**组成**扩展表面**，park 等外部触发。
 
 ## 架构
 
@@ -262,7 +239,7 @@ M2.5-G + M2.5-X 收官后，还排有 **9 条能力工作流**。它们是 WVmp 
 [Marked regions]
    ↓ lifter                 ← capstone 解码 → IR
 [IR]                       ← 冻结载体域（ir::Op）
-   ↓ virtualize             ← IR → VmOp 表（kVmOpMax=97）
+   ↓ virtualize             ← IR → VmOp 表（kVmOpMax=164）
 [VmOp sequence]
    ↓ stub_link              ← 生成 stub 派发入口
 [Protected PE]
@@ -281,14 +258,17 @@ WVmp/
 ├── docs/
 │   ├── STATUS.md              # 当前权威阶段状态
 │   ├── GAPS.md                # 完整支持矩阵 + X7 收口节
-│   ├── MULTICA_ISSUES.md      # multica 工单目录（24 单）
+│   ├── MULTICA_ISSUES.md      # multica 工单目录（M2.5 时期；之后的批次见 STATUS.md）
 │   └── multica-archive.tar.gz # 原始 multica 工件（不入 git）
 ├── scripts/
 │   ├── build.bat              # MSVC + Ninja 构建
 │   ├── test.bat               # ctest
 │   ├── multiseed_e2e.sh       # 5-seed × 66 样本回归
 │   └── verifier/
-│       └── mit_x7_rescan.py   # 客户态覆盖率扫描器
+│       ├── mit_x7_rescan.py       # 客户态覆盖率扫描器
+│       ├── mit_515_bmi_probe/     # BMI2（mulx/pdep/pext）硬件探针
+│       ├── mit_517_avx_profile/   # AVX/VEX codegen 频率画像
+│       └── dump_handler_xmm_check.py # handler 形状 dump 门
 ├── tests/wvmpTest/            # 103-kernel 功能测试靶
 │   ├── src/                   # test kernels 源码
 │   ├── build.bat              # 构建 test_target.exe

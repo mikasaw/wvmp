@@ -7,8 +7,7 @@ A self-researched PE virtual-machine protector. Translates marked regions of x86
 ![x64 direct](https://img.shields.io/badge/x64_direct-99.26%25-brightgreen)
 ![x86 direct](https://img.shields.io/badge/x86_direct-95.15%25-green)
 ![wvmpTest x86](https://img.shields.io/badge/wvmpTest_x86-85.7%25-yellowgreen)
-![main](https://img.shields.io/badge/main-0b6c5ba-blue)
-![baseline](https://img.shields.io/badge/baseline-330%2F330-brightgreen)
+![baseline](https://img.shields.io/badge/baseline-355%2F355-brightgreen)
 
 ## Targets
 
@@ -17,20 +16,42 @@ A self-researched PE virtual-machine protector. Translates marked regions of x86
 | **x64 (PE32+)** | 0x8664 | **Production ready** |
 | **x86 (PE32)** | 0x14C | **Production ready** (WOW64 verified) |
 
-Native client code paths are unchanged. Marked regions (two consecutive 8-byte markers) are translated to a custom register-based VM (97 ops, jump table 128 entries). Output preserves byte-identical behavior under `byte-exact` verification — see [docs/GAPS.md](docs/GAPS.md) for full support matrix.
+Native client code paths are unchanged. Marked regions (two consecutive 8-byte markers) are translated to a custom register-based VM (164 ops, jump table 256 entries). Output preserves byte-identical behavior under `byte-exact` verification — see [docs/GAPS.md](docs/GAPS.md) for full support matrix.
 
-## Permanent gate boundaries (documented, not bugs)
+Instruction surface highlights (September 2026): **AVX/VEX.256** — a full ymm data path on x64 (`vmov*` + 18 packed-arithmetic ops, `vzeroupper`/`vzeroall`, on-demand ymm stub sync); **x87 FPU** — virtualized on x86 (L0–L4: load/store, compare, fcmov, transcendentals). Each is architecture-gated on the opposite arch — see Gate boundaries below.
 
-WVmp documents certain instruction families as **permanently gated** — regions containing them remain native and produce byte-identical output, but are not virtualized:
+## Gate boundaries (documented, not bugs)
+
+Regions containing gated instructions remain native and produce byte-identical output, but are not virtualized. Gates fall into three classes:
+
+**Architecture gates** (instruction family not meaningful for that arch's codegen):
+
+| Family | Scope | Note |
+|---|---|---|
+| x87 FPU (D8-DF) | x64 regions | MSVC x64 defaults to SSE; x87 is virtualized on x86 instead (MIT-509/510). |
+| ymm / VEX.256 | x86 regions | MSVC x86 has no VEX emission surface (MIT-511). |
+| EVEX (0x62 prefix) | both | Not yet lifted. |
+
+**Frequency-gated** (flipping is evidence-driven; tracker MIT-521):
+
+| Family | Trigger to revisit |
+|---|---|
+| legacy SSE + ymm mixed in one function | Whole function stays native; flip the mixed-protocol support when a real protection sample requires it (MIT-514). |
+| `vextractf128`/`vinsertf128` horizontal ops | +2 VmOp bridge; proven present in intrinsic reduction code (MIT-520), enters on the same trigger. |
+| VEX-GP BMI2 (`mulx`/`pdep`/`pext`) | Pending the BMI2 minimum-machine product decision; `mulx` CF/ZF non-modification verified on Zen5 (MIT-515). |
+
+**Permanent**:
 
 | Family | Why permanent |
 |---|---|
-| **x87 FPU (D8-DF)** | MSVC defaults to SSE for floating-point; x87 only appears in legacy or /arch:IA32 builds. Implementing x87 handlers would consume jump-table slots for vanishingly rare real-world usage. (MIT-418 R3, MIT-445 §6 B-route, MIT-455 B-route closed.) |
-| **Indirect jmp (`jmp [mem]`/`jmp reg`)** | Static analyzable "table form" represents < 0.001% of all indirect jumps in System32 / SysWorld32. Dominant forms (arbitrary mem/reg) require L-level runtime analysis. (MIT-455 §3.2 closed as maintenance.) |
-| **Stack depth at mul64hi-like boundaries** | x86 stack frame save area is finite. Outer-frame dependencies require forward-looking ESP resync; deferred. |
-| **SEH (`fs:[...])` / segment overrides** | Requires cooperation with Windows exception dispatcher; out of scope for current research line. |
+| Indirect jmp (`jmp [mem]`/`jmp reg`) | Statically analyzable "table form" is < 0.001% of all indirect jumps in System32 / SysWOW64; dominant forms require L-level runtime analysis. (MIT-455 §3.2, MIT-494x.) |
+| SEH (`fs:[...]`) / segment overrides | Requires cooperation with the Windows exception dispatcher; out of scope for the current research line. |
 
-For the full picture see [docs/GAPS.md](docs/GAPS.md) §X7 closure and §Gate distribution table.
+Historical note: x87 and the mul64hi stack-depth boundary were formerly permanent gates — both have since been resolved (x87 → per-arch virtualization, MIT-509/510; mul64hi → esp-resync lookahead + callee `ret N` scanning, MIT-497/500, x86 22/22 regions virtualized). The current status table lives in [docs/GAPS.md](docs/GAPS.md).
+
+## Configuration (TOML)
+
+Pack-time behavior is configured via TOML: per-function protection levels (`default_level` plus `[[functions]]` rules, MIT-457) and `[avx] require` (default `true`; set `false` to keep AVX-word functions native so packed binaries still run on non-AVX machines, MIT-518).
 
 ## Build (Windows / MSVC / Ninja, requires VS 18 Insiders)
 
@@ -69,6 +90,8 @@ See [tests/wvmpTest/](tests/wvmpTest/) for the test target source and build scri
 
 ## Coverage (X7 rescan, 2026-09-03)
 
+*Snapshot of the 2026-09-03 full rescan. The instruction surface expanded afterwards (x87 on x86, ymm/AVX on x64 — see Gate boundaries), so these runs predate that expansion.*
+
 | Metric | Value |
 |---|---|
 | **x64 mnemonic-level direct coverage** (System32 103 files / 17.6M clean insns) | **99.26%** |
@@ -88,11 +111,13 @@ For deep context on the methodology (three-layer replacement for unavailable str
 
 WVmp development is driven by [multica](https://github.com/multica-ai/multica) — every capability addition since 2026-08-29 has been a dispatched task with project-owner verification.
 
-**24 tasks ACCEPTED, 0 rejected, 0 cancelled across two milestones:**
-- **M2.5-G (instruction virtualization phase)** — MIT-419 through MIT-435, baseline 240/240, complete
-- **M2.5-X (multi-target platform phase)** — MIT-436 through MIT-455, baseline 330/330, complete
+**The same dispatch discipline has run continuously from MIT-419 through MIT-521:**
+- **M2.5-G (instruction virtualization phase, x64)** — MIT-419 through MIT-435, baseline 240/240
+- **M2.5-X (multi-target platform phase, x86 production)** — MIT-436 through MIT-455, baseline 330/330
+- **M3 protection surface (Streams 1–5)** — from MIT-456: all five protective passes shipped v1 plus a hardening wave (config system, TLS-hook init, dr*/RDTSC checks, import ref rewrite)
+- **Instruction-surface extension (x87 on x86, ymm/AVX on x64)** — MIT-509 through MIT-521, including two autonomous offline batches (2026-09-14)
 
-For the full issue roster, discipline notes, and accumulated lessons see [docs/MULTICA_ISSUES.md](docs/MULTICA_ISSUES.md).
+[docs/MULTICA_ISSUES.md](docs/MULTICA_ISSUES.md) carries the M2.5-era roster and discipline notes; later waves are documented in [docs/STATUS.md](docs/STATUS.md).
 
 **Raw multica artifacts** (155 files, 451 KB) are packaged separately for archive download: `docs/multica-archive.tar.gz`. This file is not under git (kept out of source tree to keep the repo lean). For ongoing users, the multica dashboard is the authoritative source.
 
@@ -102,78 +127,44 @@ For the full issue roster, discipline notes, and accumulated lessons see [docs/M
 |---|---|
 | M2.5-G instruction virtualization (x64) | Done (2026-08-31) |
 | M2.5-X multi-target platform (x86 production) | Done (2026-09-03) |
-| M3 protection surface (Streams 1-5 below) | Six streams queued, ready to dispatch (see Roadmap) |
-| Extended surface (Streams 7-9 below) | Three streams parked, awaiting trigger (see Roadmap) |
-| Product surface (Stream 6 below) | One stream, gated on Streams 1-5 (see Roadmap) |
+| M3 protection surface (Streams 1–5) | **v1 shipped** (2026-09, MIT-456 wave) — see Roadmap |
+| Instruction-surface extension (x87 x86 / ymm+AVX x64 / BMI2 memo) | Done (2026-09-14, MIT-509–521) |
+| Frequency-gated instruction backlog | Open, sample-driven (mixed SSE+ymm, `vextractf128` bridge, BMI2 contract — MIT-521) |
+| Product surface (Stream 6 GUI) | Not started, unblocked by Streams 1–5 |
+| Extended surface (Streams 7–9) | Parked pending trigger |
 
 ## Roadmap
 
-Nine capability streams are queued beyond the current M2.5-G + M2.5-X close-out. They are **independent products** of WVmp (not "stages" of M2.5-X) — each has its own scope, prerequisites, and dispatch plan. They are listed in **roadmap order** (data-side → product surface), not priority order.
+The nine capability streams were charted after the M2.5-G + M2.5-X close-out as **independent products** of WVmp. **Streams 1–5 shipped v1 in September 2026** (MIT-456 wave): the five protective passes are real, pipeline-wired, and configurable per function. Stream 6 (GUI) and Streams 7–9 remain future work. The currently open backlog is the frequency-gated instruction set listed under Gate boundaries — mixed SSE+ymm protocol, `vextractf128`/`vinsertf128` bridge, and the BMI2 minimum-machine decision — all evidence-driven (MIT-521).
 
-The five protective passes in `passes/` (`anti_debug`, `crypt`, `integrity_crc`, `import_protect`, `mutate`) and the `vm/regvm/codecs/` module are all registered as placeholders today (per `docs/STATUS.md` "M3 plugin pool ⏳ not started"). Streams 1-5 are how those placeholders become real product. Streams 7-9 extend the protection surface to broader scopes (driver / VM-detection / host-OS surface) and are explicitly parked until external triggers.
+### Stream 1: bytecode cryptographic obfuscation — shipped v1 (MIT-458)
 
-### Stream 1: bytecode cryptographic obfuscation
+An xor-chain codec encrypts the VM bytecode blob after virtualization; the stub performs one-shot decryption at entry, so the marker magic and the VM program are inseparable from the runtime decoder. Regression-hardened in MIT-462; Stream 5 closes the tamper loop on top of it.
 
-Replaces the placeholder in `passes/crypt/src/crypt_pass.cpp` and implements the placeholder codec interface in `vm/regvm/codecs/`.
+### Stream 2: instruction-level code mutation — shipped v1 (MIT-459)
 
-- **What it does**: encrypts the VM bytecode stream after virtualization, embeds decrypt metadata into the stub, and decodes on entry. The marker-pair magic and the VM program become inseparable from the runtime decoder.
-- **Why first**: smallest blast radius (one pass + one codec module), no cross-pass dependencies, validates the codec/roundtrip contract end-to-end.
-- **Open design decisions** (must be locked before dispatch):
-  - **Cipher primitive** — AES-NI (fast, recognizable signature) / custom S-box (no signature, slower) / VM-emulated (homomorphic to current protection, slowest).
-  - **Key bundle** — per-target embed (current marker-magic approach, offline-runtime) / server-fetched (anti-tamper, online-runtime only).
-  - **Threat model** — interactive debugger / automated taint / mass-scanner — different models favor different cipher choices.
-- **Effort**: 1 single-architect dispatch, 2-3 days.
+Seed-deterministic IR-level mutation before bytecode emission. v1 ships Nop insertion; junk-Mov substitution followed under flags-liveness gating (MIT-474, MIT-478/479), keeping mutated streams semantically pinned.
 
-### Stream 2: instruction-level code mutation
+### Stream 3: anti-debug / anti-instrumentation hardening — shipped v1 (MIT-463)
 
-Replaces the placeholder in `passes/mutate/src/mutate_pass.cpp`.
+PEB.BeingDebugged + NtGlobalFlag checks with FailFast response (MIT-463), initialized via TLS hook (MIT-465/467); hardware-breakpoint (dr*) and RDTSC timing checks added in MIT-470/471.
 
-- **What it does**: rewrites the lifted IR before VM bytecode emission — dead-code insertion, equivalent substitutions, bogus control flow — deterministically from `ctx.seed`. Increases reverse-engineering cost without changing semantics.
-- **Why second**: low risk (pure IR transformation, no runtime dependency), builds on the existing frozen IR carrier domain.
-- **Open questions**:
-  - **Strength/cost tradeoff** — mutation density affects both runtime perf and reverse-engineering difficulty; calibrate to a target ratio.
-  - **Determinism** — seed-derived reproducibility is a hard requirement (test baseline stability).
-- **Effort**: 1 single-architect dispatch, 2-3 days.
+### Stream 4: import protection (IAT hardening) — shipped v1 (MIT-466)
 
-### Stream 3: anti-debug / anti-instrumentation hardening
+Import calls routed through the protection stub, with import reference rewrite (MIT-477).
 
-Replaces the placeholder in `passes/anti_debug/src/anti_debug_pass.cpp`.
+### Stream 5: runtime integrity verification — shipped v1 (MIT-464)
 
-- **What it does**: emits anti-debug checks (PEB.BeingDebugged, hardware breakpoints, NtQuery variants, timing attacks) and anti-instrumentation guards (ProcessInstrumentationCallback, debug break-in hooks) into the protected image.
-- **Why third**: independent from crypto/mutate, but requires **runtime stub surface** that the current stub_link interface doesn't yet provide. Needs a small stub extension before the pass is meaningful.
-- **Open questions**:
-  - **User-mode only** vs **user-mode + kernel-mode** — kernel hooks require a separate SYS runtime; current scope is user-mode only.
-  - **Anti-DBI strategy** — ProcessInstrumentationCallback is a Windows 10+ feature; XP/Vista coverage requires alternate approach.
-- **Effort**: 2 sub-dispatches (stub extension + pass implementation), 3-4 days total.
+IEEE CRC32 over each ciphertext stream, stored in a reserved trailer slot; the stub verifies before decryption and FailFasts on mismatch (tamper experiment: one flipped ciphertext byte → deterministic crash, rc=139).
 
-### Stream 4: import protection (IAT hardening)
-
-Replaces the placeholder in `passes/import_protect/src/import_protect_pass.cpp`.
-
-- **What it does**: rewrites the import directory to route API calls through the protection stub. IAT entries are encrypted, resolved lazily on first call, with per-function keys.
-- **Why fourth**: complementary to bytecode crypto (Stream 1) — together they prevent static extraction of both VM program and API call surface. Builds on existing `passes/stub_link/` infrastructure.
-- **Open questions**:
-  - **Lazy vs eager resolution** — eager is simpler but leaks presence-of-imports; lazy requires runtime decoder in stub.
-  - **SDK API separation** — SDK functions (loader-time helpers) need a separate code path from user-imported APIs.
-- **Effort**: 1 single-architect dispatch, 2-3 days.
-
-### Stream 5: runtime integrity verification
-
-Replaces the placeholder in `passes/integrity_crc/src/integrity_crc_pass.cpp`.
-
-- **What it does**: computes digests over protected sections at build time, embeds verification data, and runs self-check on load (with anti-tamper response).
-- **Why fifth**: closes the loop on tamper detection — even if Streams 1-4 are bypassed, the runtime can detect that the protected image has been modified post-build.
-- **Open questions**:
-  - **Verification granularity** — whole-section vs per-function vs per-VM-region. Per-region is strongest but increases overhead.
-  - **Trigger strategy** — load-time-only / periodic / on-sensitive-call. Each has different performance/tamper-resistance tradeoffs.
-- **Effort**: 1 single-architect dispatch, 1-2 days.
+All five passes are wired through the TOML config system (MIT-457): per-function protection levels and pass-specific switches.
 
 ### Stream 6: standalone GUI
 
 A new top-level deliverable. CLI is currently the only interface (`cli/src/main.cpp`). Stream 6 adds a standalone GUI on top of the CLI subprocess.
 
 - **What it does**: project management (load/save WVmp project files), region selection visualization, pass-by-pass configuration panels, real-time compile log, code preview with marker highlighting.
-- **Why sixth**: depends on Streams 1-5 having real options to configure. A GUI without real pass options is just a CLI wrapper with chrome.
+- **Why now**: Streams 1–5 shipped real, configurable options (MIT-456+), so a GUI has substance to expose. Without them a GUI is just a CLI wrapper with chrome.
 - **Scope decisions** (must be locked before dispatch):
   - **GUI framework** — Qt (industry standard, paid license for commercial use) / wxWidgets (permissive, smaller ecosystem) / Dear ImGui + native window (developer-friendly, less polished). License compatibility with WVmp's MIT license must be checked per choice.
   - **OS targets** — Windows-only first, cross-platform deferred (matches current WVmp scope).
@@ -229,29 +220,15 @@ Hook-based re-direction of host-OS file and registry I/O — emulated resources 
   - Internal decision to harden host-OS surface (product-line decision).
 - **Effort**: 2-3 weeks of design + 3-4 dispatch cycles. **Note**: this is roughly the same magnitude as all of Streams 1-5 combined — non-trivial commitment.
 
-### Sequencing principle
+### Sequencing
 
-The nine streams are listed in **roadmap order**, not priority order:
+**Current order**:
 
-**Active surface (Streams 1-5)**: protective passes for user-mode PE executables.
+1. **Frequency-gated instruction backlog** — sample-driven (MIT-521): mixed SSE+ymm protocol flip, `vextractf128`/`vinsertf128` bridge (+2 VmOp), and the BMI2 minimum-machine product decision (technical side unblocked, MIT-515).
+2. **Stream 6 (GUI)** — unblocked by the shipped Streams 1–5.
+3. **Streams 7–9** — parked on their external triggers, unchanged.
 
-1. **Stream 1 (crypt)** — execute side has the smallest scope; codec stub validates the roundtrip contract.
-2. **Stream 2 (mutate)** — IR-level, no runtime dependency, build on Stream 1's codec if roundtrip shapes overlap.
-3. **Stream 3 (anti_debug)** — needs stub surface extension, builds on Stream 1+2's emitter.
-4. **Stream 4 (import_protect)** — depends on Stream 1 for lazy resolution codec, builds on `passes/stub_link/`.
-5. **Stream 5 (integrity_crc)** — last protective layer, closes the tamper-detection loop.
-
-**Product surface (Stream 6)**: standalone GUI consumes Streams 1-5.
-
-6. **Stream 6 (GUI)** — entirely dependent on Streams 1-5 having real options to expose.
-
-**Extended surface (Streams 7-9)**: parked, requires external trigger.
-
-7. **Stream 7 (kernel-driver)** — independent runtime; customer pull required.
-8. **Stream 8 (anti-VM/anti-sandbox)** — partial coverage; requires specific adversary decision.
-9. **Stream 9 (virtual FS / virtual registry)** — host-OS surface; non-trivial scope, requires product-line decision.
-
-If the team receives a new external priority (e.g. customer needs anti-debug urgently), Streams 1-5 can be reordered; if a customer pulls on Streams 7-9 specifically, those can jump ahead. Each stream's prerequisites should be respected. Streams 1-5 form the **M3 protection surface**; Stream 6 is the **M3 product surface**; Streams 7-9 form the **extended surface** parked pending external trigger.
+When Streams 1–5 shipped, their internal ordering (crypt → mutate → anti_debug → import_protect → integrity_crc) followed the prerequisite chain; hardening follow-ups then landed per wave. Stream 6 is the **M3 product surface**; Streams 7–9 form the **extended surface** parked pending external trigger.
 
 ## Architecture
 
@@ -263,7 +240,7 @@ If the team receives a new external priority (e.g. customer needs anti-debug urg
 [Marked regions]
    ↓ lifter                 ← capstone decode → IR
 [IR]                       ← frozen carrier domain (ir::Op)
-   ↓ virtualize             ← IR → VmOp table (kVmOpMax=97)
+   ↓ virtualize             ← IR → VmOp table (kVmOpMax=164)
 [VmOp sequence]
    ↓ stub_link              ← generate stub dispatch entry
 [Protected PE]
@@ -282,14 +259,17 @@ WVmp/
 ├── docs/
 │   ├── STATUS.md              # current authoritative stage status
 │   ├── GAPS.md                # full support matrix + X7 closure
-│   ├── MULTICA_ISSUES.md      # multica task roster (24 tasks)
+│   ├── MULTICA_ISSUES.md      # multica task roster (M2.5-era; later waves in STATUS.md)
 │   └── multica-archive.tar.gz # raw multica artifacts (not under git)
 ├── scripts/
 │   ├── build.bat              # MSVC + Ninja build
 │   ├── test.bat               # ctest
 │   ├── multiseed_e2e.sh       # 5-seed x 66 sample regression
 │   └── verifier/
-│       └── mit_x7_rescan.py   # client-state coverage scanner
+│       ├── mit_x7_rescan.py       # client-state coverage scanner
+│       ├── mit_515_bmi_probe/     # BMI2 (mulx/pdep/pext) hardware probe
+│       ├── mit_517_avx_profile/   # AVX/VEX codegen frequency profiler
+│       └── dump_handler_xmm_check.py # handler-shape dump gate
 ├── tests/wvmpTest/            # 103-kernel functional test target
 │   ├── src/                   # test kernels source
 │   ├── build.bat              # builds test_target.exe
