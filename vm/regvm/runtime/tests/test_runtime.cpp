@@ -431,7 +431,7 @@ void run_semantic_battery(const vm::RuntimeImage& image, const std::string& dump
         // 宿主帧被 0x2222... 覆写；ctx 扩容使测试函数代码 gen 恰好出现块 (g)
         // 之后的 rbp 相对寻址，潜伏违约引爆为 AV）。
         // 栈窗（9 push + sub 0x20 home 后）：[rsp]=home 区底（call 时 callee
-        // home = [rsp, rsp+0x20)）… [rsp+0x28]=r15、[rsp+0x48]=rbx、
+        // home = [rsp, rsp+0x20)）… [rsp+0x20]=r15、[rsp+0x58]=rbx、
         // [rsp+0x60]=saved rcx(store)（home 区在 push 窗之下，push-then-sub
         // 规范序——sub 放 push 之前则 home 落在 r12-r15 槽位，合法写 home
         // 的 callee 即毁宿主寄存器，MIT-519 验收 F1 ml64 复现实证）。寄存器
