@@ -1307,5 +1307,5 @@ asmgen 零触碰 → dump 锚不受影响（无换代）。
 - dump 门脚本行尾归一（功能回归 PASS）+ battery (g) driver shadow space 正规化（push-then-sub 规范序；验收 F1 实证 sub-first 的 home 落在 r12-r15 槽位=契约违约，已修）。验证：ctest 23/23、dump 门 RESULT PASS。
   证据链 GAPS MIT-519。
 ### MIT-520 (T72 · wvmpTest x64 AVX 语料批) ✅ 2026-09-14
-- wvmpTest：+3 AVX 内核（intrinsic 确定性 ymm 词流，x64 专属 TU，per-TU /arch:AVX 单编链接）+ kernavx 驱动（位精确对拍）。native x64 106/106 / x86 105/105 零影响；x64 打包 stub 27（3 AVX 区真虚拟化）、native vs packed 106/106 IDENTICAL。两坑实录：batch 文件必须 CRLF（LF 被 cmd 解析错乱 spin）、if() 块内 echo 括号提前闭合。avx_kernels.h 自包含补 WV_TARGET_NOINLINE。
+- wvmpTest：+3 AVX 内核（intrinsic 确定性 ymm 词流，x64 专属 TU，per-TU /arch:AVX + /Od 单编链接）+ kernavx 驱动（位精确对拍）。native x64 106/106 / x86 105/105 零影响；x64 打包 stub 29（**3 AVX 区全部真虚拟化**）、native vs packed 106/106 IDENTICAL。开发实录：batch 文件必须 CRLF（LF 被 cmd 解析错乱 spin）、if() 块内 echo 括号提前闭合、avx_kernels.h 自包含补 WV_TARGET_NOINLINE、**ymm kernel 内禁止 float 标量运算**（/Od 必产 addss 与 ymm 词同函数 → 混排 gate，归约移驱动侧）。
   证据链 GAPS MIT-520。

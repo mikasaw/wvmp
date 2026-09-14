@@ -4250,11 +4250,19 @@ spin/挂起）——**batch 文件必须 CRLF**（已转换）；② if() 块内
 **avx_kernels.h 初版漏 WV_TARGET_NOINLINE 宏定义**（自包含头依赖缺
 失，kernels.h 的宏不随带）——补自包含定义。
 
-**验证**：native x64 106/106（kernavx 组 PASS）；x64 打包 stub 26→27
-（3 个 AVX 区域真虚拟化 +1 net——require_avx 默认开）；x64 native vs
-packed 双跑 106/106 IDENTICAL（`[PASS] kernavx` 在位 = 保护后真虚拟化
-回归）；x86 105/105 零影响（kernavx 缺席 = TU 守卫生效）；x86 打包
-26 stub 与 T68 持平。
+**验证（终版）**：native x64 106/106（kernavx 组 PASS）；x64 打包
+**stub 26→29（3 个 AVX 区域全部真虚拟化）**；x64 native vs packed 双跑
+106/106 IDENTICAL（`[PASS] kernavx` 在位 = 保护后真虚拟化回归）；x86
+105/105 零影响（kernavx 缺席 = TU 守卫生效）；x86 打包 26 stub 与 T68
+持平。**验收 F1 实录（重要）**：初版 dot8 的 float 标量归约（lane 求和）
+在 /O2 下被编译器向量化出 vextractf128（C4-VEX3，未入面）→ C1 gate，
+实为 1/3 虚拟化且落账误写"3 区全虚拟化"（验收 F1 抓出，+1 net stub 即
+旁证）；改写归约为驱动侧 + fma8 去 broadcast 后**仍 2 gate**——根因第二
+层：/Od 下 float 标量加生成 addss（legacy SSE 词）与同函数 ymm 词触发
+**混排 gate**（gate 行为正确——这正是它拦的形态）；终版 = kernel 纯
+ymm 词（mul8 替代 dot8，归约移驱动侧）→ 3/3 全虚拟化。**教训**：ymm
+kernel 内禁止任何 float 标量运算（/Od 必产 addss 混排）；gate note 的
+rva 定位需对照区域清单（marker rva ≠ 函数 rva）。
 
 **遗留**：T73 收口引用本批作为"ymm 词流真实回归载体"证据；vzeroupper
 自动插桩面（MSVC /arch:AVX 函数收尾）在保护后产物中的共现可后续画像。
