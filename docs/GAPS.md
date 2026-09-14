@@ -4141,8 +4141,9 @@ DEADBEEF×CAFEBABE）全部 **CF/ZF 两位保持预置值不变** —— 与 SDM
 ——数组访存 + add/sub，H×H=8I 恒等自校）；⑤ wv_dot4f（4 元素 float 点积
 顺序 mul+add——双 arch SSE movss/mulss/addss 词面，驱动同序位精确对拍）。
 
-**验证**：native 双 arch 105/105（x64+x86 SUMMARY 一致，较 T46 的 103 增
-kern 组断言）；双管道双跑 byte-exact：x64 native vs packed IDENTICAL、
+**验证**：native 双 arch 105/105（x64+x86 SUMMARY 一致；断言并入既有
+kern.realcode_lang 驱动，TEST 总数不变——验收 F1 口径修正，T46 当时已
+录得 105）；双管道双跑 byte-exact：x64 native vs packed IDENTICAL、
 x86 native vs packed IDENTICAL；stub 计数 x64=26 / x86=26（T46 后的新增
 内核区域全部真虚拟化）。打包配置 t68_x64/x86.toml 入库（顺带收编 T50 的
 untracked toml 两份）。
