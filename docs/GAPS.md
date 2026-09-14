@@ -4093,5 +4093,4 @@ Ymm 三词落 default——op=110/111/112 取证定位，管线与单测形态�
 mem 源翻倍对拍 + 426 位宽闸负例翻转 VexYmmWidthGateNowFolded）；样本
 standalone fails=0；全池 355/355（REQUIRE_REAL=1）；dump 门 ymm 21
 handler 全 PASS（119 handlers）；单 pack 对账 stub 4 + 混排 gate note 1
-（④ 设计内）。**遗留**（wave2③）：混排契约落地（本 gate 可翻面）、混排 gate 值域判据（含算术词）补 arith+SSE 混排负例入池（验收 F1：现样本④ ymm 词全 mov 族，判据回退现有测试不可见——M3 变异实测静默错值风险真实）、
-vextractf128/vinsertf128 桥、ctx.ymm 读回影子样本（T64 F4 挂账）。
+（④ 设计内）。**wave2③ (MIT-514) 收口（2026-09-14，自主队列）**：T64 F4 + T65 F1 两笔挂账清偿——样本 wvmp_ymm_data_sample 增 ⑥ ymm_pass_through（区域内 YmmLoad 写 ymm0 → 函数返回 → main 经 read_ymm0 thunk 捕获物理 ymm0 32B：stub ymm 同步变体 disp32 行为级真值钉住，字节计数之外的观测面）+ ⑦ ymm_mix_arith_neg（vaddps 算术 + addps legacy SSE 同区 → 混排 gate 负例入池，native byte-exact 翻倍值；store 在 addps 之前——T64 验收 F1 教训）。**维持 gate 裁决（D 级默认披露）**：xmm/ymm 混排双向一致性协议（ymm 写词镜像 xmm 面 + ymm 读词低半从 xmm 面拼）成本 = 全部 ymm handler 读写模板重写 + 混排矩阵测试；真实 AVX 语料混排频率证据未出现（频率门）→ 维持 gate 披露，频率触发再翻面。vextractf128/vinsertf128 桥：语料频率证据未出现（频率门）→ 不入面。**档B wave2③ 后遗留**：混排协议翻面（频率触发）、桥（频率触发）、EVEX 天然 gate、vzero 无 CPUID gate（G8b 同口径）。

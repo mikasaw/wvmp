@@ -10,6 +10,9 @@ extern "C" unsigned int      ymm_chain32(void* dst, const void* src);     // ②
 extern "C" unsigned int      ymm_vzero_mix(void* dst, const void* src);   // ③
 extern "C" unsigned int      ymm_mix_neg(void* dst, const void* src);     // ④ gate
 extern "C" unsigned int      ymm_arith(void* dst, const void* src);       // ③' MIT-513
+extern "C" void*            ymm_pass_through(const void* src);           // ⑥ MIT-514 读回 (src=rcx)
+extern "C" unsigned int      ymm_mix_arith_neg(void* dst, const void* src); // ⑦ gate
+extern "C" void             read_ymm0(void* dst);                        // ymm0 捕获 thunk
 
 namespace {
 alignas(32) unsigned char g_src[64];
@@ -74,7 +77,31 @@ int main() {
         }
     }
 
-    std::printf("ymm_data r1=%u r2=%u r3=%u r4=%u r5=%u fails=%d\n",
-                r1, r2, r3, r4, r5, fails);
+
+    // ⑥ ymm 读回 (MIT-513 F1/T64 F4): 虚拟化函数经物理 ymm0 返回 32B —
+    // stub 出口 ymm 回写行为级钉住 (disp32 正确性真值面)。
+    fill(g_src, 0x90);
+    std::memset(g_dst, 0, sizeof(g_dst));
+    ymm_pass_through(g_src);
+    read_ymm0(g_dst);
+    if (!check32(g_dst, g_src)) { std::printf("FAIL ymm readback\n"); ++fails; }
+
+    // ⑦ 混排算术负例: ymm 算术 + legacy SSE 同区 → 整函数原生 gate,
+    // 输出 = 翻倍值 (native byte-exact)。
+    fill(g_src, 0xD0);
+    std::memset(g_dst, 0, sizeof(g_dst));
+    const unsigned int r6 = ymm_mix_arith_neg(g_dst, g_src);
+        for (int i = 0; i < 8; ++i) {
+            float v;
+            std::memcpy(&v, &g_src[i * 4], 4);
+            v = v + v;
+            std::memcpy(&g_want[i], &v, 4);
+        }
+        if (!check32(g_dst, reinterpret_cast<const unsigned char*>(g_want))) {
+            std::printf("FAIL mix_arith_neg\n"); ++fails;
+        }
+
+    std::printf("ymm_data r1=%u r2=%u r3=%u r4=%u r5=%u r6=%u fails=%d\n",
+                r1, r2, r3, r4, r5, r6, fails);
     return fails == 0 ? 0 : 1;
 }

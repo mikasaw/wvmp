@@ -104,5 +104,47 @@ ymm_mix_neg PROC
     ret
 ymm_mix_neg ENDP
 
+; ---- ⑥ ymm_pass_through(src=rdx): ymm 词后返回 — 物理 ymm0 读回钉 ----
+; MIT-513 验收 F1 挂账 / T64 F4: 区域内 YmmLoad 写 ymm0 面 → 函数返回后
+; stub 出口 ymm 回写使物理 ymm0 = 加载值, 宿主经 read_ymm0 thunk 观测
+; (stub ymm 同步变体 disp32 行为级钉住, 字节计数之外的真值面)。
+ymm_pass_through PROC
+    ; ===== marker region begin =====
+    sub   rsp, 28h
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
+    vmovups ymm0, [rcx]               ; YmmLoad (单参 src=rcx; 返回值经 ymm0 出口回写)
+    nop
+    call ?marker_end@sdk@wvmp@@YAXXZ
+    ; ===== marker region end =====
+    add   rsp, 28h
+    ret
+ymm_pass_through ENDP
+
+; ---- ⑦ ymm_mix_arith_neg(dst, src): ymm 算术 + legacy SSE 混排 → gate ----
+; MIT-513 验收 F1: wave2① 混排 gate 值域判据 (含算术词) 的入池负例 —
+; vaddps (Ymm 算术) + addps (legacy SSE) 同区 → 整函数原生, 行为 byte-exact。
+; store 在 addps 之前 (恒等拷贝, addps 结果不落盘 — T64 验收 F1 教训)。
+ymm_mix_arith_neg PROC
+    ; ===== marker region begin =====
+    sub   rsp, 28h
+    call ?marker_begin@sdk@wvmp@@YAXPEBD@Z
+    vmovups ymm0, [rdx]               ; YmmLoad
+    vaddps  ymm0, ymm0, ymm0          ; Ymm 算术 (翻倍)
+    vmovups [rcx], ymm0               ; store (翻倍值)
+    addps   xmm1, xmm1                ; legacy SSE (混排判据命中 → gate)
+    nop
+    call ?marker_end@sdk@wvmp@@YAXXZ
+    ; ===== marker region end =====
+    xor eax, eax
+    add   rsp, 28h
+    ret
+ymm_mix_arith_neg ENDP
+
+; ---- read_ymm0(dst=rcx): 物理 ymm0 32B 捕获 thunk (区域外, 不虚拟化) ----
+read_ymm0 PROC
+    vmovups [rcx], ymm0
+    ret
+read_ymm0 ENDP
+
 _TEXT ENDS
 END

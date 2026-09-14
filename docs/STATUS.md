@@ -1291,3 +1291,6 @@ asmgen 零触碰 → dump 锚不受影响（无换代）。
 ### MIT-513 (T65 · AVX 档B wave2② — VEX.256 packed 算术全谱) ✅ 2026-09-14
 - +18 VmOp（kVmOpMax 164）：YmmAddps..YmmPandn 全 packed 算术（三地址折叠镜像 426：d==s1 直走 / 可交换 d==s2 swap / d 独立 YmmMov pre-Mov / 非交换 d==s2 gate；mem 源 handler aux bit0 分支零临时槽）。参数化单 builder×18（VEX.NDS 全 3 操作数，keystone 2-op errno=512 实证）。混排 gate/uses_ymm 判据改值域（op ≥ YmmMov）。dump 门 YMM_HANDLERS 扩 18。样本增 ⑤ ymm_arith（f32 lane 级对拍）。开发实录三坑（dispatch 条件行被补丁吞掉/float 数组字节索引越界/VEX vvvv 手写错——kstool 钉板）。验证：ctest 23/23（YmmArithFolds 九态 + YmmArithHardwareTruth）；样本 fails=0；全池 355/355 REQUIRE_REAL；dump 门 ymm 21 handler PASS；单 pack stub 4 + 混排 note 1。
   证据链 GAPS MIT-513。
+### MIT-514 (T66 · AVX 档B wave2③ — 挂账清偿 + 收口) ✅ 2026-09-14
+- 样本 wvmp_ymm_data_sample 增 ⑥ ymm_pass_through（物理 ymm0 出口回写读回钉 = T64 F4 清偿：stub ymm 同步 disp32 行为级真值）+ ⑦ ymm_mix_arith_neg（vaddps+addps 混排 gate 负例入池 = T65 F1 清偿）。**维持 gate 裁决**（D 级披露）：混排双向协议（ymm handler 读写模板重写 + 混排矩阵）成本高于真实语料混排频率收益（频率门未触发）→ gate 维持，频率触发再翻面；vextractf128/vinsertf128 桥同频率门不入面。验证：样本 standalone fails=0（⑥⑦）；全池 355/355 REQUIRE_REAL。
+  证据链 GAPS wave2③ 收口段。
