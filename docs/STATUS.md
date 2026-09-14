@@ -1297,3 +1297,6 @@ asmgen 零触碰 → dump 锚不受影响（无换代）。
 ### MIT-515 (T67 · BMI G8b 决策备忘录) ✅ 2026-09-14
 - 纯实测+文档（MIT-496 模式，零翻译器代码）。探针入库 scripts/verifier/mit_515_bmi_probe/。本机 AMD 9800X3D (Zen5) 实测：**mulx 完全不修改 CF/ZF（4 case 全保持 = SDM 一致，厂商分叉消解，Intel 真机交叉验证挂账非阻塞）**；pdep/pext 值语义软件参考全对拍 OK（开发实录：pdep 参考位序反写）。reopen 通路 A（lock 族同款 strip-and-execute + 打包期 require_bmi2 开关，1 任务量，推荐）/ 通路 B（stub 运行时 CPUID 门，不推荐）。剩余用户决策 = 纯产品取舍（BMI2 最低机器契约），推荐默认 = 频率证据出现时随任务接受。
   证据链 GAPS MIT-515。
+### MIT-516 (T68 · wvmpTest 语料扩面批次) ✅ 2026-09-14
+- wvmpTest 仓 2657f86：+5 内核（LCG/CRC32 步进/Bezier Q8/Hadamard8/dot4f——标志/位运算/分支/数组/SSE 词面，全 32 位安全确定性驱动）。native 双 arch 105/105；双管道双跑 byte-exact（x64/x86 native vs packed 均 IDENTICAL）；stub x64=26/x86=26 全真虚拟化。t68 打包 toml 入库（顺带收编 T50 untracked toml）。
+  证据链 GAPS MIT-516。

@@ -4130,3 +4130,23 @@ DEADBEEF×CAFEBABE）全部 **CF/ZF 两位保持预置值不变** —— 与 SDM
 **剩余用户决策（纯产品取舍）**：是否接受 mulx/pdep/pext 产物的 BMI2 最低
 机器契约（通路 A 语义未决已消解）。推荐默认 = 接受（频率证据出现时随任务
 落地）；不接受的备选 = 维持 gate（现状，零成本）。
+
+## MIT-516 (T68) wvmpTest 语料扩面批次（2026-09-14，自主队列；T46 模式续）
+
+**新增 5 内核**（wvmpTest 仓 2657f86；全 32 位安全、纯计算、确定性驱动）：
+① wv_lcg_next（u32 环绕乘加 LCG 单步——imul/add/常数旗面）；② wv_crc32_step
+（位反演 CRC-32 无表步进——shift/xor/掩码循环，驱动对拍 "123456789" 规范
+校验值 0xCBF43926）；③ wv_bezier_q8（二次 Bezier Q8 定点 Horner——i32
+乘除混面，/256 常量除 ×/O2 codegen）；④ wv_hadamard8（8 点蝶形原地变换
+——数组访存 + add/sub，H×H=8I 恒等自校）；⑤ wv_dot4f（4 元素 float 点积
+顺序 mul+add——双 arch SSE movss/mulss/addss 词面，驱动同序位精确对拍）。
+
+**验证**：native 双 arch 105/105（x64+x86 SUMMARY 一致，较 T46 的 103 增
+kern 组断言）；双管道双跑 byte-exact：x64 native vs packed IDENTICAL、
+x86 native vs packed IDENTICAL；stub 计数 x64=26 / x86=26（T46 后的新增
+内核区域全部真虚拟化）。打包配置 t68_x64/x86.toml 入库（顺带收编 T50 的
+untracked toml 两份）。
+
+**遗留**：x87 词面在 wvmpTest 的 C 语料不可达（MSVC v145 x86 默认 SSE2，
+x87 仅 MASM 样本面——主仓 x87l0/x87l1 样本已覆盖）；ymm 词面 x86 侧结构
+性无（x64 侧由主仓 ymm_data_sample 覆盖）。
