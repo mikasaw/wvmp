@@ -4100,11 +4100,13 @@ handler 全 PASS（119 handlers）；单 pack 对账 stub 4 + 混排 gate note 1
 本仓可复现；build_bmi.bat）。**实测机**：AMD Ryzen 7 9800X3D（Zen5，
 AuthenticAMD，max leaf 0x10），BMI1/BMI2/ADX/AVX/AVX2 全 1。
 
-**实测① — mulx flags 保持性（厂商分叉裁决的核心证据）**：协议 = xor 置
-ZF=1 → stc 置 CF=1 → `mulx edi, ebx, r8d` → pushfq 提取。4 组非对称输入
-（FFFFFFFF×FFFFFFFF / 80000000×2 / 1×1 / DEADBEEF×CAFEBABE）全部
-CF_after=1 ZF_after=1 —— **mulx 完全不修改任何标志，与 SDM 口径一致，
-Zen5 侧无分叉**。MIT-432 时代"Zen5 实测不写 vs SDM 分叉待决"的待决项
+**实测① — mulx flags 保持性（厂商分叉裁决的核心证据）**：协议 = 实参
+入位（EDX=a 隐式被乘数, r8d=b 源——验收 F1 修复：原版漏 EDX 装载实算
+b×b，描述失真已修）→ xor 置 ZF=1 → stc 置 CF=1 → `mulx edi, ebx, r8d` →
+pushfq 提取。4 组非对称输入（FFFFFFFF×FFFFFFFF / 80000000×2 / 1×1 /
+DEADBEEF×CAFEBABE）全部 **CF/ZF 两位保持预置值不变** —— 与 SDM 口径
+一致，Zen5 侧无分叉（观测面 = CF/ZF 两位；PF/AF/SF/OF 未观测，SDM 全
+标志口径按 Intel 定义文采信——STATUS 用语精确）。MIT-432 时代"Zen5 实测不写 vs SDM 分叉待决"的待决项
 降级为：Intel 真机交叉验证挂账（非阻塞——SDM 为 Intel 定义文，Zen5 实测
 与之一致；残留风险仅在第三方厂商/虚拟化环境的未验证面）。
 

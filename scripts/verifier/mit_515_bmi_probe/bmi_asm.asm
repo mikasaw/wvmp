@@ -11,7 +11,9 @@ mulx_cf_probe PROC
     push rsi
     push rdi
     mov r8d, edx                 ; b
-    mov r9d, ecx                 ; a 暂存 (mulx 源需寄存器)
+    mov edx, ecx                 ; EDX = a (MULX 隐式被乘数 = EDX; 验收 F1:
+                                 ;   原版漏此行实算 b×b, 核心结论不受影响
+                                 ;   但描述失真)
     xor ecx, ecx                 ; ZF = 1
     stc                          ; CF = 1
     mulx edi, ebx, r8d           ; edi=hi(a*b), ebx=lo(a*b)
