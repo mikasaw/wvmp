@@ -4232,3 +4232,29 @@ rsp+0x20)，sub 在前则该区落在 push 窗之上为死空间，callee 的 ho
 add rsp,8）。**教训**：home 区语义锚定在 call 时刻的 rsp，不在"函数
 开头的 sub"——帧序必须 push-then-sub（与 stub/同文件 (g2) driver 规范
 一致）。wvmpTest 杂散清理：T68 提交已收编，无残留。
+
+## MIT-520 (T72) wvmpTest x64 AVX 语料批（2026-09-14，自主队列；T69 静态画像的动态延伸）
+
+**新增**（wvmpTest 仓；x64 专属 TU）：`src/targets/avx_kernels.h/.cpp`
+（`#if _MSC_VER && _WIN64` 自包含守卫；intrinsic 确定性 ymm 词流——
+3 内核：wv_avx_add8（_mm256_add_ps）/ wv_avx_fma8（mul+add k 翻倍）/
+wv_avx_dot8（mul_ps + extractf128 水平归约）——全部 PROTECT 标记 +
+#pragma optimize("", off) 防尾调用化）+ `src/tests/t_kernels_avx.cpp`
+驱动（kernavx 组；小整数初值位精确对拍；非 x64 空 TU）。
+
+**build.bat 改造**：x64 分支单独 `/arch:AVX /c` 编 avx_kernels.obj 再链
+接（per-TU arch；x86 分支完全不含该 TU）。**两坑实录**：① build.bat 被
+Edit 重写为 LF 行尾 → cmd 对 LF-only batch 解析错乱（垃圾命令执行/
+spin/挂起）——**batch 文件必须 CRLF**（已转换）；② if() 块内 echo 的
+`(x64 only)` 括号提前闭合 if 块 → "此时不应有 ..."（去括号）。
+**avx_kernels.h 初版漏 WV_TARGET_NOINLINE 宏定义**（自包含头依赖缺
+失，kernels.h 的宏不随带）——补自包含定义。
+
+**验证**：native x64 106/106（kernavx 组 PASS）；x64 打包 stub 26→27
+（3 个 AVX 区域真虚拟化 +1 net——require_avx 默认开）；x64 native vs
+packed 双跑 106/106 IDENTICAL（`[PASS] kernavx` 在位 = 保护后真虚拟化
+回归）；x86 105/105 零影响（kernavx 缺席 = TU 守卫生效）；x86 打包
+26 stub 与 T68 持平。
+
+**遗留**：T73 收口引用本批作为"ymm 词流真实回归载体"证据；vzeroupper
+自动插桩面（MSVC /arch:AVX 函数收尾）在保护后产物中的共现可后续画像。
