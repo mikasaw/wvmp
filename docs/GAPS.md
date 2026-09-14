@@ -4215,3 +4215,20 @@ AvxRequireMustBeBool 三测试）；require_avx=false 管线实测：ymm 样本
 Vzeroupper=142）依赖"AVX 词 = 枚举尾部连续段"——未来 append-only 追加
 非 AVX 新词（值 ≥165）会落入 require_avx/混排 gate 误判，届时须把判据
 改为显式集合或移出值域（与 MIT-512 混排 gate 同款共享约束）。
+
+## MIT-519 (T71) 技术债卫生批（2026-09-14，自主队列）
+
+① **dump 门脚本行尾归一**：dump_handler_xmm_check.py 历史补丁行尾混杂
+（666 CRCRLF + 10 CRLF + 其余 LF）→ 归一为纯 LF（语法校验 + dumpbin 流程
+RESULT PASS 功能回归）。提交信息曾误记行尾统计为"676 CRLF"（验收 F3 勘
+误：实为 666 CRCRLF + 10 CRLF）。
+② **battery (g) driver shadow space 正规化（T63 验收 F2 注记清偿）**：
+driver 加 32B home 区（严格 Win64）。**验收 F1 Major 实录**：首版把
+`sub rsp,0x20` 放在 9 push 之前——ABI 的 callee home = call 时刻 [rsp,
+rsp+0x20)，sub 在前则该区落在 push 窗之上为死空间，callee 的 home 实际
+= r12-r15 push 槽（合法写 home 的 callee 即毁宿主寄存器；验收方 ml64
+复现实证 DEADBEEF 覆写）。修复 = push-then-sub 规范序（9 push → sub
+0x20 → call；saved rcx 重载 [rsp+0x60]；收尾 add rsp,0x20 + 8 pop +
+add rsp,8）。**教训**：home 区语义锚定在 call 时刻的 rsp，不在"函数
+开头的 sub"——帧序必须 push-then-sub（与 stub/同文件 (g2) driver 规范
+一致）。wvmpTest 杂散清理：T68 提交已收编，无残留。

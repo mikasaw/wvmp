@@ -430,16 +430,18 @@ void run_semantic_battery(const vm::RuntimeImage& image, const std::string& dump
         // 它为制造魔数而 clobber 的 8 个 callee-saved（原版裸写 rbp 后 ret，
         // 宿主帧被 0x2222... 覆写；ctx 扩容使测试函数代码 gen 恰好出现块 (g)
         // 之后的 rbp 相对寻址，潜伏违约引爆为 AV）。
-        // 栈窗（0x20 home + 9 push 后）：[rsp]=home 底、[rsp+0x20]=r15
-        // … [rsp+0x58]=rbx、[rsp+0x40]=saved rcx(store)；寄存器参数不落栈
-        // （shadow 空间无保证值）——ctx 仍从 r8 直读（driver 魔数面未触碰
-        // r8）。MIT-519: call 前 rsp 下方留 0x20 home 区（严格 Win64；
-        // blob entry 实测不写 shadow，此处正规化为契约正确性）。
+        // 栈窗（9 push + sub 0x20 home 后）：[rsp]=home 区底（call 时 callee
+        // home = [rsp, rsp+0x20)）… [rsp+0x28]=r15、[rsp+0x48]=rbx、
+        // [rsp+0x60]=saved rcx(store)（home 区在 push 窗之下，push-then-sub
+        // 规范序——sub 放 push 之前则 home 落在 r12-r15 槽位，合法写 home
+        // 的 callee 即毁宿主寄存器，MIT-519 验收 F1 ml64 复现实证）。寄存器
+        // 参数不落栈（shadow 无保证值）——ctx 仍从 r8 直读；call 前 rsp ≡ 0
+        // (mod 16)。
         const std::string driver_asm =
-            "sub rsp, 0x20\n"
             "push rcx\n"
             "push rbx\n push rbp\n push rdi\n push rsi\n"
             "push r12\n push r13\n push r14\n push r15\n"
+            "sub rsp, 0x20\n"
             "mov rbx, 0x1111111111111111\n"
             "mov rbp, 0x2222222222222222\n"
             "mov r12, 0x3333333333333333\n"
@@ -450,7 +452,7 @@ void run_semantic_battery(const vm::RuntimeImage& image, const std::string& dump
             "mov rsi, 0x8888888888888888\n"
             "mov rcx, r8\n"
             "call rdx\n"
-            "mov rcx, [rsp+0x40]\n"
+            "mov rcx, [rsp+0x60]\n"
             // 位移必须 0x 前缀：keystone Intel 裸数字按 16 进制解析（16→0x16=22），
             // 错位写穿 store 数组（slot2-7 全坏而 0/1 幸存的根因）。
             "mov [rcx], rbx\n"
@@ -461,9 +463,10 @@ void run_semantic_battery(const vm::RuntimeImage& image, const std::string& dump
             "mov [rcx+0x28], r15\n"
             "mov [rcx+0x30], rdi\n"
             "mov [rcx+0x38], rsi\n"
+            "add rsp, 0x20\n"
             "pop r15\n pop r14\n pop r13\n pop r12\n"
             "pop rsi\n pop rdi\n pop rbp\n pop rbx\n"
-            "add rsp, 0x28\n"
+            "add rsp, 8\n"
             "ret\n";
         RwxImage driver(assemble_or_throw(driver_asm));
         using DriverFn = void (*)(u64*, void*, void*);

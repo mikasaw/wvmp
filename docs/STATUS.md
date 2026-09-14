@@ -1303,3 +1303,6 @@ asmgen 零触碰 → dump 锚不受影响（无换代）。
 ### MIT-518 (T70 · 打包期 require_avx 配置开关) ✅ 2026-09-14
 - config 顶层 `[avx] require`（默认 true 零变化；false 时含 AVX 词流的函数整函数 gate——部署非 AVX 机器安全开关；G8b require_bmi2 同位预留）。实现 = ProtectRules 哨兵对 + config 解析（严格 schema 白名单同步）+ virtualize 值域扫描 gate。验证：ctest 23/23（+3 配置测试）；false 态管线 7 gate note + 0 stub；默认态全池 355/355 零回踩。开发实录：新顶层键三处同步（白名单/解析/消费），白名单最易漏。
   证据链 GAPS MIT-518。
+### MIT-519 (T71 · 技术债卫生批) ✅ 2026-09-14
+- dump 门脚本行尾归一（功能回归 PASS）+ battery (g) driver shadow space 正规化（push-then-sub 规范序；验收 F1 实证 sub-first 的 home 落在 r12-r15 槽位=契约违约，已修）。验证：ctest 23/23、dump 门 RESULT PASS。
+  证据链 GAPS MIT-519。
