@@ -3498,7 +3498,7 @@ REPEATS=10 = **335/335 PASS，jitter_events=0**——零真实抖动事件（对
 |---|---|---|---|
 | x87 全族（D8-DF） | R3 裁决永久 gate（MIT-416/418）；x64 频率≈0、x86 0.01–0.88%（old_runtime 7.81% 为 OS runtime 域，非保护目标面）；v145 MSVC x86 默认 /arch:SSE2；B 路线（x87 L0）触发条件不满足（MIT-445 §6 原文口径，append-only 入册） | x87 L0 ~80 新 VmOp → 98+80=178 > 128（跳表唯一必然溢出者）→ 前置 = 跳表 128→256 扩容（G9r §3.2 spike 已验：S 级）+ ST 栈模型（triage §4/§5 蓝图在档）+ callgate FP 面复核（MIT-417 已修 = 前置已清） | **用户决策**（推翻 append-only 裁决 + 大生产量；触发条件在档，蓝图直接生效） |
 | AVX 档B（ymm/zmm 32B） | G6a 位宽闸按操作数尺寸拒（X86_INS_VADDPS 双宽同 id）；kCtxSize 冻结合同（ctx.xmm[8]×16B，ymm 需 +512B ctx 面） | kCtxSize 合同版本 bump + ctx.ymm[16] 面 + 跳表扩容前置（档B 20–30 op = 128 临界实质触发者）+ vzeroupper ABI 面 | **用户决策**（冻结合同触碰，零触碰纪律外） |
-| VEX-GP BMI 残族（mulx/pdep/pext） | G8a 负例族照旧 C1 gate（MIT-434）；G8b 档方向 = native 直执行 + CPUID gate 基建挂账；mulx CF Zen5 实测不写 vs SDM 厂商分叉待决（MIT-432 §2/§6.4） | 直执行基建（新通道）+ CPUID 门控 + 厂商分叉裁决 | **用户决策**（基建级 + CPU 行为语义未决） |
+| VEX-GP BMI 残族（mulx/pdep/pext） | G8a 负例族照旧 C1 gate（MIT-434）；G8b 档方向 = native 直执行 + CPUID gate 基建挂账；mulx CF 厂商分叉已消解（MIT-515 Zen5 实测 = SDM 不修改 flags 一致；Intel 真机交叉验证挂账非阻塞） | 通路 A = lock 族同款 strip-and-execute + 打包期 require_bmi2 配置开关（1 任务量）；通路 B = stub 运行时 CPUID 门（不推荐） | **用户决策**（纯产品取舍：BMI2 最低机器契约；语义未决已消解，备忘录推荐默认 = 接受） |
 | blsr 族四条（blsr/blsi/blsmsk/bextr） | 语料 27 文件命中 0，文档化永久 gate（432 §6.4） | 频率触发面（语料出现即立单） | 维持（零频率） |
 | d==s2 标量族（VEX 标量三态折叠盲区） | 合并频率 0.75% < 1% 准入门（MIT-426 B.3）；需 xmm→GP 双槽暂存原语 = 新 VmOp（G6a 批内 D1 零新 VmOp 纪律） | 频率过 1% 或批内预算出现 | 维持（低于准入门） |
 | FMA 族 | 双舍入红线，永不拆 mul+add（triage §6.5） | 无 | 永久 |
@@ -4094,3 +4094,37 @@ mem 源翻倍对拍 + 426 位宽闸负例翻转 VexYmmWidthGateNowFolded）；�
 standalone fails=0；全池 355/355（REQUIRE_REAL=1）；dump 门 ymm 21
 handler 全 PASS（119 handlers）；单 pack 对账 stub 4 + 混排 gate note 1
 （④ 设计内）。**wave2③ (MIT-514) 收口（2026-09-14，自主队列）**：T64 F4 + T65 F1 两笔挂账清偿——样本 wvmp_ymm_data_sample 增 ⑥ ymm_pass_through（区域内 YmmLoad 写 ymm0 → 函数返回 → main 经 read_ymm0 thunk 捕获物理 ymm0 32B：stub ymm 同步变体 disp32 行为级真值钉住，字节计数之外的观测面）+ ⑦ ymm_mix_arith_neg（vaddps 算术 + addps legacy SSE 同区 → 混排 gate 负例入池，native byte-exact 翻倍值；store 在 addps 之前——T64 验收 F1 教训）。**维持 gate 裁决（D 级默认披露）**：xmm/ymm 混排双向一致性协议（ymm 写词镜像 xmm 面 + ymm 读词低半从 xmm 面拼）成本 = 全部 ymm handler 读写模板重写 + 混排矩阵测试；真实 AVX 语料混排频率证据未出现（频率门）→ 维持 gate 披露，频率触发再翻面。vextractf128/vinsertf128 桥：语料频率证据未出现（频率门）→ 不入面。**档B wave2③ 后遗留**：混排协议翻面（频率触发）、桥（频率触发）、EVEX 天然 gate、vzero 无 CPUID gate（G8b 同口径）。
+## MIT-515 (T67) BMI G8b 决策备忘录（2026-09-14，自主队列；复刻 MIT-496 模式——纯实测+文档，零翻译器代码）
+
+**实测探针**：`scripts/verifier/mit_515_bmi_probe/`（ml64 asm + C++ 驱动，
+本仓可复现；build_bmi.bat）。**实测机**：AMD Ryzen 7 9800X3D（Zen5，
+AuthenticAMD，max leaf 0x10），BMI1/BMI2/ADX/AVX/AVX2 全 1。
+
+**实测① — mulx flags 保持性（厂商分叉裁决的核心证据）**：协议 = xor 置
+ZF=1 → stc 置 CF=1 → `mulx edi, ebx, r8d` → pushfq 提取。4 组非对称输入
+（FFFFFFFF×FFFFFFFF / 80000000×2 / 1×1 / DEADBEEF×CAFEBABE）全部
+CF_after=1 ZF_after=1 —— **mulx 完全不修改任何标志，与 SDM 口径一致，
+Zen5 侧无分叉**。MIT-432 时代"Zen5 实测不写 vs SDM 分叉待决"的待决项
+降级为：Intel 真机交叉验证挂账（非阻塞——SDM 为 Intel 定义文，Zen5 实测
+与之一致；残留风险仅在第三方厂商/虚拟化环境的未验证面）。
+
+**实测② — pdep/pext 值语义**：4 组 (x, mask) 与软件参考全对拍 OK
+（含 12345678×FF00 → 7800 散布/压缩双向）。语义确定，无分叉面。
+
+**reopen 路径与成本量化（G8b 基建）**：
+- **通路 A（备忘录推荐默认）**：MIT-419 lock 族同款 strip-and-execute
+  通路——+3 VmOp（Mulx/Pdep/Pext，reg-reg 三操作数，flag_sem=kNone 实测
+  支撑）+ 3 个 native 直发 handler（读 ctx GP 槽 → 物理 reg 执行 → 写回，
+  无 flags 通路）+ **打包期配置开关**（config `require_bmi2`：开启才收
+  白名单，产物契约披露"最低 BMI2 机器"——与 ymm AVX 机器要求同哲学，
+  零运行时 CPUID 门基建）。工程量 ≈ 1 任务（T64/T65 同量级）。
+- **通路 B（不推荐）**：stub 入口运行时 CPUID 检查分支（全产物通用门）
+  ——真正的基建级改动，影响所有产物 stub 形状 + dump 门/字节恒等面，
+  收益仅在不接受最低 CPU 契约的场景。
+- **开发实录并入**：pdep 软件参考位序反写（x 的 bit i 应取 bit bn 非
+  bit i——参考错时硬件"疑似 MISMATCH"假象，T65 vvvv 手写错同款教训：
+  软件参考与手写编码一律对拍二次校验）。
+
+**剩余用户决策（纯产品取舍）**：是否接受 mulx/pdep/pext 产物的 BMI2 最低
+机器契约（通路 A 语义未决已消解）。推荐默认 = 接受（频率证据出现时随任务
+落地）；不接受的备选 = 维持 gate（现状，零成本）。
