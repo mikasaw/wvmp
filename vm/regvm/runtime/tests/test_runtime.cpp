@@ -430,10 +430,13 @@ void run_semantic_battery(const vm::RuntimeImage& image, const std::string& dump
         // 它为制造魔数而 clobber 的 8 个 callee-saved（原版裸写 rbp 后 ret，
         // 宿主帧被 0x2222... 覆写；ctx 扩容使测试函数代码 gen 恰好出现块 (g)
         // 之后的 rbp 相对寻址，潜伏违约引爆为 AV）。
-        // 栈窗（9 push 后）：[rsp]=r15 … [rsp+0x38]=rbx、[rsp+0x40]=saved
-        // rcx(store)；寄存器参数不落栈（shadow 空间无保证值）——ctx 仍从
-        // r8 直读（driver 魔数面未触碰 r8），call 前 rsp ≡ 0 (mod 16)。
+        // 栈窗（0x20 home + 9 push 后）：[rsp]=home 底、[rsp+0x20]=r15
+        // … [rsp+0x58]=rbx、[rsp+0x40]=saved rcx(store)；寄存器参数不落栈
+        // （shadow 空间无保证值）——ctx 仍从 r8 直读（driver 魔数面未触碰
+        // r8）。MIT-519: call 前 rsp 下方留 0x20 home 区（严格 Win64；
+        // blob entry 实测不写 shadow，此处正规化为契约正确性）。
         const std::string driver_asm =
+            "sub rsp, 0x20\n"
             "push rcx\n"
             "push rbx\n push rbp\n push rdi\n push rsi\n"
             "push r12\n push r13\n push r14\n push r15\n"
@@ -460,7 +463,7 @@ void run_semantic_battery(const vm::RuntimeImage& image, const std::string& dump
             "mov [rcx+0x38], rsi\n"
             "pop r15\n pop r14\n pop r13\n pop r12\n"
             "pop rsi\n pop rdi\n pop rbp\n pop rbx\n"
-            "add rsp, 8\n"
+            "add rsp, 0x28\n"
             "ret\n";
         RwxImage driver(assemble_or_throw(driver_asm));
         using DriverFn = void (*)(u64*, void*, void*);
