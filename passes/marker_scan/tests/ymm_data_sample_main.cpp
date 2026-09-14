@@ -10,7 +10,7 @@ extern "C" unsigned int      ymm_chain32(void* dst, const void* src);     // ②
 extern "C" unsigned int      ymm_vzero_mix(void* dst, const void* src);   // ③
 extern "C" unsigned int      ymm_mix_neg(void* dst, const void* src);     // ④ gate
 extern "C" unsigned int      ymm_arith(void* dst, const void* src);       // ③' MIT-513
-extern "C" void*            ymm_pass_through(const void* src);           // ⑥ MIT-514 读回 (src=rcx)
+extern "C" void             ymm_pass_through(const void* src);           // ⑥ MIT-514 读回 (src=rcx)
 extern "C" unsigned int      ymm_mix_arith_neg(void* dst, const void* src); // ⑦ gate
 extern "C" void             read_ymm0(void* dst);                        // ymm0 捕获 thunk
 

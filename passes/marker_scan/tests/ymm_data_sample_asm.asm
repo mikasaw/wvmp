@@ -104,7 +104,7 @@ ymm_mix_neg PROC
     ret
 ymm_mix_neg ENDP
 
-; ---- ⑥ ymm_pass_through(src=rdx): ymm 词后返回 — 物理 ymm0 读回钉 ----
+; ---- ⑥ ymm_pass_through(src=rcx): ymm 词后返回 — 物理 ymm0 读回钉 ----
 ; MIT-513 验收 F1 挂账 / T64 F4: 区域内 YmmLoad 写 ymm0 面 → 函数返回后
 ; stub 出口 ymm 回写使物理 ymm0 = 加载值, 宿主经 read_ymm0 thunk 观测
 ; (stub ymm 同步变体 disp32 行为级钉住, 字节计数之外的真值面)。
