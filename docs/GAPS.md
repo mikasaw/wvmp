@@ -4266,3 +4266,18 @@ rva 定位需对照区域清单（marker rva ≠ 函数 rva）。
 
 **遗留**：T73 收口引用本批作为"ymm 词流真实回归载体"证据；vzeroupper
 自动插桩面（MSVC /arch:AVX 函数收尾）在保护后产物中的共现可后续画像。
+
+## MIT-521 (T73) 频率门挂账数据驱动收口备忘录（2026-09-14，自主队列；依 MIT-517 画像数据逐项裁决）
+
+| 挂账项 | 画像/语料证据 | 裁决 |
+|---|---|---|
+| ① xmm/ymm 混排协议翻面 | /arch:AVX 产物混排 switches=7 次/exe（EVEX 修正口径）——切换真实高频；但受益前提=切换点落在受保护函数区内；wvmpTest AVX 语料批（MIT-520）3 内核为纯 ymm 词无混排，未复现受影响函数 | **维持 gate**（保守面保留；触发条件改写 = 出现"真实被保护需求且含混排词流"的函数样本时凭样本立项） |
+| ② vextractf128/vinsertf128 桥 | MIT-517 画像 BRIDGE=0（自动向量化不生成，仅 intrinsic 面）；MIT-520 语料 dot8 初版 extractf128 归约实证 = 该 intrinsic 在归约场景真实出现（C1 gate 正确拦截） | **维持频率门 + 证据升级**：桥的 intrinsic 场景已实证存在（归约/半区搬运），触发条件 = 出现使用该 intrinsic 的真实保护需求；入面工程量小（+2 VmOp，语义 = xmm 槽 ↔ ymm 半区） |
+| ③ BMI2 mulx/pdep/pext | MIT-515 备忘录：mulx flags 分叉消解（Zen5=SDM）；通路 A = 1 任务量 | **维持待用户产品决策**（BMI2 最低机器契约）；技术面无阻塞 |
+
+**第二波自主队列（T69-T73）收口**：T69 画像（供数）→ T70 开关（require_avx，
+零回踩实证）→ T71 卫生批（行尾归一 + shadow space 正规化，验收抓出 home
+区位置错并修复）→ T72 AVX 语料批（3/3 真虚拟化 + C4-VEX 缺口实证：
+vextractf128/vpbroadcast 未入面系 intrinsic 场景真实存在——与 ② 呼应）→
+本单收口。**队列清空，下一轮需用户输入**（候选：② 桥入面、① 混排协议
+翻面、BMI2 通路 A、wvmpTest 继续扩面、或用户新方向）。

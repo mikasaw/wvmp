@@ -1309,3 +1309,6 @@ asmgen 零触碰 → dump 锚不受影响（无换代）。
 ### MIT-520 (T72 · wvmpTest x64 AVX 语料批) ✅ 2026-09-14
 - wvmpTest：+3 AVX 内核（intrinsic 确定性 ymm 词流，x64 专属 TU，per-TU /arch:AVX + /Od 单编链接）+ kernavx 驱动（位精确对拍）。native x64 106/106 / x86 105/105 零影响；x64 打包 stub 29（**3 AVX 区全部真虚拟化**）、native vs packed 106/106 IDENTICAL。开发实录：batch 文件必须 CRLF（LF 被 cmd 解析错乱 spin）、if() 块内 echo 括号提前闭合、avx_kernels.h 自包含补 WV_TARGET_NOINLINE、**ymm kernel 内禁止 float 标量运算**（/Od 必产 addss 与 ymm 词同函数 → 混排 gate，归约移驱动侧）。
   证据链 GAPS MIT-520。
+### MIT-521 (T73 · 频率门挂账数据驱动收口备忘录) ✅ 2026-09-14
+- 依 MIT-517 画像 + MIT-520 语料实证逐项裁决：① 混排协议翻面 = 维持 gate（switches=7/exe 真实高频但受益前提未复现，触发条件改写为样本驱动）；② vextractf128/vinsertf128 桥 = 维持频率门 + 证据升级（intrinsic 归约场景实证存在，入面工程量 +2 VmOp 小）；③ BMI2 = 维持待用户产品决策（技术无阻塞）。第二波自主队列（T69-T73）全部收口，队列清空。
+  证据链 GAPS MIT-521。
