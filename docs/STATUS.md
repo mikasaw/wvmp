@@ -1294,3 +1294,6 @@ asmgen 零触碰 → dump 锚不受影响（无换代）。
 ### MIT-514 (T66 · AVX 档B wave2③ — 挂账清偿 + 收口) ✅ 2026-09-14
 - 样本 wvmp_ymm_data_sample 增 ⑥ ymm_pass_through（物理 ymm0 出口回写读回钉 = T64 F4 清偿：stub ymm 同步 disp32 行为级真值）+ ⑦ ymm_mix_arith_neg（vaddps+addps 混排 gate 负例入池 = T65 F1 清偿）。**维持 gate 裁决**（D 级披露）：混排双向协议（ymm handler 读写模板重写 + 混排矩阵）成本高于真实语料混排频率收益（频率门未触发）→ gate 维持，频率触发再翻面；vextractf128/vinsertf128 桥同频率门不入面。验证：样本 standalone fails=0（⑥⑦）；全池 355/355 REQUIRE_REAL。
   证据链 GAPS wave2③ 收口段。
+### MIT-515 (T67 · BMI G8b 决策备忘录) ✅ 2026-09-14
+- 纯实测+文档（MIT-496 模式，零翻译器代码）。探针入库 scripts/verifier/mit_515_bmi_probe/。本机 AMD 9800X3D (Zen5) 实测：**mulx 完全不修改 CF/ZF（4 case 全保持 = SDM 一致，厂商分叉消解，Intel 真机交叉验证挂账非阻塞）**；pdep/pext 值语义软件参考全对拍 OK（开发实录：pdep 参考位序反写）。reopen 通路 A（lock 族同款 strip-and-execute + 打包期 require_bmi2 开关，1 任务量，推荐）/ 通路 B（stub 运行时 CPUID 门，不推荐）。剩余用户决策 = 纯产品取舍（BMI2 最低机器契约），推荐默认 = 频率证据出现时随任务接受。
+  证据链 GAPS MIT-515。
