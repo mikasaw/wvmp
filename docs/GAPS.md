@@ -4211,4 +4211,7 @@ has_require_avx/require_avx 哨兵对（MIT-468 三态模式）+ config.cpp [avx
 **验证**：ctest 23/23（+AvxRequireParses/AvxUnknownSubkeyFails/
 AvxRequireMustBeBool 三测试）；require_avx=false 管线实测：ymm 样本
 7 gate note + 0 stub（全部 AVX 函数原生保持）；默认态零回踩 = 全池
-355/355（REQUIRE_REAL=1）。
+355/355（REQUIRE_REAL=1）。**验收 F2 前瞻约束**：值域判据（op ≥
+Vzeroupper=142）依赖"AVX 词 = 枚举尾部连续段"——未来 append-only 追加
+非 AVX 新词（值 ≥165）会落入 require_avx/混排 gate 误判，届时须把判据
+改为显式集合或移出值域（与 MIT-512 混排 gate 同款共享约束）。
