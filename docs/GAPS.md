@@ -4093,5 +4093,5 @@ Ymm 三词落 default——op=110/111/112 取证定位，管线与单测形态�
 mem 源翻倍对拍 + 426 位宽闸负例翻转 VexYmmWidthGateNowFolded）；样本
 standalone fails=0；全池 355/355（REQUIRE_REAL=1）；dump 门 ymm 21
 handler 全 PASS（119 handlers）；单 pack 对账 stub 4 + 混排 gate note 1
-（④ 设计内）。**遗留**（wave2③）：混排契约落地（本 gate 可翻面）、
+（④ 设计内）。**遗留**（wave2③）：混排契约落地（本 gate 可翻面）、混排 gate 值域判据（含算术词）补 arith+SSE 混排负例入池（验收 F1：现样本④ ymm 词全 mov 族，判据回退现有测试不可见——M3 变异实测静默错值风险真实）、
 vextractf128/vinsertf128 桥、ctx.ymm 读回影子样本（T64 F4 挂账）。
