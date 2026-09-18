@@ -1,0 +1,39 @@
+WVmp code review verification: 2026-09-18
+Baseline commit: d382c5463e0eb535286fe5db37adae84a2b8b6be
+Command: .\docs\code-review-2026-09-18\reproduce.ps1
+
+review_probe.cpp
+bytes.cpp
+registry.cpp
+pe_image.cpp
+section_builder.cpp
+crypt_pass.cpp
+xor_chain.cpp
+blob.cpp
+config.cpp
+正在生成代码...
+NAME_RULE parse_ok=1 expected=virtualize actual=none
+CRYPT_INDEX expected_encrypted=C actual_encrypted=B
+PDATA PE32 expected=1 actual=0 empty=1
+PDATA PE32+ expected=1 actual=1 empty=0
+SECTIONS auto_then_fixed expected=2000,3000 actual=4000,3000
+DIRECTORY_COUNT zero expected_pdata=0 actual_pdata=1
+flags_probe.cpp
+  正在创建库 flags_probe.lib 和对象 flags_probe.exp
+notes=0
+mov cond_or_size=2
+mov cond_or_size=2
+cmp cond_or_size=6
+shlcl cond_or_size=2
+setcc cond_or_size=4
+jmp cond_or_size=3
+halt cond_or_size=0
+ZERO_SHIFT expected_eax=1 actual_eax=0
+
+Freshly rebuilt CTest run (--timeout 300 -j 2):
+22/23 Test #22: p0_smoke .........................   Passed    1.27 sec
+23/23 Test  #4: regvm_runtime_tests ..............   Passed   55.53 sec
+
+100% tests passed, 0 tests failed out of 23
+
+Total Test time (real) =  55.58 sec
