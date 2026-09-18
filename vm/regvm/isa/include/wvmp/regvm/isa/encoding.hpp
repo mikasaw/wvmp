@@ -68,12 +68,23 @@ inline constexpr u8 kFlagsDeadBit = 0x4;
 //     CF_in 流入 dst = a + b + CF_in——寄存器消费无条件可观察）→ 输入侧
 //     恒为读者（live_in = 1，前驱写永不标记）；自身 flags 写仍可标记
 //    （tail 跳过不影响块体的寄存器计算）。MIT-474 验收 B1 裁决。
+//   - kWriteConditional：**条件定义**——要么按结果全量重写五位，要么整条
+//     连值带 flags 一概不写，走哪条路由运行时才确定的操作数决定。移位族即
+//     此形：有效计数（按操作数宽度掩码后）为零 → asmgen build_shift 的
+//     `jz adv` 出口直通，flags 与目的寄存器原样保留（Intel SDM Vol.2
+//     SHL/SHR/SAR："If COUNT is 0, the flags are unaffected"）。前驱
+//     cmp/test 的可观察性因此经零计数移位延续 → 输入侧透传
+//     （live_in = live_out），不得杀前驱（CR-01 / MIT-490：无条件 kWrite
+//     曾把零次移位前的 cmp 判成 dead，setcc/jcc 读陈旧位静默算错）。自身写
+//     仍可标记（无读者 ⇒ 两条路都无可观察差异）。立即数计数的有效值翻译期
+//     已知，由 flag_sem_of(const VmInsn&) 细化回 kWrite。
 //   - kRead：只读（Jcc/Setcc/Cmovcc/GetFlags 全量读；ExitNative 条件形式
 //     经 cond_eval 读，无条件直退形保守同判）。
 //   - kNone：与 VM flags 无交互。SetFlags 直写 flags 槽、不经 tail（无捕
 //     获装配面），标记无消费点 → 归 kNone（永不标记、不杀、透传），后人
 //     勿改。
-enum class FlagSem { kNone, kRead, kWrite, kWriteReadMerge, kWriteReadReg };
+enum class FlagSem { kNone, kRead, kWrite, kWriteReadMerge, kWriteReadReg,
+                     kWriteConditional };
 [[nodiscard]] constexpr FlagSem flag_sem_of(VmOp op) {
     switch (op) {
         case VmOp::Jcc: case VmOp::Setcc: case VmOp::Cmovcc:
@@ -86,10 +97,14 @@ enum class FlagSem { kNone, kRead, kWrite, kWriteReadMerge, kWriteReadReg };
         case VmOp::RolCl: case VmOp::RorCl:
         case VmOp::Inc: case VmOp::Dec:                 // 保旧 CF（只进 flags）
             return FlagSem::kWriteReadMerge;
-        case VmOp::Add: case VmOp::Sub: case VmOp::And: case VmOp::Or:
-        case VmOp::Xor: case VmOp::Neg: case VmOp::Cmp: case VmOp::Test:
+        // CR-01 (MIT-490)：有效计数为零 ⇒ 整条 no-op（值与 flags 均不变），
+        // 输入 flags 可能原样流出——条件定义，输入侧透传。立即数形按
+        // flag_sem_of(const VmInsn&) 细化。
         case VmOp::Shl: case VmOp::Shr: case VmOp::Sar:
         case VmOp::ShlCl: case VmOp::ShrCl: case VmOp::SarCl:
+            return FlagSem::kWriteConditional;
+        case VmOp::Add: case VmOp::Sub: case VmOp::And: case VmOp::Or:
+        case VmOp::Xor: case VmOp::Neg: case VmOp::Cmp: case VmOp::Test:
         case VmOp::Imul: case VmOp::Mul: case VmOp::Cmpxchg: case VmOp::Xadd:
         case VmOp::Bts: case VmOp::Btr: case VmOp::Btc:
         case VmOp::Ucomiss: case VmOp::Ucomisd:
@@ -117,6 +132,36 @@ enum class FlagSem { kNone, kRead, kWrite, kWriteReadMerge, kWriteReadReg };
         default:
             return FlagSem::kNone;
     }
+}
+
+// 写族（自身对 VM flags 的写可打 dead 标，且在 liveness 里承担杀/透传/
+// 条件定义的输入侧角色）——translator 两处判定与翻译快照测试共用单一来源，
+// 新增分类只改这里。⚠️ Jcc/Setcc/Cmovcc 的 cond 域是条件码，永不入选。
+[[nodiscard]] constexpr bool is_flag_write(FlagSem sem) {
+    return sem == FlagSem::kWrite || sem == FlagSem::kWriteReadMerge ||
+           sem == FlagSem::kWriteReadReg || sem == FlagSem::kWriteConditional;
+}
+
+// 移位有效计数掩码（Intel SDM Vol.2 SHL/SHR/SAR：8/16/32 位操作数 count
+// & 31、64 位 & 63）。⚠️ 与 asmgen build_shift 的运行时掩码（s <= 1 ? 0x1F
+// : 0x3F，S32 取 63）在 S32 上不重合——那是独立于本单的运行时偏差（已报
+// 交付评论，未在本役修）。本函数按**架构语义**取掩码，方向上对 liveness
+// 保守：判"有效为零"⇒ 透传不杀前驱（欠优化，安全）；偏差日后修正也无需
+// 回改此处。
+[[nodiscard]] constexpr u32 shift_count_mask(ir::Size s) {
+    return s == ir::Size::S64 ? 0x3Fu : 0x1Fu;
+}
+
+// 逐指令 flags 语义：kWriteConditional 的立即数计数形在翻译期即可定有效
+// 计数（CR-01 / MIT-490 允许的细化档）。CL 形与寄存器计数形运行时才知道
+// 计数（含 guest 自做 `and cl,31` / `and cl,63` 归零）→ 保持条件定义。
+// 位 2（flags-dead 标）已在 field_size 的 & 3 掩码外，不受干扰。
+[[nodiscard]] constexpr FlagSem flag_sem_of(const VmInsn& insn) {
+    const FlagSem sem = flag_sem_of(insn.op);
+    if (sem == FlagSem::kWriteConditional && insn.b_kind == OpKind::Imm &&
+        (insn.aux & shift_count_mask(field_size(insn.cond_or_size))) != 0)
+        return FlagSem::kWrite;   // 有效计数非零 ⇒ 与纯写等价（杀前驱）
+    return sem;
 }
 
 // 8 字节定长编码：单条指令即一个 LE u64，64 位恰好用尽、无保留位。

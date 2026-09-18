@@ -134,9 +134,7 @@ void expect_is(const VmInsn& g, VmOp op, OpKind ak, u8 ra, OpKind bk, u8 rb, u32
     // MIT-474 (T18)：flags 写 op 的 cond 位 2 = flags-dead 标记，由翻译期
     // 跨块 liveness 数据驱动（快照不钉；标记有无由 FlagsLiveness 专测断
     // 言），size 语义 = 低 2 位。
-    if (isa::flag_sem_of(op) == isa::FlagSem::kWrite ||
-        isa::flag_sem_of(op) == isa::FlagSem::kWriteReadMerge ||
-        isa::flag_sem_of(op) == isa::FlagSem::kWriteReadReg) {
+    if (isa::is_flag_write(isa::flag_sem_of(op))) {
         EXPECT_EQ(static_cast<u8>(g.cond_or_size & 3), static_cast<u8>(cs & 3));
     } else {
         EXPECT_EQ(g.cond_or_size, cs);
@@ -667,6 +665,154 @@ TEST(Translate, FlagsLivenessAdcSbbRegDepKeepsPredecessor) {
     EXPECT_FALSE(dead(d.insns[0]));   // add：adc 读它的 CF_in（寄存器依赖）
     EXPECT_EQ(d.insns[1].op, VmOp::Adc);
     EXPECT_TRUE(dead(d.insns[1]));    // adc 自身 flags 写：后无读者
+}
+
+// ---------------------------------------------------------------------------
+// CR-01 (MIT-490)：移位族是**条件定义**写。{Shl,Shr,Sar} × {立即数形, Cl 形}
+// × {零计数, 掩码归零计数, 非零计数} 全格断言。
+//
+// 夹具序列（单块，末端 sete 是唯一读者）：
+//   [<计数预备>]  cmp eax,0  /  <op> edx,<计数>  /  sete ecx
+// 断言的是"谁还能被看见"：
+//   · 有效计数可能为零 ⇒ 移位整条走 build_shift 的 `jz adv` 出口，cmp 的五位
+//     原样流出给 sete ⇒ **cmp 不得被标 dead**（修复前恒被标 dead → setcc 读
+//     陈旧位，审查实录 eax=0 vs 期望 1）。
+//   · 立即数计数翻译期已知非零 ⇒ 移位必然覆写五位，cmp 是死写（杀语义保留，
+//     地址拼装 shl ix,3 一类不因本单退化）。
+//   · 移位自身：sete 是读者 ⇒ 一律不标 dead（标了就把唯一读者的输入吃掉）。
+// ---------------------------------------------------------------------------
+
+namespace {
+struct ShiftCells {
+    VmInsn cmp;
+    VmInsn shift;
+};
+struct ShiftCase {
+    ir::Op iop;
+    VmOp sop;       // Cl 形时 = 翻译器实发的 *Cl 词
+    const char* name;
+};
+
+// 按 op 找词流里的 guest cmp / 移位词（各至多一条，多者即夹具走样）。
+ShiftCells find_cmp_shift(const Decoded& d, VmOp sop) {
+    ShiftCells out{};
+    int n_cmp = 0, n_shift = 0;
+    for (const auto& g : d.insns) {
+        if (g.op == VmOp::Cmp && g.reg_a == kRax) { out.cmp = g; ++n_cmp; }
+        if (g.op == sop && g.reg_a == kRdx) { out.shift = g; ++n_shift; }
+    }
+    EXPECT_EQ(n_cmp, 1) << "夹具 cmp 词数";
+    EXPECT_EQ(n_shift, 1) << "夹具移位词数";
+    return out;
+}
+
+// Cl 形断言用：Imm op → 翻译器实发的 *Cl op。
+VmOp cl_shift_op_of(VmOp imm_op) {
+    switch (imm_op) {
+    case VmOp::Shl: return VmOp::ShlCl;
+    case VmOp::Shr: return VmOp::ShrCl;
+    case VmOp::Sar: return VmOp::SarCl;
+    default: return imm_op;
+    }
+}
+
+// cl_form=true → 计数走 RCX（实发 ShlCl/ShrCl/SarCl）；false → 立即数计数。
+// pre = 计数预备指令（Cl 形用它表达 mov ecx,N / and cl,31）。
+void expect_shift_cell(const ShiftCase& tc, bool cl_form, i64 imm_count,
+                       ir::Size sz, std::vector<ir::Insn> pre, bool cmp_alive,
+                       const std::string& tag) {
+    const VmOp sop = cl_form ? cl_shift_op_of(tc.sop) : tc.sop;
+    pre.push_back(alu(ir::Op::Cmp, ir::Operand::reg_(ir::Reg::Rax),
+                      ir::Operand::imm_(0), sz));
+    const ir::Operand cnt =
+        cl_form ? ir::Operand::reg_(ir::Reg::Rcx) : ir::Operand::imm_(imm_count);
+    pre.push_back(alu(tc.iop, ir::Operand::reg_(ir::Reg::Rdx), cnt, sz));
+    ir::Insn set = I(ir::Op::Setcc, ir::Size::S8);
+    set.cond = ir::Cond::E;
+    set.dst = ir::Operand::reg_(ir::Reg::Rcx);
+    pre.push_back(set);
+
+    const auto r = wvmp::regvm::translator::translate_function(
+        fn_of({blk(0x1000, std::move(pre))}));
+    // 受支持组合必须整段翻译成功：notes 非空 = 有指令被拦/跳过，本格断言失效。
+    ASSERT_TRUE(r.notes.empty()) << tag << " notes=" << r.notes.size();
+    const Decoded d = decode_program(r.program);
+    const ShiftCells c = find_cmp_shift(d, sop);
+    EXPECT_EQ(dead(c.cmp), !cmp_alive) << tag << "：cmp 死写标记失配";
+    EXPECT_FALSE(dead(c.shift)) << tag << "：移位自身（sete 是读者）不得标记";
+    // 条件定义形在 flag_sem_of 表上必须是 kWriteConditional（立即数非零形
+    // 由逐指令重载细化回 kWrite）。
+    if (!cmp_alive) {
+        EXPECT_EQ(isa::flag_sem_of(c.shift), isa::FlagSem::kWrite)
+            << tag << "：有效计数非零应细化为 kWrite";
+    } else {
+        EXPECT_EQ(isa::flag_sem_of(c.shift), isa::FlagSem::kWriteConditional)
+            << tag << "：零/不可知计数应为条件定义";
+    }
+}
+
+// mov ecx, N（S32 计数预备）+ 可选 `and cl, 31`（guest 自做位宽掩码归零）。
+std::vector<ir::Insn> cl_setup(i64 n, bool mask31) {
+    std::vector<ir::Insn> v{mov_imm(ir::Reg::Rcx, n, ir::Size::S32)};
+    if (mask31)
+        v.push_back(alu(ir::Op::And, ir::Operand::reg_(ir::Reg::Rcx),
+                        ir::Operand::imm_(31), ir::Size::S8));
+    return v;
+}
+
+const ShiftCase kShiftCases[] = {
+    {ir::Op::Shl, VmOp::Shl, "shl"},
+    {ir::Op::Shr, VmOp::Shr, "shr"},
+    {ir::Op::Sar, VmOp::Sar, "sar"},
+};
+} // namespace
+
+TEST(Translate, FlagsLivenessShiftMatrixImmForm) {
+    // 立即数形：计数 0 / 计数 32@S32、64@S64（经位宽掩码归零）⇒ 条件定义，
+    // cmp 保留；计数非零 ⇒ 细化回 kWrite，cmp 判死（地址拼装 shl ix,3 一类
+    // 不因本单退化）。
+    for (const auto& tc : kShiftCases) {
+        expect_shift_cell(tc, false, 0, ir::Size::S32, {}, true,
+                          std::string(tc.name) + " imm#0");
+        expect_shift_cell(tc, false, 32, ir::Size::S32, {}, true,
+                          std::string(tc.name) + " imm#32@S32(掩码归零)");
+        expect_shift_cell(tc, false, 64, ir::Size::S64, {}, true,
+                          std::string(tc.name) + " imm#64@S64(掩码归零)");
+        expect_shift_cell(tc, false, 1, ir::Size::S32, {}, false,
+                          std::string(tc.name) + " imm#1(非零)");
+        expect_shift_cell(tc, false, 3, ir::Size::S64, {}, false,
+                          std::string(tc.name) + " imm#3@S64(非零)");
+    }
+}
+
+TEST(Translate, FlagsLivenessShiftMatrixClForm) {
+    // Cl 形：计数运行时才定（含 guest 自做 `and cl,31` 归零），翻译期不可知
+    // ⇒ 三档计数（0 / 掩码归零 / 非零）全部保守透传，前驱 cmp 恒不判死。
+    for (const auto& tc : kShiftCases) {
+        expect_shift_cell(tc, true, 0, ir::Size::S32, cl_setup(0, false), true,
+                          std::string(tc.name) + " cl#0");
+        expect_shift_cell(tc, true, 0, ir::Size::S32, cl_setup(32, true), true,
+                          std::string(tc.name) + " cl#32+and cl,31(掩码归零)");
+        expect_shift_cell(tc, true, 0, ir::Size::S32, cl_setup(1, false), true,
+                          std::string(tc.name) + " cl#1(非零，翻译期不可知)");
+    }
+}
+
+TEST(Translate, FlagsLivenessShiftNoReaderMarksSelfOnly) {
+    // 移位后无读者（末端）：零计数 Cl 形自身可标 dead（两条路都无可观察差异），
+    // 且透传后 cmp 的 live_out 同为 0 → 末端死写一并判死，正确（区域末端
+    // VM flags 不跨区）。本格钉住"标记自身"与"透传不杀"在无读者末端同时成立。
+    const auto r = wvmp::regvm::translator::translate_function(fn_of({
+        blk(0x1000, {alu(ir::Op::Cmp, ir::Operand::reg_(ir::Reg::Rax),
+                         ir::Operand::imm_(0), ir::Size::S32),
+                     alu(ir::Op::Shl, ir::Operand::reg_(ir::Reg::Rdx),
+                         ir::Operand::reg_(ir::Reg::Rcx), ir::Size::S32)}),
+    }));
+    ASSERT_TRUE(r.notes.empty());
+    const Decoded d = decode_program(r.program);
+    const ShiftCells c = find_cmp_shift(d, VmOp::ShlCl);
+    EXPECT_TRUE(dead(c.shift));  // 自身无读者 → 标
+    EXPECT_TRUE(dead(c.cmp));    // 经透传 live_out 仍为 0 → 末端死写，正确
 }
 
 // ---------------- MIT-494d：合成指令 flags 透明化 ----------------

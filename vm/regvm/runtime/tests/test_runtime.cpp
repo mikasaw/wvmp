@@ -19,11 +19,15 @@
 
 #include "wvmp/regvm/runtime/runtime.hpp"
 
+#include "wvmp/common/bytes.hpp"
 #include "wvmp/common/rng.hpp"
 #include "wvmp/regvm/codecs/xor_chain.hpp"
+#include "wvmp/regvm/isa/blob.hpp"
 #include "wvmp/regvm/isa/encoding.hpp"
 #include "wvmp/regvm/isa/vm_op.hpp"
 #include "wvmp/regvm/isa/vm_reg.hpp"
+// MIT-490 (CR-01) 层③：D6 案例必须经**真实翻译器**到运行时，不得手工搭词替代。
+#include "wvmp/regvm/translator/translator.hpp"
 #include "wvmp/vm/backend.hpp"
 
 #include <keystone/keystone.h>
@@ -2490,6 +2494,314 @@ TEST(Interpreter, RotFlagsPartialPreserve) {
                       u64(isa::kFlagSF | isa::kFlagCF | isa::kFlagOF))
                 << "组12 rorcl SF 保留 seed=" << seed;
         }
+    }
+}
+
+// =============================================================================
+// MIT-490 (CR-01) 层②：移位族零计数 = 整条 no-op，五位 flags 全保留。
+//
+// build_shift 的 `jz adv` 出口此前只钉过"值不变"（ShlClExecutes）与 rol/ror
+// 的 count=0（RotFlagsPartialPreserve 组10）——shl/shr/sar 的 **flags 保留面
+// 零断言**。translator 侧的条件定义 liveness（层①）与 cmp→shift(0)→setcc
+// 端到端（层③）都成立在这个运行时事实上，缺它则"运行时改了出口、liveness
+// 还按全量写建模"这类漂移无人拦。
+// =============================================================================
+TEST(Interpreter, ShiftZeroCountFlagsPreserved) {
+    // 非平凡前态：ZF/CF/SF 全 1，PF/OF 为 0 —— 零计数若误走全量装配，五位
+    // 会被宿主 setcc5 结果覆写，任何一位的翻转都能抓到。
+    const u64 pre = isa::kFlagZF | isa::kFlagCF | isa::kFlagSF;
+    // 对照档要"移一下就让 ZF 变"：3 左移→6、3 右移→1、3 算术右移→1，三者
+    // 结果都非零（ZF 必被写 0）且都异于原值；换成 1 则 shr/sar 得 0 → ZF 仍
+    // 为 1，抓不到"整族空转"这一反向失真。
+    const u64 value = 3;
+    for (u64 seed : {11ull, 22ull, 33ull, 44ull, 55ull}) {
+        wvmp::Rng rng(seed);
+        const auto result = rt::generate_runtime(rng);
+        RwxImage rwx(result.image.code);
+        const auto entry = rwx.entry();
+        alignas(16) std::array<u8, 0x10000> scratch{};
+
+        // 掩码归零档刻意取 count=64（S64 与 S32 的运行时掩码 0x3F 下都归零，
+        // 原生 8/16/32 位 &31、64 位 &63 同样归零 → 两侧一致）。不用
+        // count=32@S32：asmgen 运行时掩码在 S32 上取 0x3F（本机另一处独立
+        // 偏差，已随本单交付评论上报），那里 32 不归零，断言会自相矛盾。
+        struct Cell {
+            isa::VmOp imm_op, cl_op;
+            const char* name;
+        };
+        for (const Cell& c : {Cell{isa::VmOp::Shl, isa::VmOp::ShlCl, "shl"},
+                              Cell{isa::VmOp::Shr, isa::VmOp::ShrCl, "shr"},
+                              Cell{isa::VmOp::Sar, isa::VmOp::SarCl, "sar"}}) {
+            for (ir::Size sz : {ir::Size::S32, ir::Size::S64}) {
+                for (u32 count : {0u, 64u}) {   // 零计数 / 掩码归零计数
+                    const std::string tag =
+                        std::string(c.name) + (sz == ir::Size::S32 ? "@S32" : "@S64") +
+                        "#count" + std::to_string(count) + " seed" + std::to_string(seed);
+                    // 立即数计数形。
+                    {
+                        std::vector<u8> s;
+                        isa::append_insn(s, mov_imm(0, static_cast<u32>(value), sz));
+                        isa::append_insn(s, mov_imm(2, static_cast<u32>(pre)));
+                        isa::append_insn(s, isa::make_insn(isa::VmOp::SetFlags,
+                                                           isa::OpKind::Reg, 2,
+                                                           isa::OpKind::None, 0));
+                        isa::append_insn(s, bin_imm(c.imm_op, 0, count, sz));
+                        isa::append_insn(s, isa::make_insn(isa::VmOp::GetFlags,
+                                                           isa::OpKind::Reg, 3,
+                                                           isa::OpKind::None, 0));
+                        isa::append_insn(s, halt());
+                        const auto ctx = run_stream(entry, s, scratch.data());
+                        EXPECT_EQ(ctx.regs[0], value) << tag << " imm：值应原样";
+                        EXPECT_EQ(ctx.regs[3] & isa::kFlagsMask, pre)
+                            << tag << " imm：五位应全保留";
+                    }
+                    // CL 计数形（计数写 RCX 槽 v1，运行时按宽度掩码）。
+                    {
+                        std::vector<u8> s;
+                        isa::append_insn(s, mov_imm(0, static_cast<u32>(value), sz));
+                        isa::append_insn(s, mov_imm(1, count));
+                        isa::append_insn(s, mov_imm(2, static_cast<u32>(pre)));
+                        isa::append_insn(s, isa::make_insn(isa::VmOp::SetFlags,
+                                                           isa::OpKind::Reg, 2,
+                                                           isa::OpKind::None, 0));
+                        isa::append_insn(s, cl_shift(c.cl_op, 0, sz));
+                        isa::append_insn(s, isa::make_insn(isa::VmOp::GetFlags,
+                                                           isa::OpKind::Reg, 3,
+                                                           isa::OpKind::None, 0));
+                        isa::append_insn(s, halt());
+                        const auto ctx = run_stream(entry, s, scratch.data());
+                        EXPECT_EQ(ctx.regs[0], value) << tag << " cl：值应原样";
+                        EXPECT_EQ(ctx.regs[3] & isa::kFlagsMask, pre)
+                            << tag << " cl：五位应全保留";
+                    }
+                }
+                // 对照档：count=1 真实改写 flags（ZF 必被结果写 0）——证明上面
+                // 的"保留"不是移位族整体空转（build_shift 两条路都要活着）。
+                {
+                    std::vector<u8> s;
+                    isa::append_insn(s, mov_imm(0, static_cast<u32>(value), sz));
+                    isa::append_insn(s, mov_imm(2, static_cast<u32>(pre)));
+                    isa::append_insn(s, isa::make_insn(isa::VmOp::SetFlags,
+                                                       isa::OpKind::Reg, 2,
+                                                       isa::OpKind::None, 0));
+                    isa::append_insn(s, bin_imm(c.imm_op, 0, 1, sz));
+                    isa::append_insn(s, isa::make_insn(isa::VmOp::GetFlags,
+                                                       isa::OpKind::Reg, 3,
+                                                       isa::OpKind::None, 0));
+                    isa::append_insn(s, halt());
+                    const auto ctx = run_stream(entry, s, scratch.data());
+                    EXPECT_EQ(ctx.regs[3] & isa::kFlagZF, 0ull)
+                        << std::string(c.name) << "#count1(对照) seed=" << seed;
+                    EXPECT_NE(ctx.regs[0], value)
+                        << std::string(c.name) << "#count1(对照) 值应被移 seed=" << seed;
+                }
+            }
+        }
+    }
+}
+
+// =============================================================================
+// MIT-490 (CR-01) 层③ / D6 转正：审查附件
+// docs/code-review-2026-09-18/flags_probe.cpp 的最小复现（原生
+//   mov eax,0 / mov ecx,0 / cmp eax,0 / shl edx,cl / sete al
+// 期望 eax=1，修复前生成 VM 实跑得 eax=0 且 notes=0 零告警）转为仓内正式
+// 断言测试。口径：经**真实翻译器**（translate_function，非手工搭词）+
+// **真实 x64 运行时**（generate_runtime → RWX 页执行），三档计数 × {setcc,
+// jcc} 两种读者逐一对拍，并钉住"曾被静默消掉的 cmp 写"的 dead 标。
+// =============================================================================
+namespace {
+// ---- IR 便捷构造（层③夹具，与 translator 测试同款字段口径）----
+ir::Insn e2_i(ir::Op op, ir::Size sz, u64 addr) {
+    ir::Insn i;
+    i.op = op;
+    i.size = sz;
+    i.addr = addr;
+    return i;
+}
+ir::Insn e2_mov(ir::Reg d, i64 v, ir::Size sz, u64 addr) {
+    ir::Insn i = e2_i(ir::Op::Mov, sz, addr);
+    i.dst = ir::Operand::reg_(d);
+    i.src = ir::Operand::imm_(v);
+    return i;
+}
+ir::Insn e2_cmp_imm(ir::Reg a, i64 v, ir::Size sz, u64 addr) {
+    ir::Insn i = e2_i(ir::Op::Cmp, sz, addr);
+    i.dst = ir::Operand::reg_(a);
+    i.src = ir::Operand::imm_(v);
+    i.updates_flags = true;
+    return i;
+}
+ir::Insn e2_bin(ir::Op op, ir::Reg d, ir::Operand s, ir::Size sz, u64 addr) {
+    ir::Insn i = e2_i(op, sz, addr);
+    i.dst = ir::Operand::reg_(d);
+    i.src = s;
+    i.updates_flags = true;
+    return i;
+}
+ir::Insn e2_setcc(ir::Reg d, ir::Cond c, u64 addr) {
+    ir::Insn i = e2_i(ir::Op::Setcc, ir::Size::S8, addr);
+    i.cond = c;
+    i.dst = ir::Operand::reg_(d);
+    return i;
+}
+ir::Insn e2_jcc(ir::Cond c, u64 target, u64 addr) {
+    ir::Insn i = e2_i(ir::Op::Jcc, ir::Size::S64, addr);
+    i.cond = c;
+    i.dst = ir::Operand::imm_(static_cast<i64>(target));
+    return i;
+}
+ir::Insn e2_jmp(u64 target, u64 addr) {
+    ir::Insn i = e2_i(ir::Op::Jmp, ir::Size::S64, addr);
+    i.dst = ir::Operand::imm_(static_cast<i64>(target));
+    return i;
+}
+ir::BasicBlock e2_blk(u64 addr, std::vector<ir::Insn> insns) {
+    ir::BasicBlock b;
+    b.addr = addr;
+    b.insns = std::move(insns);
+    return b;
+}
+
+// 真翻译 + 真执行：返回解码词流与执行后 ctx。
+struct E2eRun {
+    std::vector<isa::VmInsn> words;
+    rt::VmContext ctx;
+    size_t notes = 0;
+};
+
+E2eRun translate_and_run(RwxImage::Entry entry, std::vector<ir::BasicBlock> blocks) {
+    E2eRun out;
+    ir::FunctionRegion fn;
+    fn.name = "zero_shift_flags";
+    fn.arch = ir::Arch::X64;
+    fn.begin_rva = 0x1000;
+    fn.end_rva = 0x1200;
+    fn.blocks = std::move(blocks);
+    const auto tr = wvmp::regvm::translator::translate_function(fn);
+    out.notes = tr.notes.size();
+    wvmp::ByteReader r(tr.program.bytecode.data(), tr.program.bytecode.size());
+    const isa::VmBlob blob = isa::read_blob(r);
+    for (size_t off = 0; off + 8 <= blob.stream.size(); off += 8) {
+        u64 w = 0;
+        for (int k = 0; k < 8; ++k)
+            w |= static_cast<u64>(blob.stream[off + k]) << (8 * k);
+        out.words.push_back(isa::decode(w));
+    }
+    out.ctx.bytecode = const_cast<u8*>(tr.program.bytecode.data()) +
+                       sizeof(isa::VmBlobHeader) + tr.program.entry_offset;
+    entry(&out.ctx);
+    return out;
+}
+
+// 词流里唯一的 guest cmp 词（前驱 flags 写）。
+const isa::VmInsn* find_word(const std::vector<isa::VmInsn>& words, isa::VmOp op,
+                             int reg_a) {
+    const isa::VmInsn* hit = nullptr;
+    for (const auto& g : words)
+        if (g.op == op && static_cast<int>(g.reg_a) == reg_a) hit = &g;
+    return hit;
+}
+
+const u8 kE2eRax = isa::vm_reg_of(ir::Reg::Rax);
+const u8 kE2eRcx = isa::vm_reg_of(ir::Reg::Rcx);
+const u8 kE2eRdx = isa::vm_reg_of(ir::Reg::Rdx);
+const u8 kE2eRbx = isa::vm_reg_of(ir::Reg::Rbx);
+} // namespace
+
+TEST(Interpreter, ZeroShiftFlagsLivenessE2E) {
+    wvmp::Rng rng(0x4C01u);
+    const auto result = rt::generate_runtime(rng);
+    RwxImage rwx(result.image.code);
+    const auto entry = rwx.entry();
+    const u8 s32 = isa::size_field(ir::Size::S32);
+
+    // 三档计数（0 / guest 自做 `and cl,31` 归零 / 非零），edx 预置 1，使
+    // "移位到底发生没发生"在 flags 上留下可分岔的读数：
+    //   计数为零 ⇒ 整条 no-op，读者看到的仍是 cmp eax,0 的 ZF=1；
+    //   计数为 1 ⇒ edx=2 非零，ZF 被移位写 0。
+    // 于是 sete 期望 {1,1,0}、je 走向 {取,取,不取} —— 两档零计数与非零档互
+    // 为反证，任何一侧建模失手都会撞车。另附立即数两档：翻译期已知计数，
+    // 非零形细化回 kWrite（cmp 判死）、零形仍条件定义（cmp 保留）。
+    struct Cell {
+        bool imm_form;          // true → `shl edx,imm`；false → `shl edx,cl`
+        u32 imm_count;          // 立即数形的计数
+        i64 ecx_init;           // CL 形的计数初值
+        bool mask_cl;           // 追加 `and cl,31`（把 32 掩成 0）
+        bool cmp_dead;          // cmp 词应否携带 flags-dead 标
+        u64 expect_sete_eax;
+        u64 expect_jcc_ecx;
+        const char* tag;
+    };
+    const Cell cells[] = {
+        {false, 0, 0, false, false, 1, 7, "cl#0(零计数)"},
+        {false, 0, 32, true, false, 1, 7, "cl#32+and cl,31(掩码归零)"},
+        {false, 0, 1, false, false, 0, 9, "cl#1(非零，翻译期不可知)"},
+        {true, 0, 0, false, false, 1, 7, "imm#0(零计数)"},
+        {true, 1, 0, false, true, 0, 9, "imm#1(非零，细化为 kWrite)"},
+    };
+
+    for (const Cell& c : cells) {
+        const isa::VmOp sop = c.imm_form ? isa::VmOp::Shl : isa::VmOp::ShlCl;
+        const u8 want_cmp = static_cast<u8>(s32 | (c.cmp_dead ? isa::kFlagsDeadBit : 0));
+        // 读者不同的两条通路各自收敛到 join 块（0x1080），取/不取的落点必
+        // 须可分：taken → ecx=7，fall-through → ecx=9。
+        auto build = [&](bool jcc_form) {
+            std::vector<ir::Insn> v;
+            v.push_back(e2_mov(ir::Reg::Rdx, 1, ir::Size::S32, 0x1000));
+            v.push_back(e2_mov(ir::Reg::Rcx, c.ecx_init, ir::Size::S32, 0x1004));
+            if (c.mask_cl)
+                v.push_back(e2_bin(ir::Op::And, ir::Reg::Rcx, ir::Operand::imm_(31),
+                                   ir::Size::S8, 0x1008));
+            v.push_back(e2_mov(ir::Reg::Rax, 0, ir::Size::S32, 0x1010));
+            v.push_back(e2_cmp_imm(ir::Reg::Rax, 0, ir::Size::S32, 0x1014));
+            const ir::Operand cnt =
+                c.imm_form ? ir::Operand::imm_(c.imm_count)
+                           : ir::Operand::reg_(ir::Reg::Rcx);
+            v.push_back(e2_bin(ir::Op::Shl, ir::Reg::Rdx, cnt, ir::Size::S32, 0x1018));
+            if (jcc_form) {
+                v.push_back(e2_jcc(ir::Cond::E, 0x1050, 0x101C));
+                v.push_back(e2_mov(ir::Reg::Rcx, 9, ir::Size::S32, 0x1020));
+                v.push_back(e2_jmp(0x1080, 0x1024));
+            } else {
+                v.push_back(e2_setcc(ir::Reg::Rax, ir::Cond::E, 0x101C));
+            }
+            return v;
+        };
+
+        // ---- setcc 读者：cmp eax,0 / shl edx,<计数> / sete al ----
+        const E2eRun run = translate_and_run(entry, {e2_blk(0x1000, build(false))});
+        // ① 该组合必须被完整翻译：notes 非空 = 有指令被 gate/跳过 ⇒ 下面的
+        //    读数就不是"受支持组合"的读数（本判据的静默面正是审查实录点）。
+        EXPECT_EQ(run.notes, 0u) << c.tag << "：setcc 形被 gate/跳过";
+        // ② 曾经被静默消掉的那一位：零计数两档 ⇒ cmp 写不得标 dead（修复前
+        //    恒标 → setcc 读陈旧位、零告警算错）；立即数非零档 ⇒ 移位必覆写
+        //    五位，cmp 是死写，标记照打（本单不收窄这一档的优化）。
+        const isa::VmInsn* cmp = find_word(run.words, isa::VmOp::Cmp, kE2eRax);
+        const isa::VmInsn* shl = find_word(run.words, sop, kE2eRdx);
+        ASSERT_NE(cmp, nullptr) << c.tag << "：词流缺 cmp";
+        ASSERT_NE(shl, nullptr) << c.tag << "：词流缺移位词";
+        EXPECT_EQ(cmp->cond_or_size, want_cmp)
+            << c.tag << "：cmp 词 cond_or_size 失配（实得 " << int(cmp->cond_or_size)
+            << "，期望 " << int(want_cmp) << "）";
+        EXPECT_FALSE(isa::flags_dead_field(shl->cond_or_size))
+            << c.tag << "：移位自身（sete 是读者）不得标记";
+        // ③ 真执行读数。
+        EXPECT_EQ(run.ctx.regs[kE2eRax], c.expect_sete_eax)
+            << c.tag << "：sete al 期望 " << c.expect_sete_eax;
+
+        // ---- jcc 读者：同一序列换 je（取则 ecx=7 / 不取 ecx=9）----
+        const E2eRun rj = translate_and_run(
+            entry, {e2_blk(0x1000, build(true)),
+                    e2_blk(0x1050, {e2_mov(ir::Reg::Rcx, 7, ir::Size::S32, 0x1050),
+                                    e2_jmp(0x1080, 0x1054)}),
+                    e2_blk(0x1080, {e2_mov(ir::Reg::Rbx, 0x5A, ir::Size::S32, 0x1080)})});
+        EXPECT_EQ(rj.notes, 0u) << c.tag << "：jcc 形被 gate/跳过";
+        const isa::VmInsn* cmpj = find_word(rj.words, isa::VmOp::Cmp, kE2eRax);
+        ASSERT_NE(cmpj, nullptr) << c.tag << "：jcc 词流缺 cmp";
+        EXPECT_EQ(cmpj->cond_or_size, want_cmp) << c.tag << "：jcc 形 cmp 标记失配";
+        EXPECT_EQ(rj.ctx.regs[kE2eRcx], c.expect_jcc_ecx)
+            << c.tag << "：je 路径期望 ecx=" << c.expect_jcc_ecx;
+        EXPECT_EQ(rj.ctx.regs[kE2eRbx], 0x5Aull) << c.tag << "：两路都须到达 join";
     }
 }
 

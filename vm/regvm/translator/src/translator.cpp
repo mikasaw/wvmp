@@ -4077,9 +4077,16 @@ struct StackWalkVerdict {
 // Jcc → {i+1, i+aux}；Jmp → {i+aux}；Halt/Ret/ExitNative → 汇（无后继）。
 // 反向数据流（live = "该状态在下一个 flags 写之前被某读者读"）：
 //   kRead            → live_in = true
-//   kWrite/kWriteReadMerge → live_in = false（写即杀）；live_out == false
+//   kWrite           → live_in = false（写即杀）；live_out == false
 //                      时本写打 flags-dead 标记（cond 位 2）
+//   kWriteReadMerge  → live_in = live_out（旧位流入结果，透传）；可标记
+//   kWriteReadReg    → live_in = true（CF_in 流入寄存器值）；可标记
+//   kWriteConditional→ live_in = live_out（CR-01：计数为零时旧 flags 整组
+//                      流出）；可标记
 //   kNone            → live_in = live_out
+// 标记判定一律走 flag_sem_of(const VmInsn&) 的逐指令形：移位族只在**立即数
+// 计数的有效值非零**时回到 kWrite 的杀语义，CL / 寄存器计数形恒为条件定义
+// （guest 自做 `and cl,31`、`and cl,63` 归零同样落在这保守一档）。
 // 块汇合 = 后继 live_in 并集，worklist 至不动点。区域末端（Halt/Ret/
 // ExitNative/越界）= 汇且 VM flags 不跨区（stub 每区清零 ctx）→ 末端死写
 // 真死。保守性：aux 越界/回填残留（|rel| > 流长）即整体放弃（零标记 =
@@ -4124,11 +4131,8 @@ void mark_dead_flag_writes(std::vector<isa::VmInsn>& code) {
             // （encoding 契约：位 2 仅算术类使用）；Jcc/Setcc/Cmovcc/
             // ExitNative 的 cond 域是 4 位条件码，bit2 = 条件数据，不可
             // 误读为标记。
-            auto base_sem = isa::flag_sem_of(code[i].op);
-            const bool write_family =
-                base_sem == isa::FlagSem::kWrite ||
-                base_sem == isa::FlagSem::kWriteReadMerge ||
-                base_sem == isa::FlagSem::kWriteReadReg;
+            auto base_sem = isa::flag_sem_of(code[i]);
+            const bool write_family = isa::is_flag_write(base_sem);
             const auto sem =
                 (write_family && isa::flags_dead_field(code[i].cond_or_size))
                     ? isa::FlagSem::kNone
@@ -4147,17 +4151,21 @@ void mark_dead_flag_writes(std::vector<isa::VmInsn>& code) {
             //（dst = a + b + CF_in），寄存器消费无条件可观察——输入侧恒读
             // 者，前驱写永不标记；自身 flags 写仍可标记（tail 跳过不影响块
             // 体寄存器计算）。
+            else if (sem == isa::FlagSem::kWriteConditional) in = out;
+            // 条件定义写（CR-01 / MIT-490：移位族）：有效计数为零时整条
+            // no-op，旧 flags 原样流出——与合并型写同按透传处理，前驱
+            // cmp/test 不得被杀（零计数 ⇒ guest 视角就是那条前驱写在生效）。
             // 纯写（kWrite）：杀旧状态。
             else in = 0;
             if (in != live_in[i]) { live_in[i] = in; changed = true; }
         }
     }
-    // 死写标记（kWrite / kWriteReadMerge / kWriteReadReg 且 live_out ==
-    // false——adc/sbb 自身 flags 写可标记，tail 跳过不影响块体寄存器计算）。
+    // 死写标记（kWrite / kWriteReadMerge / kWriteReadReg / kWriteConditional
+    // 且 live_out == false——adc/sbb 自身 flags 写可标记，tail 跳过不影响块
+    // 体寄存器计算；条件定义写的两条路（全量写 / 整条不写）在"无读者"下
+    // 均无可观察差异）。
     for (size_t i = 0; i < n; ++i) {
-        const auto sem = isa::flag_sem_of(code[i].op);
-        if (sem != isa::FlagSem::kWrite && sem != isa::FlagSem::kWriteReadMerge &&
-            sem != isa::FlagSem::kWriteReadReg)
+        if (!isa::is_flag_write(isa::flag_sem_of(code[i])))
             continue;
         u8 out = 0;
         for (size_t k = succ_begin[i]; k < succ_begin[i + 1]; ++k)

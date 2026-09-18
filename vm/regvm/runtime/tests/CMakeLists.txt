@@ -7,6 +7,10 @@ target_link_libraries(wvmp_regvm_runtime_tests PRIVATE
     wvmp_regvm_runtime
     wvmp_regvm_isa
     wvmp_regvm_codecs
+    # MIT-490 (CR-01) 层③：cmp → shift(0) → setcc/jcc 端到端要过真实翻译器。
+    # OBJECT 库不传播对象文件（陷阱②），故显式挂 TARGET_OBJECTS。
+    wvmp_regvm_translator
+    $<TARGET_OBJECTS:wvmp_regvm_translator>
     wvmp::vm
     wvmp::ir
     wvmp::common
