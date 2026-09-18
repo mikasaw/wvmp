@@ -55,7 +55,7 @@ EOF
         || { echo "[mit490-capture] FAIL protect $tag" >&2; exit 1; }
     python scripts/verifier/mit490_flags_delta.py collect \
         --asm "$out/$tag.asm.txt" --pe "$out/$tag.protected.exe" \
-        --out "$out/$tag.handlers.csv" || exit 1
+        --out "$out/$tag.handlers.csv" --out-bin "$out/$tag.bin" || exit 1
     # 词面：.wvmp 数据节里的 WVMP blob 即翻译器落地的原始词流（v1 codec 直通），
     # flags-dead 位（cond 位 2）的 delta 在这张表上逐词可读。
     python scripts/verifier/mit490_flags_delta.py words \

@@ -254,6 +254,14 @@ def cmd_collect(a: argparse.Namespace) -> int:
         f.write("handler,off,size,sha256_16\n")
         for r in rows:
             f.write(f"{r[0]},0x{r[1]:x},{r[2]},{r[3]}\n")
+    if a.out_bin:
+        # 顺手落一份码体镜像 bin，供既有 dump 门直接吃：
+        #   python scripts\\verifier\\dump_handler_xmm_check.py \
+        #       --asm <tag>.asm.txt --bin <tag>.bin
+        # （该门的 --pe 分支还按单节老布局找 .wvmp，双节布局下会报
+        #   "raw size < total"，与本单无关。）
+        with open(a.out_bin, "wb") as f:
+            f.write(code)
     print(f"[mit490-diff] collect -> {a.out}: {len(rows)} handlers, "
           f"code={len(code)}B, table=0x{table:x}, total=0x{total:x}")
     if len(code) < total:
@@ -305,6 +313,8 @@ def main() -> int:
     c.add_argument("--asm", required=True)
     c.add_argument("--pe", required=True)
     c.add_argument("--out", required=True)
+    c.add_argument("--out-bin", dest="out_bin",
+                   help="同时落码体镜像 bin（供 dump_handler_xmm_check.py --bin）")
     c.set_defaults(fn=cmd_collect)
     w = sub.add_parser("words", help="逐词解码 .wvmp 里的 VM blob → CSV")
     w.add_argument("--pe", required=True)
