@@ -26,6 +26,13 @@ CLI="build/cli/wvmp_cli.exe"
 x64_sample="build/wvmp_tls_sample.exe"
 x86_sample="build/x86_samples/wvmp_x86_tls_sample.exe"
 
+# MIT-526 判据 3：TLS 回调面的 DRx / rdtsc 四象限。默认维持 MIT-470/471 时点的
+# 「全开」口径 —— 不设环境变量时两处 cfg 的 drx/rdtsc 取值与判据逐字不变（只多
+# 下面一行配置面回显）；跑四象限时由外层设 TLS_E2E_DRX / TLS_E2E_RDTSC 覆盖。
+TLS_DRX="${TLS_E2E_DRX:-true}"
+TLS_RDTSC="${TLS_E2E_RDTSC:-true}"
+echo "[tls-e2e] 配置面: anti_debug drx=$TLS_DRX rdtsc=$TLS_RDTSC"
+
 pass=0
 fail=0
 
@@ -137,8 +144,8 @@ output = "$out_win"
 seed   = 1
 
 [anti_debug]
-drx = true
-rdtsc = true
+drx = ${TLS_DRX}
+rdtsc = ${TLS_RDTSC}
 
 [[passes]]
 name = "pe_loader"
@@ -259,8 +266,8 @@ seed   = 1
 skip_backfill = true
 
 [anti_debug]
-drx = true
-rdtsc = true
+drx = ${TLS_DRX}
+rdtsc = ${TLS_RDTSC}
 
 [[passes]]
 name = "pe_loader"

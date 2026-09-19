@@ -292,9 +292,15 @@ std::vector<u8> assemble_callback_stub(bool is_x86,
     if (drx != nullptr && drx->gtc_slot_va != 0) {
         // MIT-470：DRx 硬件断点检查——GetThreadContext(伪句柄 -2, CONTEXT)
         // 取 CONTEXT_DEBUG_REGISTERS，Dr0-Dr3 任一非零 → FailFast。GTC 调用
-        // 失败（al=0）静默跳过（保守：不误杀）。x64 块内 sub/add 8 保 16 对齐；
+        // 失败（al=0）静默跳过（保守：不误杀）。
+        // CR-04（MIT-526）：x64 块内 sub/add 必须是 0x28 = 32B shadow space
+        // + 8B 对齐。旧的 sub 8 只解决了 16B 对齐（入口 rsp≡8 → call 点 ≡0），
+        // 没给被调方留 home 区：被调按 Microsoft x64 约定合法写自己的第 3 个
+        // 参数槽 [rsp+0x10]，正落在回调入口 rsp 上 = 回调自己的返回地址 ⇒
+        // 回调 ret 回飞（tls_abi_probe 实测 gap 0x18、[rsp]=0x4141… 写脏）。
+        // 本块位于 IAT 回填序列之前，不能复用后者稍后才分配的栈空间。
         // FailFast 路径栈不再复用（进程即死）。drx_cleanup 为唯一汇合点，
-        // 各路径栈平衡。
+        // 各路径栈平衡（sub/add 对称，je / 四路 jne / fall-through 同标签）。
         char db[700];
         if (is_x86) {
             std::snprintf(db, sizeof(db),
@@ -340,7 +346,7 @@ std::vector<u8> assemble_callback_stub(bool is_x86,
                           char(10));
         } else {
             std::snprintf(db, sizeof(db),
-                          "sub rsp, 8%c"
+                          "sub rsp, 0x28%c"
                           "mov rcx, -2%c"
                           "mov rdx, 0x%llX%c"
                           "mov dword ptr [rdx+0x30], 0x%08X%c"
@@ -362,7 +368,7 @@ std::vector<u8> assemble_callback_stub(bool is_x86,
                           "xor eax, eax%c"
                           "mov qword ptr [rax], 0%c"
                           "drx_cleanup:%c"
-                          "add rsp, 8%c",
+                          "add rsp, 0x28%c",
                           char(10),
                           char(10),
                           drx->ctx_va, char(10),
