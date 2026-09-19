@@ -107,7 +107,14 @@
 #     5 区 = ror/rol ZF + rol SF + ror PF 消费 + shl 对照, 区内 Store
 #     落盘; 修复前 stdout 分叉必 FAIL, 修复后 byte-exact)。
 #     单边新增 1 样本 → 47 × 5 = 235 runs。
+#   - MIT-522 (B0-3): 每样本规则挂点（scripts/multiseed_rules/）+ 断言式计数器。池内
+#     [[functions]] 选择器路径此前零覆盖（全仓任何 .toml 里 [[functions]] 0 命中），池的
+#     唯一真信号只有 REQUIRE_REAL 的 "已生成 ≥1 个入口 stub"，用 ≥1 守"点数对不对"= 哑锁。
+#     新增 4 个规则变体槽（同一枚已入池样本 wvmp_shift0_flags_sample，不新建样本）⇒
+#     池 72→76 槽、360→380 runs。带 expect 的槽位改判精确 stub 数 + 选择器披露 Note 分类
+#     计数；无规则挂点的老样本判定逐字不变。`--selftest` 是门禁有效性反证的复跑入口。
 #   - MIT-306: REQUIRE_REAL=1 校验日志含 "已生成 N 个入口 stub" 防止 C1 gate
+
 #     兜底被误判 PASS（仅 byte-exact 不够, C1 gate 函数被跳过仍能输出相同
 #     stdout+rc）。与 multiseed_e2e_real.sh 配套使用。
 
@@ -130,6 +137,186 @@ fi
 # "已生成 N 个入口 stub" 标记（stub_link 在 virtualize 至少产生 1 个
 # VirtualizedFunction 时输出; C1 gate 兜底或无已虚拟化函数则不会出此标记）。
 REQUIRE_REAL="${REQUIRE_REAL:-0}"
+
+# ── MIT-522 (B0-3)：每样本规则挂点 + 断言式计数器 ─────────────────────────────
+# 口径真源 = scripts/multiseed_rules/README.md（正则原文、三类 Note 的实抄、为什么不许
+# 写成"数含 gate 的行"）。MULTISEED_RULES_DIR 只给 --selftest 的错值/缺文件反证用，
+# 现网跑池不设该变量即指向仓内目录。
+RULES_DIR="${MULTISEED_RULES_DIR:-$repo/scripts/multiseed_rules}"
+
+# 缺省管道（无 .passes.txt 的槽位 = 与改前 heredoc 逐字节相同的那 6 条）。
+DEFAULT_PASSES=$'pe_loader\nmarker_scan\nlifter\nvirtualize\nstub_link\npe_writer'
+
+re_stub='^\[wvmp\] \[note\] stub_link: 已生成 [0-9]+ 个入口 stub'
+re_waive='^\[wvmp\] \[note\] virtualize: 函数 .+ 按配置 level=none 保持原生（rva=0x[0-9A-Fa-f]+）$'
+re_arb='^\[wvmp\] \[note\] (virtualize|crypt): 函数 .+ 命中 [0-9]+ 条 (level|crypt) 规则（跨选择器撞同一函数，按声明序后评胜）'
+re_gate='^\[wvmp\] \[note\] virtualize: 函数 .+，跳过虚拟化'
+re_crypt='^\[wvmp\] \[note\] crypt: 已加密 [0-9]+/[0-9]+ 个 VM 程序'
+
+# 断言键：前 4 条必填，后 4 条可选（写了就必判；crypt_* 三键要求该槽位管道里有 crypt pass，
+# 日志里数不到那行即 FAIL —— 认不出的键、缺必填键、写了断言却数不到，一律判失败）。
+EXPECT_REQUIRED="stubs selector_waive_notes selector_arbitration_notes translate_gate_notes"
+EXPECT_ALL="$EXPECT_REQUIRED selector_waive_targets crypt_encrypted crypt_total crypt_exempt"
+
+cnt_matches() { printf '%s\n' "$2" | grep -E -c "$1" || true; }
+
+waive_targets_of() {
+    printf '%s\n' "$1" | grep -E "$re_waive" \
+        | sed -E 's/^\[wvmp\] \[note\] virtualize: 函数 (.+) 按配置 level=none 保持原生（rva=.*/\1/' \
+        | paste -sd, - || true
+}
+
+crypt_summary_of() { printf '%s\n' "$1" | grep -E "$re_crypt" | head -1 || true; }
+
+# 该槽位某断言键的实读数（数不到 = MISSING，永不静默当 0）。
+actual_of() {
+    local key="$1" log="$2" line
+    case "$key" in
+        stubs)
+            line="$(printf '%s\n' "$log" | grep -E "$re_stub" | head -1 || true)"
+            if [[ "$line" =~ 已生成\ ([0-9]+)" 个入口 stub" ]]; then
+                printf '%s' "${BASH_REMATCH[1]}"
+            else
+                printf '0'
+            fi
+            ;;
+        selector_waive_notes)        cnt_matches "$re_waive" "$log" ;;
+        selector_arbitration_notes)  cnt_matches "$re_arb" "$log" ;;
+        translate_gate_notes)        cnt_matches "$re_gate" "$log" ;;
+        selector_waive_targets)      waive_targets_of "$log" ;;
+        crypt_encrypted|crypt_total|crypt_exempt)
+            line="$(crypt_summary_of "$log")"
+            if [[ -z "$line" ]]; then
+                printf 'MISSING'
+            elif [[ "$key" == "crypt_encrypted" ]]; then
+                [[ "$line" =~ 已加密\ ([0-9]+)/ ]] && printf '%s' "${BASH_REMATCH[1]}" || printf 'MISSING'
+            elif [[ "$key" == "crypt_total" ]]; then
+                [[ "$line" =~ 已加密\ [0-9]+/([0-9]+) ]] && printf '%s' "${BASH_REMATCH[1]}" || printf 'MISSING'
+            else
+                # 摘要行在而"；豁免 N 个"尾巴不在 = 产品侧确数 0（crypt_pass.cpp:160-164）。
+                [[ "$line" =~ ；豁免\ ([0-9]+) ]] && printf '%s' "${BASH_REMATCH[1]}" || printf '0'
+            fi
+            ;;
+    esac
+}
+
+expect_has_key() { grep -qE "^[[:space:]]*$2[[:space:]]*=" "$1"; }
+
+expect_get() {
+    grep -E "^[[:space:]]*$2[[:space:]]*=" "$1" | tail -1 \
+        | sed -E 's/^[^=]*=[[:space:]]*//' | tr -d '\r'
+}
+
+# expect 里写了认不出的键 = 那条断言静默失效，必须当场红（与本单要消灭的恒真判据同病灶）。
+expect_unknown_keys() {
+    local out="" line k
+    while IFS= read -r line; do
+        line="${line%$'\r'}"
+        [[ -z "${line//[[:space:]]/}" || "${line#"${line%%[![:space:]]*}"}" == \#* ]] && continue
+        [[ "$line" == *=* ]] || { out="$out '$line'"; continue; }
+        k="${line%%=*}"
+        k="${k//[[:space:]]/}"
+        [[ " $EXPECT_ALL " == *" $k "* ]] || out="$out '$k'"
+    done < "$1"
+    printf '%s' "$out"
+}
+
+# 断言式判定：返回 0 = 该槽位通过；失败原因在全局 EVAL_MSG。
+# 三条路径的强弱顺序：带 expect（精确）> 有规则无 expect（直接 FAIL，R2）> 老样本（≥1 现口径）。
+evaluate_slot() {
+    local slot="$1" rules="$2" expect="$3" log="$4" k want got bad
+    EVAL_MSG=""
+    if [[ -n "$rules" && -z "$expect" ]]; then
+        EVAL_MSG="$slot：存在规则片段 $(basename "$rules") 而缺同名期望值文件 $(basename "${rules%.rules.toml}.expect.txt") —— 有挂点无 expect 即判失败，不得退回 ≥1（R2 fail-closed）"
+        return 1
+    fi
+    if [[ -z "$expect" ]]; then
+        if [[ "$REQUIRE_REAL" == "1" ]]; then
+            if ! printf '%s\n' "$log" | grep -q "已生成 [1-9][0-9]* 个入口 stub"; then
+                EVAL_MSG="$slot is C1 gate, not real virtualization"
+                return 1
+            fi
+        fi
+        return 0
+    fi
+    bad="$(expect_unknown_keys "$expect")"
+    if [[ -n "$bad" ]]; then
+        EVAL_MSG="$slot：期望值文件 $(basename "$expect") 含认不出的断言键$bad（认不出即该条断言永不生效；可用键: $EXPECT_ALL）"
+        return 1
+    fi
+    for k in $EXPECT_REQUIRED; do
+        if ! expect_has_key "$expect" "$k"; then
+            EVAL_MSG="$slot：期望值文件 $(basename "$expect") 缺必填断言键 '$k'（缺键不得视为不判）"
+            return 1
+        fi
+    done
+    for k in $EXPECT_ALL; do
+        expect_has_key "$expect" "$k" || continue
+        want="$(expect_get "$expect" "$k")"
+        got="$(actual_of "$k" "$log")"
+        if [[ "$want" != "$got" ]]; then
+            EVAL_MSG="$slot：断言 '$k' 不符 —— 期望 [$want]，实得 [$got]（expect 先行不可回写，见 scripts/multiseed_rules/README.md）"
+            return 1
+        fi
+    done
+    return 0
+}
+
+emit_passes() {
+    local src="${1:-}" p list
+    if [[ -n "$src" ]]; then
+        list="$(tr -d '\r' < "$src")"
+    else
+        list="$DEFAULT_PASSES"
+    fi
+    while IFS= read -r p; do
+        [[ -z "$p" ]] && continue
+        printf '[[passes]]\nname = "%s"\n' "$p"
+    done <<< "$list"
+}
+
+# 槽位配置生成。规则片段插在 [[passes]] 块之前（default_level 是 TOML 顶层键，写在任何
+# [[表头]] 之后会被解析进上一个表 —— 见 cli/src/config.cpp:202-205 的报错文案）。
+write_cfg() {
+    {
+        printf 'input  = "%s"\n' "$2"
+        printf 'output = "%s"\n' "$3"
+        printf 'seed   = %s\n\n' "$4"
+        if [[ -n "${5:-}" ]]; then
+            tr -d '\r' < "$5"
+            printf '\n'
+        fi
+        emit_passes "${6:-}"
+    } > "$1"
+}
+
+# 规则挂点的三个文件名（无 variant = 老样本，三者皆空 = 行为与改前逐字节相同）。
+slot_files() {
+    local base="${1%.exe}" variant="${2:-}" suffix
+    suffix=""
+    [[ -n "$variant" ]] && suffix="__${variant}"
+    RULES_FILE="$RULES_DIR/${base}${suffix}.rules.toml"
+    EXPECT_FILE="$RULES_DIR/${base}${suffix}.expect.txt"
+    PASSES_FILE="$RULES_DIR/${base}${suffix}.passes.txt"
+    [[ -f "$RULES_FILE" ]] || RULES_FILE=""
+    [[ -f "$EXPECT_FILE" ]] || EXPECT_FILE=""
+    [[ -f "$PASSES_FILE" ]] || PASSES_FILE=""
+}
+
+# 只跑 protect 取日志（--selftest 的反证要复用同一份真日志，只换 expect 值）。
+capture_protect() {
+    local sample="$1" seed="$2" variant="${3:-}" tdd cf ow rc=0 out=""
+    slot_files "$(basename "$sample")" "$variant"
+    tdd="$(mktemp -d)"
+    cf="$tdd/cfg.toml"
+    ow="$(cygpath -m "$tdd")/out.exe"
+    write_cfg "$cf" "$(cygpath -m "$sample")" "$ow" "$seed" "$RULES_FILE" "$PASSES_FILE"
+    out="$("$cli" protect --config "$cf" 2>&1)" || rc=$?
+    rm -rf "$tdd"
+    printf '%s' "$out"
+    return $rc
+}
+
 
 samples=(
     "build/passes/marker_scan/tests/wvmp_call_gate_sample.exe"
@@ -364,6 +551,20 @@ x86_samples=(
     "build/x86_samples/wvmp_x86_x87l1_sample.exe"
 )
 
+# MIT-522 (B0-3) B0-3: 带 [[functions]] 规则片段的变体槽 —— "<样本>|<变体名>"，
+# 挂点与期望值在 scripts/multiseed_rules/<样本名>__<变体名>.{rules.toml,expect.txt}。
+# 登记式而非目录扫描：总槽数 = samples(52) + x86_samples(20) + 本数组(4) = 76，
+# 只读脚本即可算出（架构判据 1），落错文件也不会悄悄多出/少掉槽位。
+# 四个变体全打在已入池的 wvmp_shift0_flags_sample.exe 上（架构判据 3：别新建样本）——
+# 该样本 7 区、无规则基线 7 stub，是唯一"每区各自可翻译"的多区样本，选择器错位
+# 在任一条上都会换成一个可数的读数差。
+rule_variants=(
+    "build/passes/marker_scan/tests/wvmp_shift0_flags_sample.exe|v1_name_open"
+    "build/passes/marker_scan/tests/wvmp_shift0_flags_sample.exe|v2_name_exclude"
+    "build/passes/marker_scan/tests/wvmp_shift0_flags_sample.exe|v3_cross_selector"
+    "build/passes/marker_scan/tests/wvmp_shift0_flags_sample.exe|v4_index_anchor"
+)
+
 # Seeds: 1 (small), 12345 (default), 99999 (large), 0xDEADBEEF (magic), 0xCAFEBABE (magic).
 seeds=(1 12345 99999 3735928559 3405691582)
 
@@ -376,27 +577,22 @@ fail=0
 run_one_seed() {
     local sample="$1"
     local seed="$2"
+    local variant="${3:-}"
+    local slot=""
+    slot="seed=$seed sample=$(basename "$sample")"
+    [[ -n "$variant" ]] && slot="$slot variant=$variant"
+        slot_files "$(basename "$sample")" "$variant"
+        # R2 fail-closed：挂了规则却没配期望值 → 连 protect 都不必跑，当场红。
+        if [[ -n "$RULES_FILE" && -z "$EXPECT_FILE" ]]; then
+            evaluate_slot "$slot" "$RULES_FILE" "" ""
+            echo "[multiseed] FAIL $EVAL_MSG" >&2
+            fail=$((fail + 1))
+            return
+        fi
         tmp="$(mktemp -d)"
         cfg="$tmp/e2e.toml"
         out_win="$(cygpath -m "$tmp")/wvmp_e2e_out.exe"
-        cat > "$cfg" <<EOF
-input  = "$sample_win"
-output = "$out_win"
-seed   = $seed
-
-[[passes]]
-name = "pe_loader"
-[[passes]]
-name = "marker_scan"
-[[passes]]
-name = "lifter"
-[[passes]]
-name = "virtualize"
-[[passes]]
-name = "stub_link"
-[[passes]]
-name = "pe_writer"
-EOF
+        write_cfg "$cfg" "$sample_win" "$out_win" "$seed" "$RULES_FILE" "$PASSES_FILE"
         rc=0
         out="$("$cli" protect --config "$cfg" 2>&1)" || rc=$?
         if [[ $rc -ne 0 ]]; then
@@ -406,19 +602,19 @@ EOF
             rm -rf "$tmp"
             return
         fi
-        # MIT-306: REQUIRE_REAL 校验日志含 "已生成 N 个入口 stub" 标记。
+        # MIT-306: REQUIRE_REAL 校验日志含 "已生成 N 个入口 stub" 标记（无期望值的槽位）。
         # stub_link 在 virtualize pass 至少产生 1 个 VirtualizedFunction 时输出此
-        # Note; C1 gate (virtualize 放弃) 或无已虚拟化函数则不会出此标记。
-        # 仅 byte-exact 不够, C1 gate 函数被跳过仍能输出相同 stdout+rc, 这是假
-        # PASS——REQUIRE_REAL=1 时必须含 stub 生成标记才视为真虚拟化。
-        if [[ "$REQUIRE_REAL" == "1" ]]; then
-            if ! echo "$out" | grep -q "已生成 [1-9][0-9]* 个入口 stub"; then
-                echo "[multiseed] FAIL seed=$seed sample=$sample is C1 gate, not real virtualization" >&2
-                echo "$out" | tail -5 >&2
-                fail=$((fail + 1))
-                rm -rf "$tmp"
-                return
-            fi
+        # Note; C1 gate 兜底或无已虚拟化函数则不会出此标记。仅 byte-exact 不够, C1 gate
+        # 函数被跳过仍能输出相同 stdout+rc，这是假 PASS——REQUIRE_REAL=1 时必须含 stub
+        # 生成标记才视为真虚拟化。
+        # MIT-522 (B0-3): 带期望值的槽位改判精确读数（stub 数 + 选择器披露 Note 分类计数，
+        # ≥1 那把哑锁换成点数锁），判定与 ≥1 同在 evaluate_slot 单点里，不留第二份逻辑。
+        if ! evaluate_slot "$slot" "$RULES_FILE" "$EXPECT_FILE" "$out"; then
+            echo "[multiseed] FAIL $EVAL_MSG" >&2
+            echo "$out" | tail -5 >&2
+            fail=$((fail + 1))
+            rm -rf "$tmp"
+            return
         fi
         # Run both, compare stdout + rc byte-exact.
         "$sample" > "$tmp/stdout.expected" 2>/dev/null
@@ -450,7 +646,7 @@ EOF
         fi
         if [[ "$crash_e" == "1" || "$crash_a" == "1" ]]; then
             if [[ "$crash_e" == "1" && "$crash_a" == "1" && "$rc_e" == "$rc_a"                   && -s "$tmp/stdout.actual" ]]; then
-                echo "[multiseed] PASS seed=$seed sample=$(basename "$sample") (designed crash pair rc=$rc_e)"
+                echo "[multiseed] PASS $slot (designed crash pair rc=$rc_e)"
                 pass=$((pass + 1))
             else
                 echo "[multiseed] FAIL seed=$seed sample=$sample abnormal rc (native=$rc_e packed=$rc_a, MIT-427 B.5 crash guard)" >&2
@@ -464,11 +660,133 @@ EOF
             echo "[multiseed] FAIL seed=$seed sample=$sample rc mismatch $rc_e vs $rc_a" >&2
             fail=$((fail + 1))
         else
-            echo "[multiseed] PASS seed=$seed sample=$(basename "$sample")"
+            echo "[multiseed] PASS $slot"
             pass=$((pass + 1))
         fi
         rm -rf "$tmp"
 }
+
+# ── MIT-522 (B0-3)：门禁有效性反证的复跑入口（R3）───────────────────────────
+# 反证不许以"我手工跑了一次并把输出贴进评论"为终态（MIT-406：agent 单方粘贴不算数）。
+# 本函数对每个变体槽位跑一次真 protect 取真日志，然后在**同一份日志**上逐类翻期望值：
+# 判词必须随期望值而动 —— 期望对了 PASS、期望错了 FAIL 且点名是哪条断言。任何一条不按
+# 预期动作，selftest 自己先红。最后拿一枚无规则老样本做正则活体正证：translate_gate
+# 口径必须能在真实产物日志上数到 ≥1，否则那条正则就是死码（本单要消灭的正是这个）。
+# 选 "--selftest 内建"而不是另开 scripts/verifier/ 脚本：反证必须走池判定同一份代码
+# （evaluate_slot 单点），另开脚本等于把解析逻辑抄第二遍，抄的那份漂移了没人知道——
+# 正是 MIT-503 缺陷 2「门自己空转」的形态。
+ST_CHECKS=0
+ST_BAD=0
+
+st_case() {
+    local name="$1" want="$2" needle="$3" slot="$4" rules="$5" expect="$6" log="$7"
+    local verdict="PASS" why=""
+    ST_CHECKS=$((ST_CHECKS + 1))
+    if ! evaluate_slot "$slot" "$rules" "$expect" "$log"; then
+        verdict="FAIL"
+        why="$EVAL_MSG"
+    fi
+    if [[ "$verdict" != "$want" ]]; then
+        echo "[selftest] BAD $name：判成 $verdict，该判 $want${why:+ —— 判词: $why}" >&2
+        ST_BAD=$((ST_BAD + 1))
+        return
+    fi
+    if [[ "$want" == "FAIL" && -n "$needle" && "$why" != *"$needle"* ]]; then
+        echo "[selftest] BAD $name：判了 FAIL 却没点名 '$needle' —— 判词: $why" >&2
+        ST_BAD=$((ST_BAD + 1))
+        return
+    fi
+    echo "[selftest] ok   $name → $verdict${needle:+（点名 $needle）}"
+}
+
+selftest() {
+    local tmpd rv sample base variant slot rules expect pf log k want
+    tmpd="$(mktemp -d)"
+    echo "[selftest] 反证矩阵：每变体 = 真 expect + 4 条计数器错值 + 豁免身份错值 + 缺 expect(R2)"
+    for rv in "${rule_variants[@]}"; do
+        sample="${rv%%|*}"
+        variant="${rv##*|}"
+        base="$(basename "$sample" .exe)"
+        rules="$RULES_DIR/${base}__${variant}.rules.toml"
+        expect="$RULES_DIR/${base}__${variant}.expect.txt"
+        if [[ ! -f "$sample" || ! -f "$rules" || ! -f "$expect" ]]; then
+            echo "[selftest] FAIL 变体 $variant 三件套不齐（sample/rules/expect 必须同在）" >&2
+            ST_CHECKS=$((ST_CHECKS + 1))
+            ST_BAD=$((ST_BAD + 1))
+            continue
+        fi
+        if ! log="$(capture_protect "$sample" "${seeds[0]}" "$variant")"; then
+            echo "[selftest] FAIL 变体 $variant 的 protect 没通过，反证无从谈起" >&2
+            ST_CHECKS=$((ST_CHECKS + 1))
+            ST_BAD=$((ST_BAD + 1))
+            continue
+        fi
+        slot="selftest seed=${seeds[0]} sample=$base variant=$variant"
+        echo "[selftest] 实读 $variant: stubs=$(actual_of stubs "$log") waive=$(actual_of selector_waive_notes "$log") arb=$(actual_of selector_arbitration_notes "$log") gate=$(actual_of translate_gate_notes "$log") crypt=$(actual_of crypt_encrypted "$log")/$(actual_of crypt_total "$log") 豁免=$(actual_of crypt_exempt "$log") targets=$(actual_of selector_waive_targets "$log")"
+        st_case "$variant/expect真值" PASS "" "$slot" "$rules" "$expect" "$log"
+        for k in $EXPECT_REQUIRED; do
+            want="$(expect_get "$expect" "$k")"
+            pf="$tmpd/${variant}.${k}.expect"
+            sed -E "s/^([[:space:]]*)$k[[:space:]]*=.*/\1$k=$((want + 1))/" "$expect" > "$pf"
+            st_case "$variant/错值:$k" FAIL "断言 '$k' 不符" "$slot" "$rules" "$pf" "$log"
+        done
+        if expect_has_key "$expect" selector_waive_targets; then
+            pf="$tmpd/${variant}.targets.expect"
+            sed -E "s/^([[:space:]]*)selector_waive_targets[[:space:]]*=.*/\1selector_waive_targets=(marker@0xdeadbeef)/" \
+                "$expect" > "$pf"
+            st_case "$variant/错值:豁免身份" FAIL "断言 'selector_waive_targets' 不符" \
+                "$slot" "$rules" "$pf" "$log"
+        fi
+        st_case "$variant/缺expect(R2)" FAIL "缺同名期望值文件" "$slot" "$rules" "" "$log"
+    done
+    # 活体正证（translate_gate 口径）：x87 样本的 x87 区是永久 C1 gate，无规则跑也必出
+    # 那条 Note ⇒ 拿它证明正则对得上产品文案。数到 0 = 该断言是死码，selftest 直接红。
+    local gate_sample="build/passes/marker_scan/tests/wvmp_x87_gate_sample.exe"
+    if [[ -f "$gate_sample" ]]; then
+        ST_CHECKS=$((ST_CHECKS + 1))
+        if log="$(capture_protect "$gate_sample" "${seeds[0]}" "")"; then
+            k="$(actual_of translate_gate_notes "$log")"
+            if [[ "$k" =~ ^[1-9] ]]; then
+                echo "[selftest] ok   活体正证:translate_gate 在无规则 x87 样本上实数 = $k（≥1 ⇒ 非死码）"
+            else
+                echo "[selftest] BAD 活体正证:translate_gate 实数 = $k —— 正则对不上产品文案，该断言是死码" >&2
+                ST_BAD=$((ST_BAD + 1))
+            fi
+        else
+            echo "[selftest] BAD 活体正证样本 wvmp_x87_gate_sample 的 protect 没通过" >&2
+            ST_BAD=$((ST_BAD + 1))
+        fi
+    fi
+    rm -rf "$tmpd"
+    echo "[selftest] TOTAL: $((ST_CHECKS - ST_BAD))/$ST_CHECKS 条反证按预期动作"
+    if [[ "$ST_BAD" -gt 0 ]]; then
+        echo "[selftest] RESULT: FAIL"
+        return 1
+    fi
+    echo "[selftest] RESULT: PASS"
+    return 0
+}
+
+if [[ "${1:-}" == "--selftest" ]]; then
+    selftest
+    exit $?
+fi
+
+# 取某个已登记变体槽的 protect 原文（seed = seeds[0]，走的是与跑池同一条 write_cfg +
+# capture 路径）。复核不必信交付评论里的粘贴：自己跑一条就有（MIT-406 教训）。
+if [[ "${1:-}" == "--protect-log" ]]; then
+    name="${2:-}"
+    hit=""
+    for rv in "${rule_variants[@]}"; do
+        [[ "$(basename "${rv%%|*}" .exe)__${rv##*|}" == "$name" ]] && hit="$rv"
+    done
+    if [[ -z "$hit" ]]; then
+        echo "[multiseed] 未登记的变体槽: '$name'；已登记: $(for rv in "${rule_variants[@]}"; do printf '%s ' "${rv##*|}"; done)" >&2
+        exit 2
+    fi
+    capture_protect "${hit%%|*}" "${seeds[0]}" "${hit##*|}"
+    exit $?
+fi
 
 for sample in "${samples[@]}"; do
     if [[ ! -f "$sample" ]]; then
@@ -494,6 +812,28 @@ for sample in "${x86_samples[@]}"; do
     sample_win="$(cygpath -m "$sample")"
     for seed in "${seeds[@]}"; do
         run_one_seed "$sample" "$seed"
+    done
+done
+
+# MIT-522 (B0-3): 规则变体槽 —— 同一枚已入池样本 × 4 套 [[functions]] 规则，判据与老槽位
+# 同一条（protect rc + 精确计数断言 + stdout/rc byte-exact），只是断言从 ≥1 换成点数。
+for rv in "${rule_variants[@]}"; do
+    sample="${rv%%|*}"
+    variant="${rv##*|}"
+    if [[ ! -f "$sample" ]]; then
+        echo "[multiseed] 规则变体样本文件不存在: $sample" >&2
+        fail=$((fail + 1))
+        continue
+    fi
+    # 登记了变体却没有规则片段 = 该槽位悄悄退回"缺省档位"那最窄的一条路，必须红。
+    if [[ ! -f "$RULES_DIR/$(basename "$sample" .exe)__${variant}.rules.toml" ]]; then
+        echo "[multiseed] FAIL 变体 $variant 未挂规则片段: $RULES_DIR/$(basename "$sample" .exe)__${variant}.rules.toml" >&2
+        fail=$((fail + 1))
+        continue
+    fi
+    sample_win="$(cygpath -m "$sample")"
+    for seed in "${seeds[@]}"; do
+        run_one_seed "$sample" "$seed" "$variant"
     done
 done
 
