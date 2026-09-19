@@ -1,0 +1,62 @@
+# MIT-505 逐 handler 码体差分（base=_mit505_base head=_mit505_head，seed 12345，全池）
+# 采集=mit490_capture.sh all / 工具=mit490_flags_delta.py diff
+# 预期改动面 = {rol rolcl ror rorcl sar sarcl shl shlcl shr shrcl}
+sample                                         handlers  changed  changed_handlers
+wvmp_aligned_mov_sample                        119/119       10  rol rolcl ror rorcl sar sarcl shl shlcl shr shrcl 
+wvmp_aligned_mov_xmm_readback_sample           119/119       10  rol rolcl ror rorcl sar sarcl shl shlcl shr shrcl 
+wvmp_atomic_incdec_sample                      119/119       10  rol rolcl ror rorcl sar sarcl shl shlcl shr shrcl 
+wvmp_atomic_ops_sample                         119/119       10  rol rolcl ror rorcl sar sarcl shl shlcl shr shrcl 
+wvmp_bmi_sample                                119/119       10  rol rolcl ror rorcl sar sarcl shl shlcl shr shrcl 
+wvmp_bswap_sample                              119/119       10  rol rolcl ror rorcl sar sarcl shl shlcl shr shrcl 
+wvmp_call_gate_sample                          119/119       10  rol rolcl ror rorcl sar sarcl shl shlcl shr shrcl 
+wvmp_call_gate_simple_sample                   119/119       10  rol rolcl ror rorcl sar sarcl shl shlcl shr shrcl 
+wvmp_cl_shift_sample                           119/119       10  rol rolcl ror rorcl sar sarcl shl shlcl shr shrcl 
+wvmp_cmovcc_sample                             119/119       10  rol rolcl ror rorcl sar sarcl shl shlcl shr shrcl 
+wvmp_cmpxchg_sample                            119/119       10  rol rolcl ror rorcl sar sarcl shl shlcl shr shrcl 
+wvmp_deepcall_div_sample                       119/119       10  rol rolcl ror rorcl sar sarcl shl shlcl shr shrcl 
+wvmp_deepcall_sample                           119/119       10  rol rolcl ror rorcl sar sarcl shl shlcl shr shrcl 
+wvmp_div_flags_readback_sample                 119/119       10  rol rolcl ror rorcl sar sarcl shl shlcl shr shrcl 
+wvmp_div_sample                                119/119       10  rol rolcl ror rorcl sar sarcl shl shlcl shr shrcl 
+wvmp_exitnative_pos_sample                     119/119       10  rol rolcl ror rorcl sar sarcl shl shlcl shr shrcl 
+wvmp_flags_rol_sample                          119/119       10  rol rolcl ror rorcl sar sarcl shl shlcl shr shrcl 
+wvmp_forkface_sample                           119/119       10  rol rolcl ror rorcl sar sarcl shl shlcl shr shrcl 
+wvmp_fp_callgate_sample                        119/119       10  rol rolcl ror rorcl sar sarcl shl shlcl shr shrcl 
+wvmp_imul_sample                               119/119       10  rol rolcl ror rorcl sar sarcl shl shlcl shr shrcl 
+wvmp_jmp_table8_sample                         119/119       10  rol rolcl ror rorcl sar sarcl shl shlcl shr shrcl 
+wvmp_jmp_table_sample                          119/119       10  rol rolcl ror rorcl sar sarcl shl shlcl shr shrcl 
+wvmp_retimm_sample                             119/119       10  rol rolcl ror rorcl sar sarcl shl shlcl shr shrcl 
+wvmp_rip_relative_sample                       119/119       10  rol rolcl ror rorcl sar sarcl shl shlcl shr shrcl 
+wvmp_rip_relative_simple_sample                119/119       10  rol rolcl ror rorcl sar sarcl shl shlcl shr shrcl 
+wvmp_rol_sample                                119/119       10  rol rolcl ror rorcl sar sarcl shl shlcl shr shrcl 
+wvmp_setcc_sample                              119/119       10  rol rolcl ror rorcl sar sarcl shl shlcl shr shrcl 
+wvmp_shift0_flags_sample                       119/119       10  rol rolcl ror rorcl sar sarcl shl shlcl shr shrcl 
+wvmp_snake_sample                              119/119       10  rol rolcl ror rorcl sar sarcl shl shlcl shr shrcl 
+wvmp_sse_add_sample                            119/119       10  rol rolcl ror rorcl sar sarcl shl shlcl shr shrcl 
+wvmp_sse_bridge_sample                         119/119       10  rol rolcl ror rorcl sar sarcl shl shlcl shr shrcl 
+wvmp_sse_bridge_xmm_readback_sample            119/119       10  rol rolcl ror rorcl sar sarcl shl shlcl shr shrcl 
+wvmp_sse_bwcmp_sample                          119/119       10  rol rolcl ror rorcl sar sarcl shl shlcl shr shrcl 
+wvmp_sse_bwcmpss_flags_readback_sample         119/119       10  rol rolcl ror rorcl sar sarcl shl shlcl shr shrcl 
+wvmp_sse_div_sample                            119/119       10  rol rolcl ror rorcl sar sarcl shl shlcl shr shrcl 
+wvmp_sse_divss_xmm_readback_sample             119/119       10  rol rolcl ror rorcl sar sarcl shl shlcl shr shrcl 
+wvmp_sse_fin_sample                            119/119       10  rol rolcl ror rorcl sar sarcl shl shlcl shr shrcl 
+wvmp_sse_fin_xmm_readback_sample               119/119       10  rol rolcl ror rorcl sar sarcl shl shlcl shr shrcl 
+wvmp_sse_memop_sample                          119/119       10  rol rolcl ror rorcl sar sarcl shl shlcl shr shrcl 
+wvmp_sse_memop_xmm_readback_sample             119/119       10  rol rolcl ror rorcl sar sarcl shl shlcl shr shrcl 
+wvmp_sse_mov_sample                            119/119       10  rol rolcl ror rorcl sar sarcl shl shlcl shr shrcl 
+wvmp_sse_movss_xmm_readback_sample             119/119       10  rol rolcl ror rorcl sar sarcl shl shlcl shr shrcl 
+wvmp_sse_rip_sample                            119/119       10  rol rolcl ror rorcl sar sarcl shl shlcl shr shrcl 
+wvmp_sse_rip_xmm_readback_sample               119/119       10  rol rolcl ror rorcl sar sarcl shl shlcl shr shrcl 
+wvmp_sse_sub_sample                            119/119       10  rol rolcl ror rorcl sar sarcl shl shlcl shr shrcl 
+wvmp_sse_subss_xmm_readback_sample             119/119       10  rol rolcl ror rorcl sar sarcl shl shlcl shr shrcl 
+wvmp_string_ops_sample                         119/119       10  rol rolcl ror rorcl sar sarcl shl shlcl shr shrcl 
+wvmp_vex128_sample                             119/119       10  rol rolcl ror rorcl sar sarcl shl shlcl shr shrcl 
+wvmp_vex128_xmm_readback_sample                119/119       10  rol rolcl ror rorcl sar sarcl shl shlcl shr shrcl 
+wvmp_x87_gate_sample                           119/119       10  rol rolcl ror rorcl sar sarcl shl shlcl shr shrcl 
+wvmp_xchg_sample                               119/119       10  rol rolcl ror rorcl sar sarcl shl shlcl shr shrcl 
+wvmp_ymm_data_sample                           119/119       10  rol rolcl ror rorcl sar sarcl shl shlcl shr shrcl 
+---
+[mit505-diff] 改动面与预期集合完全一致的样本数不匹配计数 = 0
+--- 字节级 delta（逐 handler，全池）---
+# 样本 52 个 × 移位 handler 10 个：期望每 handler 恰 1 字节 3f->1f，其余 handler 0 字节
+# 字节级越界计数 = 0
+[mit505-diff] 读数 = scripts/verifier/mit505_shiftmask_out/handler_diff_all.log

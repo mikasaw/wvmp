@@ -322,7 +322,7 @@ stub 数与 README 读数，归 B 波语料候选单，不在文档单修（本�
 
 | 指令族 | 状态 | 裁决/实现要点 | 出处 |
 |---|---|---|---|
-| GP 算术/逻辑/移位/位技巧（含 div/idiv、movzx/movsx、popcnt/lzcnt/tzcnt、shift/rot 全谱） | ✅ 支持 | 上节 08-31 行全部维持；**新增**：零次移位（`Shl/Shr/Sar` + `*Cl` + 立即数形）flags 活跃性改判为条件定义，不再杀前驱 `cmp/test`——`FlagSem::kWriteConditional`，立即数形按有效计数细化 | MIT-351~355 / MIT-404 / C2 收口 / MIT-433 / **MIT-490 (T74)** |
+| GP 算术/逻辑/移位/位技巧（含 div/idiv、movzx/movsx、popcnt/lzcnt/tzcnt、shift/rot 全谱） | ✅ 支持 | 上节 08-31 行全部维持；**新增**：零次移位（`Shl/Shr/Sar` + `*Cl` + 立即数形）flags 活跃性改判为条件定义，不再杀前驱 `cmp/test`——`FlagSem::kWriteConditional`，立即数形按有效计数细化；**移位计数运行时掩码按宽度取 `isa::shift_count_mask` 单一真源**（8/16/32 位 &31、64 位 &63），S32 且计数 32 走「计数 0 → 值与五位 flags 双不变」旁路（旧 x64 `0x3F` 档把宿主 `0x11` 残渣经 setcc5 装配进 guest，560 格真值电池坐实后清偿） | MIT-351~355 / MIT-404 / C2 收口 / MIT-433 / **MIT-490 (T74)** / **MIT-505 (B0-2)** |
 | 区域内 ret / ret imm16 | ✅ 支持 | 同 08-31 行 | MIT-438 (X1b) |
 | 浮点 SSE 全族（标量+packed+mem 形） | ✅ 支持 | 同 08-31 行 | MIT-371~376 / 408 / 411 / 425 |
 | SSE2 整数位运算档① + GP↔xmm 桥 + 对齐传送 | ✅ 支持 | 档② paddq/psubq 本体维持**频率 gate**（实测 16/854k ≈ 0.002%） | MIT-425 / 427 / 428 |
@@ -4667,3 +4667,124 @@ CMakeLists.txt cmake/` 只命中脚本自身 docstring 与 `test_runtime_x86.cpp
 注释 ⇒ 该门至今**没有任何自动化 runner 调用**，这正是腐化能存活 6 天的原因。是否接进
 `scripts/test.bat` / ctest 属项目主的口径决定（本单不动接线，接线会撑破改动面预算）；
 若接，按上面的退出码契约判「非 0 即不通过」。
+
+## MIT-505 (B0-2 · x64 移位运行时计数掩码按宽度取，S32 档清偿) 落账（2026-09-19）
+
+> 交付分支 `mit-debt-b-shiftmask`，**基线 = `mit-debt-b-x86dumpgate` tip `7537406`**
+> （非 main——B0-1 的门修复尚未合 main，判据 7 的 x86 门只有从该 tip 起才可证；
+> Architect 2026-09-19 基线钉法第 1/4 条）。合入顺序 B0-1 → B0-2。
+
+**疑点**：`vm/regvm/runtime/src/asmgen.cpp` `build_shift`（x64 路径）的运行时计数掩码
+`and cl, (s <= 1 ? "0x1F" : "0x3F")`，`s` 枚举 0..3 = S8/S16/S32/S64 ⇒ **S32（s==2）落进
+64 位档的 `0x3F`**。Intel SDM Vol.2：8/16/32 位操作数计数 &31、仅 64 位 &63。x86 侧
+`build_shift_x86` 早已按架构语义统一 `0x1F`（32 位模式恒 5 位），只有 x64 侧没跟。
+
+**机制定性（先于改码，且父单初稿被真值修正过一次）**：`and cl,…` 之后紧跟的是
+`jz adv_lbl`（计数 0 出口），再往后才是 native `shl <rs(t_[0], s)>, cl` ⇒ 该掩码的
+**唯一**作用是决定走不走「计数 0 → 整条 no-op、值与 flags 都不动」旁路；真移位量由
+CPU 按操作数宽度自己再掩一次。两条推论：① **值不背离**；② 背离只在 flags，且是
+**静默污染**（旁路漏触发 → `zero5()` 清 5 个捕获寄存器 → native 内部掩成 0 不碰
+EFLAGS → `setcc5()` 捕到 `and`/`xor` 留下的宿主残渣 → `flags_tail` 装配写回 guest）。
+父单初稿的「VM 侧按 `cl` 全宽移位、`1 << 33` 低 32 位归零」**不成立**，oracle 期望列
+未据其写；真值实测①完全兑现（值列零背离）⇒ 没有去"修"一个不存在的值缺陷。
+
+**B.1 判据实验（真硬件出真值，零产品代码）**：电池 `Interpreter.ShiftCountMaskOracleGrid`
+（`vm/regvm/runtime/tests/test_runtime.cpp` 末）。原生参照 = Keystone 现场汇编 20 个
+（op × size）小函数：`popfq` 预置五位前态（宿主 IF/IOPL 等其余位原值保留，不裸
+`popfq`）、**紧跟**被测移位指令（中间零条指令）、`pushfq` 取回 ⇒ 值与 flags 都是 CPU
+给的，不是模型推演。VM 侧 = `generate_runtime` → RWX 页真执行，`SetFlags` 预置同一
+guest 前态，`GetFlags` 读回。值列与 flags 列分开判定、分开出格。参照系自身另有 8 条
+锚点断言 + guest↔native 位布局映射断言（参照系坏了整张表即作废）。
+
+网格 = {shl,shr,sar,rol,ror} × {S8,S16,S32,S64} × {imm 形, cl 形} ×
+count{0,1,31,32,33,63,64} × 4 个 flags 前态 × seed{12345,7} ⇒ **560 格**（每格内含 4
+前态子样；CSV 记 seed 12345 的 1120 子样行）。
+
+| 列 | base（旧 `0x3F`@S32）<br>`mit505_shiftmask_out/grid_base_7537406.csv` | head（单一真源后）<br>`mit505_shiftmask_out/grid_head.csv` |
+|---|---|---|
+| 值列背离 | **0 / 560 格**（0 / 1120 子样行） | 0 / 560 |
+| flags 列背离 | **20 / 560 格**（36 / 1120 子样行） | 0 / 560 |
+
+背离格集合**恰为** `{shl,shr,sar,rol,ror} × {imm,cl} × S32 × count=32`（10 格 × 2 seed
+= 20），无第二形态：
+
+- `shl/shr/sar@S32#count32`：vm flags 恒 **`0x11`**（ZF|PF —— 正是 `zero5()` 五条
+  `xor r,r` 的宿主状态），对 4 种 guest 前态（`0x0`/`0x1F`/`0x5`/`0x1A`）**一律覆写**
+  ⇒ 全量装配通路，五位全污染（6 格 × 4 前态 = 24 子样行）。
+- `rol/ror@S32#count32`：走 `flags_tail_partial`，只装配 CF/OF、ZF/SF/PF 从 ctx 旧值
+  保留 ⇒ vm `0x19`/`0x1`/`0x18` 对前态 `0x1F`/`0x5`/`0x1A`，而前态 `CF=OF=0` 那一子样
+  **侥幸相同** ⇒ 4 格 × 3 = 12 子样行背离（检出率 3/4 而非 4/4）。派活单「Rol/Ror
+  污染面不同、网格须一并纳入」由此坐实：只测 shl 族会低估覆盖面。
+- `count∈{33,63}` 的 S32 档两侧一致（CPU 自己掩成 1..31 后照常写 flags）⇒ 掩码偏差的
+  可观测面严格是「`count & 0x3F ≠ 0` 而 `count & 0x1F == 0`」那一档，本网格内即 32。
+
+⇒ 疑点**坐实为缺陷**（flags 静默污染，非假阳性），值列预测坐实 ⇒ 进 B.2。
+读数复跑：`bash scripts/verifier/mit505_grid_capture.sh report`（出表）/
+`... strict`（逐格 EXPECT，修复后为回归钉）。
+
+**反证（新断言真会咬）**：`mit505_shiftmask_out/negctl_oldmask_7537406.log` —— 只把掩码
+行临时回退成旧档 `s<=1?0x1F:0x3F`（其余同 head），两把新断言当场失败：电池
+`ShiftZeroCountFlagsPreserved` 在 `*@S32#count32` 全线炸（实得 `17`=0x11、期望 `11`=前态
+ZF|CF|SF），网格 strict 模式 `diverge_flags=20`。反证后掩码行已复原，非落树改动。
+
+**B.2 修复面**：
+
+1. **掩码单一真源化**：`build_shift` 改 `"    and cl, " + imm(isa::shift_count_mask(kSizeOf[s]))`，
+   取 MIT-490 已落的 `isa::shift_count_mask`（`encoding.hpp`）——**不再造第二个字面量表**。
+   档位口径 `s=0..3 → ir::Size` 用 `static_assert` 钉住枚举序（序一变即断编译，防静默错档）。
+   liveness 侧按该函数自己的注无需回改（架构语义本来就对）。
+2. **改动面 x64-only**：`build_shift_x86` 码体零触碰（32 位模式恒 5 位掩码是架构事实），
+   本单只作网格对照组；x86 侧仅改一处*指称 x64 状态*的过期子句（见 5）。
+3. **补钉 MIT-490 刻意绕开的那一档**：`ShiftZeroCountFlagsPreserved` 的归零计数列表由
+   `{0, 64}` 改为按宽度取（S32 `{0, 32, 64}` / S64 `{0, 64}`），绕开注释改写为记录本单
+   结论；另加**反向钉**（count=33：S32 必须等价 &1 且五位与 count=1 全同、S64 必须真按
+   33 移）——只钉归零档的话，把掩码写成 `0x1F` 全宽也能过，反向钉封掉这一手。
+4. **受影响 handler 数全**：`build_shift` 的 10 个 x64 复用者 = `Shl/Shr/Sar/Rol/Ror` +
+   `ShlCl/ShrCl/SarCl/RolCl/RorCl`。`build_adc/build_sbb` 不复用 `build_shift`（两向不可
+   复用理由见 asmgen 该注），**实测未出现在差分清单**⇒ 无越界。
+5. **两处过期注释翻正**：`encoding.hpp` 的 `shift_count_mask` 注（原写「与 asmgen 运行时
+   掩码在 S32 上不重合……未在本役修」）、`build_shift_x86` 注里指称 x64 的子句（原写
+   「x64 侧同形缺口属既有面，X3b 不触碰，报告披露」）⇒ 均改为记录已清偿 + 互指本节。
+   纯注释，码体零影响（由下表 1 字节 delta 机器证明）。
+
+**逐 handler 码体差分表（判据 5；禁以 packed sha 恒等论证）**：base↔head 全池
+52 样本 × seed 12345，两侧各一次真实 protect 采集（`mit490_capture.sh all`）+
+`mit490_flags_delta.py diff`，聚合与自检脚本
+`scripts/verifier/mit505_handler_diff.sh`，读数
+`scripts/verifier/mit505_shiftmask_out/handler_diff_all.log`。
+
+| 口径 | 读数 |
+|---|---|
+| 逐 handler 码体切片（52 样本 × 119 handler = 6188 对） | 每样本**恰 10 个** handler 变化，集合恒为 `rol rolcl ror rorcl sar sarcl shl shlcl shr shrcl`；其余 **109/119 逐字节 IDENTICAL**；两侧 handler 集合规模恒 119/119（无新增/消失） |
+| 字节级 delta（逐 handler 码体镜像 `--out-bin` 对拍） | 10 个移位 handler **各恰 1 字节**变化，位置恒为 handler 内偏移 `0x1c3`（S32 块 `and cl, imm8` 的操作数字节），`0x3F → 0x1F`；其余 handler **0 字节**；`shl/shr/sar/shlcl/shrcl/sarcl` 579B、`rol/ror/rolcl/rorcl` 566B —— **尺寸与偏移两侧全等**（imm8 同宽，码体不长不缩） |
+| 越界自检 | 全池 `total_delta=10`、字节级越界计数 **0** |
+| 行为恒等 | 见下六件套：multiseed 全池 byte-exact、wvmpTest 双 arch diff-0 |
+
+**六件套（基线 = `7537406`）**：build `[407/407]` rc=0、本单触及文件 0 告警（全仓非
+`.deps` 唯一告警 = 既有 `sse_bridge_sample_main.cpp` C4335 Mac 行尾，未触碰）；
+ctest **23/23**（A 波后 target 数口径，非过期 15/15/16/16；`regvm_runtime_tests`
+用例 64→65 = 新增网格电池一把，判绿口径 63 passed + 2 把既有 `Mul*` SKIPPED）；x86 电池
+**67/67**（对照组，独立 32 位进程真执行）；REQUIRE_REAL=1 全池 multiseed
+**TOTAL: 360 pass / 0 fail**（72 槽 × 5 seeds，exit 0）；wvmpTest 双 arch 双跑 diff-0（x64 `106/106` + 29
+stub、x86 `105/105` + 26 stub）；dump 门两把全 PASS（x64 `dump_handler_xmm_check.py`
+3 样本 `RESULT: PASS` rc=0；x86 `verify_x86_dump.py` 当前树现采 dump **带 `--code`**
+`RESULT: PASS` exit=0，掩码真源对账 `kTableEntries=256` 读得到 ⇒ 非 INCOMPLETE 档）；
+静态扫描 `RESULT: PASS`（新立即数一律经 `imm()`，无裸多位数字）。
+
+**冻结面零改动**：`kVmOpMax=164` / 跳表 256 / `kCtxSize` / `ir::Op` / `keys.hpp` /
+`common/include` 全未触碰。产品码改动面 = `git diff --stat 7537406...HEAD` 四文件
+（asmgen.cpp、test_runtime.cpp、encoding.hpp（仅注释）、GAPS/STATUS 两件文档），
+另附本单采集脚本与读数各一套：`scripts/verifier/{mit505_grid_capture.sh,
+mit505_handler_diff.sh, mit505_shiftmask_out/}`。
+
+**支持矩阵口径行追正（本文档「当前口径」表 · GP 移位族那一行）**：追加掩码口径一条
+——「按宽度取 `isa::shift_count_mask` 单一真源（8/16/32 位 &31、64 位 &63），S32 计数 32
+走计数 0 旁路，值与五位 flags 双不变」，溯源列补 MIT-505。该行原文只讲 liveness 侧
+（MIT-490 改判），从未把旧的 `0x3F` 运行时档写成"支持口径"，故此处是**追加正确口径**
+而非改判。
+
+**遗留风险**：① 本单修的是「掩码 → 旁路判定」这一条通路；`flags_tail` 全量装配在
+**其他** 旁路漏触发场景下的污染面未被本网格覆盖（网格只覆盖移位族的计数轴）。② x86
+侧掩码正确性依赖「32 位模式恒 5 位」这一架构事实，若将来引入 64 位模式的 x86 池外
+handler 需重立口径。③ 判据 4 的反向钉只覆盖 count=33 一档，`[32,63]` 全区间由网格
+battery 的 31/32/33/63/64 五点采样代表，未穷举 0..255 计数轴。

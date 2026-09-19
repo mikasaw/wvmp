@@ -1,0 +1,57 @@
+# NEGCTL: asmgen build_shift 掩码临时回退为旧档 (s<=1?0x1F:0x3F)，产品码其余部分=head。证明新增两把断言真的会咬。
+# branch=mit-debt-b-shiftmask base=7537406 utc=2026-09-19T12:15:58Z
+C:\Users\www\AiCode\WVmp\wvmp\vm\regvm\runtime\tests\test_runtime.cpp(2562): error: Expected equality of these values:
+    Which is: 17
+    Which is: 11
+shl@S32#count32 seed11 imm：五位应全保留
+C:\Users\www\AiCode\WVmp\wvmp\vm\regvm\runtime\tests\test_runtime.cpp(2581): error: Expected equality of these values:
+    Which is: 17
+    Which is: 11
+shl@S32#count32 seed11 cl：五位应全保留
+C:\Users\www\AiCode\WVmp\wvmp\vm\regvm\runtime\tests\test_runtime.cpp(2562): error: Expected equality of these values:
+    Which is: 17
+    Which is: 11
+shr@S32#count32 seed11 imm：五位应全保留
+C:\Users\www\AiCode\WVmp\wvmp\vm\regvm\runtime\tests\test_runtime.cpp(2581): error: Expected equality of these values:
+    Which is: 17
+    Which is: 11
+shr@S32#count32 seed11 cl：五位应全保留
+C:\Users\www\AiCode\WVmp\wvmp\vm\regvm\runtime\tests\test_runtime.cpp(2562): error: Expected equality of these values:
+    Which is: 17
+    Which is: 11
+sar@S32#count32 seed11 imm：五位应全保留
+C:\Users\www\AiCode\WVmp\wvmp\vm\regvm\runtime\tests\test_runtime.cpp(2581): error: Expected equality of these values:
+    Which is: 17
+    Which is: 11
+sar@S32#count32 seed11 cl：五位应全保留
+C:\Users\www\AiCode\WVmp\wvmp\vm\regvm\runtime\tests\test_runtime.cpp(2562): error: Expected equality of these values:
+    Which is: 17
+    Which is: 11
+shl@S32#count32 seed22 imm：五位应全保留
+C:\Users\www\AiCode\WVmp\wvmp\vm\regvm\runtime\tests\test_runtime.cpp(2581): error: Expected equality of these values:
+    Which is: 17
+[mit505-grid] cells=560 diverge_value=0 diverge_flags=20 strict=1
+[mit505-grid] shl@S32#imm#count32#seed12345 [flags] → flags[p0x0] vm=0x11 native=0x0 flags[p0x1F] vm=0x11 native=0x1F flags[p0x5] vm=0x11 native=0x5 flags[p0x1A] vm=0x11 native=0x1A
+[mit505-grid] shl@S32#cl#count32#seed12345 [flags] → flags[p0x0] vm=0x11 native=0x0 flags[p0x1F] vm=0x11 native=0x1F flags[p0x5] vm=0x11 native=0x5 flags[p0x1A] vm=0x11 native=0x1A
+[mit505-grid] shr@S32#imm#count32#seed12345 [flags] → flags[p0x0] vm=0x11 native=0x0 flags[p0x1F] vm=0x11 native=0x1F flags[p0x5] vm=0x11 native=0x5 flags[p0x1A] vm=0x11 native=0x1A
+[mit505-grid] shr@S32#cl#count32#seed12345 [flags] → flags[p0x0] vm=0x11 native=0x0 flags[p0x1F] vm=0x11 native=0x1F flags[p0x5] vm=0x11 native=0x5 flags[p0x1A] vm=0x11 native=0x1A
+[mit505-grid] sar@S32#imm#count32#seed12345 [flags] → flags[p0x0] vm=0x11 native=0x0 flags[p0x1F] vm=0x11 native=0x1F flags[p0x5] vm=0x11 native=0x5 flags[p0x1A] vm=0x11 native=0x1A
+[mit505-grid] sar@S32#cl#count32#seed12345 [flags] → flags[p0x0] vm=0x11 native=0x0 flags[p0x1F] vm=0x11 native=0x1F flags[p0x5] vm=0x11 native=0x5 flags[p0x1A] vm=0x11 native=0x1A
+[mit505-grid] rol@S32#imm#count32#seed12345 [flags] → flags[p0x1F] vm=0x19 native=0x1F flags[p0x5] vm=0x1 native=0x5 flags[p0x1A] vm=0x18 native=0x1A
+[mit505-grid] rol@S32#cl#count32#seed12345 [flags] → flags[p0x1F] vm=0x19 native=0x1F flags[p0x5] vm=0x1 native=0x5 flags[p0x1A] vm=0x18 native=0x1A
+[mit505-grid] ror@S32#imm#count32#seed12345 [flags] → flags[p0x1F] vm=0x19 native=0x1F flags[p0x5] vm=0x1 native=0x5 flags[p0x1A] vm=0x18 native=0x1A
+[mit505-grid] ror@S32#cl#count32#seed12345 [flags] → flags[p0x1F] vm=0x19 native=0x1F flags[p0x5] vm=0x1 native=0x5 flags[p0x1A] vm=0x18 native=0x1A
+[mit505-grid] shl@S32#imm#count32#seed7 [flags] → flags[p0x0] vm=0x11 native=0x0 flags[p0x1F] vm=0x11 native=0x1F flags[p0x5] vm=0x11 native=0x5 flags[p0x1A] vm=0x11 native=0x1A
+[mit505-grid] shl@S32#cl#count32#seed7 [flags] → flags[p0x0] vm=0x11 native=0x0 flags[p0x1F] vm=0x11 native=0x1F flags[p0x5] vm=0x11 native=0x5 flags[p0x1A] vm=0x11 native=0x1A
+[mit505-grid] shr@S32#imm#count32#seed7 [flags] → flags[p0x0] vm=0x11 native=0x0 flags[p0x1F] vm=0x11 native=0x1F flags[p0x5] vm=0x11 native=0x5 flags[p0x1A] vm=0x11 native=0x1A
+[mit505-grid] shr@S32#cl#count32#seed7 [flags] → flags[p0x0] vm=0x11 native=0x0 flags[p0x1F] vm=0x11 native=0x1F flags[p0x5] vm=0x11 native=0x5 flags[p0x1A] vm=0x11 native=0x1A
+[mit505-grid] sar@S32#imm#count32#seed7 [flags] → flags[p0x0] vm=0x11 native=0x0 flags[p0x1F] vm=0x11 native=0x1F flags[p0x5] vm=0x11 native=0x5 flags[p0x1A] vm=0x11 native=0x1A
+[mit505-grid] sar@S32#cl#count32#seed7 [flags] → flags[p0x0] vm=0x11 native=0x0 flags[p0x1F] vm=0x11 native=0x1F flags[p0x5] vm=0x11 native=0x5 flags[p0x1A] vm=0x11 native=0x1A
+[mit505-grid] rol@S32#imm#count32#seed7 [flags] → flags[p0x1F] vm=0x19 native=0x1F flags[p0x5] vm=0x1 native=0x5 flags[p0x1A] vm=0x18 native=0x1A
+[mit505-grid] rol@S32#cl#count32#seed7 [flags] → flags[p0x1F] vm=0x19 native=0x1F flags[p0x5] vm=0x1 native=0x5 flags[p0x1A] vm=0x18 native=0x1A
+[mit505-grid] ror@S32#imm#count32#seed7 [flags] → flags[p0x1F] vm=0x19 native=0x1F flags[p0x5] vm=0x1 native=0x5 flags[p0x1A] vm=0x18 native=0x1A
+[mit505-grid] ror@S32#cl#count32#seed7 [flags] → flags[p0x1F] vm=0x19 native=0x1F flags[p0x5] vm=0x1 native=0x5 flags[p0x1A] vm=0x18 native=0x1A
+[  FAILED  ] Interpreter.ShiftCountMaskOracleGrid (336 ms)
+[  PASSED  ] 0 tests.
+[  FAILED  ] 1 test, listed below:
+[  FAILED  ] Interpreter.ShiftCountMaskOracleGrid

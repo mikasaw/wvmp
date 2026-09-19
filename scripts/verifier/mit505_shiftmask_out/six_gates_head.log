@@ -1,0 +1,36 @@
+# MIT-505 (B0-2) 六件套读数  head=7537406+工作树改动  utc=2026-09-19T12:39:16Z
+
+## 1) build (scripts/build.bat)
+exit=0  [407/407] Linking CXX executable cli\wvmp_cli.exe
+本单触及文件 0 个 C4xxx；全仓非 .deps 唯一告警 = 既有 passes/marker_scan/tests/sse_bridge_sample_main.cpp C4335（未触碰）
+
+## 2) ctest (scripts/test.bat)
+100% tests passed, 0 tests failed out of 23  （基线同树亦 23/23）
+regvm_runtime_tests: 65 tests ran = 63 passed + 2 既有 SKIPPED(MulSemantics/MulFuzzTenThousand)
+
+## 3) x86 电池对照组 (build/x86, 32 位进程)
+[==========] 67 tests from 1 test suite ran. [ PASSED ] 67 tests.
+
+## 4) REQUIRE_REAL=1 全池 multiseed
+[multiseed] TOTAL: 360 pass / 0 fail
+明细 = 同目录 multiseed_real_head.log
+
+## 5) wvmpTest 双 arch 双跑
+x64: native SUMMARY passed=106 failed=0 | packed SUMMARY passed=106 failed=0 | diff count = 0 | 29 入口 stub
+x86: native SUMMARY passed=105 failed=0 | packed SUMMARY passed=105 failed=0 | diff count = 0 | 26 入口 stub
+
+## 6) dump 门（两把，实跑逐字）
+--- x64: dump_handler_xmm_check.py（当前树 protect 产物，seed 12345）
+  wvmp_cl_shift_sample rc=0 [dump-check] RESULT: PASS - all SSE handlers emit real ctx.xmm updates
+  wvmp_rol_sample rc=0 [dump-check] RESULT: PASS - all SSE handlers emit real ctx.xmm updates
+  wvmp_snake_sample rc=0 [dump-check] RESULT: PASS - all SSE handlers emit real ctx.xmm updates
+--- x86: verify_x86_dump.py（当前树现采 dump + 带 --code，判据 7 有效形态）
+  rc=0
+  [x86-dump-gate] header ok: dispatch=+0x1d table=+0x7af8
+  [x86-dump-gate] mask ok: kTableEntries=256 → and <r>, 0xFF（源：dump 跳表标记 × asmgen.cpp 对账）
+  [x86-dump-gate] handlers ok: 138 登记项（电池集 94 全覆盖）
+  [x86-dump-gate] disasm ok: entry idiom / dispatch mask 0xFF / 138 handler 首条全可解码
+  [x86-dump-gate] RESULT: PASS - 文本审 + 反汇编审（掩码 0xFF，138 handler）全过
+
+## 7) 静态扫描（裸多位立即数）
+  [static-scan] RESULT: PASS - no bare multi-digit decimal immediates in emitted asm text

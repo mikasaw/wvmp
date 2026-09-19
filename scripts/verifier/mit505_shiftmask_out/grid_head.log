@@ -1,0 +1,13 @@
+Running main() from C:\Users\www\AiCode\WVmp\wvmp\.deps\googletest-src\googletest\src\gtest_main.cc
+Note: Google Test filter = Interpreter.ShiftCountMaskOracleGrid
+[==========] Running 1 test from 1 test suite.
+[----------] Global test environment set-up.
+[----------] 1 test from Interpreter
+[ RUN      ] Interpreter.ShiftCountMaskOracleGrid
+[mit505-grid] cells=560 diverge_value=0 diverge_flags=0 strict=0
+[       OK ] Interpreter.ShiftCountMaskOracleGrid (346 ms)
+[----------] 1 test from Interpreter (346 ms total)
+
+[----------] Global test environment tear-down
+[==========] 1 test from 1 test suite ran. (346 ms total)
+[  PASSED  ] 1 test.

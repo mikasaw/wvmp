@@ -86,6 +86,7 @@
 #include "wvmp/regvm/runtime/runtime_x86.hpp"
 
 #include "wvmp/ir/insn.hpp"
+#include "wvmp/regvm/isa/encoding.hpp"
 #include "wvmp/regvm/isa/vm_op.hpp"
 #include "wvmp/regvm/isa/vm_reg.hpp"
 
@@ -1023,7 +1024,28 @@ public:
     // （ZF/SF/PF 从 ctx 旧值保留，见该函数注）。块体逐字节同构（load/count
     // 掩码/zero5/native/setcc5/writeback/计数 0 出口全部一致），仅 tail 一处
     // 分叉，shl/shr/sar 生成字节码不受影响（D3 sha 逐字节对账保证）。
+    //
+    // MIT-505 (B0-2) 计数掩码按宽度取：旧式 `s <= 1 ? 0x1F : 0x3F` 让 S32
+    // （s==2）落进 64 位档的 0x3F，与 Intel SDM Vol.2（8/16/32 位 &31、仅
+    // 64 位 &63）差一档。⚠️ 该掩码的**唯一**作用是决定走不走"计数 0 → 整条
+    // no-op、值与 flags 都不动"旁路——真移位量由 native 的 CPU 按操作数宽度
+    // 自己再掩一次，所以旧档**不改值**（全网格 560 格值列 0 背离实证，见
+    // GAPS MIT-505 节），但 S32 且计数 32 时旁路漏触发：走完 zero5 → native
+    // （CPU 内部掩成 0，不碰 EFLAGS）→ setcc5 捕到的是 and/xor 留下的宿主
+    // 残渣 → flags_tail 全量装配把残渣写进 guest。实测残渣恒为 0x11（ZF|PF，
+    // 即 zero5 五条 xor 的宿主状态），与前态无关 ⇒ 静默污染，非"恰好对得上"。
+    // rol/ror 走 partial 尾部只装配 CF/OF，污染面窄一档（ZF/SF/PF 仍从 ctx
+    // 保留，故前态 CF=OF=0 时那一格看不出错）。修 = 掩码单一真源化。
     std::string build_shift(const char* native, u64 dispatch, bool partial_flags = false) const {
+        // 档位索引 s（0..3，与 rs()/mptr()/size_chain 同口径）→ ir::Size。
+        // s 的口径由 ir::Size 枚举值直接给出，不另造映射表。
+        static_assert(static_cast<int>(ir::Size::S8) == 0 &&
+                          static_cast<int>(ir::Size::S16) == 1 &&
+                          static_cast<int>(ir::Size::S32) == 2 &&
+                          static_cast<int>(ir::Size::S64) == 3,
+                      "ir::Size 枚举序已变：build_shift 的 s=0..3 档位口径需重立");
+        constexpr ir::Size kSizeOf[4] = {ir::Size::S8, ir::Size::S16, ir::Size::S32,
+                                         ir::Size::S64};
         const std::string tag = std::string(native) + std::to_string(seq());
         const std::string adv_lbl = "adv_" + tag;
         const std::string tail_lbl = "ftail_" + tag;
@@ -1042,7 +1064,7 @@ public:
             o += std::string("    mov ") + r64(t_[1]) + ", " + r64(t_[5]) + "\n";
             o += "cntg" + stag + ":\n";
             o += std::string("    mov cl, ") + rs(t_[1], 0) + "\n";
-            o += std::string("    and cl, ") + (s <= 1 ? "0x1F" : "0x3F") + "\n";
+            o += "    and cl, " + imm(isa::shift_count_mask(kSizeOf[s])) + "\n";
             o += "    jz " + adv_lbl + "\n";   // 计数 0：值与 flags 均不变
             o += zero5();
             o += std::string("    ") + native + " " + rs(t_[0], s) + ", cl\n";
@@ -4726,9 +4748,10 @@ public:
     //   1. 计数掩码 = **0x1F 全宽**：SDM Vol. 2 —— 6 位掩码仅 64 位模式
     //      REX.W 生效，legacy/compat（含 32 位模式）恒 5 位。计数 32..63 在
     //      S32 档：0x1F 掩码 → 0 → 走计数 0 出口（值与 flags 均不动，native
-    //      语义）；若沿用 x64 S32 的 0x3F 掩码，计数 32 会漏进 native（内部
-    //      再掩 0）且把 and 的宿主 flags 经 setcc 装配进 guest —— 静默污染
-    //      （x64 侧同形缺口属既有面，X3b 不触碰，报告披露）。电池
+    //      语义）；若沿用 x64 旧 S32 档的 0x3F 掩码，计数 32 会漏进 native
+    //      （内部再掩 0）且把 and 的宿主 flags 经 setcc 装配进 guest —— 静默
+    //      污染（x64 侧同形缺口已由 MIT-505 清偿：build_shift 改调
+    //      isa::shift_count_mask 单一真源；本函数一直是它的对照组）。电池
     //      ShiftImmMask 实测钉死（count=0x20 值+flags 双不变）。
     //   2. 计数 0 出口在 flags 装配**前**旁路（x64 同构）—— rol/ror 的
     //      partial 装配同理（SDM: count&31 == 0 时 flags 不受影响）。

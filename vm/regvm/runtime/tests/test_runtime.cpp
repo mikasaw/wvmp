@@ -2521,10 +2521,13 @@ TEST(Interpreter, ShiftZeroCountFlagsPreserved) {
         const auto entry = rwx.entry();
         alignas(16) std::array<u8, 0x10000> scratch{};
 
-        // 掩码归零档刻意取 count=64（S64 与 S32 的运行时掩码 0x3F 下都归零，
-        // 原生 8/16/32 位 &31、64 位 &63 同样归零 → 两侧一致）。不用
-        // count=32@S32：asmgen 运行时掩码在 S32 上取 0x3F（本机另一处独立
-        // 偏差，已随本单交付评论上报），那里 32 不归零，断言会自相矛盾。
+        // 掩码归零档按宽度取（MIT-505 起）：S32 = {0, 32, 64}、S64 = {0, 64}。
+        // MIT-490 立单时此处刻意只留 {0, 64} 并绕开 count=32@S32——理由是
+        // "asmgen 运行时掩码在 S32 上取 0x3F，那里 32 不归零，断言会自相矛盾"。
+        // MIT-505 的全网格真值电池已把那个 0x3F 档定性为缺陷（S32 且计数 32
+        // → 旁路漏触发 → 宿主 xor 残渣 0x11 经 setcc5 装配进 guest，前态无关），
+        // 掩码已改调 isa::shift_count_mask 单一真源 ⇒ 32@S32 现在真的归零，
+        // 本档就地补钉（绕开理由随修复一并作废）。
         struct Cell {
             isa::VmOp imm_op, cl_op;
             const char* name;
@@ -2533,7 +2536,11 @@ TEST(Interpreter, ShiftZeroCountFlagsPreserved) {
                               Cell{isa::VmOp::Shr, isa::VmOp::ShrCl, "shr"},
                               Cell{isa::VmOp::Sar, isa::VmOp::SarCl, "sar"}}) {
             for (ir::Size sz : {ir::Size::S32, ir::Size::S64}) {
-                for (u32 count : {0u, 64u}) {   // 零计数 / 掩码归零计数
+                // 该宽度下"掩码后归零"的计数档（S32 多出 32 一档 = MIT-505 补的）。
+                const std::vector<u32> zero_counts = sz == ir::Size::S32
+                                                         ? std::vector<u32>{0u, 32u, 64u}
+                                                         : std::vector<u32>{0u, 64u};
+                for (u32 count : zero_counts) {   // 零计数 / 掩码归零计数
                     const std::string tag =
                         std::string(c.name) + (sz == ir::Size::S32 ? "@S32" : "@S64") +
                         "#count" + std::to_string(count) + " seed" + std::to_string(seed);
@@ -2594,6 +2601,48 @@ TEST(Interpreter, ShiftZeroCountFlagsPreserved) {
                         << std::string(c.name) << "#count1(对照) seed=" << seed;
                     EXPECT_NE(ctx.regs[0], value)
                         << std::string(c.name) << "#count1(对照) 值应被移 seed=" << seed;
+                }
+                // 有效计数档（MIT-505 反向钉）：count=33 在 S32 必须等价 &1、在
+                // S64 必须真按 33 移。只钉归零档的话，把掩码写成 0x1F 全宽也会
+                // 过——本档正是防这一手的（S64 的 3<<33 / 3>>33 与 &1 档不可能
+                // 相同，两侧掩码各自被独立钉住）。
+                struct Band {
+                    u64 value;
+                    u64 flags;
+                };
+                const auto run_shift = [&](bool cl_form, u32 count) -> Band {
+                    std::vector<u8> s;
+                    isa::append_insn(s, mov_imm(0, static_cast<u32>(value), sz));
+                    isa::append_insn(s, mov_imm(2, static_cast<u32>(pre)));
+                    isa::append_insn(s, isa::make_insn(isa::VmOp::SetFlags,
+                                                       isa::OpKind::Reg, 2,
+                                                       isa::OpKind::None, 0));
+                    if (cl_form) {
+                        isa::append_insn(s, mov_imm(1, count));   // 1 = RCX 槽
+                        isa::append_insn(s, cl_shift(c.cl_op, 0, sz));
+                    } else {
+                        isa::append_insn(s, bin_imm(c.imm_op, 0, count, sz));
+                    }
+                    isa::append_insn(s, isa::make_insn(isa::VmOp::GetFlags,
+                                                       isa::OpKind::Reg, 3,
+                                                       isa::OpKind::None, 0));
+                    isa::append_insn(s, halt());
+                    const auto ctx = run_stream(entry, s, scratch.data());
+                    return {ctx.regs[0], ctx.regs[3] & isa::kFlagsMask};
+                };
+                const bool is_shl = c.imm_op == isa::VmOp::Shl;
+                const u64 want33 = sz == ir::Size::S32
+                                       ? (is_shl ? 6ull : 1ull)
+                                       : (is_shl ? 0x600000000ull : 0ull);   // 3<<33
+                for (bool cl_form : {false, true}) {
+                    const std::string bt =
+                        std::string(c.name) + (sz == ir::Size::S32 ? "@S32" : "@S64") +
+                        (cl_form ? "#cl" : "#imm") + "#count33 seed" + std::to_string(seed);
+                    const auto b33 = run_shift(cl_form, 33u);
+                    EXPECT_EQ(b33.value, want33) << bt;
+                    if (sz == ir::Size::S32)
+                        EXPECT_EQ(b33.flags, run_shift(cl_form, 1u).flags)
+                            << bt << "：S32 的 33 应与 1 同（掩码 &31）";
                 }
             }
         }
@@ -4573,3 +4622,364 @@ TEST(Interpreter, FetchDecryptSemanticParity) {
     }
 }
 } // namespace
+
+// =============================================================================
+// MIT-505 (B0-2) 移位计数掩码全网格真值电池
+//
+// 立项前提待证：asmgen build_shift 的 `and cl, (s <= 1 ? 0x1F : 0x3F)` 让 S32
+// 落进 64 位档。该掩码的唯一作用是决定走不走"计数 0 → 整条 no-op"旁路（真
+// 移位量由 CPU 按操作数宽度自己再掩一次），故预测是**值不背离、flags 静默
+// 背离**——预测不是结论，本电池用真硬件出真值来判它。
+//
+// 每格双跑：
+//   (a) 原生参照 = Keystone 现场汇编一小段真 x64：popfq 预置五位 → 真
+//       shl/shr/sar/rol/ror 目的, cl → pushfq 取回。值与 flags 都由 CPU 给，
+//       不是模型推演（模型与 CPU 冲突时整张表作废）。
+//   (b) VM 真执行 = generate_runtime → RWX 页，SetFlags 预置同一 guest 前态。
+// ⚠️ 值列与 flags 列分开判定、分开出格，绝不合成一个"一致/不一致"。
+//
+// 网格：{shl,shr,sar,rol,ror} × {S8,S16,S32,S64} × {imm,cl} ×
+//       count{0,1,31,32,33,63,64} × pre{0,全五位,ZF|OF,CF|SF|PF} ×
+//       seed{12345,7}（寄存器分配随 seed 随机，防"恰好不撞"）。
+// x86 对照组 = 既有电池 X86Battery.ShiftImmMask（同档 count=0x20@S32 值+flags
+// 双断言已钉死），本单不改它。
+//
+// 模式：缺省报告模式出全网格表（WVMP_SHIFT_GRID_OUT=<path> 落盘，读数入仓可
+// 复跑），只硬断言参照系自证 + 前态无关性；WVMP_SHIFT_GRID_STRICT=1 时逐格
+// EXPECT，作修复落地后的回归钉。
+// =============================================================================
+namespace {
+
+constexpr int kShiftOpCount = 5;
+constexpr int kShiftSizeCount = 4;
+const char* const kShiftOpName[kShiftOpCount] = {"shl", "shr", "sar", "rol", "ror"};
+const char* const kShiftSizeName[kShiftSizeCount] = {"S8", "S16", "S32", "S64"};
+const char* const kShiftSizeReg[kShiftSizeCount] = {"al", "ax", "eax", "rax"};
+// 每档宽度一个值：MSB 置位（sar/shl 的 OF 有趣）+ bit0 置位（shr/ror 的 CF
+// 有趣）+ 低半字交替 1（PF 有趣）。
+const u64 kShiftProbeValue[kShiftSizeCount] = {
+    0xD5ull, 0x8055ull, 0x80000055ull, 0x8000000000000055ull,
+};
+// imm 形 / cl 形两套 VmOp。
+const isa::VmOp kShiftVmOp[kShiftOpCount][2] = {
+    {isa::VmOp::Shl, isa::VmOp::ShlCl},
+    {isa::VmOp::Shr, isa::VmOp::ShrCl},
+    {isa::VmOp::Sar, isa::VmOp::SarCl},
+    {isa::VmOp::Rol, isa::VmOp::RolCl},
+    {isa::VmOp::Ror, isa::VmOp::RorCl},
+};
+
+u64 shift_low_mask(int size_idx) {
+    return size_idx == 3 ? ~0ull : ((1ull << (8 << size_idx)) - 1);
+}
+
+std::string shift_hex(u64 v) {
+    char b[32];
+    std::snprintf(b, sizeof(b), "0x%llX", static_cast<unsigned long long>(v));
+    return b;
+}
+
+// guest 五位（ZF=0 CF=1 OF=2 SF=3 PF=4）↔ 原生 EFLAGS（CF=0 PF=2 ZF=6 SF=7 OF=11）。
+constexpr u64 kNativeFiveMask = (1ull << 0) | (1ull << 2) | (1ull << 6) |
+                                (1ull << 7) | (1ull << 11);
+
+u64 guest_flags_to_native(u64 g) {
+    u64 n = 0;
+    if (g & isa::kFlagZF) n |= 1ull << 6;
+    if (g & isa::kFlagCF) n |= 1ull << 0;
+    if (g & isa::kFlagOF) n |= 1ull << 11;
+    if (g & isa::kFlagSF) n |= 1ull << 7;
+    if (g & isa::kFlagPF) n |= 1ull << 2;
+    return n;
+}
+u64 native_flags_to_guest(u64 n) {
+    u64 g = 0;
+    if (n & (1ull << 6)) g |= isa::kFlagZF;
+    if (n & (1ull << 0)) g |= isa::kFlagCF;
+    if (n & (1ull << 11)) g |= isa::kFlagOF;
+    if (n & (1ull << 7)) g |= isa::kFlagSF;
+    if (n & (1ull << 2)) g |= isa::kFlagPF;
+    return g;
+}
+
+// 原生参照的输入/输出块（Win64 第一参 = rcx = 本块指针）。
+struct ShiftOracleBlock {
+    u64 value_in;   // +0x00 移位前目的操作数（低 N 位有效）
+    u64 count;      // +0x08 原始计数——不预掩，交给 CPU 按宽度掩
+    u64 pre_flags;  // +0x10 预置宿主 EFLAGS（原生布局）
+    u64 keep_mask;  // +0x18 = ~五位掩码，保住宿主 IF/IOPL 等原值
+    u64 out_value;  // +0x20 移位后 rax 全宽
+    u64 out_flags;  // +0x28 移位后 EFLAGS 全宽
+};
+
+// 骨架：预置五位前态（宿主其余位原样保留，绝不裸 popfq 动 IF），紧跟被测移位
+// 指令（中间零条指令——多一条都会把宿主 flags 搅乱，参照系自身就假了）。
+const char* kOracleHead = R"(
+    push rbx
+    push rsi
+    mov  rsi, rcx
+    mov  rax, qword ptr [rsi + 0x00]
+    mov  rcx, qword ptr [rsi + 0x08]
+    mov  r9,  qword ptr [rsi + 0x10]
+    mov  r10, qword ptr [rsi + 0x18]
+    pushfq
+    pop  r8
+    mov  rdx, r8
+    and  rdx, r10
+    or   rdx, r9
+    push rdx
+    popfq
+)";
+const char* kOracleTail = R"(
+    pushfq
+    pop  r11
+    mov  qword ptr [rsi + 0x20], rax
+    mov  qword ptr [rsi + 0x28], r11
+    push r8
+    popfq
+    pop  rsi
+    pop  rbx
+    ret
+)";
+
+// 20 个（op × size）变体的原生移位小函数；真执行 = 真值来源。
+class NativeShiftOracle {
+public:
+    using Fn = void (*)(ShiftOracleBlock*);
+
+    NativeShiftOracle() {
+        for (int o = 0; o < kShiftOpCount; ++o) {
+            for (int s = 0; s < kShiftSizeCount; ++s) {
+                const std::string src = std::string(kOracleHead) + "    " +
+                                        kShiftOpName[o] + " " + kShiftSizeReg[s] +
+                                        ", cl\n" + kOracleTail;
+                const std::vector<u8> code = assemble_or_throw(src);
+                void* m = ::VirtualAlloc(nullptr, code.size(), MEM_COMMIT | MEM_RESERVE,
+                                         PAGE_EXECUTE_READWRITE);
+                if (!m) throw std::runtime_error("VirtualAlloc(RWX) failed (oracle)");
+                std::memcpy(m, code.data(), code.size());
+                mem_[o][s] = m;
+                fn_[o][s] = reinterpret_cast<Fn>(m);
+            }
+        }
+    }
+    ~NativeShiftOracle() {
+        for (int o = 0; o < kShiftOpCount; ++o)
+            for (int s = 0; s < kShiftSizeCount; ++s)
+                if (mem_[o][s]) ::VirtualFree(mem_[o][s], 0, MEM_RELEASE);
+    }
+    NativeShiftOracle(const NativeShiftOracle&) = delete;
+    NativeShiftOracle& operator=(const NativeShiftOracle&) = delete;
+
+    struct Out {
+        u64 value;
+        u64 flags;
+    };
+    Out run(int op_idx, int size_idx, u64 value, u64 count, u64 pre_guest) const {
+        ShiftOracleBlock b{};
+        b.value_in = value;
+        b.count = count;
+        b.pre_flags = guest_flags_to_native(pre_guest);
+        b.keep_mask = ~kNativeFiveMask;
+        fn_[op_idx][size_idx](&b);
+        return {b.out_value & shift_low_mask(size_idx), native_flags_to_guest(b.out_flags)};
+    }
+
+private:
+    void* mem_[kShiftOpCount][kShiftSizeCount] = {};
+    Fn fn_[kShiftOpCount][kShiftSizeCount] = {};
+};
+
+// VM 侧一格：同一 guest 前态、同一计数，跑 imm 形或 cl 形。
+struct VmOut {
+    u64 value;
+    u64 flags;
+};
+VmOut run_vm_shift(RwxImage::Entry entry, int op_idx, int size_idx, bool cl_form,
+                   u64 count, u64 pre_guest, u64 scratch_va) {
+    const auto sz = static_cast<ir::Size>(size_idx);
+    std::vector<u8> s;
+    // 值经 LoadRva 从宿主内存取，绕开"用被测 Shl 拼 64 位立即数"的自指。
+    // 槽位：v0=目的 / v4=前态 flags / v3=GetFlags 读回 / v6=LoadRva 偏移；
+    // 计数符号取 RCX 槽（cl_shift 的 reg_b 即它），绝不能用字面量槽号——本文件
+    // cl_shift 注里的"=2"是过期口径，取错槽会让 flags 被当计数，整格读数作废。
+    const u8 rcx_slot = isa::vm_reg_of(ir::Reg::Rcx);
+    isa::append_insn(s, mov_imm(6, 0u, ir::Size::S64));   // 0: 槽 6 = 偏移 0
+    isa::append_insn(s, isa::make_insn(isa::VmOp::LoadRva, isa::OpKind::Reg, 0,
+                                       isa::OpKind::Reg, 6, 0,
+                                       isa::size_field(sz)));  // 1: v0 = *[scratch+0]
+    isa::append_insn(s, mov_imm(4, static_cast<u32>(pre_guest), ir::Size::S64));  // 2
+    isa::append_insn(s, isa::make_insn(isa::VmOp::SetFlags, isa::OpKind::Reg, 4,
+                                       isa::OpKind::None, 0));  // 3: guest flags = pre
+    if (cl_form) {
+        isa::append_insn(s, mov_imm(rcx_slot, static_cast<u32>(count), ir::Size::S64));  // 4
+        isa::append_insn(s, cl_shift(kShiftVmOp[op_idx][1], 0, sz));              // 5
+    } else {
+        isa::append_insn(s, bin_imm(kShiftVmOp[op_idx][0], 0,
+                                    static_cast<u32>(count), sz));                 // 4
+    }
+    isa::append_insn(s, isa::make_insn(isa::VmOp::GetFlags, isa::OpKind::Reg, 3,
+                                       isa::OpKind::None, 0));  // 5/6: 读回 guest flags
+    isa::append_insn(s, halt());
+    rt::VmContext ctx;
+    ctx.bytecode = s.data();
+    ctx.pc = 0;
+    ctx.scratch_mem = scratch_va;
+    entry(&ctx);
+    return {ctx.regs[0] & shift_low_mask(size_idx), ctx.regs[3] & isa::kFlagsMask};
+}
+
+std::string env_or_empty(const char* name) {
+    char* v = nullptr;
+    size_t n = 0;
+    std::string out;
+    if (_dupenv_s(&v, &n, name) == 0 && v && n > 1) out = v;
+    std::free(v);
+    return out;
+}
+
+struct GridRow {
+    u32 seed;
+    int op;
+    int size;
+    bool cl_form;
+    u64 count;
+    u64 pre;
+    u64 value_native;
+    u64 flags_native;
+    u64 value_vm;
+    u64 flags_vm;
+};
+
+} // namespace
+
+TEST(Interpreter, ShiftCountMaskOracleGrid) {
+    const bool strict = env_or_empty("WVMP_SHIFT_GRID_STRICT") == "1";
+    const std::string out_path = env_or_empty("WVMP_SHIFT_GRID_OUT");
+    const std::string tag = env_or_empty("WVMP_SHIFT_GRID_TAG");
+
+    NativeShiftOracle orc;
+
+    // ---- 参照系自证：CPU 不配合则整张表作废（两种模式都硬断言）----
+    struct Anchor {
+        int op, size;
+        u64 count, value, pre, want_value;
+        bool want_flags_unchanged;
+        const char* why;
+    };
+    const u64 kAll = isa::kFlagZF | isa::kFlagCF | isa::kFlagOF | isa::kFlagSF | isa::kFlagPF;
+    const u64 kAllNative = kAll;  // 仅用作 guest 布局入参
+    const Anchor anchors[] = {
+        {0, 2, 32, 0x80000001ull, kAll, 0x80000001ull, true,
+         "S32 shl 计数 32 → CPU 内部掩 0 → 值与 flags 全不动"},
+        {0, 2, 33, 1ull, 0ull, 2ull, false, "S32 shl 计数 33 → 等价 shl 1"},
+        {0, 3, 64, 1ull, kAll, 1ull, true, "S64 shl 计数 64 → &63 归零"},
+        {0, 0, 32, 0x81ull, kAll, 0x81ull, true, "S8 shl 计数 32 → &31 归零"},
+        {0, 1, 63, 0x8001ull, 0ull, 0x0000ull, false,
+         "S16 shl 计数 63 → 等价 shl 31（两位全被移出 16 位窗口）"},
+        {3, 2, 32, 0x81ull, kAll, 0x81ull, true, "S32 rol 计数 32 → 循环 0 位"},
+        {1, 2, 32, 1ull, kAll, 1ull, true, "S32 shr 计数 32 → &31 归零"},
+        {2, 3, 64, ~0ull, kAll, ~0ull, true, "S64 sar 计数 64 → &63 归零"},
+    };
+    for (const Anchor& a : anchors) {
+        const auto r = orc.run(a.op, a.size, a.value, a.count, a.pre);
+        EXPECT_EQ(r.value, a.want_value) << "参照系自证 value: " << a.why;
+        if (a.want_flags_unchanged)
+            EXPECT_EQ(r.flags, a.pre) << "参照系自证 flags: " << a.why;
+    }
+    // 布局映射自身也要钉住（映射错了整表读数是假的）。
+    EXPECT_EQ(guest_flags_to_native(kAllNative), kNativeFiveMask);
+    EXPECT_EQ(native_flags_to_guest(kNativeFiveMask), kAll);
+
+    alignas(16) std::array<u8, 0x10000> scratch{};
+    std::vector<GridRow> rows;
+    std::vector<std::string> diverge;
+    int diverge_value = 0, diverge_flags = 0, cells = 0;
+
+    for (const u32 seed : {12345u, 7u}) {
+        wvmp::Rng rng(seed);
+        const auto result = rt::generate_runtime(rng);
+        ASSERT_FALSE(result.image.code.empty());
+        const RwxImage rwx(result.image.code);
+        const auto entry = rwx.entry();
+        for (int op = 0; op < kShiftOpCount; ++op) {
+            for (int size = 0; size < kShiftSizeCount; ++size) {
+                for (int form = 0; form < 2; ++form) {
+                    for (const u64 count : {0ull, 1ull, 31ull, 32ull, 33ull, 63ull, 64ull}) {
+                        ++cells;
+                        bool value_ok = true, flags_ok = true;
+                        std::string detail;
+                        for (const u64 pre : {0ull, kAll, isa::kFlagZF | isa::kFlagOF,
+                                              isa::kFlagCF | isa::kFlagSF | isa::kFlagPF}) {
+                            const u64 value = kShiftProbeValue[size];
+                            std::memcpy(scratch.data(), &value, sizeof(value));
+                            const u64 scratch_va =
+                                reinterpret_cast<u64>(scratch.data());
+                            const auto n = orc.run(op, size, value, count, pre);
+                            const auto v = run_vm_shift(entry, op, size, form == 1, count,
+                                                        pre, scratch_va);
+                            if (seed == 12345u)
+                                rows.push_back({seed, op, size, form == 1, count, pre,
+                                                n.value, n.flags, v.value, v.flags});
+                            if (v.value != n.value) {
+                                value_ok = false;
+                                detail += " value[p" + shift_hex(pre) + "] vm=" +
+                                          shift_hex(v.value) + " native=" +
+                                          shift_hex(n.value);
+                            }
+                            if (v.flags != n.flags) {
+                                flags_ok = false;
+                                detail += " flags[p" + shift_hex(pre) + "] vm=" +
+                                          shift_hex(v.flags) + " native=" +
+                                          shift_hex(n.flags);
+                            }
+                        }
+                        if (!value_ok) ++diverge_value;
+                        if (!flags_ok) ++diverge_flags;
+                        const std::string cell = std::string(kShiftOpName[op]) + "@" +
+                                                 kShiftSizeName[size] +
+                                                 (form == 1 ? "#cl" : "#imm") +
+                                                 "#count" + std::to_string(count) +
+                                                 "#seed" + std::to_string(seed);
+                        if (!value_ok || !flags_ok)
+                            diverge.push_back(cell + (value_ok ? " [flags]" : " [value]") +
+                                              " →" + detail);
+                        if (strict) {
+                            EXPECT_TRUE(value_ok) << cell << "：值列背离" << detail;
+                            EXPECT_TRUE(flags_ok) << cell << "：flags 列背离" << detail;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (!out_path.empty()) {
+        FILE* f = nullptr;
+        if (fopen_s(&f, out_path.c_str(), "wb") == 0 && f) {
+            std::fprintf(f, "# MIT-505 B.1 移位计数掩码全网格真值表\n");
+            std::fprintf(f, "# %s\n", tag.c_str());
+            std::fprintf(f, "# cells=%d diverge_value=%d diverge_flags=%d\n", cells,
+                         diverge_value, diverge_flags);
+            std::fprintf(f, "seed,op,size,form,count,pre,value_native,flags_native,"
+                            "value_vm,flags_vm,value_ok,flags_ok\n");
+            for (const GridRow& r : rows) {
+                std::fprintf(f, "%u,%s,%s,%s,%llu,%llX,%llX,%llX,%llX,%llX,%d,%d\n",
+                             r.seed, kShiftOpName[r.op], kShiftSizeName[r.size],
+                             r.cl_form ? "cl" : "imm",
+                             static_cast<unsigned long long>(r.count),
+                             static_cast<unsigned long long>(r.pre),
+                             static_cast<unsigned long long>(r.value_native),
+                             static_cast<unsigned long long>(r.flags_native),
+                             static_cast<unsigned long long>(r.value_vm),
+                             static_cast<unsigned long long>(r.flags_vm),
+                             r.value_vm == r.value_native ? 1 : 0,
+                             r.flags_vm == r.flags_native ? 1 : 0);
+            }
+            std::fclose(f);
+        }
+    }
+    std::printf("[mit505-grid] cells=%d diverge_value=%d diverge_flags=%d strict=%d\n",
+                cells, diverge_value, diverge_flags, strict ? 1 : 0);
+    for (const std::string& d : diverge) std::printf("[mit505-grid] %s\n", d.c_str());
+}

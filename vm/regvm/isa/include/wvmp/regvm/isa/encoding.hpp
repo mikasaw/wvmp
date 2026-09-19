@@ -143,11 +143,11 @@ enum class FlagSem { kNone, kRead, kWrite, kWriteReadMerge, kWriteReadReg,
 }
 
 // 移位有效计数掩码（Intel SDM Vol.2 SHL/SHR/SAR：8/16/32 位操作数 count
-// & 31、64 位 & 63）。⚠️ 与 asmgen build_shift 的运行时掩码（s <= 1 ? 0x1F
-// : 0x3F，S32 取 63）在 S32 上不重合——那是独立于本单的运行时偏差（已报
-// 交付评论，未在本役修）。本函数按**架构语义**取掩码，方向上对 liveness
-// 保守：判"有效为零"⇒ 透传不杀前驱（欠优化，安全）；偏差日后修正也无需
-// 回改此处。
+// & 31、64 位 & 63）。本函数是掩码的**单一真源**：liveness 侧与 asmgen 运行
+// 时侧（build_shift 的 `and cl, …`，MIT-505 起改为调本函数）共用，不再有第二
+// 份字面量表。MIT-490 立单时 asmgen 侧 S32 取 0x3F 与本函数不重合，那笔 runtime
+// 偏差已由 MIT-505 清偿（全网格真值电池坐实为 flags 静默污染、值列不背离）。
+// 方向上对 liveness 保守：判"有效为零"⇒ 透传不杀前驱（欠优化，安全）。
 [[nodiscard]] constexpr u32 shift_count_mask(ir::Size s) {
     return s == ir::Size::S64 ? 0x3Fu : 0x1Fu;
 }
