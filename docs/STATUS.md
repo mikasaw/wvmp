@@ -4,6 +4,8 @@
 
 > 追记（2026-09-19 · **B 波第二张 MIT-505 B0-2**，交付面 = 分支 `mit-debt-b-shiftmask`，**基线 = B0-1 tip `7537406`（非 main）**，未合 main）：x64 `build_shift` 运行时计数掩码按宽度取回架构语义 —— 旧 `s <= 1 ? 0x1F : 0x3F` 让 **S32 落进 64 位档**，改调 `isa::shift_count_mask` **单一真源**（liveness 侧不回改）。⚠️ 该掩码只决定"走不走计数 0 旁路"，真移位量由 CPU 再掩一次 ⇒ **560 格真值电池实测：值列 0 背离、flags 列 20 格背离**（`{shl,shr,sar,rol,ror}×{imm,cl}@S32#count32`；shl 族五位全覆为宿主 `zero5` 残渣 `0x11`，rol/ror 走 partial 只污染 CF/OF、12/16 子样背离）——父单初稿的"低 32 位归零"值缺陷说被真值否掉，未据其改码。逐 handler 差分：**每样本恰 10 个移位 handler 各 1 字节 `3f→1f`（handler 内偏移恒 `0x1c3`）、其余 109/119 逐字节恒等、尺寸偏移两侧全等**；adc/sbb 未出现 = 无越界。补钉 MIT-490 绕开的 `count=32@S32` 档 + 加反向钉（`count=33`：S32 等价 &1、S64 真按 33），并以旧档反证两把断言真会咬。六件套：build 0/0、ctest **23/23**、x86 电池 67/67（对照组未动码体）、REQUIRE_REAL 全池 **360/360**、wvmpTest 双 arch diff-0（106/106 + 105/105）、dump 门 x64 PASS + x86 带 `--code` PASS、静态扫描 PASS；冻结面（`kVmOpMax=164`/跳表 256/`kCtxSize`/`ir::Op`/`keys.hpp`/`common/include`）零 diff。网格表与差分读数在 `scripts/verifier/mit505_shiftmask_out/`，裁决见 GAPS「MIT-505 (B0-2 …)」节。
 
+> 追记（2026-09-19 · **B 波第三张 MIT-522 B0-3**，交付面 = 分支 `mit-debt-b-poolgate`，**基线 = B0-2 tip `608b826`（非 main）**，未合 main）：池内 `[[functions]]` 选择器路径由「全池零覆盖」转为**断言式复跑门禁**。`scripts/multiseed_e2e.sh` 加每样本规则挂点（sidecar，因 `default_level` 是 TOML 顶层键 ⇒ 插在 `[[passes]]` 块**之前**而非末尾追加）+ 精确读数断言：`stubs` / `selector_waive_notes` / `selector_arbitration_notes` / `translate_gate_notes` 四键必填，另有可选的豁免身份断言 `selector_waive_targets` 与加密摘要三键。4 个变体全打在已入池的 `wvmp_shift0_flags_sample.exe`（7 区 / 无规则基线 7 stub）上，不新建样本 ⇒ 池 **72→76 槽 × 5 seeds = 380**，实测 `TOTAL: 380 pass / 0 fail` exit 0。期望值按 R1 **跑前预测**：推导链写在 `scripts/multiseed_rules/*.expect.txt` 里，commit `852094d` 排在任何带规则实跑之前，首跑四槽全中、零回写。有 `.rules.toml` 而无同名 `.expect.txt` ⇒ 当场 FAIL 并点名缺文件（R2 fail-closed，绝不退回 `≥1` 那把哑锁）。门禁有效性做成可复跑反证 `bash scripts/multiseed_e2e.sh --selftest`（同一份 `evaluate_slot` 代码路径，不另抄一份解析逻辑）；零扰动证明按 R4 全量脚本化 `bash scripts/multiseed_rules/compare_baseline_cfg.sh 608b826`。**产品代码零改动**（判据 5 面：`passes/**` `cli/**` `vm/**` `framework/**` 零 diff；D3 冻结面 `kVmOpMax=164` / `kTableEntries=256` / `kCtxSize` / 跳表项数 / `keys.hpp` 零 diff）。逐单节见本文 `### MIT-522 (B0-3 · 池内选择器断言式回归门禁)`，证据链 GAPS 同名节。
+
 > （**历史头部 2026-09-05，MIT-464 integrity_crc-v1：M3 工作流 5 完整性校验首版——密文 CRC32 + 解密前 FailFast**（无派单直接开发；MIT-456~463 均已合入）：
 IntegrityCrcPass（Transform，crypt 之后，requires kCryptPlan——crypt pass 显式 provide）对每个密文流算 IEEE CRC32（common/crc32.hpp 单一来源，反射式 0xEDB88320），写入尾区 reserved 槽（布局 [flag][crc32] 零变更兑现 MIT-458 预留位）；stub crypt 块解密前 bitwise 校验（mismatch → FailFast）。**安全价值 = 封死 xor 链可延展加密的盲翻密文位面**。**验证**：ctest **21/21**（crc32 已知向量 "123456789"→0xCBF43926 + 分段一致 + plan 写入 + 单字节翻转检测）；wvmpTest 10-pass 全栈（mutate+crypt+integrity+anti_debug）双跑 103/103 byte-identical（14 密文流全校验）；**篡改实验**：密文翻转 1 字节 → 确定性崩溃 rc=139。**D1 边界**：仅覆盖密文流面（头/旗标不在 CRC 内；解密后明文与 .wvmp 其余部分属 init 钩子面 MIT-465 后续）；无 crypt 管道 Note 跳过；bitwise 无表实现 per-call 开销 ~9 指令/字节（表驱动优化留后续））
 
@@ -1439,3 +1441,47 @@ asmgen 零触碰 → dump 锚不受影响（无换代）。
   交项目主拍，本单边界禁接。
   证据链 GAPS「MIT-503 (B0-1 · x86 dump 门腐化修复，2026-09-19)」节（含四条历史读数的
   回溯标注：MIT-494s / MIT-494t 两条结构门 PASS 未记 `--code` ⇒ 按新契约归 INCOMPLETE 档）。
+
+### MIT-522 (B0-3 · 池内选择器断言式回归门禁) ✅ 2026-09-19
+> 编号说明：MIT-522 无同编号旧族（逐单节前一条是 MIT-521 (T73)，`grep -n MIT-522 docs/`
+> 在本节之前 0 命中），不进「MIT-490~493 编号复用登记」那类判族面。
+
+- **交付面 = 分支 `mit-debt-b-poolgate`（D0：未合 main、未 push；基线 = B0-2 tip
+  `608b826`，非 main）**，三枚：`852094d` 预测先行（expect + 推导链 + R5 口径锁定，排在
+  任何带规则实跑之前）+ harness 枚（`scripts/multiseed_e2e.sh` + 两个复跑入口）+ 本 docs 枚。
+  **产品代码零改动**：`passes/**` / `cli/**` / `vm/**` / `framework/**` 零 diff，D3 冻结面
+  （`kVmOpMax=164` / `kTableEntries=256` / `kCtxSize` / 跳表项数 / `keys.hpp`）零 diff。
+- **补的是哪一格**：A 波 CR-02/03 的修复证据已由 Verifier 在入池样本上实测过，但**没有东西
+  在守它** —— 全仓 `[[functions]]` 在任何 .toml 里 0 命中，360/360 全程走"缺省档位"那最窄
+  的一条路；池里唯一的真信号 `grep "已生成 [1-9][0-9]* 个入口 stub"` 只要求 ≥1，而受保护产物
+  与原生产物 stdout 按设计恒等 ⇒ 选择器错位永远不会让任何门变红。本单把它换成点数锁。
+- **改动（harness 单点）**：① 每样本规则挂点 `scripts/multiseed_rules/<样本>[__变体].rules.toml`，
+  因 `default_level` 是 TOML 顶层键（写在任何 `[[表头]]` 之后会被解析进上一个表，CLI 自己的
+  报错文案 `cli/src/config.cpp:202-205` 就要求前置）⇒ 片段**插在 `[[passes]]` 块之前**，
+  无片段时 cfg 逐字节不变；② `evaluate_slot` 单点判定：带 expect 走精确读数（`stubs` +
+  三类 Note 计数 + 可选豁免身份 `selector_waive_targets` + 可选加密摘要三键），无 expect
+  无片段走原 `≥1` 现口径（逐字未动，不放宽任何老槽位）；③ R2 fail-closed：有片段无 expect
+  当场红并点名文件，认不出的断言键、缺必填键、写了断言却数不到（`MISSING`）一律红；
+  ④ 4 个变体（点名开保护 / 点名排除 / 跨选择器撞车后声明胜 / 前置豁免 + crypt 按原始扫描序）
+  全打在已入池的 `wvmp_shift0_flags_sample.exe` 上，登记式 `rule_variants=(…)` ⇒ 总槽数只读
+  脚本即可算出。
+- **读数（判据逐条，全部现跑）**：全池 `bash scripts/multiseed_e2e_real.sh` ⇒
+  **`TOTAL: 380 pass / 0 fail`** exit 0（76 槽 = 52+20+4 × 5 seeds）；四变体首跑实读 =
+  预测零差（1/6/1/2 stub、6/1/6/5 豁免、0/0/1/2 仲裁、gate 全 0、v4 加密 `0/2` 豁免 2）；
+  门禁自证 `--selftest` ⇒ **29/29 条反证按预期动作** RESULT: PASS（四变体各：真 expect PASS +
+  四类计数器错值各 FAIL 且点名 + 豁免身份错值 FAIL + 缺 expect FAIL；另拿无规则 x87 样本正证
+  `translate_gate` 口径实数 = 1 ⇒ 该正则不是死码）；R2 真删（仓外副本删 v3 的 expect）⇒
+  `TOTAL: 375 pass / 5 fail` exit 1，五条全点名缺文件、零其它失败；恢复 ⇒ 380/0；
+  零扰动 `compare_baseline_cfg.sh 608b826` ⇒ **`no-rule slots compared: 72, cfg diffs: 0,
+  protect-line diffs: 0`**，同跑两侧读数 改前 72/0 与 改后 76/0（1 seed）。
+- **防再犯条款**：① 新增带规则挂点的槽位必须**先落 expect 与推导链再实跑**（R1），实跑不符
+  只上报不回写；② 计数器正则只许**收窄不许放宽**，禁止把 `selector_waive_notes` 与
+  `translate_gate_notes` 合并成"含保持原生的行"（C1 gate 文案里也有"保持原生"，合并即把
+  两类扫成一锅 = 恒真判据换形式复活），要守 `stub_link` 侧的 x86 白名单 gate 得另立新键；
+  ③ 反证以 `--selftest` 的复跑输出为准，不以评论粘贴为准（MIT-406）。
+- **本单未做（边界，非缺口）**：MIT-494 🟡4 的"规则命中 0 条必须出 Note"属 `passes/` 侧行为
+  改动，派 CppDev，未顺手加（项目主已裁：R1 的精确计数已覆盖"函数名打错 ⇒ 命中 0 ⇒
+  `stubs=0 ≠ expect` 照样红"这一失效面）；`verify_x86_dump.py` 未接进 `test.bat`/ctest
+  （MIT-503 明令本波禁接）。共享工作树纪律：本单全部构建与实跑在**独立 worktree**
+  `../wvmp-poolgate` 内完成，未在主树 `wvmp` 落任何写操作。
+  证据链 GAPS「MIT-522 (B0-3 · 池内选择器断言式回归门禁，2026-09-19)」节。

@@ -264,6 +264,7 @@
 | `kVmOpMax` | **164**（末位枚举子 `YmmPandn`） | `sed -n '689p' vm/regvm/isa/include/wvmp/regvm/isa/vm_op.hpp` → `kVmOpMax = static_cast<u16>(VmOp::YmmPandn); // MIT-513: 164`；静态复算：该 enum 自 `Mov = 1` 起连续、全枚举仅 1 处显式赋值 ⇒ 枚举子计 164 个；编译期由 `asmgen.cpp:356` `static_assert(kVmOpMax < kTableEntries)` 兜底（越界即编译失败，不再运行时空转） |
 | dispatch 跳表容量 | **256 项**（掩码 = `kTableEntries-1` = `0xFF`，自动导出），余量 **91** = 256 − (164+1) | `sed -n '355p' vm/regvm/runtime/src/asmgen.cpp` → `constexpr u64 kTableEntries = 256;`（MIT-510 按冻结契约批量前置条款 128→256） |
 | baseline 池总数 | **360 pass / 0 fail** = 72 槽 × 5 seeds | `bash scripts/multiseed_e2e_real.sh` → `[multiseed] TOTAL: 360 pass / 0 fail`；算式独立复算：`awk '/^samples=\(/,/^\)/' scripts/multiseed_e2e.sh \| grep -c '\.exe'` = **52**、`x86_samples=(` 同法 = **20**、`seeds=(…)` 计 **5** ⇒ (52+20)×5 = **360** |
+| baseline 池总数（B0-3 规则变体后） | **380 pass / 0 fail** = 76 槽 × 5 seeds = 72 无规则挂点 + 4 `[[functions]]` 规则变体 | `bash scripts/multiseed_e2e_real.sh` → `[multiseed] TOTAL: 380 pass / 0 fail`（exit 0）；算式独立复算：上面两行同法 52 + 20、`rule_variants=(` 同法 = **4**、`seeds=(…)` 计 **5** ⇒ (52+20+4)×5 = **380**。⚠️ 本行读数取自分支 `mit-debt-b-poolgate`（MIT-522 B0-3，基线 = `mit-debt-b-shiftmask` tip `608b826`，**未合 main**），不属本表上方那句"main `54db77f` 实测"口径；上一行 360/72 槽不追改（435 append-only），B0-3 合入后以本行为准 |
 | ctest 目标数 | **23**（全绿） | `scripts\test.bat`（MIT-380 起旧 "15/15" 字样已过期） |
 | x87 (D8-DF) | **x86 ✅ 虚拟化**（L0–L4）/ **x64 ⛔ 架构 gate** | 见下矩阵行；证据链 GAPS MIT-509 / MIT-510 |
 | ymm / VEX.256 | **x64 ✅ 虚拟化**（`vzeroupper`/`vzeroall` + `vmov*` 32B + 18 条 packed 算术）/ **x86 ⛔ 架构 gate** | 见下矩阵行；证据链 GAPS MIT-511~514 |
@@ -4796,3 +4797,96 @@ mit505_handler_diff.sh, mit505_shiftmask_out/}`。
 侧掩码正确性依赖「32 位模式恒 5 位」这一架构事实，若将来引入 64 位模式的 x86 池外
 handler 需重立口径。③ 判据 4 的反向钉只覆盖 count=33 一档，`[32,63]` 全区间由网格
 battery 的 31/32/33/63/64 五点采样代表，未穷举 0..255 计数轴。
+
+## MIT-522 (B0-3 · 池内选择器断言式回归门禁，2026-09-19)
+
+交付面 = 分支 `mit-debt-b-poolgate`，基线 = B0-2 tip `608b826`（**非 main**，D0 未 push 未
+merge）。派单：MIT-501 B 波 B0-3；配对验证 = MIT-523（B0-3V，Verifier）。harness 单，
+产品代码与 D3 冻结面零改动。
+
+**病灶**：受保护产物与原生产物 stdout 按设计恒等 ⇒ 选择器错位（该虚拟化的没虚拟化、豁免错
+了对象）**不会**让 byte-exact 那一跳变红；而 A 波之后池里唯一的真信号仍只有
+`grep "已生成 [1-9][0-9]* 个入口 stub"`（要求 ≥1）。360/360 全程只走"缺省档位"这条最窄的
+路（全仓 `[[functions]]` 在任何 .toml 里 0 命中），与 A 波前那个"355 恒真"是同一个盲区，
+只是池变大了 —— 即 MIT-494 收口复核 🔴2。CR-02/03 的修复证据因此处于**没有任何门在守**
+的状态：下次选择器再错位，不会有门变红。
+
+**改动面**（`scripts/multiseed_e2e.sh` + 新目录 `scripts/multiseed_rules/`，共 4 枚复跑/取证
+入口）：
+
+| 件 | 作用 |
+|---|---|
+| `scripts/multiseed_rules/<样本>[__变体].rules.toml` | 每样本规则挂点（片段插在 `[[passes]]` 块**之前**：`default_level` 是 TOML 顶层键，追加到文件末尾会被解析进上一个 `[[passes]]` 表并触发严格 schema 拒绝，见 `cli/src/config.cpp:202-205`） |
+| `…__<变体>.expect.txt` | 跑前预测：4 必填键 `stubs` / `selector_waive_notes` / `selector_arbitration_notes` / `translate_gate_notes` + 可选 `selector_waive_targets`（豁免函数身份）与 `crypt_encrypted` / `crypt_total` / `crypt_exempt`；顶部是推导链 |
+| `…__<变体>.passes.txt` | 可选管道覆盖（当前只 v4 用：把 `crypt` 加进该槽位，否则 `crypt=` 规则无人消费 = 死断言） |
+| `evaluate_slot`（脚本内单点） | 三条路径：带 expect ⇒ 精确读数；有片段无 expect ⇒ 直接 FAIL 点名文件（R2 fail-closed）；老槽位 ⇒ 原 `≥1` 口径逐字不变 |
+| `bash scripts/multiseed_e2e.sh --selftest` | 门禁有效性反证的复跑入口（R3）。选内建 `--selftest` 而非另开 `scripts/verifier/` 脚本：反证必须走池判定的**同一份** `evaluate_slot`，另开脚本等于把解析抄第二遍，抄的那份漂移无人知（MIT-503 缺陷 2 同形态） |
+| `bash scripts/multiseed_e2e.sh --protect-log <样本>__<变体>` | 该槽位 protect 原文的复跑命令（判据 3 的证据不必信评论粘贴，MIT-406） |
+| `bash scripts/multiseed_rules/compare_baseline_cfg.sh <base>` | 零扰动全量证明（R4），改前/改后两份副本打同一枚 dump 补丁 |
+
+**R5 口径锁定（先锁正则再动手，四类互不重叠）**：Note 出口统一 `[wvmp] [note] <pass>: <msg>`
+（`cli/src/main.cpp:33-40`，Note→`note` 在 `:35`；stderr，池脚本 `2>&1` 合并）。三行真实
+日志实抄（前两条 = `wvmp_shift0_flags_sample` 的 v1 带规则跑与无规则基线跑，第三条 =
+`wvmp_x87_gate_sample` 无规则基线跑）：
+
+```
+[wvmp] [note] virtualize: 函数 (marker@0x5b0) 按配置 level=none 保持原生（rva=0x11B0）          ← 豁免类
+[wvmp] [note] stub_link: 已生成 1 个入口 stub，数据节 .wvmp 8304 字节 @ RVA 0xB000, …            ← 开保护正例
+[wvmp] [note] virtualize: 函数 (marker@0x79a) 含不可翻译指令，跳过虚拟化（保持原生）: … C1 gate   ← 翻译 gate 类
+```
+
+第 3 行里的"保持原生"是 C1 gate 的措辞而非选择器豁免 ⇒ 粗口径"数含 gate / 含保持原生的行"
+会把两类扫进一锅；实测该粗口径在 x87 无规则样本上数到 **1** 行，而 `selector_waive_notes`
+口径数 **0**、`translate_gate_notes` 口径数 **1**（正是 MIT-503 缺陷 2 那一类"门数进来了
+但数的是别的东西"）。另两条边界：必须限定 pass 名（同一次输出里还有 `marker_scan` 的 P7
+回退 Note 与 `pe_writer` 的 ASLR Note）；`stub_link` 侧的 x86 白名单 gate
+（`stub_link_pass.cpp:319`）与 stub 生成失败（`:392`）是另一语义面，**刻意不并入**
+`translate_gate_notes`，要守那面得另立键。首跑前口径按源码字面量锁定
+（`passes/virtualize/src/virtualize_pass.cpp:98-101` 豁免、`:107`/`:130`/`:154`/`:202`
+四条翻译 gate、`passes/crypt/src/crypt_pass.cpp:114`/`:162`/`:165` 加密面），实跑后补实抄。
+⚠️ 一条实测教训：翻译 gate 的四条文案在"跳过虚拟化"前是**全角逗号**不是空格，按 `" 跳过虚拟化"`
+带空格写正则会全池数不到（首版就是这么错的，靠真日志跑出来才发现）——口径必须对真产物验，
+不能只对源码字符串读。
+
+**四变体读数（判据 3；预测在 `852094d`，实跑在其后，零回写）**：靶 = 已入池
+`wvmp_shift0_flags_sample.exe`（区域清单 7 区、无规则基线 7 stub、零 gate），seed 1：
+
+| 变体 | 规则要点 | 预测 = 实读（`stubs` / 豁免 / 仲裁 / 翻译gate / 加密） |
+|---|---|---|
+| `v1_name_open` | `default_level=none` + `name="(marker@0x614)" level=virtualize` | 1 / 6 / 0 / 0 / — |
+| `v2_name_exclude` | 不写 `default_level`（= 全 Virtualize）+ 同一条 `level=none` | 6 / 1 / 0 / 0 / — |
+| `v3_cross_selector` | 声明 0 `name=… level=none`、声明 1 `index=2 level=virtualize`（同指区域 [2]） | 1 / 6 / **1** / 0 / — |
+| `v4_index_anchor` | `index=0 level=none` 前置豁免 + `index=3 crypt=false` + `name`/`rva` 双条同指区域 [4] | 2 / 5 / **2** / 0 / `0/2`、豁免 2 |
+
+v1↔v2 钉住 CR-02 的两面（只点名开 = 1、只点名关 = 6，任一面错位即红）；v3 与 v1 的差集恰
+是那 1 条仲裁 Note，且 `stubs=1` 钉住"胜者是后声明的 `index=2 virtualize`"（若实现错成
+选择器优先级或先声明胜，`stubs` 变 0、豁免变 7）；v4 是 CR-03 的反证：`index=3 crypt=false`
+命中的是**原始扫描序**的区域 [3]（前置豁免使 `kVmProgram` 压成 2 项），若加密面错按压缩下标
+解释则 `crypt_encrypted` 变 1、`crypt_exempt` 变 1、crypt 仲裁 Note 消失 ⇒ 三键同时红。
+豁免身份键（`selector_waive_targets`）另钉"是哪几个函数"，数量不变而身份漂移的形态也咬得住。
+
+**判据读数汇总**：
+
+| 判据 | 命令 | 读数 |
+|---|---|---|
+| 1 全池 | `bash scripts/multiseed_e2e_real.sh` | `TOTAL: 380 pass / 0 fail`，exit 0（76 槽 × 5 seeds） |
+| 2 零扰动（R4 全量） | `bash scripts/multiseed_rules/compare_baseline_cfg.sh 608b826` | `no-rule slots compared: 72, cfg diffs: 0, protect-line diffs: 0` RESULT: PASS；两侧自证 改前 `72 pass / 0 fail`、改后 `76 pass / 0 fail` |
+| 3 变体实读 = 预测 | `--selftest` 的 `实读` 行 / `--protect-log <槽位>` | 四槽全中，零回写（见上表） |
+| 4 三类反证 + 活体正证 | `bash scripts/multiseed_e2e.sh --selftest` | `TOTAL: 29/29 条反证按预期动作` RESULT: PASS（`stubs`/豁免/仲裁/翻译gate 各错值一次 FAIL 且点名、豁免身份错值 FAIL、缺 expect FAIL、真值 PASS；`translate_gate` 正证在无规则 x87 样本上实数 1） |
+| 6 R2 抽验（不落树） | 仓外副本删 v3 的 `.expect.txt` 后跑全池 | `TOTAL: 375 pass / 5 fail` exit 1，五条 FAIL 全点名缺 `wvmp_shift0_flags_sample__v3_cross_selector.expect.txt`、零其它失败；恢复 ⇒ `380 / 0` |
+| 5 改动面 | `git diff --stat 608b826..HEAD` | 只含 `scripts/multiseed_e2e.sh` + `scripts/multiseed_rules/**` + `docs/STATUS.md` + `docs/GAPS.md`；`passes/**` `cli/**` `vm/**` `framework/**` 零 diff |
+| 7 冻结面 | `grep -n "kTableEntries = " vm/regvm/runtime/src/asmgen.cpp`、`grep -n "kVmOpMax = " vm/regvm/isa/include/wvmp/regvm/isa/vm_op.hpp`（行号现算，本单实测：`:356` = 256、`:690` = 164） | `kVmOpMax=164` / `kTableEntries=256` / `kCtxSize` / 跳表项数 / `keys.hpp` 本单零触碰；最强口径 = 上面判据 5 的 `git diff --name-only 608b826..HEAD` 里根本不出现 `vm/**` / `framework/**` 任何文件 |
+
+**残余边界（披露，不是已修）**：① 4 个变体全在同一枚 x64 样本上 ⇒ x86 侧选择器路径仍无
+断言式覆盖（x86 槽位仍 `≥1` 口径）；② `selector_arbitration_notes` 是 virtualize 面与
+crypt 面两条口径的合计，单面漂移靠 `stubs` + `crypt_*` 三键夹住，未拆成两个键（拆了 expect
+要重写推导链，本单先不动）；③ crypt 面仲裁 Note 目前只由 v4 一处非零期望覆盖，扩到多样本
+属插件池阶段的 crypt 入池单；④ 断言的是"点数与身份"，不是"字节码里确实虚拟化了那一段"——
+后者仍由 byte-exact + `stub_link` 计数承担（本单不越界改产品披露面）；⑤ `--selftest` 的
+反证跑单 seed（`seeds[0]`），5 seed 维度的期望值一致性由判据 1 的全池跑承担。
+
+**防再犯条款**：新增带规则挂点的槽位 = 先落 `.expect.txt` 与推导链、后实跑（R1），实测不符
+只上报不回写；计数器正则只许收窄不许放宽，禁止合并"豁免"与"翻译 gate"两类口径；门禁有效性
+以 `--selftest` 复跑输出为准（MIT-406：单方粘贴不算数）；给样本立"禁止删掉某处以喂饱 ≥1
+断言"那类保护条款（`multiseed_e2e.sh:76` 那条注释就是这种形态）不再是可接受的演进方向 ——
+要宽判据就配 expect 收紧，别为哑锁立宪章。
