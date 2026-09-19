@@ -4,6 +4,18 @@ project(wvmp_test_target LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# MIT-520 AVX corpus batch is x64-only, matching build.bat: the x86 flavor
+# carries neither TU, so kernavx registration stays in exactly one place.
+set(WVMPTEST_AVX_SOURCES "")
+if(MSVC AND CMAKE_SIZEOF_VOID_P EQUAL 8)
+    set(WVMPTEST_AVX_SOURCES
+        src/targets/avx_kernels.cpp
+        src/tests/t_kernels_avx.cpp
+    )
+    set_source_files_properties(src/targets/avx_kernels.cpp PROPERTIES
+        COMPILE_OPTIONS "/Od;/arch:AVX")
+endif()
+
 add_executable(test_target
     src/main.cpp
     src/testfw.cpp
@@ -21,6 +33,7 @@ add_executable(test_target
     src/tests/t_winapi.cpp
     src/tests/t_float_sse.cpp
     src/tests/t_kernels.cpp
+    ${WVMPTEST_AVX_SOURCES}
 )
 
 target_compile_definitions(test_target PRIVATE

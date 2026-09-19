@@ -4,11 +4,13 @@
 # Schema: see cli/include/wvmp/cli/config.hpp; pass order follows default.toml
 # (Pipeline by Phase: Load -> Analyze -> Transform -> Emit -> Write).
 #
-# Paths are relative to WVmp repo root.
-# smoke_test.bat writes output here when invoked from WVmp repo root.
+# Paths are relative to the process working directory, NOT to this file.
+# smoke_test.bat pushes the WVmp repo root before invoking wvmp_cli.exe, so
+# the two paths below resolve inside this repo's tests/wvmpTest/build tree
+# (MIT-492 corpus in-repo: no external sibling clone is read or written).
 
-input  = "../wvmpTest/build/x64/test_target.exe"
-output = "../wvmpTest/build/x64/packed.exe"
+input  = "tests/wvmpTest/build/x64/test_target.exe"
+output = "tests/wvmpTest/build/x64/packed.exe"
 seed   = 12345
 
 [[passes]]

@@ -1,0 +1,22 @@
+# WVmp protection config - wvmpTest kernels target, x86 (PE32) flavor.
+#
+# Same pipeline as kernels.toml; only the two paths differ. CWD-relative to
+# the WVmp repo root (smoke_test.bat / scripts/e2e.bat push it before call).
+# Run `tests\wvmpTest\build.bat x86` first to produce the input.
+
+input  = "tests/wvmpTest/build/x86/test_target.exe"
+output = "tests/wvmpTest/build/x86/packed.exe"
+seed   = 12345
+
+[[passes]]
+name = "pe_loader"
+[[passes]]
+name = "marker_scan"
+[[passes]]
+name = "lifter"
+[[passes]]
+name = "virtualize"
+[[passes]]
+name = "stub_link"
+[[passes]]
+name = "pe_writer"

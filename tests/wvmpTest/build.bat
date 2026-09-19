@@ -28,6 +28,14 @@ if not exist build\%ARCH% mkdir build\%ARCH%
 set OUT=build\%ARCH%\test_target.exe
 set COMMONFLAGS=/nologo /std:c++17 /EHsc /O2 /W3 /DNDEBUG /D_WIN32_WINNT=0x0601 /utf-8 /D_CRT_SECURE_NO_WARNINGS
 
+rem MIT-520 (T72): x64 构建额外单编 AVX 语料批（/arch:AVX 只作用于该 TU）。
+set AVXOBJ=
+if not "%ARCH%"=="x86" (
+    echo [i] compiling AVX corpus x64 only ...
+    cl %COMMONFLAGS% /Od /arch:AVX /c src\targets\avx_kernels.cpp /Fo:build\%ARCH%\avx_kernels.obj || exit /b 3
+    set AVXOBJ=build\%ARCH%\avx_kernels.obj
+)
+
 echo [i] compiling (%ARCH%) ...
 cl %COMMONFLAGS% ^
    src\main.cpp src\testfw.cpp ^
@@ -36,7 +44,8 @@ cl %COMMONFLAGS% ^
    src\tests\t_memory.cpp src\tests\t_datastruct.cpp src\tests\t_hashcrypto.cpp ^
    src\tests\t_exception.cpp src\tests\t_stl.cpp src\tests\t_oop.cpp ^
    src\tests\t_thread.cpp src\tests\t_winapi.cpp src\tests\t_float_sse.cpp ^
-   src\tests\t_kernels.cpp ^
+   src\tests\t_kernels.cpp src\tests\t_kernels_avx.cpp ^
+   %AVXOBJ% ^
    advapi32.lib ^
    /Fe:%OUT% /Fo:build\%ARCH%\ || exit /b 3
 

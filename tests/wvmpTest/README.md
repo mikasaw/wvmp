@@ -6,7 +6,8 @@
 
 - 每个用例独立自校验，输出 `[PASS]/[FAIL]/[SKIP]` 与 `SUMMARY` 行
 - 进程退出码：全部通过 `0`；有失败或被加壳器打死均为非 0（崩溃码即结论）
-- 覆盖 12 个模块共 **94 个用例**，x64 与 x86 双架构均已验证
+- 覆盖 14 个组，x64 **106 个用例** / x86 **105 个用例**（差 1 = `kernavx`
+  组在 x86 编译为空 TU），双架构均已验证
 
 ## 构建
 
@@ -60,6 +61,10 @@ test_target.exe --quiet             不打印逐条失败明细
 4. 通过标准：两份日志逐字节一致 且 rc 均为 0。差异行直接指出哪个语义被子系统破坏。
 
 或直接使用现成批处理：`run_compare.cmd unpacked.exe packed.exe`
+（日志镜像固定落本目录 `out\`；diff 数非 0 即 rc 1，不只是"两边都返回 0 就 PASS"）。
+仓根一步到位的双 arch 复跑入口：`tests\wvmpTest\smoke_test.bat`（x64，配置
+`kernels.toml`）/ `tests\wvmpTest\smoke_test.bat x86`（配置 `kernels_x86.toml`），
+两者都只吃仓内 `tests\wvmpTest\build\<arch>\` 产物。
 
 ## 模块 → 保护器风险面映射
 
@@ -77,6 +82,8 @@ test_target.exe --quiet             不打印逐条失败明细
 | thrd/win | join 求和/atomic fetch_add 精确总量/单调 CAS/CV 生产者消费者 drain/CRITICAL_SECTION 收支/auto-reset Event 握手 transcript/call_once/静态 + 动态 TLS | 线程原语共存、TLS 支持、同步对象兼容 |
 | winapi | 文件 RW 追加清理共享模式/stdio-kernel 接力/内存映射文件改动持久化/VirtualAlloc→RO 写入探针(受控 AV)→RW 还原→VirtualQuery 动态解析 CharUpperW 实调/环境变量容量契约/HKCU 注册表三种类型读写清除 | IAT 重建、VirtualProtect 类钩子共存 |
 | fp_sse | 截断转换矩阵/isnan isinf 符号位/hypot 整数勾股精确相等/SSE2 epi32 add + mullo_epi16 + 解包通道对拍标量/浮点点积整数域 bitexact/x87 控制字往返(x86) | SIMD 通道翻译精度、浮点环境保存恢复 |
+| kern | targets 层 27 个打标内核的薄驱动（见"给打标者的提示"） | 标记区域定位、逐函数真虚拟化 |
+| kernavx | `wv_avx_add8/fma8/mul8` 三区 8-lane intrinsic 对拍（**仅 x64**） | ymm 数据通路、VEX 词流、legacy-SSE 混排 gate |
 
 ## 设计约束（为什么这样写）
 
@@ -96,8 +103,10 @@ test_target.exe --quiet             不打印逐条失败明细
 
 `src/targets/kernels.{h,cpp}` 是专门为"函数收尾加标记"准备的一层：
 `extern "C"` + `noinline`、纯计算（无 EH/TLS/alloc/锁）、单一职责，
-符号在目标文件里稳定可见。当前包含 15 个内核（13 个打标靶 + `sha256_h0`
-向量源）：
+符号在目标文件里稳定可见。当前 `kernels.cpp` 内 **27 个打标区域**
+（`git grep -c PROTECT_BEGIN` 读 28，多出的 1 处是文件头用法示例注释），
+另有 `src/targets/avx_kernels.{h,cpp}` 的 **3 个 x64 专属 AVX 区域**
+（`#if _MSC_VER && _WIN64` 守卫，per-TU `/arch:AVX` 单编，见下）：
 
 | 族 | 符号 |
 |---|---|
@@ -106,8 +115,24 @@ test_target.exe --quiet             不打印逐条失败明细
 | 流密码 | `wv_rc4_ksa` `wv_rc4_crypt` |
 | 分组密码 | `wv_xtea_encipher` `wv_xtea_decipher` |
 | 编码 | `wv_b64_encode` `wv_b64_decode` |
+| 真实 codegen 面（T46） | `wv_matmul4x4_i32` `wv_list_sum` `wv_siftdown` `wv_modpow_u32` `wv_pt_pack` `wv_switch_grade` `wv_pixel_grey` `wv_atoi32` |
+| 标志/位运算/数组/SSE 词面（T68） | `wv_lcg_next`（区域为空，见下）`wv_crc32_step` `wv_bezier_q8` `wv_hadamard8` `wv_dot4f` |
+| AVX ymm 词面（T72，仅 x64） | `wv_avx_add8` `wv_avx_fma8` `wv_avx_mul8` |
 
-对应验证在 `kern.*` 组：每个内核都有独立薄驱动 + 黄金向量。
+> **`wv_lcg_next` 的标记对之间没有指令** —— `PROTECT_BEGIN` 紧接
+> `PROTECT_END`，LCG 式子写在 `PROTECT_END()` 之后，因此该区域不产生
+> stub（protect 日志报 `RVA 区间为空/非法`）。这是回灌时原样保留的
+> 上游语料缺陷，账目口径 = 30 个 marker 函数 / 29 个 stub（x64）、
+> 27 / 26（x86）。改它会同时改动两 arch 的 stub 读数，留待语料单裁决。
+>
+> **AVX 三区的注册点只有一个**：`avx_kernels.cpp` 由 `build.bat` 的 x64
+> 分支以 `/Od /arch:AVX` 单独编译成 obj 再链接，`/arch:AVX` 不外溢到
+> 其余 TU；`t_kernels_avx.cpp` 整体落在 `#if _MSC_VER && _WIN64` 内，
+> x86 编译为空 TU ⇒ `kernavx` 组自然缺席（不是 SKIP）。**不要**把
+> `avx_kernels.cpp` 加进主 `cl` 命令行——那会把 `/arch:AVX` 摊到全部
+> 语料上，词面就不是 AVX 区在演了。
+
+对应验证在 `kern.*` / `kernavx.*` 组：每个内核都有独立薄驱动 + 黄金向量。
 把某个内核加壳后若其驱动 FAIL 而 `hash.*` 等旧实现组仍 PASS，
 即可直接归因到该被保护函数。新增内核时遵循 kernels.h 顶部的入选标准。
 

@@ -115,6 +115,13 @@
     <ClCompile Include="src\tests\t_winapi.cpp" />
     <ClCompile Include="src\tests\t_float_sse.cpp" />
     <ClCompile Include="src\tests\t_kernels.cpp" />
+    <ClCompile Include="src\targets\avx_kernels.cpp">
+      <ExcludedFromBuild Condition="'$(Platform)'=='Win32'">true</ExcludedFromBuild>
+      <AdditionalOptions Condition="'$(Platform)'=='x64'">/Od /arch:AVX %(AdditionalOptions)</AdditionalOptions>
+    </ClCompile>
+    <ClCompile Include="src\tests\t_kernels_avx.cpp">
+      <ExcludedFromBuild Condition="'$(Platform)'=='Win32'">true</ExcludedFromBuild>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="src\common.h" />

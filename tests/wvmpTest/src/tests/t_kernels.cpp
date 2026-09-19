@@ -322,3 +322,201 @@ TEST(kern, search_sort_basics) {
     CHECK_EQ(wv_ackermann(2, 3), 9);
     CHECK_EQ(wv_ackermann(3, 3), 61);
 }
+
+// ---------------------------------------------------------------------------
+// MIT-494w (T46): 真实 codegen 面扩展驱动 —— 8 个新 kernel 的共识/向量对
+// 拍。驱动侧引用实现只用独立算法（naive 循环 / u64 参考 / 标准库共识），
+// 与内核实现不共享代码路径；数据域受限以保证全程 32 位安全。
+TEST(kern, realcode_datapath) {
+    Rng rng(20260912u);
+
+    // 4x4 矩阵乘 vs naive 三重循环（元素 |v|<=9 防溢出，32 轮 PRNG 矩阵）
+    enum { D = 4 };
+    int32_t a[D * D], b[D * D], got[D * D], ref[D * D];
+    for (int t = 0; t < 32; ++t) {
+        for (int i = 0; i < D * D; ++i) {
+            a[i] = (int32_t)(rng.next() % 19u) - 9;
+            b[i] = (int32_t)(rng.next() % 19u) - 9;
+        }
+        for (int i = 0; i < D; ++i)
+            for (int j = 0; j < D; ++j) {
+                int32_t acc = 0;
+                for (int k = 0; k < D; ++k) acc += a[i * D + k] * b[k * D + j];
+                ref[i * D + j] = acc;
+            }
+        wv_matmul4x4_i32(got, a, b);
+        for (int i = 0; i < D * D; ++i) CHECK_EQ(got[i], ref[i]);
+    }
+
+    // 像素灰度：逐像素公式复算
+    enum { PN = 512 };
+    std::vector<uint32_t> px(PN), po(PN);
+    for (int i = 0; i < PN; ++i)
+        px[(size_t)i] = (uint32_t)(rng.next() & 0x00FFFFFFu);
+    wv_pixel_grey(px.data(), po.data(), PN);
+    for (int i = 0; i < PN; ++i) {
+        uint32_t r = (px[(size_t)i] >> 16) & 0xFFu;
+        uint32_t g = (px[(size_t)i] >> 8) & 0xFFu;
+        uint32_t b = px[(size_t)i] & 0xFFu;
+        CHECK_EQ(po[(size_t)i], (r * 3 + g * 6 + b) / 10u);
+    }
+
+    // 链表：静态节点构建 + 求和/计数共识（含空表）
+    enum { LN = 64 };
+    static wv_node nodes[LN];
+    uint64_t want_sum = 0;
+    uint32_t cnt = 0;
+    for (int i = 0; i < LN; ++i) {
+        nodes[i].val = (int32_t)(rng.next() % 1000u);
+        nodes[i].next = (i + 1 < LN) ? &nodes[i + 1] : nullptr;
+        want_sum += (uint64_t)(uint32_t)nodes[i].val;
+        ++cnt;
+    }
+    uint64_t got_ls = wv_list_sum(nodes);
+    CHECK_EQ((uint32_t)(got_ls >> 32), (uint32_t)want_sum);
+    CHECK_EQ((uint32_t)got_ls, cnt);
+    CHECK_EQ(wv_list_sum(nullptr), 0ull);
+
+    // 堆 sift：返回值（交换数）手工推演闭式断言（验收 SF-1：置换效果类
+    // 断言测不出返回值错算，补小规模精确锚）
+    {
+        int32_t t1[3] = { 1, 3, 2 };
+        CHECK_EQ(wv_siftdown(t1, 3, 0), 1);            // 与 idx1 交换即停
+        int32_t t2[3] = { 1, 2, 3 };
+        CHECK_EQ(wv_siftdown(t2, 3, 0), 1);            // 与 idx2 交换即停
+        int32_t t3[5] = { 0, 4, 2, 3, 1 };
+        CHECK_EQ(wv_siftdown(t3, 5, 0), 2);            // 0 沉底两跳
+        int32_t t4[3] = { 5, 3, 2 };
+        CHECK_EQ(wv_siftdown(t4, 3, 0), 0);            // 已满足 → 0 次
+        int32_t t5[1] = { 7 };
+        CHECK_EQ(wv_siftdown(t5, 1, 0), 0);            // 无子结点
+    }
+
+    // 堆 sift：重复下沉构建最大堆 → 堆性质 + 多重集一致（std::sort 共识）
+    enum { HN = 256 };
+    std::vector<int32_t> h(HN), orig(HN);
+    for (int i = 0; i < HN; ++i)
+        h[(size_t)i] = (int32_t)(rng.next() % 5000u);
+    orig = h;
+    for (int i = HN / 2 - 1; i >= 0; --i) wv_siftdown(h.data(), HN, i);
+    for (int i = 1; i < HN; ++i)
+        CHECK(h[(size_t)((i - 1) / 2)] >= h[(size_t)i]);
+    std::sort(orig.begin(), orig.end());
+    std::sort(h.begin(), h.end());
+    for (int i = 0; i < HN; ++i) CHECK_EQ(h[(size_t)i], orig[(size_t)i]);
+}
+
+TEST(kern, realcode_lang) {
+    Rng rng(424242u);
+
+    // 模幂 vs u64 逐位参考平方乘（mod<2^16 限域）；Fermat 锚 3^65520 mod 65521
+    CHECK_EQ(wv_modpow_u32(3, 65520, 65521), 1u);
+    CHECK_EQ(wv_modpow_u32(2, 10, 1000), 24u);
+    for (int t = 0; t < 200; ++t) {
+        uint32_t mod = 3u + (uint32_t)(rng.next() % 60000u);
+        uint32_t base = (uint32_t)(rng.next() % mod);
+        uint32_t exp = (uint32_t)(rng.next() % 100000u);
+        uint64_t r = 1, b = base % mod;
+        uint32_t e = exp;
+        while (e) {
+            if (e & 1u) r = (r * b) % mod;
+            b = (b * b) % mod;
+            e >>= 1;
+        }
+        CHECK_EQ(wv_modpow_u32(base, exp, mod), (uint32_t)r);
+    }
+
+    // switch 分派扫描（含负值与越域；参考 = 同语义闭式）
+    for (int32_t s = -60; s <= 160; ++s) {
+        int32_t q = s / 25;
+        int32_t want = (q >= 0 && q <= 3) ? q : 4;
+        CHECK_EQ(wv_switch_grade(s), want);
+    }
+
+    // atoi：字面串（空白/符号/非数字尾随）
+    CHECK_EQ(wv_atoi32("42"), 42);
+    CHECK_EQ(wv_atoi32("  -17"), -17);
+    CHECK_EQ(wv_atoi32("+7x"), 7);
+    CHECK_EQ(wv_atoi32("	blank 99"), 0);
+    CHECK_EQ(wv_atoi32(""), 0);
+    for (int t = 0; t < 200; ++t) {
+        char buf[24];
+        int32_t want = (int32_t)(rng.next() % 1000000u);
+        if (t & 1) want = -want;      // want 已含符号（首版再加 "-" 前缀成
+                                      // "--N"，atoi 正确返 0 —— 驱动笔误）
+        snprintf(buf, sizeof(buf), "%d", want);
+        CHECK_EQ(wv_atoi32(buf), want);
+    }
+
+    // 按值 struct ABI：坐标打包
+    for (int t = 0; t < 200; ++t) {
+        wv_pt p;
+        p.x = (int32_t)(rng.next() % 65536u) - 32768;
+        p.y = (int32_t)(rng.next() % 65536u) - 32768;
+        uint32_t want = ((uint32_t)(uint16_t)p.x << 16) | (uint32_t)(uint16_t)p.y;
+        CHECK_EQ(wv_pt_pack(p), want);
+    }
+    // ---- MIT-516 (T68) 语料扩面批次 ----
+
+    // LCG 单步: 独立链对拍（驱动自己跑同样的 u32 环绕递推）。
+    {
+        uint32_t s1 = 123456789u, s2 = s1;
+        for (int i = 0; i < 500; ++i) {
+            s1 = wv_lcg_next(s1);
+            s2 = s2 * 1664525u + 1013904223u;
+            CHECK_EQ(s1, s2);
+        }
+    }
+
+    // CRC-32 步进: "123456789" 全串 = 规范校验值 0xCBF43926。
+    {
+        uint32_t crc = 0xFFFFFFFFu;
+        const char* msg = "123456789";
+        for (const char* q = msg; *q; ++q)
+            crc = wv_crc32_step(crc, (uint8_t)*q);
+        CHECK_EQ(crc ^ 0xFFFFFFFFu, 0xCBF43926u);
+    }
+
+    // Bezier Q8: 端点精确 + 中点凸组合 + 随机与宿主公式对拍。
+    CHECK_EQ(wv_bezier_q8(100, 200, 300, 0), 100);
+    CHECK_EQ(wv_bezier_q8(100, 200, 300, 256), 300);
+    for (int t = 0; t <= 500; ++t) {
+        int32_t a = (int32_t)(rng.next() % 4096u) - 2048;
+        int32_t b = (int32_t)(rng.next() % 4096u) - 2048;
+        int32_t c = (int32_t)(rng.next() % 4096u) - 2048;
+        int32_t tt = (int32_t)(rng.next() % 257u);
+        int32_t k1 = 2 * (b - a);
+        int32_t k2 = a - 2 * b + c;
+        int32_t want = a + (tt * (k1 + (tt * k2) / 256)) / 256;
+        CHECK_EQ(wv_bezier_q8(a, b, c, tt), want);
+    }
+
+    // Hadamard8: 常量向量 + H×H = 8I 恒等（施加两遍后 /8 = 原向量）。
+    {
+        int32_t v[8] = {1, 0, 0, 0, 0, 0, 0, 0};
+        wv_hadamard8(v);
+        for (int i = 0; i < 8; ++i) CHECK_EQ(v[i], 1);
+    }
+    for (int t = 0; t < 100; ++t) {
+        int32_t v[8], orig[8];
+        for (int i = 0; i < 8; ++i) {
+            v[i] = (int32_t)(rng.next() % 65536u) - 32768;
+            orig[i] = v[i];
+        }
+        wv_hadamard8(v);
+        wv_hadamard8(v);
+        for (int i = 0; i < 8; ++i) CHECK_EQ(v[i] / 8, orig[i]);  // H×H=8I
+    }
+
+    // dot4f: 小整数初值保证 float 精确；同序宿主计算位精确对拍。
+    {
+        float a[4] = {1.0f, 2.0f, 3.0f, 4.0f};
+        float b[4] = {5.0f, 6.0f, 7.0f, 8.0f};
+        float got = wv_dot4f(a, b);
+        uint32_t gb, wb;
+        std::memcpy(&gb, &got, 4);
+        float want = a[0]*b[0]; want += a[1]*b[1]; want += a[2]*b[2]; want += a[3]*b[3];
+        std::memcpy(&wb, &want, 4);
+        CHECK_EQ(gb, wb);
+    }
+}

@@ -100,6 +100,66 @@ WV_TARGET_NOINLINE int32_t wv_b64_encode(const uint8_t* src, uint32_t n,
 WV_TARGET_NOINLINE int32_t wv_b64_decode(const char* s, uint32_t len,
                                          uint8_t* dst);
 
+// ===========================================================================
+// [MIT-494w (T46) 真实 codegen 面扩展 —— 结构/链式/查表/解析]
+// 全部 32 位安全：无 64 位除法（x86 会落 CRT 辅助调用出白名单）、无堆/
+// 异常/系统调用；链表节点由驱动侧静态存储构建。
+// ===========================================================================
+typedef struct wv_pt { int32_t x, y; } wv_pt;
+typedef struct wv_node { int32_t val; struct wv_node* next; } wv_node;
+
+// 4x4 int32 矩阵乘 out = a*b（行主序，内层全展开 = 64 mul）。
+WV_TARGET_NOINLINE void wv_matmul4x4_i32(int32_t out[16], const int32_t a[16],
+                                         const int32_t b[16]);
+
+// 单链表求和 + 计数（指针追踪 Load 链）；返回 (sum<<32)|count 编码。
+WV_TARGET_NOINLINE uint64_t wv_list_sum(const wv_node* head);
+
+// 二叉最大堆 sift-down（分支密集 + 成对交换）；返回交换次数。
+WV_TARGET_NOINLINE int32_t wv_siftdown(int32_t* h, int32_t n, int32_t i);
+
+// u32 模幂（平方乘）。约束 mod < 65536：中继积恒 < 2^32，全程 32 位
+// （x86 白名单面；mod>=65536 行为未定义，调用方自负）。
+WV_TARGET_NOINLINE uint32_t wv_modpow_u32(uint32_t base, uint32_t exp,
+                                          uint32_t mod);
+
+// 按值传递点结构（ABI 面）：打包 (x&0xFFFF)<<16 | (y&0xFFFF)。
+WV_TARGET_NOINLINE uint32_t wv_pt_pack(wv_pt p);
+
+// 5 路数值分派 switch（查表/比较链 codegen 实证面）：C 向零截断语义 ——
+// 商 0..3 返该值；score<=-25（负商）与 >=125（商 >=5）→ 4；[-24,-1] → 0。
+WV_TARGET_NOINLINE int32_t wv_switch_grade(int32_t score);
+
+// RGBX 像素数组灰度混合：out[i] = (r*3 + g*6 + b) / 10。
+WV_TARGET_NOINLINE void wv_pixel_grey(const uint32_t* px, uint32_t* out,
+                                      uint32_t n);
+
+// 十进制串转整数（atoi 语义：跳空白、可选正负号；无溢出防护——驱动侧
+// 限域）。
+WV_TARGET_NOINLINE int32_t wv_atoi32(const char* s);
+// ===========================================================================
+// [MIT-516 (T68) 语料扩面批次 —— 标志/位运算/分支/数组/SSE 词面]
+// ===========================================================================
+
+// LCG 单步（u32 环绕乘加：imul+add+mul 常数旗面）。
+WV_TARGET_NOINLINE uint32_t wv_lcg_next(uint32_t s);
+
+// 位反演 CRC-32 单字节步进（无表，8 轮 shift/xor/掩码；驱动对拍
+// "123456789" 规范校验值 0xCBF43926）。
+WV_TARGET_NOINLINE uint32_t wv_crc32_step(uint32_t crc, uint8_t byte);
+
+// 二次 Bezier Q8 定点（i32 Horner，t 单位 = 1/256，域 0..256；中间量
+// 受限不溢出）。
+WV_TARGET_NOINLINE int32_t wv_bezier_q8(int32_t a, int32_t b, int32_t c,
+                                         int32_t t);
+
+// 8 点 Hadamard 原地蝶形（3 级 add/sub 数组访存面；H×H = 8I 恒等可自校）。
+WV_TARGET_NOINLINE void wv_hadamard8(int32_t* v);
+
+// 4 元素 float 点积（顺序 mul+add —— x86/x64 双侧 SSE movss/mulss/addss
+// 词面；驱动用同序整数倍初值位精确对拍）。
+WV_TARGET_NOINLINE float wv_dot4f(const float* a, const float* b);
+
 #ifdef __cplusplus
 }
 #endif

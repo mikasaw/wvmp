@@ -381,4 +381,172 @@ WV_TARGET_NOINLINE int32_t wv_b64_decode(const char* s, uint32_t len,
     return o;
 }
 
+// ===========================================================================
+// [MIT-494w (T46) 真实 codegen 面扩展]
+// ===========================================================================
+WV_TARGET_NOINLINE void wv_matmul4x4_i32(int32_t out[16], const int32_t a[16],
+                                         const int32_t b[16]) {
+    PROTECT_BEGIN("wv_matmul4x4_i32");
+    for (int32_t i = 0; i < 4; ++i) {
+        for (int32_t j = 0; j < 4; ++j) {
+            int32_t acc = 0;
+            for (int32_t k = 0; k < 4; ++k)
+                acc += a[i * 4 + k] * b[k * 4 + j];
+            out[i * 4 + j] = acc;
+        }
+    }
+    PROTECT_END();
+}
+
+WV_TARGET_NOINLINE uint64_t wv_list_sum(const wv_node* head) {
+    PROTECT_BEGIN("wv_list_sum");
+    uint64_t sum = 0, count = 0;
+    for (const wv_node* p = head; p; p = p->next) {
+        sum += (uint64_t)(uint32_t)p->val;
+        ++count;
+    }
+    PROTECT_END();
+    return (sum << 32) | count;
+}
+
+WV_TARGET_NOINLINE int32_t wv_siftdown(int32_t* h, int32_t n, int32_t i) {
+    PROTECT_BEGIN("wv_siftdown");
+    int32_t swaps = 0;
+    for (;;) {
+        int32_t l = 2 * i + 1, r = l + 1, m = i;
+        if (l < n && h[l] > h[m]) m = l;
+        if (r < n && h[r] > h[m]) m = r;
+        if (m == i) break;
+        int32_t t = h[i];
+        h[i] = h[m];
+        h[m] = t;
+        ++swaps;
+        i = m;
+    }
+    PROTECT_END();
+    return swaps;
+}
+
+WV_TARGET_NOINLINE uint32_t wv_modpow_u32(uint32_t base, uint32_t exp,
+                                          uint32_t mod) {
+    PROTECT_BEGIN("wv_modpow_u32");
+    uint32_t r = 1 % mod;
+    uint32_t b = base % mod;
+    while (exp) {
+        if (exp & 1u) r = (r * b) % mod;
+        b = (b * b) % mod;
+        exp >>= 1;
+    }
+    PROTECT_END();
+    return r;
+}
+
+WV_TARGET_NOINLINE uint32_t wv_pt_pack(wv_pt p) {
+    PROTECT_BEGIN("wv_pt_pack");
+    uint32_t hi = (uint32_t)(uint16_t)p.x;
+    uint32_t lo = (uint32_t)(uint16_t)p.y;
+    PROTECT_END();
+    return (hi << 16) | lo;
+}
+
+WV_TARGET_NOINLINE int32_t wv_switch_grade(int32_t score) {
+    PROTECT_BEGIN("wv_switch_grade");
+    switch (score / 25) {
+        case 0: return 0;
+        case 1: return 1;
+        case 2: return 2;
+        case 3: return 3;
+        default: break;
+    }
+    PROTECT_END();
+    return 4;
+}
+
+WV_TARGET_NOINLINE void wv_pixel_grey(const uint32_t* px, uint32_t* out,
+                                      uint32_t n) {
+    PROTECT_BEGIN("wv_pixel_grey");
+    for (uint32_t i = 0; i < n; ++i) {
+        uint32_t p = px[i];
+        uint32_t r = (p >> 16) & 0xFFu;
+        uint32_t g = (p >> 8) & 0xFFu;
+        uint32_t b = p & 0xFFu;
+        out[i] = (r * 3 + g * 6 + b) / 10;
+    }
+    PROTECT_END();
+}
+
+WV_TARGET_NOINLINE int32_t wv_atoi32(const char* s) {
+    PROTECT_BEGIN("wv_atoi32");
+    while (*s == ' ' || *s == '	') ++s;
+    int32_t sign = 1;
+    if (*s == '-') {
+        sign = -1;
+        ++s;
+    } else if (*s == '+') {
+        ++s;
+    }
+    int32_t v = 0;
+    while (*s >= '0' && *s <= '9') {
+        v = v * 10 + (*s - '0');
+        ++s;
+    }
+    PROTECT_END();
+    return v * sign;
+}
+// ---- MIT-516 (T68) 语料扩面批次 ----
+
+WV_TARGET_NOINLINE uint32_t wv_lcg_next(uint32_t s) {
+    PROTECT_BEGIN("wv_lcg_next");
+    PROTECT_END();
+    return s * 1664525u + 1013904223u;
+}
+
+WV_TARGET_NOINLINE uint32_t wv_crc32_step(uint32_t crc, uint8_t byte) {
+    PROTECT_BEGIN("wv_crc32_step");
+    crc ^= byte;
+    for (int k = 0; k < 8; ++k) {
+        uint32_t mask = 0u - (crc & 1u);
+        crc = (crc >> 1) ^ (0xEDB88320u & mask);
+    }
+    PROTECT_END();
+    return crc;
+}
+
+WV_TARGET_NOINLINE int32_t wv_bezier_q8(int32_t a, int32_t b, int32_t c,
+                                        int32_t t) {
+    PROTECT_BEGIN("wv_bezier_q8");
+    // B(t) = a + t/256 * ( 2*(b-a) + t/256 * (a - 2b + c) )  —— Horner
+    int32_t k1 = 2 * (b - a);
+    int32_t k2 = a - 2 * b + c;
+    int32_t inner = k1 + (t * k2) / 256;
+    int32_t r = a + (t * inner) / 256;
+    PROTECT_END();
+    return r;
+}
+
+WV_TARGET_NOINLINE void wv_hadamard8(int32_t* v) {
+    PROTECT_BEGIN("wv_hadamard8");
+    for (int len = 1; len <= 4; len <<= 1) {
+        for (int i = 0; i < 8; i += len << 1) {
+            for (int j = i; j < i + len; ++j) {
+                int32_t x = v[j];
+                int32_t y = v[j + len];
+                v[j] = x + y;
+                v[j + len] = x - y;
+            }
+        }
+    }
+    PROTECT_END();
+}
+
+WV_TARGET_NOINLINE float wv_dot4f(const float* a, const float* b) {
+    PROTECT_BEGIN("wv_dot4f");
+    float s = a[0] * b[0];
+    s += a[1] * b[1];
+    s += a[2] * b[2];
+    s += a[3] * b[3];
+    PROTECT_END();
+    return s;
+}
+
 } // extern "C"
