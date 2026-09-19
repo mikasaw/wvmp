@@ -780,3 +780,111 @@ TEST(ConfigParse, MixedSelectorPairStillRejected) {
     ASSERT_FALSE(result.ok);
     EXPECT_TRUE(contains(result.error, "只能选其一"));
 }
+
+// ==================== MIT-491 (CR-02 / 契约 C-A2)：档位面三选择器对等 ====================
+
+TEST(ConfigParse, NameSelectorDrivesLevelOn) {
+    // 审核附件 CR-02 的 TOML 原样：修复前 parse_ok=1 而档位查询预期
+    // virtualize、实际 none（name 进不了 level_for）。
+    const TempToml toml(
+        "input  = \"input.exe\"\n"
+        "output = \"output.exe\"\n"
+        "default_level = \"none\"\n"
+        "[[functions]]\n"
+        "name = \"target\"\n"
+        "level = \"virtualize\"\n");
+    const auto result = wvmp::cli::parse_config(toml.path());
+    ASSERT_TRUE(result.ok) << result.error;
+    EXPECT_EQ(result.value.rules.level_for(0x1000, 0, "target"),
+              wvmp::ProtectLevel::Virtualize);
+    EXPECT_EQ(result.value.rules.level_for(0x2000, 1, "bystander"),
+              wvmp::ProtectLevel::None);
+}
+
+TEST(ConfigParse, NameSelectorDrivesLevelOff) {
+    // 反向配置（CR-02 关）：默认虚拟化 + 按 name 排除 → 该函数保持原生。
+    const TempToml toml(
+        "input  = \"input.exe\"\n"
+        "output = \"output.exe\"\n"
+        "default_level = \"virtualize\"\n"
+        "[[functions]]\n"
+        "name = \"target\"\n"
+        "level = \"none\"\n");
+    const auto result = wvmp::cli::parse_config(toml.path());
+    ASSERT_TRUE(result.ok) << result.error;
+    EXPECT_EQ(result.value.rules.level_for(0x1000, 0, "target"),
+              wvmp::ProtectLevel::None);
+    EXPECT_EQ(result.value.rules.level_for(0x2000, 1, "bystander"),
+              wvmp::ProtectLevel::Virtualize);
+}
+
+TEST(ConfigParse, CrossSelectorConflictResolvesByDeclarationOrder) {
+    // 规则 3：跨选择器撞同一函数解析期不可静态判定（index 要落到实际区域才
+    // 知），故解析放行、按声明序后评胜，运行时由 virtualize 的 Note 披露。
+    const TempToml toml(
+        "input  = \"input.exe\"\n"
+        "output = \"output.exe\"\n"
+        "default_level = \"none\"\n"
+        "[[functions]]\n"
+        "name = \"target\"\n"
+        "level = \"none\"\n"
+        "[[functions]]\n"
+        "index = 0\n"
+        "level = \"virtualize\"\n"
+        "[[functions]]\n"
+        "rva = 0x1000\n"
+        "level = \"none\"\n");
+    const auto result = wvmp::cli::parse_config(toml.path());
+    ASSERT_TRUE(result.ok) << result.error;
+    ASSERT_EQ(result.value.rules.functions.size(), size_t{3});
+    // 三条都命中同一函数（name='target' / index=0 / rva=0x1000）→ 末条生效。
+    EXPECT_EQ(result.value.rules.level_for(0x1000, 0, "target"),
+              wvmp::ProtectLevel::None);
+    const auto decision = result.value.rules.resolve_level(0x1000, 0, "target");
+    ASSERT_EQ(decision.hits.size(), size_t{3});
+    EXPECT_EQ(decision.hits.back(), size_t{2});  // 披露口径：生效的是第 2 条
+    // 去掉末条（rva）后生效者随声明序前移，不是"某选择器天然优先"。
+    const TempToml no_rva(
+        "input  = \"input.exe\"\n"
+        "output = \"output.exe\"\n"
+        "default_level = \"none\"\n"
+        "[[functions]]\n"
+        "name = \"target\"\n"
+        "level = \"none\"\n"
+        "[[functions]]\n"
+        "index = 0\n"
+        "level = \"virtualize\"\n");
+    const auto r2 = wvmp::cli::parse_config(no_rva.path());
+    ASSERT_TRUE(r2.ok) << r2.error;
+    EXPECT_EQ(r2.value.rules.level_for(0x1000, 0, "target"),
+              wvmp::ProtectLevel::Virtualize);
+}
+
+TEST(ConfigParse, DuplicateNameSelectorFails) {
+    const TempToml toml(
+        "input  = \"target.exe\"\n"
+        "output = \"out.exe\"\n"
+        "[[functions]]\n"
+        "name = \"dup\"\n"
+        "level = \"none\"\n"
+        "[[functions]]\n"
+        "name = \"dup\"\n");
+    const auto result = wvmp::cli::parse_config(toml.path());
+    ASSERT_FALSE(result.ok);
+    EXPECT_TRUE(contains(result.error, "重复")) << result.error;
+}
+
+TEST(ConfigParse, DuplicateIndexSelectorFails) {
+    const TempToml toml(
+        "input  = \"target.exe\"\n"
+        "output = \"out.exe\"\n"
+        "[[functions]]\n"
+        "index = 2\n"
+        "level = \"none\"\n"
+        "[[functions]]\n"
+        "index = 2\n"
+        "crypt = false\n");
+    const auto result = wvmp::cli::parse_config(toml.path());
+    ASSERT_FALSE(result.ok);
+    EXPECT_TRUE(contains(result.error, "重复")) << result.error;
+}

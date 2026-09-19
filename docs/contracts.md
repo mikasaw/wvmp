@@ -1,6 +1,7 @@
 # WVmp 契约与扩展点（P0 冻结版）
 
-本文档描述 WVmp 的三类扩展点、三层粒度模型、跨模块 key 常量以及契约变更流程。
+本文档描述 WVmp 的三类扩展点、三层粒度模型、跨模块 key 常量、契约变更流程，以及
+`[[functions]]` 配置选择器的口径与仲裁序（§6，契约 C-A2）。
 所有列出的头文件为**冻结契约**：接口语义不得在泳道内擅自变更。
 
 ## 1. 三类扩展点
@@ -43,3 +44,131 @@
 任何对上述头文件的接口变更（增删函数、改签名/语义、改枚举值）**必须报协调者**，
 由协调者评估影响面、同步所有受影响泳道后统一落地；泳道内自行修改契约视为事故，
 回滚并重做。新增 key 常量同样先在本文档登记再使用。
+
+## 6. `[[functions]]` 配置选择器与仲裁序（契约 C-A2，MIT-491）
+
+适用面：`default_level` + `[[functions]]` 规则集。落点在
+`framework/include/wvmp/framework/protect_levels.hpp`（**不在** §4 冻结清单内，
+接口可按 §5 流程演进）：`wvmp::ProtectRules` 由 CLI 解析 TOML 后整体写入扩展槽
+`kProtectRules`，消费方为 `virtualize` / `mutate`（档位面）与 `crypt`（加密覆写面）。
+
+### 6.1 三个选择器的口径（唯一真源 = CLI 打印的区域清单）
+
+| 选择器 | 口径 | 稳定性 |
+|---|---|---|
+| `rva = 0x…` | 区域 begin 标记 RVA（= `ir::FunctionRegion::begin_rva`，TOML 支持 `0x` 字面量） | 同版本产物内稳定 |
+| `index = N` | `ctx.functions` 的**原始扫描序，0-based** | 跨重编译不稳（调试/临时用） |
+| `name = "…"` | 标记函数真名（C++ SDK `WVMP_BEGIN(fn)` 串化；未解析到名字时 marker_scan 回退 `(marker@0x偏移)`） | 跨重编译稳定 |
+
+三口径同源：`wvmp_cli protect` 的 stdout 行 `[wvmp] 区域清单: [0] tick rva=0x1110 [1] …`
+—— 第 1 列就是 `index`、第 2 列就是 `name`、`rva=` 就是 `rva`。
+
+⚠️ `index` **不是** `kVmProgram`（VM 程序列表）的下标。VirtualizePass 会跳过
+`level=none`、无已 lift 基本块、C1 不可翻译 gate、`require_avx=false` gate 等区域，
+`kVmProgram` 是被压缩后的列表；其下标只作为 `CryptPlan::vfs_index` 存在（stub_link
+的密文↔程序配对键），与配置里的 `index` 无关。配置 `index` 由
+`VirtualizedFunction::src_index`（VirtualizePass 赋的原始扫描序号）解释——
+前置区域被跳过不改变后续区域的序号。手工构造 `kVmProgram`（未经 VirtualizePass）
+时 `src_index` 保持 `kNoSrcIndex` 哨兵 = 不匹配任何 `index` 规则。
+
+### 6.2 查询面签名（两面对等）
+
+```cpp
+ProtectLevel      level_for(u64 begin_rva, u64 src_index, std::string_view name) const;
+std::optional<bool> crypt_for(u64 begin_rva, u64 src_index, std::string_view name) const;
+// 上面两个查询的披露增强版（命中列表可读回，判定与 level_for / crypt_for 完全一致）
+ProtectRules::LevelDecision  resolve_level(u64 begin_rva, u64 src_index, std::string_view name) const;
+ProtectRules::CryptDecision  resolve_crypt(u64 begin_rva, u64 src_index, std::string_view name) const;
+```
+
+`src_index` 一律是 §6.1 的原始扫描序号。两面**共用同一套遍历**
+（`matching_rule_indices`），不允许再出现第二套仲裁序。
+
+### 6.3 仲裁序：声明序单遍，后声明者胜
+
+1. 按 `[[functions]]` 的**声明顺序**单遍扫描全部规则；
+2. 任一选择器（`name` / `index` / `rva`）命中该函数即覆写当前结果，**后声明者胜**；
+3. **不存在选择器之间的优先级**（`rva` 不比 `index` 优先，`index` 不比 `name` 优先）；
+4. 一条都没命中 → 档位面落到 `default_level`；crypt 面落到"无覆写 = 跟随管道全局行为"；
+5. crypt 面只统计**显式写了** `crypt = true/false` 的规则；只写 `level` 的规则不参与
+   crypt 仲裁（反之亦然：只写 `crypt` 的规则仍带 `level`，缺省 `level = "virtualize"`）。
+
+> 历史：MIT-457~MIT-461 期间 `level_for` 不接 `name`，且是"index 先评、rva 后评"的两遍
+> 序。后果即 CR-02：按 `name` 配 `level` 解析成功却永远查不到，保护面与用户意图相反。
+> C-A2 起废除两遍序，本小节是唯一判据。
+
+### 6.4 冲突处理：解析期拒同选择器，运行期披露跨选择器
+
+| 情形 | 判定 |
+|---|---|
+| 同一条目写两个选择器（如 `name` + `rva`） | 解析期拒：`'rva'/'index'/'name' 只能选其一` |
+| 同一选择器值出现两条规则（两条 `name="x"` / 两条 `index=1` / 两条 `rva=0x1000`） | 解析期拒：`选择器与前文规则重复（同一函数只允许一条规则）`——同选择器各只允许一条 |
+| 不同选择器命中同一函数（如 `name="x"` level=none + `index=0` level=virtualize） | 解析期**不可**静态判定（`index` 要落到实际区域才知），故解析放行，按 §6.3 后评胜；消费方对命中 >1 条规则的函数记一条 Note 披露生效者与被覆写者，不留静默仲裁：**档位面**由 `virtualize` 披露（`resolve_level` 的 hits），**加密面**由 `crypt` 披露（`resolve_crypt` 的 hits） |
+
+披露 Note 形态（`index=0` 声明在 `name` 之后 ⇒ index 条生效）：
+
+```
+[note] virtualize: 函数 (marker@0xca11) 命中 2 条 level 规则（跨选择器撞同一函数，按声明序后评胜）：生效 = 第 1 条 index=0 level=virtualize；被覆写 = 第 0 条 name='(marker@0xca11)' level=none
+```
+
+`第 k 条` = 该规则在 `[[functions]]` 中的声明序号（0-based）。`mutate` 消费同一档位面
+但不重复披露（同一规则集下 `virtualize` 的 Note 已覆盖全部撞车点）。
+
+### 6.5 可直接跑的实例与预测法
+
+实例 A —— 只放行按名字点名的一个函数进 VM（靶标 = `tests\wvmpTest\smoke_test.bat`
+用的同一个 x64 test_target，区域清单 30 个 / 无规则基线 29 个入口 stub）：
+
+```toml
+input  = "../wvmpTest/build/x64/test_target.exe"
+output = "../wvmpTest/build/x64/packed_level_by_name.exe"
+seed   = 12345
+
+default_level = "none"          # 缺省：全部保持原生
+
+[[functions]]                   # 只点名一个
+name  = "(marker@0xca11)"       # 名字口径 = 区域清单第 2 列
+level = "virtualize"
+```
+
+```
+已生成 1 个入口 stub            ← 29 条 "按配置 level=none 保持原生" Note
+```
+
+CR-02 修复前同一配置的实读数：`无已虚拟化函数，跳过 stub 生成`（0 个 stub）——
+`name` 规则对档位面完全无效。反向配置（`default_level` 缺省 virtualize + 同一条规则
+改 `level = "none"`）实测 29 → **28** 个 stub（修复前恒为 29，排除不生效）。
+
+实例 B —— 跨选择器撞同一函数（区域 `[0]` 同时被 `name` 与 `index=0` 指到），
+两条都写、后声明者胜：
+
+```toml
+input  = "../wvmpTest/build/x64/test_target.exe"
+output = "../wvmpTest/build/x64/packed_collision.exe"
+seed   = 12345
+
+[[functions]]                   # 声明序号 0
+name  = "(marker@0xca11)"
+level = "none"
+[[functions]]                   # 声明序号 1 —— 与上条同指一函数，本条胜
+index = 0
+level = "virtualize"
+```
+
+```
+已生成 29 个入口 stub           ← 与无规则基线同数（name 条的排除被 index 条覆写）
+[note] virtualize: 函数 (marker@0xca11) 命中 2 条 level 规则（跨选择器撞同一函数，按声明序后评胜）：生效 = 第 1 条 index=0 level=virtualize；被覆写 = 第 0 条 name='(marker@0xca11)' level=none
+```
+
+两条对调声明序（`index = 0` 在前、`name` 在后）⇒ `生效 = 第 1 条 name='(marker@0xca11)'
+level=virtualize`，读数仍是 29。把后声明那条的档位换成 `level = "none"`（`name` 写
+virtualize 在前、`index = 0` 写 none 在后）⇒ **28 个 stub**（该函数被后评胜的 none 排除）。
+即：生效者只由声明序决定，**没有任何"选择器优先级"可依赖**。
+
+预测任一配置对某函数的实际效果，四步：
+
+1. 跑一次取 `区域清单`，得到该函数的 `index` / `name` / `rva` 三口径；
+2. 收集**所有**命中它的规则（三选择器任一相等即命中；crypt 面还要求写了 `crypt`）；
+3. 有命中 → 取声明序最后一条的 `level`（crypt 面同理取其 `crypt`）；
+4. 无命中 → `default_level`（crypt 面无覆写 = 跟随管道全局行为）。
+

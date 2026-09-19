@@ -8,7 +8,9 @@
 #include "wvmp/framework/protect_levels.hpp"
 #include "wvmp/framework/registry.hpp"
 
+#include <cstdio>
 #include <stdexcept>
+#include <string>
 
 namespace wvmp::passes {
 
@@ -39,6 +41,26 @@ namespace {
 // 不扰动 ctx.rng 的既有消费序——stub 布局/解释器随机化对无 crypt 管道
 // 逐字节不变，回归基线零回踩）。
 constexpr u64 kCryptSeedSalt = 0x57564D5043525950ull;  // "WVMPCRYP" LE
+
+// 披露用（契约 C-A2 规则 3）：把一条规则的选择器 + 两面取值写成可复述标签。
+std::string rule_label(const FunctionProtectRule& r) {
+    std::string sel;
+    if (r.has_name) {
+        sel = "name='" + r.name + "'";
+    } else if (r.has_index) {
+        sel = "index=" + std::to_string(r.index);
+    } else {
+        char buf[32];
+        std::snprintf(buf, sizeof(buf), "rva=0x%llX",
+                      static_cast<unsigned long long>(r.rva));
+        sel = buf;
+    }
+    sel += " level=";
+    sel += to_string(r.level);
+    sel += r.has_crypt ? (r.crypt ? " crypt=true" : " crypt=false")
+                       : " crypt=(缺省)";
+    return sel;
+}
 
 } // namespace
 
@@ -81,9 +103,25 @@ void CryptPass::run(ProtectionContext& ctx) {
         // 规则"时不改变任何已加密函数的 key0（MIT-461 验收 REJECT 项修复）。
         const u32 key0 = static_cast<u32>(key_rng.next());
         if (!fetch_mode && rules != nullptr) {
-            const auto override_crypt =
-                rules->crypt_for(vf.begin_rva, i, vf.name);
-            if (override_crypt.has_value() && !*override_crypt) {
+            // index 口径 = ctx.functions 原始扫描序号（vf.src_index），**不是**
+            // 本循环的压缩下标 i（契约 C-A2 规则 4 / CR-03：前置区域被档位或
+            // gate 跳过时，用 i 解释 index 会让"要求加密的函数留下明文"）。
+            const auto decision =
+                rules->resolve_crypt(vf.begin_rva, vf.src_index, vf.name);
+            // 跨选择器撞同一函数（解析期不可静态判定）→ 披露生效规则，不留
+            // 静默仲裁（C-A2 规则 3，与 virtualize 的 level 面披露同款）。
+            if (decision.hits.size() > 1) {
+                std::string msg = "函数 " + vf.name + " 命中 " +
+                                  std::to_string(decision.hits.size()) +
+                                  " 条 crypt 规则（跨选择器撞同一函数，按声明序后评胜）：生效 = 第 " +
+                                  std::to_string(decision.hits.back()) + " 条 " +
+                                  rule_label(rules->functions[decision.hits.back()]);
+                for (size_t h = 0; h + 1 < decision.hits.size(); ++h)
+                    msg += "；被覆写 = 第 " + std::to_string(decision.hits[h]) + " 条 " +
+                           rule_label(rules->functions[decision.hits[h]]);
+                ctx.diag.report(Severity::Note, name(), msg);
+            }
+            if (decision.crypt.has_value() && !*decision.crypt) {
                 ++exempted;
                 continue;
             }

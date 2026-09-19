@@ -10,6 +10,13 @@ target_link_libraries(wvmp_virtualize_tests PRIVATE
     # MIT-407: regvm_backend 编译期调用 PeImage::find_function_end_rva
     # (Pass wvmp_pass_pe_loader 提供). OBJECT 链不可靠, 显式列。
     wvmp_pass_pe_loader
+    # MIT-491 (CR-03)：档位 + 加密选择器的跨 pass 回归需要 CryptPass 在场
+    # （原始扫描序号漂移只能在真 VirtualizePass 压缩后的 kVmProgram 上复现）。
+    wvmp_pass_crypt
+    $<TARGET_OBJECTS:wvmp_pass_crypt>
+    wvmp_pass_crypt_plan
+    wvmp_regvm_codecs
+    $<TARGET_OBJECTS:wvmp_regvm_codecs>
     wvmp::framework
     wvmp::ir
     wvmp::common

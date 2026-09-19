@@ -240,7 +240,7 @@ void MutatePass::run(ProtectionContext& ctx) {
             }
         }
         if (rules != nullptr &&
-            rules->level_for(fn.begin_rva, fn_index) == ProtectLevel::None)
+            rules->level_for(fn.begin_rva, fn_index, fn.name) == ProtectLevel::None)
             continue;
 
         const ir::Size junk_size =

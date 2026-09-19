@@ -29,6 +29,26 @@ std::string hex64(u64 v) {
     return buf;
 }
 
+// 披露用：把一条规则的选择器 + 档位写成可复述形式（契约 C-A2 规则 3 的
+// "运行时 Note 披露生效规则"——跨选择器撞同一函数时不留静默仲裁）。
+std::string describe_rule(const FunctionProtectRule& r) {
+    const std::string sel = r.has_name  ? "name='" + r.name + "'"
+                            : r.has_index ? "index=" + std::to_string(r.index)
+                                          : "rva=" + hex64(r.rva);
+    return sel + " level=" + std::string(to_string(r.level));
+}
+
+std::string join_rules(const ProtectRules& rules, const std::vector<size_t>& hits,
+                       size_t from, size_t to) {
+    std::string out;
+    for (size_t i = from; i < to; ++i) {
+        if (i != from) out += "、";
+        out += "第 " + std::to_string(hits[i]) + " 条 " +
+               describe_rule(rules.functions[hits[i]]);
+    }
+    return out;
+}
+
 } // namespace
 
 std::span<const std::string_view> VirtualizePass::requires_keys() const {
@@ -57,12 +77,30 @@ void VirtualizePass::run(ProtectionContext& ctx) {
 
     for (size_t fn_index = 0; fn_index < ctx.functions.size(); ++fn_index) {
         const ir::FunctionRegion& fn = ctx.functions[fn_index];
-        if (rules != nullptr &&
-            rules->level_for(fn.begin_rva, fn_index) == ProtectLevel::None) {
-            ctx.diag.report(Severity::Note, name(),
-                            "函数 " + fn.name + " 按配置 level=none 保持原生（rva=" +
-                                hex64(fn.begin_rva) + "）");
-            continue;
+        if (rules != nullptr) {
+            // 档位查询三参数形状与 crypt_for 对等（name 选择器进得了档位面，
+            // CR-02）；仲裁序 = 声明序后评胜（CR-02 建议的"多选择器同时命中
+            // 的优先级"唯一化，见 protect_levels.hpp 契约 C-A2）。
+            const ProtectRules::LevelDecision decision =
+                rules->resolve_level(fn.begin_rva, fn_index, fn.name);
+            if (decision.hits.size() > 1)
+                ctx.diag.report(
+                    Severity::Note, name(),
+                    "函数 " + fn.name + " 命中 " +
+                        std::to_string(decision.hits.size()) +
+                        " 条 level 规则（跨选择器撞同一函数，按声明序后评胜）："
+                        "生效 = " +
+                        join_rules(*rules, decision.hits, decision.hits.size() - 1,
+                                   decision.hits.size()) +
+                        "；被覆写 = " +
+                        join_rules(*rules, decision.hits, 0,
+                                   decision.hits.size() - 1));
+            if (decision.level == ProtectLevel::None) {
+                ctx.diag.report(Severity::Note, name(),
+                                "函数 " + fn.name + " 按配置 level=none 保持原生（rva=" +
+                                    hex64(fn.begin_rva) + "）");
+                continue;
+            }
         }
         if (fn.blocks.empty()) {
             ctx.diag.report(Severity::Note, name(),
@@ -74,6 +112,9 @@ void VirtualizePass::run(ProtectionContext& ctx) {
             vf.name = fn.name;
             vf.begin_rva = fn.begin_rva;
             vf.end_rva = fn.end_rva;
+            // 契约 C-A2 规则 4：携带上面档位查询用的同一个 fn_index（原始扫描
+            // 序号），下游 CryptPass 据此解释配置 index，不再用压缩后的下标。
+            vf.src_index = fn_index;
             vf.program = backend->compile(fn, ctx);
 
             // C1 保守拦截（MIT-243）：后端经扩展槽回传本次翻译的 skip

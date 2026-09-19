@@ -31,7 +31,9 @@ struct FunctionProtectRule {
     bool has_rva = false;
     u64  rva   = 0;  // begin 标记 RVA（= FunctionRegion.begin_rva；TOML 支持 0x 十六进制字面量）
     bool has_index = false;
-    u64  index = 0;  // 扫描序 0-based（= ProtectionContext.functions 下标；跨重编译不稳，调试用）
+    u64  index = 0;  // 扫描序 0-based（= ProtectionContext.functions 下标，
+                     // 即 VirtualizedFunction.src_index；**不是** kVmProgram 下标；
+                     // 跨重编译不稳，调试用）
     bool has_name = false;
     std::string name;  // 标记函数真名（MIT-460 解析；跨重编译稳定的选择器）
     ProtectLevel level = ProtectLevel::Virtualize;
@@ -43,9 +45,9 @@ struct FunctionProtectRule {
 };
 
 // 保护规则集（CLI 解析 TOML 后整体写入 ctx 扩展槽，key = kProtectRules）。
-// 消费方（virtualize；后续 mutate/crypt/anti_debug 各取自己关心的档位面）
-// 经 level_for 查询；槽缺席（find_slot == nullptr，直连 API 未装配配置）
-// = 全部按缺省档位 Virtualize 走，行为与 MIT-457 之前逐字节一致。
+// 消费方（virtualize / mutate 取档位面 level_for；crypt 取覆写面 crypt_for，
+// anti_debug 等后续 pass 同理）查询；槽缺席（find_slot == nullptr，直连 API
+// 未装配配置）= 全部按缺省档位 Virtualize 走，行为与 MIT-457 之前逐字节一致。
 struct ProtectRules {
     ProtectLevel default_level = ProtectLevel::Virtualize;
     std::vector<FunctionProtectRule> functions;
@@ -78,36 +80,87 @@ struct ProtectRules {
                                          // AVX 机器安全开关；G8b require_bmi2
                                          // 同位预留）
 
-    // 解析某函数的档位：显式规则覆盖缺省；index 规则先评、rva 规则后评
-    // （rva 是跨重编译唯一较稳的选择器，后评 = 与 index 规则同时命中时
-    // rva 胜；解析期已拒同选择器重复，双通道撞同一函数且档位不同的矛盾
-    // 配置属用户错误，消费方不静默仲裁——解析期拒绝成本低且报错可读，
-    // 这里保留"后评胜"的确定序只为防御直连 API 绕过解析器构造的规则集）。
-    ProtectLevel level_for(u64 begin_rva, u64 index) const {
-        ProtectLevel level = default_level;
-        for (const auto& r : functions) {
-            if (r.has_index && r.index == index) level = r.level;
-        }
-        for (const auto& r : functions) {
-            if (r.has_rva && r.rva == begin_rva) level = r.level;
-        }
-        return level;
+    // —— 查询面（契约 C-A2，MIT-491 / CR-02+CR-03）：三个选择器能力对等，
+    // 仲裁序唯一 ——
+    //
+    // level_for 与 crypt_for 共用 matching_rule_indices 的同一套遍历：按
+    // functions 声明序**单遍**扫描，任一选择器（name / index / rva）命中即
+    // 覆写，**后声明者胜**；default_level（level 面）/ 无覆写（crypt 面）是
+    // 兜底。这废除了 MIT-457~MIT-461 的"index 先评、rva 后评"两遍序——两遍
+    // 序正是"查询能力不对等"的病根（name 进不了 level 面 ⇒ 按 name 配 level
+    // 解析成功却查不到）。
+    //
+    // src_index 一律是 ProtectionContext.functions 的原始扫描序号（0-based，
+    // 见 :34）。CryptPass 侧经 VirtualizedFunction.src_index 携带（规则 4），
+    // 不再用压缩后的 kVmProgram 下标解释 index。
+    //
+    // 解析期已拒"同选择器重复"（cli/src/config.cpp 的矛盾配置拒绝）；跨选择器
+    // 撞同一函数（如 name 与 index 各一条）在解析期不可静态判定，故按本序后评
+    // 胜，并由消费方在运行时以 Note 披露生效规则（resolve_level 的 hits 即披露
+    // 依据）——不允许静默仲裁后毫无痕迹。
+    struct LevelDecision {
+        ProtectLevel level = ProtectLevel::Virtualize;
+        // 命中该函数的规则在 functions 中的声明序号，按声明序升序；末位即
+        // 生效者。空 = 无命中（level = default_level）。
+        std::vector<size_t> hits;
+    };
+
+    LevelDecision resolve_level(u64 begin_rva, u64 src_index,
+                                std::string_view name) const {
+        LevelDecision d;
+        d.hits = matching_rule_indices(begin_rva, src_index, name,
+                                       [](const FunctionProtectRule&) { return true; });
+        d.level = d.hits.empty()
+                      ? default_level
+                      : functions[d.hits.back()].level;
+        return d;
     }
 
-    // MIT-461：每函数 crypt 覆写解析。按规则声明序后评胜（任一选择器
-    // 命中即覆写；仅统计显式携带 crypt 覆写的规则）。
-    // 返回 nullopt = 无显式覆写（跟随全局行为）。
-    std::optional<bool> crypt_for(u64 begin_rva, u64 index,
+    ProtectLevel level_for(u64 begin_rva, u64 src_index,
+                           std::string_view name) const {
+        return resolve_level(begin_rva, src_index, name).level;
+    }
+
+    // MIT-461：每函数 crypt 覆写解析。返回 nullopt = 无显式覆写（跟随全局
+    // 行为）；仅统计显式携带 crypt 覆写的规则，其余同 level 面（后评胜）。
+    std::optional<bool> crypt_for(u64 begin_rva, u64 src_index,
                                   std::string_view name) const {
-        std::optional<bool> result;
-        for (const auto& r : functions) {
-            if (r.has_crypt &&
-                ((r.has_index && r.index == index) ||
-                 (r.has_rva && r.rva == begin_rva) ||
-                 (r.has_name && r.name == name)))
-                result = r.crypt;
+        return resolve_crypt(begin_rva, src_index, name).crypt;
+    }
+
+    // crypt 面的披露增强版（同 resolve_level：命中列表供消费方留痕，判定一致）。
+    struct CryptDecision {
+        std::optional<bool> crypt;
+        std::vector<size_t> hits;  // 带 crypt 覆写且命中该函数的规则声明序号
+    };
+
+    CryptDecision resolve_crypt(u64 begin_rva, u64 src_index,
+                                std::string_view name) const {
+        CryptDecision d;
+        d.hits = matching_rule_indices(
+            begin_rva, src_index, name,
+            [](const FunctionProtectRule& r) { return r.has_crypt; });
+        if (!d.hits.empty()) d.crypt = functions[d.hits.back()].crypt;
+        return d;
+    }
+
+private:
+    // 唯一的规则遍历：返回命中该函数且参与本次查询（accept 为真）的规则
+    // 声明序号，按声明序升序。选择器之间无优先级——只有声明序先后。
+    template <typename Accept>
+    std::vector<size_t> matching_rule_indices(u64 begin_rva, u64 src_index,
+                                              std::string_view name,
+                                              Accept accept) const {
+        std::vector<size_t> hits;
+        for (size_t i = 0; i < functions.size(); ++i) {
+            const FunctionProtectRule& r = functions[i];
+            if (!accept(r)) continue;
+            if ((r.has_name && r.name == name) ||
+                (r.has_index && r.index == src_index) ||
+                (r.has_rva && r.rva == begin_rva))
+                hits.push_back(i);
         }
-        return result;
+        return hits;
     }
 };
 
