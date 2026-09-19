@@ -268,6 +268,8 @@
 | baseline 池总数（C 波 C2 时点 main 复验） | **380 pass / 0 fail** = 76 槽 × 5 seeds（52 x64 + 20 x86 + 4 规则变体）—— B0-3 那行的"未合 main"标注在本时点已失效：`main = 18b354e` 已含 MIT-522，本行是 main 侧现读 | `bash scripts/multiseed_e2e_real.sh` → `[multiseed] TOTAL: 380 pass / 0 fail` exit 0（树 `wvmp-c-tlsabi` @ `mit-debt-c-tlsabi`）；`--selftest` → 29/29 RESULT: PASS；槽数三元组见「MIT-526 (C2 · CR-04 …)」节 |
 | ctest 目标数 | **23**（全绿） | `scripts\test.bat`（MIT-380 起旧 "15/15" 字样已过期） |
 | ctest 目标数（C2 TLS ABI 反证后） | **24**（全绿）＝ 上表 23 + 本单新增 `tls_abi_exec_tests`（真执行反证，子进程跑 `wvmp_tls_abi_probe.exe`） | `scripts\test.bat` → `100% tests passed, 0 tests failed out of 24`（上一行 23 不追改，435 append-only） |
+| baseline 池总数（C 波 C3 时点复验，基线 = C2 tip 非 main） | **380 pass / 0 fail** = 76 槽 × 5 seeds（口径与上两行同，本行只登记"CR-05 修复不改池"这一事实） | `bash scripts/multiseed_e2e_real.sh` → `[multiseed] TOTAL: 380 pass / 0 fail` exit 0（树 `wvmp-c-rdtsc` @ `mit-debt-c-rdtsc`，base = `8da17de`）；`--selftest` → 29/29 RESULT: PASS；槽数三元组与差分见「MIT-527 (C3 · CR-05 …)」节 |
+| ctest 目标数（C3 RDTSC 回绕反证后） | **25**（全绿）＝ 上表 24 + 本单新增 `rdtsc_wrap_tests`（注入时间戳真执行反证，子进程跑 `wvmp_rdtsc_wrap_probe.exe`） | `ctest --test-dir build` → `100% tests passed, 0 tests failed out of 25`（上一行 24 不追改，435 append-only；`scripts\test.bat` 不转发参数，单跑某格直调 ctest） |
 | x87 (D8-DF) | **x86 ✅ 虚拟化**（L0–L4）/ **x64 ⛔ 架构 gate** | 见下矩阵行；证据链 GAPS MIT-509 / MIT-510 |
 | ymm / VEX.256 | **x64 ✅ 虚拟化**（`vzeroupper`/`vzeroall` + `vmov*` 32B + 18 条 packed 算术）/ **x86 ⛔ 架构 gate** | 见下矩阵行；证据链 GAPS MIT-511~514 |
 | wvmpTest 语料面 | marker 函数 **30 区**（`kernels.cpp` 27 + `avx_kernels.cpp` 3）→ x64 **29 stub** / x86 **26 stub**，缺口 1 区为**语料缺陷**（见下「语料口径」小节，非产品 gate） | `git grep -c PROTECT_BEGIN -- tests/wvmpTest` → `kernels.cpp:28`（含 `:7` 一处文件头用法注释）+ `avx_kernels.cpp:3` + `wvmp_protect.h:2`（宏定义/`#undef`，不是区域）⇒ 真实 marker = 27+3 = 30；`tests\wvmpTest\smoke_test.bat` → `已生成 29 个入口 stub` |
@@ -5025,3 +5027,144 @@ TLS 专项（判据 3）：`scripts/tls_e2e.sh` 新增 `TLS_E2E_DRX`/`TLS_E2E_RD
 - 探针的 CONTEXT 是夹具自造的暂存（不是真 `CONTEXT` 全 0x4D0 语义），Dr0..Dr3 偏移按 x64
   `CONTEXT` 实测 0x48/0x50/0x58/0x60 与 pass 内偏移一致；真 API 面由 `tls_e2e.sh` 四象限跑真
   `GetThreadContext` 覆盖（该格 native vs packed 逐字节一致）。
+
+---
+
+## MIT-527 (C3 · CR-05 x64 RDTSC 低 32 位回绕误终止，2026-09-20) 落账
+
+交付面 = 分支 `mit-debt-c-rdtsc`，**基线 = C2 分支 tip `8da17de7fbd6ad5e43f9e44162830645d36b95ad`
+（`mit-debt-c-tlsabi`，不是 main）**，树 `C:\Users\www\AiCode\WVmp\wvmp-c-rdtsc`，未合 main
+（D0 纪律：合入权在项目主）。三枚：`3bdc8f3`（RED 反证）→ `769218e`（修复本体）→ 本枚（docs）。
+冻结面与白名单按 `8da17de..HEAD` 核 = 4 个文件全在 `passes/tls_hook/` 下（`src/tls_hook_pass.cpp`
++ `tests/CMakeLists.txt` + `tests/rdtsc_wrap_probe.cpp` + `tests/test_rdtsc_wrap.cpp`），
+`asmgen.cpp` / VM 码体 / 冻结契约头 / `keys.hpp` 零 diff。
+
+### 病灶与语义口径
+
+`build_rdtsc_open_asm` x64 分支（`base:201 / head:211`）第一次 `rdtsc` 后只 `mov r11, rax`，`EDX`
+被整条丢弃（`rdtsc` 写的是 EDX:EAX 两个 dword，各自高 32 位被架构清零）；`build_rdtsc_close_asm`
+x64 分支（`base:226 / head:238`）于是用 `sub rax, r11` 对"两个只有低 32 位有效的截断值"求 64 位差。
+判据点名的回绕例（`0x1FFFFFFF0` → `0x200000010`，真差 `0x20`）实测算成 `0xFFFFFFFF00000020` ⇒
+无符号比较远大于阈值 ⇒ 正常执行被判超时并 FailFast。反向面同一根因：高位大跳、低位不回绕时
+（`0x100001000` → `0x900002000`，真差 `0x800001000`）算成 `0x1000` ⇒ 真超时被漏。
+x86 分支（存双 dword + `sub`/`sbb`）本就是正确形，本单**逐字不动**；x64 按判据镜像其语义：
+两侧都先把 `EDX` 组合进 `RAX`（`shl rdx, 0x20` + `or rax, rdx`），差值与阈值仍走无符号 `ja`。
+`r11` 继续承担"窗内跨块存活"的第一读数存储（窗内只有 adb_init 的 push/pop rax，不蹭 r11/rdx），
+`rdx` 只在采样点内部作组合临时，不新增暂存槽 ⇒ `.wvmp` 尾部 8 字节分配面不动。
+
+### 反证夹具设计（判据 1+2：注入时间戳 + 必经真实发射码）
+
+真机等不到 TSC 回绕 ⇒ 注入是唯一可确定构造进位边界的路子，但注入不能变成纸面算术。夹具形状：
+
+1. 跑真实 `TlsHookPass`（只开 `kTimingRdtsc`）产出 `.wvmpc` 回调桩字节，连同 `.wvmp` 镜像进
+   RWX 内存（VA = 合成 image_base ⇒ 跳的正是回调数组首项那个 `plan->callback_va`）。
+2. 桩内两处 `rdtsc` 操作码 `0F 31` 原地**等长**换成 `CC 90`（int3 + nop）⇒ 桩内所有偏移、
+   相对跳转、`cmp rax,imm32` 的立即数一律不动。
+3. VEH 在断点现场把本例指定的 `EDX:EAX` 写进 `ContextRecord` 当作这一次 `rdtsc` 的返回值；
+   第二次注入后开 TF 单步，停在发射码的 `cmp rax,imm32`（字节锚点 `48 3D`）边界，从真机上下文
+   读回 **代码自己算出的差值** `delta_at_cmp` 与 `r11_at_second_sample`（open 段真实存下的第一读数）、
+   `cmp_imm`（把阈值常量与发射码钉在一起对账）。
+4. 判定读法：`decision=pass` = 桩真返回（`returned=1`）；`decision=timeout` = 撞 FailFast 写零
+   红线（`fault_addr=0` + `fault_rip_stub_off` 在桩内 + 退出码 `0xC0000005`）。asm 帧无 unwind
+   信息 ⇒ 子进程隔离（同 MIT-526 教训）。
+
+**顺带销掉 MIT-526 留下的一格遗留**：C2 的「边界与遗留」明写"`rdtsc_fail` 出口未做单测反证：
+触发需要 >500k 周期的窗内噪声，无法确定性构造"。注入时间戳后该出口已可确定性构造并被真执行
+覆盖（`multi_carry` / `threshold_plus_one` / `hi_jump_no_low_wrap` 三格都真撞了 `rdtsc_fail`
+的写零红线）。
+
+### 修前 ↔ 修后真机读数对照（判据 1 要求的四组以上，全六组）
+
+| 组 | 注入 t1 → t2 | 真值差 | 修前 `r11` / `delta_at_cmp` / 判定 | 修后 `r11` / `delta_at_cmp` / 判定 |
+|---|---|---|---|---|
+| `normal_small`（对照组） | `0x1000` → `0x1200` | `0x200` | `0x1000` / `0x200` / pass ✅ | `0x1000` / `0x200` / pass ✅ |
+| `wrap_low32`（判据本体） | `0x1FFFFFFF0` → `0x200000010` | `0x20` | `0xFFFFFFF0` / `0xFFFFFFFF00000020` / **timeout** ❌ | `0x1FFFFFFF0` / `0x20` / pass ✅ |
+| `multi_carry`（跨多次进位） | `0x5FFFFFF00` → `0x900000100` | `0x300000200` | `0xFFFFFF00` / `0xFFFFFFFF00000200` / timeout（结果对、算式错）❌ | `0x5FFFFFF00` / `0x300000200` / timeout ✅ |
+| `eq_threshold`（恰等阈值） | `0x700000000` → `0x70007A120` | `0x7A120` | `0x0` / `0x7A120` / pass（r11 少高 32 位）❌ | `0x700000000` / `0x7A120` / pass ✅ |
+| `threshold_plus_one`（反向钉） | `0x700000000` → `0x70007A121` | `0x7A121` | `0x0` / `0x7A121` / timeout（同上）❌ | `0x700000000` / `0x7A121` / timeout ✅ |
+| `hi_jump_no_low_wrap`（漏报面） | `0x100001000` → `0x900002000` | `0x800001000` | `0x1000` / `0x1000` / **pass** ❌ | `0x100001000` / `0x800001000` / timeout ✅ |
+
+修前 = **5 FAIL / 1 PASS**（对照组绿、五组缺陷格红），修后 = **6/6 PASS**。逐格 readings 与逐指令
+trace（`step NN rip_off=… bytes=… rax=… rdx=… r11=…`）留在仓外
+`C:\Users\www\wvmp-evidence\MIT-527\{red_tests_pre_fix.txt, green_tests_post_fix.txt, green_readings_*.txt}`。
+
+### 阈值口径已知边界（判据 2 追加，**本单不改阈值策略**）
+
+`kRdtscThresholdCycles = 500000`（`base:43 / head:43`）是**硬编码周期数**的启发式判据，其误报面
+不随本单消失：**在变频（SpeedStep/EPP 调频、TSC 与核心频率解耦）、深休眠/ Modern Standby 唤醒、
+或跨核迁移导致 TSC 不同步的机器上，合法执行的窗内周期数本身可跨越该常量 ⇒ 同一份打包产物在
+一台机器正常、在另一台可能被判超时而 FailFast**；反向也成立（真单步若落在低频窗口可能不触发）。
+阈值取值/自适应策略（含 `scripts/calibrate_rdtsc.sh` 分布依据的再校准与"是否改用相对量纲"）
+**留给后续单裁**，本单只把差值算式改对（算式错 = 任何阈值下都误判，与阈值选取是两个独立缺陷）。
+
+### 零扰动（判据：涉产物字节者出差分表，禁以 packed sha 恒等论证）
+
+同一 seed=1 / 同一 drx=true rdtsc=true 配置，基线 CLI（`8da17de`，sha256 `34bd4f14…`）与本树
+CLI 各产一枚 `wvmp_tls_sample`（x64）与 `wvmp_x86_tls_sample`（x86）打包产物：
+
+| arch | 尺寸 | 差异 |
+|---|---|---|
+| x86 | 53,248 B → 53,248 B | **0 字节差**（`cmp` 无差异）⇒ x86 分支逐字未动的产物层机器证明，x86 侧静态判定必然相同 |
+| x64 | 58,880 B → 59,392 B（+512 = FileAlignment 进位） | 见下分解 |
+
+x64 差分分解：`.text .rdata .data .pdata .reloc` **0 字节差**；`.wvmpc` 前 **0x86C0 字节
+（= TLS 回调桩之前的全部 VM 码体）逐字节恒等**，25 个差异区间全部落在回调桩内（RVA
+`0x136C2..0x13805`，首差 = 桩起点 + 2 = 第一处 `rdtsc` 之后；桩 311 → 325 B = +14）；
+`.wvmp` 内 12 枚 u16 条目各 **+0xE**（= 桩增量），条目数 37 → 37 不变、区间内唯一差值集合 =
+`{14}` ⇒ 属 TLS 站点登记的位置随桩体平移（MIT-494 登记面），非语义变化；头部仅 CheckSum
+（`0x1E071 → 0x19CCE`）与 `.wvmpc` 的 VirtualSize/SizeOfRawData 派生变化。行为面：两 arch
+native vs base/head 产物 stdout 逐字节一致、`rc=0`。码体侧另两条独立机器证明：
+`WVMP_RUNTIME_DUMP` 文本 base vs head **逐字节恒等**（184,812 B），x64 运行时 handler dump
+（`WVMP_X64_ASM_DUMP` + `Interpreter.MovdBridgeSemantic`）= **`d294f89b018a0442b2597bd1ffec6db35e9091876e95d78f01862a5b66c85068` /
+184,536 B**，与 C2 在 `wvmp-c-tlsabi` 的读数**逐字符相同**（跨树一致，且再次实测文档旧底稿
+`f8b0ebd6…/164,350B` 在本代树复现不出——同属 C2 已登记的底稿漂移，不记本单账）。
+
+### 六件套（时点 = 分支 `mit-debt-c-rdtsc`，基线 `8da17de`，树 `wvmp-c-rdtsc`）
+
+| 格 | 读数 | 命令 |
+|---|---|---|
+| build | `[415/415]` rc=0；/W4 /WX 下涉改文件 0 告警；全仓 warning 计数 **76 与基线建树相等**，唯一非 `.deps` 条 = 既有 C4335 `sse_bridge_sample_main.cpp` | `scripts\build.bat` |
+| ctest | **25/25 全绿**（基线现测 24/24 + 本单新增 `rdtsc_wrap_tests` 1 格） | `ctest --test-dir build`（`test.bat` 不转发参数） |
+| x86 电池 | `67 tests PASSED` + ctest `x86_runtime_battery` `1/1 Passed` | `scripts\build_x86_tests.bat` 后 `ctest --test-dir build\x86 -R x86_runtime_battery` |
+| multiseed | 树 `wvmp-c-rdtsc` / **76 槽** / **380 pass · 0 fail** exit 0（三元组照写；76 = 52 x64 + 20 x86 + 4 规则变体）；门禁 `--selftest` **29/29 RESULT: PASS**；池脚本与规则面 `git diff 8da17de..HEAD` 零改动 | `bash scripts/multiseed_e2e_real.sh` / `bash scripts/multiseed_e2e.sh --selftest` |
+| wvmpTest 双 arch | x64 `SUMMARY passed=106 failed=0` ×2（native/packed）+ `diff count = 0` + `29 个入口 stub`；x86 `passed=105 failed=0` ×2 + `diff count = 0`；**双跑 = 同组二进制两次执行**：x64/x86 各 run-vs-run native+packed 全 `IDENTICAL`，`packed.exe` sha256 两侧恒定（x64 `dd7b8cf4…`、x86 `6102d16a…`） | `tests\wvmpTest\smoke_test.bat [x64\|x86]`（首构建路径恒 rc=1 的既有工具失效 ⇒ 读数以第 2/3 跑为准） |
+| dump 门 | x86：`RESULT: PASS` exit 0（`kTableEntries=256` 对账、138 handler 全解，dispatch=+0x1d table=+0x7af8）；x64：xmm 字节门 **exit=2 tooling（基线 CLI 同形态复现，两侧同读数）** ⇒ 以 `WVMP_RUNTIME_DUMP` base/head 逐字节恒等 + handler dump sha 恒等作该格零扰动代证 | `verify_x86_dump.py --asm --code` / `dump_handler_xmm_check.py --asm --pe` |
+| 静态扫描 | 四面 PASS exit 0：`asmgen.cpp`（默认）+ `tls_hook_pass.cpp` + `rdtsc_wrap_probe.cpp`（新增 Keystone 文本面，`shl` 位移走 `0x`+`hex64`）+ `tls_abi_probe.cpp`（C2 面回归未破） | `powershell -File scripts\verifier\static_scan_bare_immediates.ps1 [-TargetFile …]` |
+
+TLS 专项（判据 3）：`scripts/tls_e2e.sh` 默认格与四象限（`TLS_E2E_DRX` × `TLS_E2E_RDTSC` =
+true/false 各 4 跑）逐格 **3 PASS / 1 FAIL**，x64 正例 + 双 arch skip-backfill 全绿，唯一
+FAIL 恒为 **x86 正例格的既有 `check_import_rewrite.py imm-hits=1` 工具门**（`rc=1`）。本单
+走 Architect 04:3x 口径的**第 ② 条 = 产物层证据**：基线 CLI 与修复后 CLI 各产一枚 x86 打包产物
+**逐字节相同**（`cmp` 无差异）⇒ 该格静态判定必然相同；另实测同一 checker 吃 base 产物与 head
+产物得到**同一行 `imm-hits=1` + 同一 rc=1**，即该 FAIL 与本单无关的基线复现。**未动
+`tls_e2e.sh` 的门**（那格属待拍工具单）。真机 TSC 面：rdtsc=true 两象限的 x64 正例格含 native
+vs packed stdout 逐字节一致 + EB FE 挂起探针 ⇒ 修后在真硬件上不误杀。
+
+### 本单撞到的既有失效（均非本单引入，全部在本单基线 `8da17de` 同形态复现）
+
+1. `dump_handler_xmm_check.py`（x64 xmm 字节门）两侧都 `FAIL tooling: .wvmp raw size 8704 <
+   runtime total 33976`、exit=2 —— 即 🟡-1（码体已迁 `.wvmpc`、门内还认 `.wvmp`）的实测形态，
+   C2 同格同读数。归属待拍工具单，本单不修。
+2. `check_import_rewrite.py` 对 x86 `wvmp_x86_tls_sample` 报 `imm-hits=1` ⇒ `tls_e2e.sh` x86
+   正例格 FAIL；base/head 两枚产物同读数（产物本身逐字节相同）。与 C2 登记的第 2 笔同一条。
+3. `tests\wvmpTest\smoke_test.bat` 首构建路径恒 `exit /b 1`（Architect 01:5x 已转待拍）：本树
+   两 arch 各实测 `[ok] build\<arch>\test_target.exe` 后仍报 `wvmpTest build failed rc=`，
+   第二跑起正常出数 ⇒ 六件套读数以第 2/3 跑为准（"双跑 = 同组二进制两次执行 + diff"口径）。
+
+### 边界与遗留（明写，不当已成立）
+
+- 反证面是 **x64**（测试进程即 x64，注入靠 x64 VEH + TF 单步）；x86 侧只覆盖到"产物逐字节恒等 +
+  `tls_e2e.sh` 真机 rdtsc=true 格绿"，没有等价的 x86 注入反证（夹具要 32 位子进程，本树 x86
+  测试目标只建电池一枚，成本与本单收益不匹配）。x86 分支的 `sub`/`sbb` 语义由代码阅读与
+  `multi_carry` 的 x64 对照给出。
+- 注入只替换 `rdtsc` 这一个不可控输入源（`0F 31` → `CC 90`，等长）；判定链
+  `shl/or/mov/sub/cmp/ja/jmp` 与 FailFast 红线全部真实执行。真机（未注入）面由 `tls_e2e.sh`
+  的 rdtsc=true 格与 multiseed 覆盖。
+- TF 单步锚点认的是 `cmp rax,imm32` 的头两字节 `48 3D`；若日后该比较改形（如 `cmp imm8` 或换
+  寄存器），锚点未命中 ⇒ 探针以 `anchor_seen` 缺失显式红，不会静默给旧读数。
+- `rdtsc` 窗内目前只有 adb_init 的 `push/pop rax`，故 `r11`/`rdx` 存活论证成立；**若后续把任何
+  带 call 的块移进窗口**（现设计明写 DRx 的 GTC 调用在窗外，系统调用抖动会误报），`r11` 作为
+  caller-saved 会被 callee 合法破坏 ⇒ 该改动必须同步把第一读数挪进 `.wvmp` 暂存（x86 已有形），
+  并给本探针加"窗内有 call"的第 5 象限。这条是本单最容易被后人回踩的地方。
+- 阈值策略（变频/深休眠机器的启发式误报面）按判据留给后续单，见上「阈值口径已知边界」。
+
