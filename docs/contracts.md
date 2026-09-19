@@ -116,12 +116,26 @@ ProtectRules::CryptDecision  resolve_crypt(u64 begin_rva, u64 src_index, std::st
 
 ### 6.5 可直接跑的实例与预测法
 
+> 本小节的"实例"由 MIT-521（2026-09-19，分支 `mit-debt-a-docs` @ `0db5abf`）逐份真跑复算，
+> 输入输出全部落在仓库内（MIT-492 语料内聚后，仓外 `wvmpTest` 已不是输入面）。
+> §6.1~§6.4 的规则正文（选择器口径 / 查询面签名 / 仲裁序 / 冲突处理）**一字未改**——
+> 本小节动的只是实例路径与期望读数。
+>
+> **无规则基线的实测出处**（两份实例共用同一个靶标）：在仓库根跑
+> `build\cli\wvmp_cli.exe protect --config tests\wvmpTest\kernels.toml`（既无 `default_level`
+> 也无 `[[functions]]`）⇒ `区域清单` 打印 `[0]`~`[29]` 共 **30** 条 + `stub_link: 已生成 29 个
+> 入口 stub`。差的 1 区 = `[12] (marker@0xd73d)`（`kernels.cpp` 里的 `wv_lcg_next`）是**空打标
+> 区域**：lifter 判"RVA 区间为空/非法，跳过"、virtualize 判"无已 lift 的基本块，跳过虚拟化"
+> ⇒ 30−1=29。口径与成因见 `docs/GAPS.md`「语料口径：30 marker 区 − 1 空区 = 29 stub」小节。
+
 实例 A —— 只放行按名字点名的一个函数进 VM（靶标 = `tests\wvmpTest\smoke_test.bat`
 用的同一个 x64 test_target，区域清单 30 个 / 无规则基线 29 个入口 stub）：
 
 ```toml
-input  = "../wvmpTest/build/x64/test_target.exe"
-output = "../wvmpTest/build/x64/packed_level_by_name.exe"
+# 在仓库根执行：input/output 是**进程 CWD** 的相对路径（与 tests\wvmpTest\kernels.toml 同口径）。
+# input 先由 `tests\wvmpTest\build.bat x64` 产出（smoke_test.bat 走的同一个靶标）。
+input  = "tests/wvmpTest/build/x64/test_target.exe"
+output = "tests/wvmpTest/build/x64/packed_level_by_name.exe"
 seed   = 12345
 
 default_level = "none"          # 缺省：全部保持原生
@@ -129,11 +143,27 @@ default_level = "none"          # 缺省：全部保持原生
 [[functions]]                   # 只点名一个
 name  = "(marker@0xca11)"       # 名字口径 = 区域清单第 2 列
 level = "virtualize"
+
+[[passes]]                      # 管道必须显式列出。缺这一段 = 空管道，CLI 只回显配置就
+name = "pe_loader"              # 退出，一个 stub 也不生成（MIT-521 实测：修前两份实例都
+[[passes]]                      # 漏了 [[passes]]，"可直接跑的实例"名不副实）
+name = "marker_scan"
+[[passes]]
+name = "lifter"
+[[passes]]
+name = "virtualize"
+[[passes]]
+name = "stub_link"
+[[passes]]
+name = "pe_writer"
 ```
 
 ```
 已生成 1 个入口 stub            ← 29 条 "按配置 level=none 保持原生" Note
 ```
+
+（MIT-521 复算 = 实测值：`已生成 1 个入口 stub`，`按配置 level=none 保持原生` 的 Note **29**
+条 = 30 区 − 被点名进 VM 的 1 区。）
 
 CR-02 修复前同一配置的实读数：`无已虚拟化函数，跳过 stub 生成`（0 个 stub）——
 `name` 规则对档位面完全无效。反向配置（`default_level` 缺省 virtualize + 同一条规则
@@ -143,8 +173,9 @@ CR-02 修复前同一配置的实读数：`无已虚拟化函数，跳过 stub �
 两条都写、后声明者胜：
 
 ```toml
-input  = "../wvmpTest/build/x64/test_target.exe"
-output = "../wvmpTest/build/x64/packed_collision.exe"
+# 同上：仓库根执行、路径按 CWD 相对，input 由 `tests\wvmpTest\build.bat x64` 产出。
+input  = "tests/wvmpTest/build/x64/test_target.exe"
+output = "tests/wvmpTest/build/x64/packed_collision.exe"
 seed   = 12345
 
 [[functions]]                   # 声明序号 0
@@ -153,6 +184,19 @@ level = "none"
 [[functions]]                   # 声明序号 1 —— 与上条同指一函数，本条胜
 index = 0
 level = "virtualize"
+
+[[passes]]                      # 管道必须显式列出。缺这一段 = 空管道，CLI 只回显配置就
+name = "pe_loader"              # 退出，一个 stub 也不生成（MIT-521 实测：修前两份实例都
+[[passes]]                      # 漏了 [[passes]]，"可直接跑的实例"名不副实）
+name = "marker_scan"
+[[passes]]
+name = "lifter"
+[[passes]]
+name = "virtualize"
+[[passes]]
+name = "stub_link"
+[[passes]]
+name = "pe_writer"
 ```
 
 ```
@@ -160,10 +204,25 @@ level = "virtualize"
 [note] virtualize: 函数 (marker@0xca11) 命中 2 条 level 规则（跨选择器撞同一函数，按声明序后评胜）：生效 = 第 1 条 index=0 level=virtualize；被覆写 = 第 0 条 name='(marker@0xca11)' level=none
 ```
 
-两条对调声明序（`index = 0` 在前、`name` 在后）⇒ `生效 = 第 1 条 name='(marker@0xca11)'
-level=virtualize`，读数仍是 29。把后声明那条的档位换成 `level = "none"`（`name` 写
-virtualize 在前、`index = 0` 写 none 在后）⇒ **28 个 stub**（该函数被后评胜的 none 排除）。
-即：生效者只由声明序决定，**没有任何"选择器优先级"可依赖**。
+同一对规则只动**声明序**、或只动**档位**，四种组合的实读（`index=0` 与 `name` 都指到区域
+`[0]`；2026-09-19 MIT-521 逐组真跑，末列即该组 `stub_link` 的实际打印）：
+
+| 声明序 0（先） | 声明序 1（后） | 生效者（后声明者胜） | 入口 stub 实读 |
+|---|---|---|---|
+| `name` = none | `index=0` = virtualize | 第 1 条 `index=0` virtualize | **29** ← 实例 B 本身 |
+| `index=0` = virtualize | `name` = none | 第 1 条 `name` none | **28** ← 实例 B 两条**只对调顺序** |
+| `name` = virtualize | `index=0` = none | 第 1 条 `index=0` none | **28** |
+| `index=0` = none | `name` = virtualize | 第 1 条 `name` virtualize | **29** |
+
+即：生效者只由声明序决定，**没有任何"选择器优先级"可依赖**；而最终生效的档位取的是**胜者
+自己**那条的 `level`，不是"两条里较松的那个"——所以把实例 B 两条顺序对调，结果就从 29 翻到 28。
+
+> **435 注记（上表由 MIT-521 立，被替换的原句照录于此、不回改历史）**：此处此前的表述按字面
+> 跑会翻车，原文为：「两条对调声明序（`index = 0` 在前、`name` 在后）⇒ `生效 = 第 1 条
+> name='(marker@0xca11)' level=virtualize`，读数仍是 29。」实例 B 两条的档位是 `name=none` /
+> `index=virtualize`，只对调顺序 ⇒ 胜者换成 `name` 那条、档位随胜者 = none ⇒ 实读 **28** 而非
+> 29；原文的"仍是 29"只对上表第 4 行（对调顺序**且**同时互换两条档位）才成立。§6.5 是现行为
+> 口径而非历史读数，故按判据 3 改真值，原句留在本注记里可查。
 
 预测任一配置对某函数的实际效果，四步：
 
