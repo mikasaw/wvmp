@@ -20,8 +20,9 @@ constexpr u16 kMagicPe32Plus = 0x20B;
 constexpr u16 kMinOptionalHeaderSize = 64;
 
 // MIT-525 (CR-06): OptionalHeader 内两处绝对偏移，单一真源。
-// 与仓内既有 7 处本地定义数值必须完全一致（pe_writer_pass.cpp:70、
-// tls_hook_pass.cpp:54、import_protect_pass.cpp:30 及其各自测试副本）：
+// 数值必须与仓内其余本地定义完全一致（清单与现算行号登记在 docs/GAPS.md 的
+// MIT-525 节：pe_writer_pass.cpp:70 / tls_hook_pass.cpp:54 /
+// import_protect_pass.cpp:30 / stub_link_pass.cpp:228 及各自测试副本）：
 // PE32 = 96 (0x60) / PE32+ = 112 (0x70)。
 constexpr u64 data_directory_offset(bool pe32_plus) {
     return pe32_plus ? 112u : 96u;
@@ -167,10 +168,10 @@ PeImage parse_impl(std::span<const u8> image) {
     //  · x64（machine=0x8664）= 常态：表式 SEH 是 PE32+ 的强制组成，实测池内
     //    x64 样本 NumberOfRvaAndSizes=16、DataDirectory[3] 恒非空（Size 为 12
     //    的整倍数）；
-    //  · x86（machine=0x014C）PE32 = 通常无此表：Microsoft 的 x86 SEH 是栈链式
-    //    （.ehdr/_except 代码），没有 RUNTIME_FUNCTION 表，链接器把
-    //    DataDirectory[3] 写成 0/0（dumpbin 实测，见 MIT-453 triage）⇒ 本函数
-    //    在 x86 上自然落到 pdata_empty=true 的回退链，行为与修前逐字节一致。
+    //  · x86（machine=0x014C）PE32 = 通常无此表：Microsoft 的 x86 SEH 是运行时
+    //    链式登记，不由链接器落成静态表，`DataDirectory[3]` 写 0/0（MIT-453
+    //    dumpbin 实测 + 本单全池 20 枚 x86 输入复测 = (0,0)）⇒ 本函数在真实 x86
+    //    产物上自然落到 pdata_empty=true 的回退链，行为与修前逐字节一致。
     //  这里不设 machine 硬门，是为了不把"目录声明了就当没有"这一新语义塞进
     //  解析层：任何镜像（含合成夹具、非 MSVC 工具链产物）声明了异常目录，
     //  都按同一 12B 表式解释；解释不通（探尾/映射/升序/区间任一失败）一律回
