@@ -4896,6 +4896,100 @@ crypt 面两条口径的合计，单面漂移靠 `stubs` + `crypt_*` 三键夹�
 要宽判据就配 expect 收紧，别为哑锁立宪章。
 
 
+## MIT-525（C1 · CR-06+CR-07：PE 异常目录绝对定位 + 目录计数/区间校验，2026-09-19）
+
+**架构口径结论（判据 3，一句话先行）**：`pe_image` 决定"是否按 12 字节
+`RUNTIME_FUNCTION` 解释 `DataDirectory[3]`"的判据是**该目录存在且三层校验通过**，
+**不是 machine 值**——不设 machine 硬门。x64（`machine=0x8664` / PE32+）是常态：表式
+SEH 是 PE32+ 的强制组成，实测全池 52 枚 x64 输入 `NumberOfRvaAndSizes=16`、
+`DataDirectory[3]` 恒非空且 Size 为 12 的整倍数（合计 5555 条表项全部解出）；x86
+（`machine=0x014C` / PE32）**通常无此表**：x86 SEH 是栈链式（代码内 `_SEH` 记录，
+没有独立表），链接器把 `DataDirectory[3]` 写成 0/0 —— 实测全池 20 枚 x86 输入
+`dir[3] = (0, 0)`，修前修后同样落 `pdata_empty=true`，走 MIT-453 的
+区域表回退链（下一区域 begin / 节尾 cap），逐字节行为不变。**"合成 PE32 携带异常
+表"只成立于解析层单测夹具**（判据 1 的双格式对照），不代表真实 x86 产物携带该表；
+下游 `find_function_end_rva` / ExitNative 上界的消费方不得据此扩宽回退链语义。
+
+**CR-06 · PE32 数据目录读偏移多跳 4B（`pe_image.cpp`，修前 `:99`）**：读完
+FileAlignment(@opt+0x24) 后两种格式的 reader 都停在 `opt+0x28`，DataDirectory 起点是
+`opt+0x60`(PE32) / `opt+0x70`(PE32+) ⇒ 跳距应为 `0x38` / `0x48`，旧码写
+`skip_to_dir = plus ? 0x48 : 0x3C`。`0x3C` 的来源是注释里那条旧算式
+`0x60-0x24=0x3C` —— 其 `0x24` 是"漏读 BaseOfData"（MIT-414 之前）时代 reader 的落点，
+MIT-414 补读 BaseOfData 后该前提已不成立，算式没人回改。后果：PE32 把
+`DataDirectory[3].Size` 当成 RVA、把 `DataDirectory[4].RVA` 当成 Size，两者通常都是
+0 ⇒ 静默读空（真实 x86 产物本就无表，所以现网零症状、只在合成对照里露形）；PE32+
+侧 `0x48` 本就对，故缺陷单向偏置，**任何"两格式都跑一遍"的对照测试都是它的反证**。
+修法 = 改绝对定位：位置只由 `opt_start = pe_off + 24` +
+`data_directory_offset(plus)`（`pe_image.cpp:26`，112/96 单一真源）派生，
+不再携带 `r.off` 的隐含落点，旧算式就地更正。
+
+**CR-07 · 目录计数与区间零校验 + 按未校验 Size 预分配**：全文件
+`grep NumberOfRvaAndSizes` 修前零命中。修后三层校验一律先于任何按 Size 派生的分配：
+① `DataDirectory[0..3]` 这 `(3+1)*8` 字节必须完整落在声明的 `SizeOfOptionalHeader`
+区间内（不满足则连 `NumberOfRvaAndSizes` 那 4 字节也不读 —— 它本身也在声明区外，
+读了就是拿节表字节当目录）；② `NumberOfRvaAndSizes >= 4`；③ 探尾 —— 按 Size 派生的
+最后一条必须可映射且 12 字节齐，不满足即整表不可信、一条都不读。旧码在扫描前无条件
+`reserve(pdata_size/12)`，`Size=0xFFFFFFFF` 即 357,913,941 条（≈4.3GB）预分配（实测
+本单用例修前耗时 1027ms、修后 0ms 且一条都不分配）⇒ 本枚删除该 reserve。任一层
+不满足都记为"无异常目录"（`pdata_rva` 留 0），不抛错、不扩宽 `pdata_empty` 语义。
+
+**修前必红读数（枚1 commit message 全文照录，判据 1）**：`--gtest_filter=PeImagePdata.*`
+8 跑 7 红 —— `DualFormatReadsSameExceptionTable` PE32 侧 `pdata.size() = 0 vs 1`；
+`SmallNumberOfRvaAndSizesFallsBack` n=0/3 两档各读出 1 条（`find_function_end_rva`
+= 4480 而非 nullopt）；`NumberOfRvaAndSizesFourIsAccepted` PE32 侧 0 条；
+`ShortSizeOfOptionalHeaderFallsBack` 从节表 `.pd` 项的 name[4..7] + VirtualSize 拼出
+1 条"合法"表项；`HugeDirectorySizeDoesNotPreallocate` `capacity()=357913941 > 64`；
+`OldBugShapeIsNotMistakenForATable`（把 Size 与下一目录 RVA 互换的旧 bug 形态）与
+`Pe32SmallNumberOfRvaAndSizesFallsBack` 各误读 1 条。修后 8/8 绿，第 8 条
+`NoDirectoryAtAllStillParsesAndFallsBack` 是既有回退语义的回归保护档（修前修后都绿）。
+
+**待办登记：OptionalHeader 目录偏移仍有 6 处产品码本地定义（本波不抽取）**。数值全部
+一致（`DataDirectory` 起点 PE32=96(0x60) / PE32+=112(0x70)；`NumberOfRvaAndSizes`
+= 前者减 4 = 92 / 108），行号现算（HEAD d5690e0）：
+
+| 本地定义点 | 目录偏移 | 计数字段偏移 |
+|---|---|---|
+| `passes/pe_loader/src/pe_image.cpp` | `:26` `data_directory_offset`（本枚新增，绝对定位单一真源） | `:31` `num_rva_sizes_offset` |
+| `passes/pe_writer/src/pe_writer_pass.cpp` | `:70` `opt_data_dir_off` | `:69` `opt_num_rva_sizes_off` |
+| `passes/tls_hook/src/tls_hook_pass.cpp` | `:54` `opt_data_dir_off` + `:555` 内联副本 | `:53` |
+| `passes/import_protect/src/import_protect_pass.cpp` | `:30` `opt_data_dir_off` | 无（未读计数字段） |
+| `passes/stub_link/src/stub_link_pass.cpp` | `:228` 内联三元式 | 无 |
+| 测试侧副本（同值） | `test_pe_loader.cpp:116`、`test_import_protect.cpp:143/404`、`test_pe_writer.cpp:284` 起 16 处、`test_stub_link.cpp:280`、`test_tls_hook.cpp:244/506` | `test_pe_loader.cpp:117`、`test_import_protect.cpp:59/401`、`test_tls_hook.cpp:61` |
+
+抽公共头要一次改 4 个 pass 的文件面 ⇒ 越出本单判据 4 的 `git diff --stat` 白名单
+（只允许 `passes/pe_loader/**` + 其 `tests/**` + 本文件 + `docs/STATUS.md`），故本波
+按 Architect 裁决**只在 `pe_image.cpp` 单点修**，抽取留作独立单。**同批待办**：
+CR-07 那两层缺失在上表 `import_protect:30` / `pe_writer:70` / `tls_hook:54` /
+`stub_link:228` 四处目录读取里同样存在（它们也从不校验 `NumberOfRvaAndSizes`），
+本单不碰，登记为后续建议。
+
+**六件套 / 零扰动读数**：`scripts\build.bat` `[407/407]` rc=0，非 `.deps` 树内唯一告警
+仍是既有 `sse_bridge_sample_main.cpp` C4335（Mac 行尾，未触碰），本单两文件 0 告警；
+`scripts\test.bat` `100% tests passed, 0 tests failed out of 23`（目标数不减；
+`wvmp_pe_loader_tests` 内部用例 13 → 21）；REQUIRE_REAL=1 全池 multiseed
+**TOTAL: 360 pass / 0 fail**（72 槽 × 5 seeds，槽数自 `scripts/multiseed_e2e.sh` 的
+`samples` + `x86_samples` 两数组现算 = 52 x64 + 20 x86 = 72，主树口径；
+`mit-debt-b-poolgate` 分支的 76 槽 / 380 未合入本基线，不得混用）；逐样本零扰动 =
+上面"修前口径 / 修后口径"两套解出结果对全池 72 输入逐样本比对，差异 **0**
+（`pdata_empty` 标志与 RUNTIME_FUNCTION 三元组列表全等 ⇒ `find_function_end_rva`
+对任意查询 RVA 的读数逐样本不变，x64 无一枚新落回退链）。
+`static_scan_bare_immediates.ps1` `RESULT: PASS`（本单零 Keystone 文本，无新立即数）。
+
+**经验对照（base↔head 逐样本产物对拍，判据 6 的正证面）**：以 `608b826` 的
+`pe_image.cpp` 单独重编 `wvmp_cli` 与 `d5690e0` 各跑一次全池 protect（seed=12345，
+6-pass 流水线与 multiseed 同配置），逐样本比 packed 产物 sha256 与 `已生成 N 个入口
+stub` 读数 ⇒ **72/72 sha 恒等 + 72/72 stub 数恒等，差异 0**（52 x64 + 20 x86；
+`PROTECT_RC != 0` 计 0）。⇒ x64 侧 `0x48` 本就正确的结论由产物字节坐实，不需要
+"x64 此前也读错、现在一并修正"那一类的归因。本单未跑 wvmpTest 双 arch 与两把 dump
+门（本单判据未列，且逐样本产物恒等已把"码体/产物零变化"直接证掉）；复核单若按波次
+共同纪律 4 要求六件套全采，按其口径自采。
+
+**遗留风险**：① 本单只把**解析层**的 CR-06/07 修掉，x86 侧"有异常表就按 12B 解释"
+这一路径在真实产物上永不触发，其正确性只有合成夹具覆盖 ⇒ 若将来出现携带非零
+`dir[3]` 的第三方 x86 产物（非 MSVC 链接器），会被按表式 SEH 解释；② 层①用
+`SizeOfOptionalHeader` 而非 224/240 定长判定，遇到"声明区间虚报得比实际大"的畸形
+镜像仍会放行到层③才挡（层③已保证只在可映射时读）；③ 抽取公共目录偏移的待办未做
+（越界风险），下一处再错位的概率仍在。
 ## MIT-526 (C2 · CR-04 x64 TLS 回调 shadow space 与全分支栈平衡，2026-09-20) 落账
 
 > 交付面 = 分支 `mit-debt-c-tlsabi`（D0：未合 main、未 push），**基线 = 开工那一刻 `main` tip

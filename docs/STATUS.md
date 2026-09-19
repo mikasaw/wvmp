@@ -7,6 +7,9 @@
 > 追记（2026-09-19 · **B 波第三张 MIT-522 B0-3**，交付面 = 分支 `mit-debt-b-poolgate`，**基线 = B0-2 tip `608b826`（非 main）**，未合 main）：池内 `[[functions]]` 选择器路径由「全池零覆盖」转为**断言式复跑门禁**。`scripts/multiseed_e2e.sh` 加每样本规则挂点（sidecar，因 `default_level` 是 TOML 顶层键 ⇒ 插在 `[[passes]]` 块**之前**而非末尾追加）+ 精确读数断言：`stubs` / `selector_waive_notes` / `selector_arbitration_notes` / `translate_gate_notes` 四键必填，另有可选的豁免身份断言 `selector_waive_targets` 与加密摘要三键。4 个变体全打在已入池的 `wvmp_shift0_flags_sample.exe`（7 区 / 无规则基线 7 stub）上，不新建样本 ⇒ 池 **72→76 槽 × 5 seeds = 380**，实测 `TOTAL: 380 pass / 0 fail` exit 0。期望值按 R1 **跑前预测**：推导链写在 `scripts/multiseed_rules/*.expect.txt` 里，commit `852094d` 排在任何带规则实跑之前，首跑四槽全中、零回写。有 `.rules.toml` 而无同名 `.expect.txt` ⇒ 当场 FAIL 并点名缺文件（R2 fail-closed，绝不退回 `≥1` 那把哑锁）。门禁有效性做成可复跑反证 `bash scripts/multiseed_e2e.sh --selftest`（同一份 `evaluate_slot` 代码路径，不另抄一份解析逻辑）；零扰动证明按 R4 全量脚本化 `bash scripts/multiseed_rules/compare_baseline_cfg.sh 608b826`。**产品代码零改动**（判据 5 面：`passes/**` `cli/**` `vm/**` `framework/**` 零 diff；D3 冻结面 `kVmOpMax=164` / `kTableEntries=256` / `kCtxSize` / 跳表项数 / `keys.hpp` 零 diff）。逐单节见本文 `### MIT-522 (B0-3 · 池内选择器断言式回归门禁)`，证据链 GAPS 同名节。
 
 
+> 追记（2026-09-20 · **C 波首张 MIT-525 C1**，交付面 = 分支 `mit-debt-c-peinput`，基线 = main `608b826`，未合 main）：`pe_image.cpp` 异常目录改绝对定位（PE32 跳距 0x3C→0x38 的错位根除，112/96 单一真源）+ 三层校验先于分配（`NumberOfRvaAndSizes>=4` / 目录项落 `SizeOfOptionalHeader` 内 / 探尾可映射，并删掉按未校验 Size 的 4.3GB 级 `reserve`）⇒ 全池 360/360、base↔head 逐样本 72/72 packed sha 恒等。逐单节见本文 `### MIT-525 (C1 · CR-06+CR-07 PE 输入解析正确性)`，证据链 GAPS 同名节。
+
+
 > 追记（2026-09-20 · **C 波第二张 MIT-526 C2**，交付面 = 分支 `mit-debt-c-tlsabi`，**基线 = 开工现读
 > 的 main tip `18b354e`**，未合 main）：x64 TLS 回调 DRx 面调 `GetThreadContext` 的 **shadow space
 > 缺失（CR-04）** 修成 `sub/add rsp, 0x28`（32B shadow + 8B 对齐）。旧值 `sub 8` 只保 16B 对齐，
@@ -1540,6 +1543,33 @@ asmgen 零触碰 → dump 锚不受影响（无换代）。
   `../wvmp-poolgate` 内完成，未在主树 `wvmp` 落任何写操作。
   证据链 GAPS「MIT-522 (B0-3 · 池内选择器断言式回归门禁，2026-09-19)」节。
 
+### MIT-525 (C1 · CR-06+CR-07 PE 输入解析正确性) ✅ 2026-09-19
+- **CR-06**：`pe_image.cpp` 的 `skip_to_dir = plus ? 0x48 : 0x3C` 改绝对定位
+  `opt_start(=pe_off+24) + data_directory_offset(plus)`，112/96 单一真源（与
+  pe_writer/tls_hook/import_protect 既有口径同值）。旧值 `0x3C` 的算式 `0x60-0x24`
+  里 `0x24` 是 MIT-414 补读 BaseOfData **之前** reader 的落点 ⇒ PE32 多跳 4B，
+  把 `DataDirectory[3].Size` 当 RVA、`DataDirectory[4].RVA` 当 Size（PE32+ 侧本就对
+  ⇒ 单向偏置，只有"双格式对照"能反证）。
+- **CR-07**：三层校验先于任何按 Size 派生的分配 —— ①目录项落在 SizeOfOptionalHeader
+  内 ②`NumberOfRvaAndSizes>=4` ③探尾可映射；删除 `reserve(pdata_size/12)`
+  （旧码 `Size=0xFFFFFFFF` ⇒ 3.58 亿条 ≈4.3GB 预分配）。任一层不过 = "无异常目录"
+  （`pdata_empty=true`），不抛错、不扩宽回退链语义。
+- **架构口径**：解释与否由"目录存在 + 校验通过"决定，**不设 machine 硬门**；x64 常态、
+  x86 PE32 通常无此表（实测全池 20 枚 x86 输入 dir[3] 全 0/0 ⇒ 照旧走 MIT-453 回退链）。
+  合成 PE32 带表只是解析层夹具，不等于真实 x86 产物携带该表。
+- **测试**：`PeImagePdata` 8 用例入 ctest（枚1 先落 7 红，RED 原文在枚1 commit
+  message；修后 8/8 绿），含双格式三元组逐字段相等、`NumberOfRvaAndSizes=0/3/4` 三档、
+  短 SizeOfOptionalHeader（从节表 `.pd` 名字段拼出假表项）、Size 越界 capacity 探针、
+  旧 bug 形态还原档。
+- **读数**：build `[407/407]` rc0（非 `.deps` 唯一告警 = 既有 C4335）；ctest
+  `100% / 0 failed out of 23`（目标数不减，`wvmp_pe_loader_tests` 13→21）；
+  REQUIRE_REAL=1 全池 **TOTAL: 360 pass / 0 fail**（72 槽 × 5 seeds 现算）；
+  base↔head 逐样本 protect 对拍 **72/72 packed sha 恒等 + 72/72 stub 数恒等**；
+  静态扫描 PASS。冻结面（`kVmOpMax`/`kTableEntries`/`kCtxSize`/`ir::Op`/`keys.hpp`/
+  `asmgen.cpp`）零 diff，改动面 = `passes/pe_loader/**` + `docs/{GAPS,STATUS}.md`。
+- 分支 `mit-debt-c-peinput`（D0 未合 main、未 push）；证据链 GAPS
+  「MIT-525（C1 · CR-06+CR-07 …，2026-09-19）」节（含"目录偏移仍有 6 处产品码本地定义"
+  待办登记 + 那 4 处同类未校验读取的后续建议）。
 ### MIT-526 (C2 · CR-04 x64 TLS 回调 shadow space 与全分支栈平衡) ✅ 2026-09-20
 
 - **交付面 = 分支 `mit-debt-c-tlsabi`（D0：未合 main、未 push；基线 = 开工现读的 main tip
