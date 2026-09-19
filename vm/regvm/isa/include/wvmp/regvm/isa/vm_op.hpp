@@ -5,8 +5,9 @@ namespace wvmp::regvm::isa {
 
 // VM 操作码：与 ir::Op 一一同义（值从 1 起，0 为非法哨兵），外加 VM 专属操作。
 // 编码空间上限 14 位（kVmOpLimit）。运行时 dispatch 跳表按 opcode 低 8 位索引
-// （asmgen.cpp kTableEntries=128，MIT-374 起；此前 6 位 = 64 项，Subpd=63 恰好
-// 占满，Divss=64 起越界静默折叠到 halt）。追加枚举前先看 asmgen.cpp 的
+// （asmgen.cpp kTableEntries=256，MIT-510 起；此前 128 项 = MIT-374 起 7 位，
+// 再前 64 项 = 6 位，Subpd=63 恰好占满，Divss=64 起越界静默折叠到 halt）。
+// 追加枚举前先看 asmgen.cpp 的
 // static_assert(kVmOpMax < kTableEntries) 是否仍成立。
 // 编码空间上限 14 位（kVmOpLimit）；MIT-404 起用到低 8 位（kVmOpMax=79，
 // Idiv；256 项 (MIT-510 扩容)跳表内，static_assert 见 asmgen.cpp kTableEntries），

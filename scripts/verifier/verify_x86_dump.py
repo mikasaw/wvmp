@@ -10,8 +10,9 @@ Why this gate exists:
     1. dump 布局头齐全（entry=+0x0 / dispatch / table）+ arch: x86 标记行；
     2. 全码体 capstone CS_MODE_32 线性可解码到跳表起点（数据段前），
        entry 首四条 = push/call/pop/sub（D2 call/pop idiom）；
-    3. dispatch 含 and <r>, 0x7f（kTableEntries-1 掩码）+ 间接 jmp（D3 8B
-       表项决策的落地证据）；
+    3. dispatch 含 and <r>, kTableEntries-1 掩码 + 间接 jmp（D3 8B 表项决策的
+       落地证据）。掩码不写字面量：由 dump 跳表标记行的项数派生，再与代码侧
+       asmgen.cpp 的 kTableEntries 对账（MIT-503：扩容曾把门留在 0x7F 上空转）。
     4. 电池集 handler（X3c 批次三起 60）全部在 dump 中登记（跳表缺项折叠 Halt 的
        对账面），
        每个登记 handler 的码体反汇编至少含 1 条指令（空 handler 检测）；
@@ -25,18 +26,23 @@ Input:
   --code <runtime_image_x86.bin> 可选：码体二进制（--pe 提取面由 X4 stub
                                  单接手；当前电池产物经 --dump-bin 落盘，
                                  或直接用电池 exe 的 image.code）
-  无 --code 时仅做 dump 文本静态审（1/2/4 项的反汇编项跳过并披露）。
+  无 --code 时仅做 dump 文本静态审：1/2/4 项的反汇编项（entry idiom、
+  dispatch 掩码、handler 码体非空）逐项显式 SKIP 披露，判词为 INCOMPLETE
+  而非 PASS（MIT-503：此前三项整段静默跳过仍打裸 PASS，等于没跑）。
 
-Exit codes: 0 = PASS; 1 = FAIL; 2 = tooling error.
+Exit codes: 0 = PASS; 1 = FAIL; 2 = tooling error;
+            3 = INCOMPLETE —— 反汇编审未执行（未传 --code，或 capstone 不可用）。
+            3 不得计为通过。
 
 Usage:
   python scripts\\verifier\\verify_x86_dump.py --asm runtime_dump_x86.txt \
-      [--code runtime_image_x86.bin]
+      --code runtime_image_x86.bin
 """
 
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import sys
 
@@ -80,6 +86,19 @@ HEADER_RE = re.compile(
     r"; regvm runtime image: entry=\+0x0, dispatch=\+0x([0-9a-fA-F]+), "
     r"table=\+0x([0-9a-fA-F]+), total=(\d+)")
 HANDLER_RE = re.compile(r"; ---- handler (\S+) @ \+0x([0-9a-fA-F]+) ----")
+# 跳表标记行 = 掩码的产物侧真源（asmgen 以 std::to_string(kTableEntries) 发射）。
+TABLE_RE = re.compile(
+    r";\s*---- jump table @ \+0x([0-9a-fA-F]+) \((\d+) x u64")
+# 代码侧真源：asmgen.cpp 的 constexpr（脚本在仓内即可直读，不再手抄字面量）。
+ASMGEN_RELPATH = os.path.join("vm", "regvm", "runtime", "src", "asmgen.cpp")
+KTABLE_RE = re.compile(r"constexpr u64 kTableEntries = (\d+)")
+AND_OPERAND_RE = re.compile(r",\s*0x([0-9a-fA-F]+)\s*$")
+# 依赖 --code 的反汇编审项 —— 未执行时必须逐项披露，不得静默。
+DISASM_ITEMS = (
+    "entry 首四条 push/call/pop/sub（D2 idiom）",
+    "dispatch 掩码 + 寄存器间接 jmp（D3）",
+    "每个 handler 码体首条可解码（空 handler 检测）",
+)
 
 
 def fail(msg: str) -> None:
@@ -87,10 +106,31 @@ def fail(msg: str) -> None:
     sys.exit(1)
 
 
+def incomplete(msg: str) -> None:
+    print(f"[x86-dump-gate] SKIP {msg}")
+    for item in DISASM_ITEMS:
+        print(f"[x86-dump-gate]   SKIP 反汇编审项未执行：{item}")
+    print("[x86-dump-gate] INCOMPLETE —— 反汇编审未执行，不计为 PASS")
+    sys.exit(3)
+
+
+def code_side_table_entries():
+    """读 asmgen.cpp 的 kTableEntries；不可读时返回 (None, 路径)。"""
+    root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    path = os.path.join(root, ASMGEN_RELPATH)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            m = KTABLE_RE.search(f.read())
+    except OSError:
+        return None, path
+    return (int(m.group(1)) if m else None), path
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--asm", required=True)
-    ap.add_argument("--code", default="")
+    ap.add_argument("--code", default="",
+                    help="码体镜像 .bin；不传则反汇编审三项整段跳过 → INCOMPLETE(exit 3)")
     args = ap.parse_args()
 
     try:
@@ -113,6 +153,43 @@ def main() -> None:
     print(f"[x86-dump-gate] header ok: dispatch=+0x{dispatch_off:x} "
           f"table=+0x{table_off:x}")
 
+    # 1b. 掩码单一真源：dump 跳表项数派生 → 与代码侧 kTableEntries 对账。
+    #     任何一方单独扩容都会在这里断掉，而不是留下"改了码没改门"的空转锁。
+    tm = TABLE_RE.search(text)
+    if not tm:
+        fail("跳表标记行缺失，无法派生 kTableEntries（掩码真源断链）")
+    if int(tm.group(1), 16) != table_off:
+        fail(f"跳表标记偏移 +0x{int(tm.group(1), 16):x} != 头 table=+0x{table_off:x}")
+    dump_entries = int(tm.group(2))
+    if dump_entries & (dump_entries - 1):
+        fail(f"kTableEntries={dump_entries} 非 2 的幂，掩码派生不成立")
+    code_entries, asmgen_path = code_side_table_entries()
+    if code_entries is None:
+        print(f"[x86-dump-gate] WARN: 读不到代码侧 kTableEntries（{asmgen_path}），"
+              f"掩码仅由 dump 跳表标记派生，无对账")
+    elif code_entries != dump_entries:
+        fail(f"掩码真源对账失败：dump 跳表 {dump_entries} 项 != asmgen.cpp "
+             f"kTableEntries {code_entries} 项（扩容后须用当前树重采 dump）")
+    mask = dump_entries - 1
+    mask_src = "dump 跳表标记" if code_entries is None else "dump 跳表标记 × asmgen.cpp 对账"
+    # 文本侧 dispatch 的 and 立即数也须等于派生掩码（先于 --code 的交叉证据）。
+    dispatch_block = re.search(r"\ndispatch:\n(.*?)(?=\n; ---- handler |\Z)",
+                               text, re.S)
+    if not dispatch_block:
+        fail("dump 文本 dispatch: 段缺失，无法核对掩码")
+    text_masks = []
+    for line in dispatch_block.group(1).splitlines():
+        stmt = line.strip()
+        if stmt.startswith("and"):
+            am = AND_OPERAND_RE.search(stmt)
+            if am:
+                text_masks.append(int(am.group(1), 16))
+    if mask not in text_masks:
+        fail(f"dump 文本 dispatch 缺 and <r>, 0x{mask:X}（kTableEntries-1，"
+             f"源：{mask_src}）；实得 {['0x%X' % m for m in text_masks]}")
+    print(f"[x86-dump-gate] mask ok: kTableEntries={dump_entries} → and <r>, "
+          f"0x{mask:X}（源：{mask_src}）")
+
     # 2. handler 登记面：电池集全覆盖 + 偏移单调（码序随机，偏移互不重叠）。
     handlers = HANDLER_RE.findall(text)
     names = [n for n, _ in handlers]
@@ -127,14 +204,12 @@ def main() -> None:
     print(f"[x86-dump-gate] handlers ok: {len(names)} 登记项（电池集 "
           f"{len(BATTERY_HANDLERS)} 全覆盖）")
 
-    # 3. 码体反汇编（可选 —— 需要 --code）。
+    # 3. 码体反汇编（需要 --code；缺它这三项一律不静默跳过）。
     if args.code:
         try:
             import capstone
         except ImportError:
-            print("[x86-dump-gate] WARN: capstone 不可用，反汇编审跳过（文本审已过）")
-            print("[x86-dump-gate] PASS (text-only)")
-            return
+            incomplete("capstone 不可用：--code 已传，但反汇编审无法执行")
         try:
             with open(args.code, "rb") as f:
                 code = f.read()
@@ -150,12 +225,19 @@ def main() -> None:
                 break
         if seq[:4] != ["push", "call", "pop", "sub"]:
             fail(f"entry 首四条 = {seq}，期望 push/call/pop/sub（D2 idiom）")
-        # dispatch 掩码 + 间接跳转。
+        # dispatch 掩码 + 间接跳转。掩码 = 派生值，不在此手抄字面量。
         d_text = []
+        d_masks = []
         for insn in md.disasm(code[dispatch_off:dispatch_off + 48], dispatch_off):
-            d_text.append(f"{insn.mnemonic} {insn.op_str}")
-        if not any(t.startswith("and") and "0x7f" in t for t in d_text):
-            fail("dispatch 缺 and <r>, 0x7f（kTableEntries-1）")
+            stmt = f"{insn.mnemonic} {insn.op_str}"
+            d_text.append(stmt)
+            if insn.mnemonic == "and":
+                am = AND_OPERAND_RE.search(stmt)
+                if am:
+                    d_masks.append(int(am.group(1), 16))
+        if mask not in d_masks:
+            fail(f"dispatch 缺 and <r>, 0x{mask:X}（kTableEntries-1，"
+                 f"源：{mask_src}）；码体实得 {['0x%X' % m for m in d_masks]}")
         if not any(t.startswith("jmp") and not t[4:5].isdigit() and "0x" not in t
                    for t in d_text):
             fail("dispatch 缺寄存器间接 jmp（8B 表项决策落地）")
@@ -165,8 +247,10 @@ def main() -> None:
             first = next(md.disasm(code[o:o + 8], o), None)
             if first is None:
                 fail(f"handler {name} 码体首条不可解码")
-        print("[x86-dump-gate] disasm ok: entry idiom / dispatch mask / "
-              f"{len(handlers)} handler 首条全可解码")
+        print("[x86-dump-gate] disasm ok: entry idiom / dispatch mask "
+              f"0x{mask:X} / {len(handlers)} handler 首条全可解码")
+    else:
+        incomplete("未传 --code：只做了 dump 文本静态审，码体反汇编审整段未执行")
 
     print("[x86-dump-gate] PASS")
 

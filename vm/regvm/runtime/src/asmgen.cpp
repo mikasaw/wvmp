@@ -5,15 +5,15 @@
 //
 // ============================== 机器码布局 ==============================
 //
-//   [entry][dispatch][handler..（码序随机）][0x90 垫片至 8 对齐][跳转表 128xu64]
+//   [entry][dispatch][handler..（码序随机）][0x90 垫片至 8 对齐][跳转表 kTableEntries x u64]
 //    ^入口    ^取指/跳表   ^各自独立 ks_asm          ^表项=handler 相对码基址偏移
 //   [cond 表 16xu64]（MIT-494s：jcc 私有 cc 块跳表，紧随跳转表之后；表项同构）
 //
 //   - 入口在 code 偏移 0：`lea BASE,[rip-7]` 取得码基址（位置无关），
 //     保存 Win64 callee-saved（rbx/rbp/rdi/rsi/r12-r15 共 8 个），RCX 的
 //     VmContext* 存入随机指派的 CTX 寄存器，初始化后跌入 dispatch 循环；
-//   - dispatch：fetch `T8=[BYTE+PC*8]` → `and T0,kTableEntries-1`（=0x7F，
-//     MIT-374 起 7 位）→
+//   - dispatch：fetch `T8=[BYTE+PC*8]` → `and T0,kTableEntries-1`（=0xFF，
+//     MIT-510 起 8 位；掩码由 kTableEntries-1 自动导出，勿在别处手抄字面量）→
 //     `T1=[BASE+T0*8+表偏移]` → `add T1,BASE` → `jmp T1`（表偏移为 disp32）；
 //   - 每个 handler 末尾 `add PC,1; jmp dispatch`（Jmp/Jcc 直接改写 PC）；
 //   - Halt：写回 ctx->pc 与 ctx->ret_value(=regs[v0])，恢复现场 ret。
