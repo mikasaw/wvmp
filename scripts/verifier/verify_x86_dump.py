@@ -102,7 +102,7 @@ DISASM_ITEMS = (
 
 
 def fail(msg: str) -> None:
-    print(f"[x86-dump-gate] FAIL {msg}")
+    print(f"[x86-dump-gate] RESULT: FAIL - {msg}")
     sys.exit(1)
 
 
@@ -110,7 +110,7 @@ def incomplete(msg: str) -> None:
     print(f"[x86-dump-gate] SKIP {msg}")
     for item in DISASM_ITEMS:
         print(f"[x86-dump-gate]   SKIP 反汇编审项未执行：{item}")
-    print("[x86-dump-gate] INCOMPLETE —— 反汇编审未执行，不计为 PASS")
+    print("[x86-dump-gate] RESULT: INCOMPLETE - 反汇编审未执行，不计为 PASS")
     sys.exit(3)
 
 
@@ -252,7 +252,8 @@ def main() -> None:
     else:
         incomplete("未传 --code：只做了 dump 文本静态审，码体反汇编审整段未执行")
 
-    print("[x86-dump-gate] PASS")
+    print("[x86-dump-gate] RESULT: PASS - 文本审 + 反汇编审（掩码 0x%X，%d handler）全过"
+          % (mask, len(handlers)))
 
 
 if __name__ == "__main__":
