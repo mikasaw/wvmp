@@ -241,7 +241,114 @@
   兜底"，而是有独立频率数据与行为承诺的裁决面。）
 - 注意与重定位/ASLR 的配合：RVA + image_base 在运行时还原，不依赖静态 VA。
 
-## 指令族支持矩阵（阶段总览，MIT-GZ 收口定稿 2026-08-31）
+## 指令族支持矩阵（当前口径，2026-09-19 实测 · 单一真源）
+
+> **真源约定（本矩阵与 README / STATUS 的关系）**：本矩阵是 WVmp 指令面支持
+> 状态与量化指标（`kVmOpMax` / 跳表容量 / baseline 池总数 / x87 与 ymm 的
+> arch 归属 / gate 分档）的**单一真源**。`README.md`、`README.zh-CN.md` 的
+> 徽章与 Gate 边界表、`docs/STATUS.md` 的逐单节都是本矩阵的镜像：三处对同一
+> 指标读数不一致时**以本矩阵为准并改那三处**；反向拿 README 或某个逐单节当
+> 依据即为违规。本矩阵全部数字取自 2026-09-19 在 main `54db77f`（A 波
+> 线 1~3 合入后）的实际命令输出，逐格复算命令见下表。
+>
+> **435 纪律（append-only，逐单节不回改历史数字）**：① GAPS 各 `## MIT-xxx`
+> 节与 STATUS 各 `### MIT-xxx` 行只追加——池总数从 355 变 360 后，355 作为
+> F3 样本入池前的历史读数**永久留在历史节原文里**，不追改；② 历史口径被翻案
+> 时（如 x87 从"永久 gate"翻为"x86 侧虚拟化"）原节原文不动，由本矩阵 + 原节
+> 顶部的取代注记完成翻面；③ 发现历史数字有误，用注记修正（追加一句"该处读数
+> X，实测应为 Y，成因 Z"），不抹平。下面「指令族支持矩阵（历史快照
+> 2026-08-31）」一节就是按此纪律原样保留的历史快照。
+
+| 指标 | 读数（2026-09-19 实测） | 复算命令 |
+|---|---|---|
+| `kVmOpMax` | **164**（末位枚举子 `YmmPandn`） | `sed -n '689p' vm/regvm/isa/include/wvmp/regvm/isa/vm_op.hpp` → `kVmOpMax = static_cast<u16>(VmOp::YmmPandn); // MIT-513: 164`；静态复算：该 enum 自 `Mov = 1` 起连续、全枚举仅 1 处显式赋值 ⇒ 枚举子计 164 个；编译期由 `asmgen.cpp:356` `static_assert(kVmOpMax < kTableEntries)` 兜底（越界即编译失败，不再运行时空转） |
+| dispatch 跳表容量 | **256 项**（掩码 = `kTableEntries-1` = `0xFF`，自动导出），余量 **91** = 256 − (164+1) | `sed -n '355p' vm/regvm/runtime/src/asmgen.cpp` → `constexpr u64 kTableEntries = 256;`（MIT-510 按冻结契约批量前置条款 128→256） |
+| baseline 池总数 | **360 pass / 0 fail** = 72 槽 × 5 seeds | `bash scripts/multiseed_e2e_real.sh` → `[multiseed] TOTAL: 360 pass / 0 fail`；算式独立复算：`awk '/^samples=\(/,/^\)/' scripts/multiseed_e2e.sh \| grep -c '\.exe'` = **52**、`x86_samples=(` 同法 = **20**、`seeds=(…)` 计 **5** ⇒ (52+20)×5 = **360** |
+| ctest 目标数 | **23**（全绿） | `scripts\test.bat`（MIT-380 起旧 "15/15" 字样已过期） |
+| x87 (D8-DF) | **x86 ✅ 虚拟化**（L0–L4）/ **x64 ⛔ 架构 gate** | 见下矩阵行；证据链 GAPS MIT-509 / MIT-510 |
+| ymm / VEX.256 | **x64 ✅ 虚拟化**（`vzeroupper`/`vzeroall` + `vmov*` 32B + 18 条 packed 算术）/ **x86 ⛔ 架构 gate** | 见下矩阵行；证据链 GAPS MIT-511~514 |
+| wvmpTest 语料面 | marker 函数 **30 区**（`kernels.cpp` 27 + `avx_kernels.cpp` 3）→ x64 **29 stub** / x86 **26 stub**，缺口 1 区为**语料缺陷**（见下「语料口径」小节，非产品 gate） | `git grep -c PROTECT_BEGIN -- tests/wvmpTest` → `kernels.cpp:28`（含 `:7` 一处文件头用法注释）+ `avx_kernels.cpp:3` + `wvmp_protect.h:2`（宏定义/`#undef`，不是区域）⇒ 真实 marker = 27+3 = 30；`tests\wvmpTest\smoke_test.bat` → `已生成 29 个入口 stub` |
+
+### gate 分档（三档，与 README「Gate boundaries」表逐行对齐）
+
+- **架构 gate**——该 arch 的代码生成不产生该指令族，翻面无意义：x87 在 x64
+  （MSVC x64 浮点默认 SSE）、ymm/VEX.256 在 x86（MSVC x86 无 VEX 发射面）、
+  EVEX 双侧未提升。
+- **频率 gate**——证据驱动翻面，触发条件在档：SSE+ymm 混排协议、
+  `vextractf128`/`vinsertf128` 桥、BMI2 `mulx`/`pdep`/`pext`、SIMD 尾族
+  （pmovmskb / pcmpeq / pcmplt / punpck 系）、SSE2 整数档② paddq/psubq。
+  挂账追踪单 = MIT-521。
+- **永久 gate**——已裁决不做：无防御表间接 jmp、SEH/段覆盖、blsr 族四条
+  （语料 0 命中）、16-bit 目标（PE 格式白名单）。
+- **挂账偏差（不属于任何一档 gate）**——指令面**支持**、但运行时某档行为与
+  SDM 有已知偏差且待独立单修正。当前只有一条，见下小节；把它写进 gate 三档
+  的任何一档都是错的（既不是"该 arch 不产生"，也不是"频率不值得"，更不是
+  "裁决不做"）。
+
+**已知运行时移位掩码偏差（挂账，待独立单修正；MIT-490 (T74) 交付评论
+「遗留风险与上报」第 1 条原句，逐字入档）**：
+
+> x64 运行时移位掩码在 S32 上取 6 位（`asmgen.cpp:1045`），与 SDM 的 5 位规定
+> 不符（x86 侧 `:4768` 正确）；`cl=32` 的 S32 移位原生为 no-op 而 VM 会真移位
+> —— 翻译期 liveness 已按 SDM 保守建模，运行时该档待独立单修正。
+
+（行号已于 2026-09-19 在 main `54db77f` 重钉：x64 `asmgen.cpp:1045` =
+`and cl, (s <= 1 ? "0x1F" : "0x3F")`，x86 `:4768` = `and cl, imm(0x1F)` 并注明
+"32 位模式全宽统一"，与原句所述两处一致。该档目前无运行时断言覆盖——
+MIT-490 层②刻意用 `count=64` 而非 `32@S32` 绕开，已立为 B 波首张候选。）
+
+### 语料口径：30 marker 区 − 1 空区 = 29 stub（成因 = 语料缺陷，不是产品 gate）
+
+`wv_lcg_next`（`tests/wvmpTest/src/targets/kernels.cpp:499`）的
+`PROTECT_BEGIN`/`PROTECT_END` 打标对**之间没有指令**（LCG 式子写在 end 宏之后），
+上游语料缺陷；线 3（MIT-492）按"内容一致"原样入库并落账。读数链条必须按下面
+这个口径写，否则会被误读成"有一个区域被产品 gate 掉了"：
+
+```
+git grep -c PROTECT_BEGIN -- tests/wvmpTest/src/targets/kernels.cpp  = 28
+  − 1（:7 是文件头用法示例注释，不是区域）                            = 27 真实 marker
+  + 3（avx_kernels.cpp）                                             = 30 marker 函数
+  − 1（wv_lcg_next 空打标区域，无词可 lift）                          = 29 stub（x64）
+x86 侧对称：27 − 1 = 26 stub（kernavx 是 x64 专属 TU，不参与 x86 计数）
+```
+
+打壳日志侧的对账证据：`[note] lifter: 函数 '(marker@0xd73d)': RVA 区间为空/非法，
+跳过` + `[note] virtualize: 函数 (marker@0xd73d) 无已 lift 的基本块，跳过虚拟化`
+—— 全池其余 29 区 0 条 gate note。**修面归属**：补这个空区会同时改动双 arch 的
+stub 数与 README 读数，归 B 波语料候选单，不在文档单修（本单只登记成因与边界）。
+
+## 指令族支持矩阵（当前口径，2026-09-19 实测）
+
+| 指令族 | 状态 | 裁决/实现要点 | 出处 |
+|---|---|---|---|
+| GP 算术/逻辑/移位/位技巧（含 div/idiv、movzx/movsx、popcnt/lzcnt/tzcnt、shift/rot 全谱） | ✅ 支持 | 上节 08-31 行全部维持；**新增**：零次移位（`Shl/Shr/Sar` + `*Cl` + 立即数形）flags 活跃性改判为条件定义，不再杀前驱 `cmp/test`——`FlagSem::kWriteConditional`，立即数形按有效计数细化 | MIT-351~355 / MIT-404 / C2 收口 / MIT-433 / **MIT-490 (T74)** |
+| 区域内 ret / ret imm16 | ✅ 支持 | 同 08-31 行 | MIT-438 (X1b) |
+| 浮点 SSE 全族（标量+packed+mem 形） | ✅ 支持 | 同 08-31 行 | MIT-371~376 / 408 / 411 / 425 |
+| SSE2 整数位运算档① + GP↔xmm 桥 + 对齐传送 | ✅ 支持 | 档② paddq/psubq 本体维持**频率 gate**（实测 16/854k ≈ 0.002%） | MIT-425 / 427 / 428 |
+| VEX.128 档A（38 id V-pair） | ✅ 支持 | 零新 VmOp 折叠 | MIT-426 (G6a) |
+| BMI1/2 六条（andn/bzhi/rorx/shlx/sarx/shrx） | ✅ 支持 | flagless 载体域 22 | MIT-434 (G8a) |
+| lock 前缀原子族 | ✅ 支持 | strip-and-execute | MIT-419 / MIT-423 |
+| 串指令 rep {movs,stos,scas,cmps,lods} | ✅ 支持 | 微程序展开；DF=0 假定披露 | MIT-415 (G3) |
+| 跳转表（受限模板）/ callgate FP 与寄存器参数桥 | ✅ 支持 | 防御常数双编码；callgate 扩为寄存器参数桥 + fastcall 样本入池 | MIT-409 / 413 / 417 / **MIT-498 / MIT-499** |
+| **x87 全族（D8-DF）** | **x86 ✅ 虚拟化 / x64 ⛔ 架构 gate** | **08-31 的"⛔ 永久 gate"已翻案**：L0（fld/fstp/fsub 族 + FCOMPI）→ L1–L4（fcom 族、fcmov（keystone 不装配 → and 掩码 + jz/jnz + fld/fstp 组合模拟）、fxch/ffree、超越 12 词、fninit 族）在 x86 全虚拟化；x64 侧维持架构 gate（MSVC x64 默认 SSE），x87 路由有架构门回归实证 | **MIT-509 / MIT-510**（旧口径见后文「x87 (永久 gate, R3 裁决)」节，按 435 原文保留） |
+| **ymm / VEX.256 算术** | **x64 ✅ 虚拟化 / x86 ⛔ 架构 gate** | **08-31 的"⛔ 档B 后续波次"已交付**：wave1 `kCtxSize` 0x1C8→0x3C8 + `ctx.ymm[16]` + `vzeroupper`/`vzeroall`；wave2① `YmmMov/YmmLoad/YmmStore`（按需 stub ymm 同步，无 ymm 产物字节恒等）；wave2② `YmmAddps..YmmPandn` 18 条 packed 算术；wave2③ 挂账清偿收口。x86 无 VEX 发射面 → 架构 gate | **MIT-511 / 512 / 513 / 514** |
+| SSE+ymm 混排协议 / `vextractf128`+`vinsertf128` 桥 / BMI2 `mulx`+`pdep`+`pext` | ⛔ 频率 gate（触发条件在档） | 混排 = fail-closed 整函数原生（gate 行为正确）；桥实证存在于 intrinsic 归约场景（+2 VmOp 小工程）；BMI2 技术面无阻塞、待用户产品决策（Zen5 实测 mulx 不写 CF/ZF，分叉消解） | MIT-514 / MIT-520 / MIT-521 / MIT-515 |
+| SIMD 尾族三行（pmovmskb / pcmpeq-pcmpgt / punpck 系） | ⛔ 频率 gate（分层定稿） | 同 08-31 行；lqdq/hqdq gate 不折 | MIT-432 §1/§1.4 + MIT-GZ D1 |
+| blsr 族四条（blsr/blsi/blsmsk/bextr） | ⛔ 永久 gate | 语料 27 文件命中 0 | MIT-432 §6.4 + MIT-GZ B.1 |
+| 间接 jmp 无防御表 / SEH·`fs:[…]`段覆盖 / EVEX 全谱 / FMA / 加密 | ⛔ 永久 gate | 静态可分析表形 < 0.001%（形级口径）；SEH 需异常派发器配合；EVEX 未提升 | MIT-409 / MIT-455 §3.2 / MIT-494x / MIT-412 |
+| x86 (PE32) 平台 | ✅ 支持 | 08-31 行的 wvmpTest 读数 **12/14 = 85.7% 属 2026-09-03 前快照**；2026-09-19 对仓内语料重测 = **26/27 = 96.3%**（唯一缺口是 `wv_lcg_next` 空区 = 语料缺陷），mul64hi 栈深面已由 X5b 永久 gate 翻面（esp-resync 前瞻 + callee `ret N` 扫描，x86 22/22 区域真虚拟化） | MIT-446~456 / **MIT-497 / MIT-500** / **MIT-492** |
+| 16-bit 目标 | ⛔ 不可行 | PE 格式白名单只收 0x014C/0x8664 | MIT-412 |
+
+> 逐族实现细节仍以本节之后各 G/C 逐单节与 `.multica/` triage 为准；那些章节里的
+> baseline / `kVmOpMax` / 覆盖率数字是**各自收口时点的历史读数**，与上表冲突时
+> 以本表为准（435 纪律：不回改历史数字，只在此处校准口径）。
+
+## 指令族支持矩阵（历史快照，MIT-GZ 收口定稿 2026-08-31）
+
+> **取代注记（2026-09-19，MIT-493 线 4）**：本节按 435 纪律**原样保留**，包括
+> "权威基线 240/240、`kVmOpMax=97`、跳表余量 30"与 x87 / ymm 两行的 ⛔ 判定
+> ——它们都是 2026-08-31 时点的真实读数，不是错误。当前口径见上一节
+> 「指令族支持矩阵（当前口径，2026-09-19 实测）」，**读 gate 结论一律读那一节**。
 
 > 读者五分钟全景：什么被保护、什么保持原生、为什么。每行一个可点名的
 > triage/裁定出处；数字全部回溯权威源（权威基线 multiseed 48 样本 × 5 =
@@ -584,6 +691,13 @@ shld/shrd → 维持（X3）；std → gate 面（G3 行）。x86 侧全部为�
 硬拒维持，X0 §F.3 证据分级），x64 侧 = 全链 E2E 实证。
 
 ## x87 (永久 gate, R3 裁决) —— 文档化不保护
+
+> **取代注记（2026-09-19，MIT-493 线 4）**：本节标题与正文所述"永久 gate"是
+> **2026-08-30/31 时点的裁决**，按 435 纪律原文保留。**x87 已翻面**：x86 侧
+> L0（MIT-509）→ L1–L4（MIT-510）全虚拟化，x64 侧才维持架构 gate（MSVC x64
+> 默认 SSE）。要读 x87 的当前状态请读「指令族支持矩阵（当前口径，2026-09-19
+> 实测）」，不要在本节下结论。本节仍有价值的部分：全族清单表、频率数据、
+> 以及 `wvmp_x87_gate_sample` 这个 x64 侧 gate 行为回归样本的存在性。
 
 **状态（2026-08-30，MIT-416/G5r triage 实测 + MIT-418/R3 收口）：x87 全族
 （D8-DF）入标记区 → lifter "未支持指令" note → C1 gate 整函数保持原生 →
@@ -4281,3 +4395,99 @@ rva 定位需对照区域清单（marker rva ≠ 函数 rva）。
 vextractf128/vpbroadcast 未入面系 intrinsic 场景真实存在——与 ② 呼应）→
 本单收口。**队列清空，下一轮需用户输入**（候选：② 桥入面、① 混排协议
 翻面、BMI2 通路 A、wvmpTest 继续扩面、或用户新方向）。
+
+## MIT-490 (T74 · A波-1 CR-01 零次移位 flags 活跃性改判条件定义) 落账（2026-09-19，线 4 代线 1 补账）
+
+**为什么由线 4 补**：线 1 分支 `mit-debt-a-flags-liveness` 的三枚 commit
+（`8c69e58` / `e0d9f90` / `b4cab41`）`git show <sha> --numstat -- docs/` **全空**
+（MIT-495 快审 F1 转记）。本节数字逐字取自 MIT-490 交付评论与 MIT-495 PASS 评论
+的实测读数，线 4 未重测（线 4 边界禁触产品代码与测试面）。
+
+**修复面**：`Shl/Shr/Sar` + `ShlCl/ShrCl/SarCl` 从无条件 `FlagSem::kWrite` 改判为
+**条件定义**（新增 `kWriteConditional`），零计数档不再杀前驱 `cmp/test`；立即数形
+按计算后的有效计数细化（§F.1 妥协档**未采纳**，因此不存在"立即数形保守保留输入
+flags"这条边界）。三层回归 + D6 端到端 `Interpreter.ZeroShiftFlagsLivenessE2E`
+入 ctest。冻结面 0 改动：`kVmOpMax=164` / 跳表 256 / `kCtxSize` / `ir::Op` /
+`keys.hpp` / `asmgen.cpp`（`asmgen.cpp` 恒等是下面码体差分的前提）。
+
+**CR-01 逐 handler / 逐词差分表（该单 AC#5）**：
+
+| 差分面 | 实测读数 |
+|---|---|
+| 逐 handler 码体字节（base↔head） | 51 样本 × 119 handler = **6069 对，0 处字节差异**；`sse_add` 整块码体镜像亦逐字节恒等（34816B / sha256[0:16] `49026615649fda31`，base = head）。抽样逐行同值：`shlcl` off 0x5b9/579B/`709c2d72a7b23948`、`shr` 0x37a5/579B/`a808c6aa91ce59bf`、`sar` 0x7fc/579B/`a454be857e4ffcf9`、`cmp` 0x5206/436B/`a33745a30e68d2d2`、`add` 0x1989/525B/`92c914d76b6f73ec`、`rol` 0x7436/566B/`1d1081f507f3e73f` |
+| 逐词字节码面 `cond_or_size` | **4481 词，0 处 delta** |
+| head 侧 flags-dead 标存量 | **864 / 4481 = 19.3%** 的词仍带 dead 标（标记通路在跑，不是被摘走） |
+| 归因句 | 扰动只可能落在*前驱 flags 写*的词上，条件为「紧邻后继是移位 **且** 该移位之后仍有读者」。全池移位词共 45 个（`Shl` 35 —— 全是地址缩放/imm64 拆条的合成词，`Shr` 3、`Sar` 1、`ShlCl`/`ShrCl`/`SarCl` 各 2），其中紧邻前词是 flags 写的只有 **3 处**（`Or`×1、`Sub`×2），且这 3 处之后无读者 ⇒ 判死结论两侧一致 ⇒ 0 delta。反证在合成夹具上成立：`cmp → shl edx,cl → sete` 形态下 cmp 词 `cond_or_size` 确实从 `6` 翻到 `2` |
+| 一句话读数 | 「全池 355 绿 + 0 delta」恰恰说明这条语料从未命中该形态 —— 这正是 CR-01 能在历轮 multiseed 全绿下存活的原因，也是它必须由真实执行断言（而不是池）来守的理由（MIT-495 快审 F3 同判：池不约束新行为；该缺口由线 3 的 F3 入池样本 `wvmp_shift0_flags_sample` 补上，见 MIT-492 节）。**355 是该单时点的池总数**，F3 入池后当前池 = 360，按 435 纪律不回改本行历史读数 |
+| 时点六件套 | build `[405/405]` rc0、`[x86] OK`、ctest `0 tests failed out of 23`（gtest 用例 `regvm_translator_tests` 137→140、`regvm_runtime_tests` 62→64）、x86 电池 `1/1`、multiseed `TOTAL: 355 pass / 0 fail`、x64 dump 门 `RESULT: PASS`、静态门 `RESULT: PASS`；x86 dump 门该单实测 **FAIL**（工具漂移，MIT-495 F2） |
+
+**遗留挂账**：x64 S32 运行时移位掩码取 6 位的偏差，已在
+「指令族支持矩阵（当前口径）」的 *已知运行时移位掩码偏差* 小节按原句入册；
+该档（`count=32@S32`）目前无运行时断言覆盖（层②刻意用 `count=64` 绕开并写明理由），
+已立为 B 波首张候选。
+
+## MIT-491 (A波-2 · CR-02+CR-03 `[[functions]]` 三选择器查询面对等，契约 C-A2 成文) 落账（2026-09-19，线 4 代线 2 补账）
+
+**补账范围**：线 2 唯一 commit `665b229` 的 docs 落账只有 `docs/contracts.md`
+（实测 `git show 665b229 --numstat -- docs/` = `130 1 docs/contracts.md`），
+`docs/GAPS.md` / `docs/STATUS.md` 零落账 —— 本两节（GAPS 此节 + STATUS 对应行）补齐。
+
+**修复面**：`level_for` 与 `crypt_for` 三参数形状对等（`name` 进得了档位面）、
+两面共用唯一遍历（声明序单遍、任一选择器命中即覆写、后声明者胜，"index 先评 / rva
+后评"两遍序废除）、`index` 锚回 `ctx.functions` 原始扫描序（新增
+`VirtualizedFunction::src_index`，缺省 `kNoSrcIndex` 哨兵 = 手工构造条目不匹配任何
+index 规则）；跨选择器撞车由运行时 Note 点名生效者与被覆写者。选择器口径与仲裁序
+成文于 `docs/contracts.md` 新增 §6（契约 **C-A2**，线 4 只读引用、未改契约）。
+
+**接口变更备案（非冻结头，按 C-A2 落笔）**：`framework/include/wvmp/framework/
+protect_levels.hpp` `level_for` 由二参数改三参数 + 新增 `resolve_level` /
+`resolve_crypt` 披露面；`FunctionProtectRule` / `ProtectRules` 字段零增删，
+`ProtectLevel` 枚举未动。
+
+**时点读数（MIT-491 交付评论）**：build `[405/405]` rc0（`warning C` 76 条 = 基线
+76 条）；ctest `0 tests failed out of 23`，75.04s（ctest 目标数不变，新增用例全挂
+既有 target：`wvmp_virtualize_tests` 12→18、`wvmp_cli_tests` 69→74）；x86 电池
+`1/1`；multiseed `TOTAL: 355 pass / 0 fail`；wvmpTest x64 `[PASS]` diff-0、x86
+`已生成 26 个入口 stub` diff-0；x64 dump 门 `RESULT: PASS`；x86 dump 门末行
+`FAIL dispatch 缺 and <r>, 0x7f（kTableEntries-1）`（F2 同因）；静态门 `RESULT: PASS`。
+全池码体零 delta。
+
+## MIT-492 (A波-3 · wvmpTest 语料内聚 + F3 CR-01 入池样本) 落账（2026-09-19，线 4 代线 3 补账）
+
+**补账范围**：线 3 三枚 commit（`582913e` / `620b530` / `54db77f`）
+`git show <sha> --numstat -- docs/` 全空（README 双语的改口不属 `docs/`）。
+
+**交付面**：① 外部 `../wvmpTest` 28 区语料 + `avx_kernels` 回灌入库，五文件
+LF 归一后 blob 逐字节等值（`kernels.toml` 为**有意不同**：原值指向仓外目录）；
+② `smoke_test.bat` 补 x86 一腿、`kernels.toml`/`kernels_x86.toml` 与 `smoke_test.bat`
+不再吃仓外产物，`run_compare.cmd` 补 diff 承重（原先两边 rc=0 即 `[PASS]`，
+diff 数不参与退出码）；③ F3 样本 `wvmp_shift0_flags_sample`（7 区，REQUIRE_REAL
+下 7/7 真虚拟化、0 条 gate note）入池，池 71→72 槽 ⇒ baseline **355→360**。
+
+**语料口径（30−1=29，成因 = 语料缺陷不是产品 gate）**：见前文
+「语料口径：30 marker 区 − 1 空区 = 29 stub」小节——`git grep -c PROTECT_BEGIN`
+的 `kernels.cpp` 28 含 1 处文件头用法注释（`:7`），真实 marker = 27 + avx 3 = **30 区**；
+`wv_lcg_next`（`kernels.cpp:499`）打标对之间无指令 = 空打标区域，线 3 按"内容一致"
+原样入库 ⇒ **29 stub（x64）/ 26 stub（x86）**。该缺陷本身**不在文档单修复面**，
+归 B 波语料候选（补它会同时改动双 arch stub 数与 README 读数）。
+
+**时点读数（MIT-492 交付评论，干净独立树 `wvmp-corpus` 已提交态）**：
+build `[407/407]` rc0；ctest `0 tests failed out of 23`，82.05s；
+`bash scripts/multiseed_e2e_real.sh` → **`TOTAL: 360 pass / 0 fail`**；
+wvmpTest x64 `SUMMARY passed=106 failed=0` + `已生成 29 个入口 stub` + diff-0、
+x86 `passed=105` + `26 个入口 stub` + diff-0；x64 dump 门 3 样本 `RESULT: PASS`
+（47 SSE handler + `vmovups ymm count = 2`）；x86 dump 门预期不可证（F2）；
+静态门 `RESULT: PASS`。
+
+## MIT-493 (A波-4 · 文档真源统一) 落账（2026-09-19）
+
+产出是**文档**，产品代码/构建脚本/测试用例零改动。四处改动：
+
+1. 新增「指令族支持矩阵（当前口径，2026-09-19 实测 · 单一真源）」= 支持矩阵
+   单一真源 + 指标×复算命令表 + gate 三档分档 + 运行时掩码偏差挂账小节 +
+   30−1=29 语料口径小节；
+2. 原「指令族支持矩阵（阶段总览，MIT-GZ 收口定稿 2026-08-31）」标题改为
+   「历史快照」并加取代注记（表内 240/240、`kVmOpMax=97`、⛔ 判定等数字**一字未动**）；
+3. 「x87 (永久 gate, R3 裁决)」节顶部加取代注记（正文与频率表未动）；
+4. 本文件末补线 1 / 线 2 / 线 3 三节的落账（`docs/STATUS.md` 对应补 `### MIT-490 (T74)`
+   与 MIT-491 / MIT-492 三行，头部"更新时间"与正文最新条目对齐）。

@@ -16,13 +16,13 @@ A self-researched PE virtual-machine protector. Translates marked regions of x86
 | **x64 (PE32+)** | 0x8664 | **Production ready** |
 | **x86 (PE32)** | 0x14C | **Production ready** (WOW64 verified) |
 
-Native client code paths are unchanged. Marked regions (two consecutive 8-byte markers) are translated to a custom register-based VM (164 ops, jump table 256 entries). Output preserves byte-identical behavior under `byte-exact` verification — see [docs/GAPS.md](docs/GAPS.md) for full support matrix.
+Native client code paths are unchanged. Marked regions (two consecutive 8-byte markers) are translated to a custom register-based VM (164 ops, jump table 256 entries). Output preserves byte-identical behavior under `byte-exact` verification — see [docs/GAPS.md](docs/GAPS.md), section **「指令族支持矩阵（当前口径，2026-09-19 实测 · 单一真源）」**: that section is the **single source of truth** for every figure in this README (`kVmOpMax` 164 / jump table 256 / baseline 360 / x87 and ymm arch split / gate classes). Where the two disagree, GAPS wins and this file is the bug.
 
 Instruction surface highlights (September 2026): **AVX/VEX.256** — a full ymm data path on x64 (`vmov*` + 18 packed-arithmetic ops, `vzeroupper`/`vzeroall`, on-demand ymm stub sync); **x87 FPU** — virtualized on x86 (L0–L4: load/store, compare, fcmov, transcendentals). Each is architecture-gated on the opposite arch — see Gate boundaries below.
 
 ## Gate boundaries (documented, not bugs)
 
-Regions containing gated instructions remain native and produce byte-identical output, but are not virtualized. Gates fall into three classes:
+Regions containing gated instructions remain native and produce byte-identical output, but are not virtualized. Gates fall into three classes (class definitions and the current per-family verdicts are authoritative in [docs/GAPS.md](docs/GAPS.md) §「gate 分档（三档…）」; the tables below are the mirror):
 
 **Architecture gates** (instruction family not meaningful for that arch's codegen):
 

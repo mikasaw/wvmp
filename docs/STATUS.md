@@ -1,4 +1,7 @@
-> 更新时间：2026-09-05（MIT-464 integrity_crc-v1：**M3 工作流 5 完整性校验首版——密文 CRC32 + 解密前 FailFast**（无派单直接开发；MIT-456~463 均已合入）：IntegrityCrcPass（Transform，crypt 之后，requires kCryptPlan——crypt pass 显式 provide）对每个密文流算 IEEE CRC32（common/crc32.hpp 单一来源，反射式 0xEDB88320），写入尾区 reserved 槽（布局 [flag][crc32] 零变更兑现 MIT-458 预留位）；stub crypt 块解密前 bitwise 校验（mismatch → FailFast）。**安全价值 = 封死 xor 链可延展加密的盲翻密文位面**。**验证**：ctest **21/21**（crc32 已知向量 "123456789"→0xCBF43926 + 分段一致 + plan 写入 + 单字节翻转检测）；wvmpTest 10-pass 全栈（mutate+crypt+integrity+anti_debug）双跑 103/103 byte-identical（14 密文流全校验）；**篡改实验**：密文翻转 1 字节 → 确定性崩溃 rc=139。**D1 边界**：仅覆盖密文流面（头/旗标不在 CRC 内；解密后明文与 .wvmp 其余部分属 init 钩子面 MIT-465 后续）；无 crypt 管道 Note 跳过；bitwise 无表实现 per-call 开销 ~9 指令/字节（表驱动优化留后续））
+> 更新时间：2026-09-19（**A 波四线收口**：MIT-490 (T74) CR-01 零次移位 flags 活跃性改判条件定义 + MIT-491 CR-02/03 `[[functions]]` 三选择器查询面对等（契约 C-A2 成文）+ MIT-492 wvmpTest 28 区语料内聚入库 + F3 CR-01 样本入池 ⇒ baseline 池 71→72 槽 × 5 seeds = **360/360** + MIT-493 文档真源统一。**支持矩阵单一真源 = `docs/GAPS.md`「指令族支持矩阵（当前口径，2026-09-19 实测 · 单一真源）」节**，本文与 README 均为其镜像。正文逐单节此前停在 MIT-521 (T73) 2026-09-14；上一版头部（2026-09-05 / MIT-464）原文按 435 纪律保留于下，不删。）
+
+> （**历史头部 2026-09-05，MIT-464 integrity_crc-v1：M3 工作流 5 完整性校验首版——密文 CRC32 + 解密前 FailFast**（无派单直接开发；MIT-456~463 均已合入）：
+IntegrityCrcPass（Transform，crypt 之后，requires kCryptPlan——crypt pass 显式 provide）对每个密文流算 IEEE CRC32（common/crc32.hpp 单一来源，反射式 0xEDB88320），写入尾区 reserved 槽（布局 [flag][crc32] 零变更兑现 MIT-458 预留位）；stub crypt 块解密前 bitwise 校验（mismatch → FailFast）。**安全价值 = 封死 xor 链可延展加密的盲翻密文位面**。**验证**：ctest **21/21**（crc32 已知向量 "123456789"→0xCBF43926 + 分段一致 + plan 写入 + 单字节翻转检测）；wvmpTest 10-pass 全栈（mutate+crypt+integrity+anti_debug）双跑 103/103 byte-identical（14 密文流全校验）；**篡改实验**：密文翻转 1 字节 → 确定性崩溃 rc=139。**D1 边界**：仅覆盖密文流面（头/旗标不在 CRC 内；解密后明文与 .wvmp 其余部分属 init 钩子面 MIT-465 后续）；无 crypt 管道 Note 跳过；bitwise 无表实现 per-call 开销 ~9 指令/字节（表驱动优化留后续））
 
 
 
@@ -272,6 +275,13 @@ gate 边界文档化——不承诺“全部 x86-64 指令”（那是 ymm/EVEX/
    时间对账）连续满分史九连（至 MIT-434，main `df3c2f1`），本收口单
    （MIT-GZ，分支 `mit-gz-phase-close`）按同条款交付，合入即十连收官。
 
+   > **2026-09-19 校准注记（线 4 / MIT-493，append-only，上方数字一字未改）**：
+   > 上条 240/240 与 `kVmOpMax=97（跳表余量 30）` 是 main `df3c2f1` 的**收口时点**
+   > 读数，永久留档。当前读数 = multiseed **360/360**、`kVmOpMax` **164**、
+   > `kTableEntries` **256**（余量 91）；**x87 已不是永久 gate**（x86 侧 L0–L4
+   > 虚拟化，MIT-509/510）。任何 gate / 指标结论一律以 GAPS
+   > 「指令族支持矩阵（当前口径，2026-09-19 实测 · 单一真源）」为准。
+
 **两挂账（明确不在本阶段内）**：
 1. **x86 (PE32) 目标支持** → 独立里程碑「**多目标平台**」（项目主
    2026-08-31 拍板，计划后续另立；GAPS C5 节仅加指针不改写）。
@@ -326,6 +336,14 @@ import_protect）恢复为主推线。**
    纸面）。扩量若撞面 → 按族提单（G8a 模式），禁绕 gate。
 3. **跳表余量现状**：kVmOpMax 97 / kTableEntries 128（余量 30）——本单
    零新 VmOp 不变；x87 L0 / ymm 立项仍触发扩容前置 commit（GZ 既有条款）。
+
+   > **2026-09-19 校准注记（线 4 / MIT-493，append-only）**：本条的"现状"是
+   > MIT-X5 收口时点（2026-09 上旬）的现状，按 435 原文保留。两个触发条件
+   > **均已发生并已交付**：跳表 128→256 扩容随 MIT-510 落地，x87 L0 与 ymm
+   > 分别随 MIT-509/510、MIT-511~514 入面 ⇒ 当前 `kVmOpMax` **164** /
+   > `kTableEntries` **256**（余量 91）。同理第 2 条所指"x87 永久 gate 节"
+   > 也已在 GAPS 加取代注记翻面（x86 侧虚拟化）。真源 = GAPS
+   > 「指令族支持矩阵（当前口径，2026-09-19 实测 · 单一真源）」。
 4. **B.2 同族残段披露**（跳转表比较链 / bzhi 边界 CF 补丁段 / cbw 载体
    stash 合并段已随五点位一并参数化，x86 真块）：X5 扩量遇新面按同款
    `sz_step_` 纪律处理，禁逐点新增 S64 tag。
@@ -1312,3 +1330,19 @@ asmgen 零触碰 → dump 锚不受影响（无换代）。
 ### MIT-521 (T73 · 频率门挂账数据驱动收口备忘录) ✅ 2026-09-14
 - 依 MIT-517 画像 + MIT-520 语料实证逐项裁决：① 混排协议翻面 = 维持 gate（switches=7/exe 真实高频但受益前提未复现，触发条件改写为样本驱动）；② vextractf128/vinsertf128 桥 = 维持频率门 + 证据升级（intrinsic 归约场景实证存在，入面工程量 +2 VmOp 小）；③ BMI2 = 维持待用户产品决策（技术无阻塞）。第二波自主队列（T69-T73）全部收口，队列清空。
   证据链 GAPS MIT-521。
+
+### MIT-490 (T74 · A波-1 CR-01 零次移位 flags 活跃性改判条件定义) ✅ 2026-09-19
+- （编号提示：本文 2026-09-09 的 `## MIT-490 (T22 · 测试卫生单)` 是平台复用同一编号的**另一工作项**，不是本单；MIT-491~493 同理。）`Shl/Shr/Sar` + `ShlCl/ShrCl/SarCl` 由无条件 `FlagSem::kWrite` 改判为**条件定义**（新增 `kWriteConditional`），零计数档不再杀前驱 `cmp/test`；立即数形按计算后的有效计数细化（§F.1 妥协档未采纳）。三层回归（liveness 矩阵 18 格 / 运行时 flags 电池 / D6 端到端真执行断言 `eax==1`）入 ctest。验证：ctest 23/23、x86 电池 1/1、全池 355/355（该单时点读数）、码体差分 **6069 对 0 字节差** + **4481 词 0 `cond_or_size` 差**（head 侧 864 词仍带 dead 标 = 标记通路未被摘走）。
+  证据链 GAPS MIT-490 (T74) 落账节。
+
+### MIT-491 (A波-2 · CR-02+CR-03 `[[functions]]` 三选择器查询面对等) ✅ 2026-09-19
+- `level_for` / `crypt_for` 三参数形状对等（`name` 进得了档位面）+ 两面共用唯一遍历（声明序单遍、任一选择器命中即覆写、后声明者胜，"index 先评 / rva 后评"两遍序废除）+ `index` 锚回 `ctx.functions` 原始扫描序（新增 `VirtualizedFunction::src_index`，`kNoSrcIndex` 哨兵 = 宁可不豁免也不误豁免）；跨选择器撞车由运行时 Note 点名生效者与被覆写者。选择器口径与仲裁序成文 `docs/contracts.md` 新增 §6（契约 C-A2）。验证：ctest 23/23（`wvmp_virtualize_tests` 12→18、`wvmp_cli_tests` 69→74，target 数不变）、全池 355/355、wvmpTest 双 arch diff-0、x64 dump 门 PASS、静态门 PASS、全池码体零 delta。
+  证据链 GAPS MIT-491 落账节。
+
+### MIT-492 (A波-3 · wvmpTest 语料内聚 + F3 CR-01 入池样本) ✅ 2026-09-19
+- 外部 `../wvmpTest` 28 区语料 + `avx_kernels` 回灌入库（五文件 LF 归一后逐 blob 等值；`kernels.toml` **有意不同** = 原值指向仓外产物），`smoke_test.bat` 补 x86 一腿、toml/脚本不再吃仓外目录、`run_compare.cmd` 补 diff 承重（原先两边 rc=0 即 `[PASS]`，diff 数不参与退出码）。F3 样本 `wvmp_shift0_flags_sample`（7 区，REQUIRE_REAL 下 7/7 真虚拟化、0 条 gate note）入池 ⇒ 池 71→72 槽 × 5 seeds = **360**。语料口径：`git grep -c PROTECT_BEGIN` 的 28 含 1 处文件头用法注释 ⇒ 真实 marker 27 + avx 3 = **30 区**，减 `wv_lcg_next` 空打标区（打标对之间无指令；**语料缺陷，不是产品 gate**）= **x64 29 stub / x86 26 stub**。验证：build `[407/407]` rc0、ctest 23/23、multiseed **360 pass / 0 fail**、wvmpTest x64 106/106 + x86 105/105 双跑 diff-0、x64 dump 门 3 样本 PASS、静态门 PASS、x86 dump 门预期不可证（MIT-495 F2）。
+  证据链 GAPS MIT-492 落账节 +「语料口径：30 marker 区 − 1 空区 = 29 stub」小节。
+
+### MIT-493 (A波-4 · 文档真源统一) ✅ 2026-09-19
+- 纯文档单，产品代码 / 构建脚本 / 测试用例零改动。① GAPS 新增「指令族支持矩阵（当前口径，2026-09-19 实测 · 单一真源）」= 支持矩阵单一真源 + 指标↔复算命令表 + gate 三档分档（架构 / 频率 / 永久）+ **挂账偏差**（x64 S32 运行时移位掩码取 6 位，逐字取 MIT-490 交付评论原句，单列一档不入 gate）+ 30−1=29 语料口径小节；② 08-31 矩阵改标「历史快照」并加取代注记、x87「永久 gate」节顶部加翻面注记（两处历史数字一字未改，435 append-only）；③ 代线 1/线 2/线 3 补 GAPS 落账三节 + 本文件上方三行；④ README.md / README.zh-CN.md 与 GAPS 逐指标交叉核对（`kVmOpMax` 164 / 跳表 256 / baseline 360 / x87 x86 / ymm x64 / gate 三档）并互指单一真源。
+  证据链 GAPS MIT-493 落账节。
