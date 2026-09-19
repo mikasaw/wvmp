@@ -6,6 +6,30 @@
 
 > 追记（2026-09-19 · **B 波第三张 MIT-522 B0-3**，交付面 = 分支 `mit-debt-b-poolgate`，**基线 = B0-2 tip `608b826`（非 main）**，未合 main）：池内 `[[functions]]` 选择器路径由「全池零覆盖」转为**断言式复跑门禁**。`scripts/multiseed_e2e.sh` 加每样本规则挂点（sidecar，因 `default_level` 是 TOML 顶层键 ⇒ 插在 `[[passes]]` 块**之前**而非末尾追加）+ 精确读数断言：`stubs` / `selector_waive_notes` / `selector_arbitration_notes` / `translate_gate_notes` 四键必填，另有可选的豁免身份断言 `selector_waive_targets` 与加密摘要三键。4 个变体全打在已入池的 `wvmp_shift0_flags_sample.exe`（7 区 / 无规则基线 7 stub）上，不新建样本 ⇒ 池 **72→76 槽 × 5 seeds = 380**，实测 `TOTAL: 380 pass / 0 fail` exit 0。期望值按 R1 **跑前预测**：推导链写在 `scripts/multiseed_rules/*.expect.txt` 里，commit `852094d` 排在任何带规则实跑之前，首跑四槽全中、零回写。有 `.rules.toml` 而无同名 `.expect.txt` ⇒ 当场 FAIL 并点名缺文件（R2 fail-closed，绝不退回 `≥1` 那把哑锁）。门禁有效性做成可复跑反证 `bash scripts/multiseed_e2e.sh --selftest`（同一份 `evaluate_slot` 代码路径，不另抄一份解析逻辑）；零扰动证明按 R4 全量脚本化 `bash scripts/multiseed_rules/compare_baseline_cfg.sh 608b826`。**产品代码零改动**（判据 5 面：`passes/**` `cli/**` `vm/**` `framework/**` 零 diff；D3 冻结面 `kVmOpMax=164` / `kTableEntries=256` / `kCtxSize` / 跳表项数 / `keys.hpp` 零 diff）。逐单节见本文 `### MIT-522 (B0-3 · 池内选择器断言式回归门禁)`，证据链 GAPS 同名节。
 
+
+> 追记（2026-09-20 · **C 波第二张 MIT-526 C2**，交付面 = 分支 `mit-debt-c-tlsabi`，**基线 = 开工现读
+> 的 main tip `18b354e`**，未合 main）：x64 TLS 回调 DRx 面调 `GetThreadContext` 的 **shadow space
+> 缺失（CR-04）** 修成 `sub/add rsp, 0x28`（32B shadow + 8B 对齐）。旧值 `sub 8` 只保 16B 对齐，
+> 被调按约定合法写第 3 个参数槽 `[rsp+0x10]` 正落在**回调自己的返回地址**上。反证不是"生成码里有没有
+> call"那种哑断言：新增 ctest 格 `tls_abi_exec_tests` 驱动探针 exe，把 pass 真实产出的回调桩字节
+> 镜像进 RWX 内存真跳进去，被调是 Keystone 现编的**会写脏自己 4 个 home slot** 的模拟 GetThreadContext /
+> VirtualProtect。修前 `gap = H−M = 0x18` + 崩溃现场 `[rsp]=0x4141414141414141`（返回地址已被写脏，
+> 而 `[rsp−16]=cb+0x44` 说明被调自身返回地址完好 ⇒ 毁的是回调帧）；修后 `gap=0x38` + `returned=1` +
+> `post_rsp==H`（出口 RSP == 入口 RSP）+ `cb_ret=0`，`drx_hit` 的 FailFast 仍崩在写零红线
+> （`fault_addr=0` 且 rip 落在桩内）。全文件 x64 call 站点共 2 处：DRx 站点本枚修，IAT 回填的
+> VirtualProtect 站点原已合规并以 `backfill` 模式实测（两次 VP 写脏 4 槽仍正常返回 + `rep movsq`
+> 真回填）；x86 侧 stdcall 参槽自清、无 shadow 语义 ⇒ 排查表见 GAPS 同名节。**本单不动 CR-05**
+> （`mov r11, rax`/`sub rax, r11` 归 C3）。零扰动：打包产物差分表恰 **4 字节**（2 字节 CheckSum +
+> `.wvmpc` 内 2 个 imm8 `08→28`），`.wvmp` VM 码体 0 字节差，x64 运行时 dump `d294f89b…`/184,536B
+> 改前后逐字节恒等（`asmgen.cpp` 零 diff）。六件套（树 `wvmp-c-tlsabi` @ `18b354e`）：build
+> `[411/411]` 0/0、ctest **24/24**、x86 电池 67/67、REQUIRE_REAL 全池 **76 槽 / 380 pass · 0 fail**
+> + `--selftest` 29/29、wvmpTest 双 arch diff-0（106/106 + 105/105，run-vs-run 4/4）、dump 门
+> x86 PASS + x64 sha 恒等（xmm 字节门 exit=2 为既有 🟡-1，基线同形态）、静态扫描三面 PASS。
+> TLS 四象限：`tls_e2e.sh` 加 `TLS_E2E_DRX/RDTSC` 覆盖（不设变量时 cfg 取值与判据逐字不变，只多一行回显）+ 仓外驱动 ⇒ 双 arch ×
+> 四象限 **8/8** native/packed stdout 逐字节一致 rc=0，每格 `tls_selfcheck.sh` EB FE 探针都证到
+> 回调链在入口前执行。逐单节见本文 `### MIT-526 (C2 · CR-04 x64 TLS 回调 shadow space)`，
+> 证据链 GAPS 同名节。
+
 > （**历史头部 2026-09-05，MIT-464 integrity_crc-v1：M3 工作流 5 完整性校验首版——密文 CRC32 + 解密前 FailFast**（无派单直接开发；MIT-456~463 均已合入）：
 IntegrityCrcPass（Transform，crypt 之后，requires kCryptPlan——crypt pass 显式 provide）对每个密文流算 IEEE CRC32（common/crc32.hpp 单一来源，反射式 0xEDB88320），写入尾区 reserved 槽（布局 [flag][crc32] 零变更兑现 MIT-458 预留位）；stub crypt 块解密前 bitwise 校验（mismatch → FailFast）。**安全价值 = 封死 xor 链可延展加密的盲翻密文位面**。**验证**：ctest **21/21**（crc32 已知向量 "123456789"→0xCBF43926 + 分段一致 + plan 写入 + 单字节翻转检测）；wvmpTest 10-pass 全栈（mutate+crypt+integrity+anti_debug）双跑 103/103 byte-identical（14 密文流全校验）；**篡改实验**：密文翻转 1 字节 → 确定性崩溃 rc=139。**D1 边界**：仅覆盖密文流面（头/旗标不在 CRC 内；解密后明文与 .wvmp 其余部分属 init 钩子面 MIT-465 后续）；无 crypt 管道 Note 跳过；bitwise 无表实现 per-call 开销 ~9 指令/字节（表驱动优化留后续））
 
@@ -1485,3 +1509,32 @@ asmgen 零触碰 → dump 锚不受影响（无换代）。
   （MIT-503 明令本波禁接）。共享工作树纪律：本单全部构建与实跑在**独立 worktree**
   `../wvmp-poolgate` 内完成，未在主树 `wvmp` 落任何写操作。
   证据链 GAPS「MIT-522 (B0-3 · 池内选择器断言式回归门禁，2026-09-19)」节。
+
+### MIT-526 (C2 · CR-04 x64 TLS 回调 shadow space 与全分支栈平衡) ✅ 2026-09-20
+
+- **交付面 = 分支 `mit-debt-c-tlsabi`（D0：未合 main、未 push；基线 = 开工现读的 main tip
+  `18b354e`）**，两枚：反证测试先行枚（`013710d`，产品码零 diff，在基线树上 6/6 FAIL）+ 实现枚
+  （`tls_hook_pass.cpp` x64 DRx 站点 `sub/add rsp 8` → `0x28` + 注释 + 本 docs 枚）。改动面
+  = `passes/tls_hook/src/tls_hook_pass.cpp`（10+/4−）+ `passes/tls_hook/tests/*`（探针 + 判据 +
+  CMake）+ `scripts/tls_e2e.sh`（四象限开关，默认口径逐字不变）+ 本 docs。**`asmgen.cpp` 零改动**
+  （判据 4 面）；冻结契约面零 diff。
+- **补的是哪一格**：MIT-470 的 DRx 面在 TLS 回调里 `call GetThreadContext` 时没留 home 区——
+  对齐对、栈帧错，被调一写自己的参数槽就毁回调返回地址。E2E 看不出来（真 GTC 在本机没写那几槽），
+  所以判据按 CR-04 要求做成"会主动写脏 home slot 的模拟被调"真执行反证，入 ctest 常驻。
+- **实现要点**：`0x28` = 32B shadow + 8B 对齐，与同文件 IAT 回填站点同值（不是新约定）；
+  `sub` 在块首、`add` 在唯一汇合标签 `drx_cleanup`，`je drx_cleanup` / 四路 `jne drx_fail` /
+  fall-through 三类出口共用同一对，FailFast 路径进程即死不回收。本块在回填序列之前，
+  **不能**复用后者稍后才分配的栈空间（这是 CR-04 的核心一句，注释已钉在源码头）。
+- **读数（判据逐条，全部现跑，树 `wvmp-c-tlsabi`）**：见 GAPS「MIT-526 (C2 · CR-04 …)」节的
+  修前↔修后对照表、全文件 call 站点排查表、4 字节产物差分表与六件套表。要点：
+  `gap 0x18 → 0x38`；修前崩溃现场 `[rsp]=0x4141414141414141` 即被毁的回调返回地址；修后 6/6
+  gtest PASS、全池 ctest **24/24**、multiseed **380/380**（76 槽）、wvmpTest 双 arch diff-0、
+  x86 dump 门 PASS、静态扫描 PASS、TLS 四象限 8/8 逐字节一致 + selfcheck 每格 PASS。
+- **防再犯**：① 任何在 TLS 回调/Stub 里新增的 x64 `call`，必须同时给出 shadow（0x28 口径）并在
+  探针里加一个"写脏 4 槽"的模拟被调模式——`gap` 断言是机器判据，注释不是；② 产物字节涉改的单一律
+  出逐区差分表（本单 4 字节），并留 x64 dump sha 作码体侧独立代证；③ 反证必须能自己 FAIL：
+  本单第一枚 commit 在基线树上 6/6 红是硬性提交次序，不是事后补写。
+- **本单未做（边界，非缺口）**：CR-05（rdtsc 低 32 位回绕，:201/:226 原样未动）归 C3；x86 侧
+  等价反证（32 位 asm 在 x64 测试进程里跑不了）未建；`rdtsc_fail` 超阈出口无确定性构造 ⇒ 未机器化；
+  撞到的三笔既有失效（x64 xmm 字节门 exit=2 / x86 `imm-hits=1` / `smoke_test.bat` 首构建守卫）
+  只登记与代证，不在本单顺手修。

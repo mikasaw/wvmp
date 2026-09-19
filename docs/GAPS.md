@@ -265,7 +265,9 @@
 | dispatch 跳表容量 | **256 项**（掩码 = `kTableEntries-1` = `0xFF`，自动导出），余量 **91** = 256 − (164+1) | `sed -n '355p' vm/regvm/runtime/src/asmgen.cpp` → `constexpr u64 kTableEntries = 256;`（MIT-510 按冻结契约批量前置条款 128→256） |
 | baseline 池总数 | **360 pass / 0 fail** = 72 槽 × 5 seeds | `bash scripts/multiseed_e2e_real.sh` → `[multiseed] TOTAL: 360 pass / 0 fail`；算式独立复算：`awk '/^samples=\(/,/^\)/' scripts/multiseed_e2e.sh \| grep -c '\.exe'` = **52**、`x86_samples=(` 同法 = **20**、`seeds=(…)` 计 **5** ⇒ (52+20)×5 = **360** |
 | baseline 池总数（B0-3 规则变体后） | **380 pass / 0 fail** = 76 槽 × 5 seeds = 72 无规则挂点 + 4 `[[functions]]` 规则变体 | `bash scripts/multiseed_e2e_real.sh` → `[multiseed] TOTAL: 380 pass / 0 fail`（exit 0）；算式独立复算：上面两行同法 52 + 20、`rule_variants=(` 同法 = **4**、`seeds=(…)` 计 **5** ⇒ (52+20+4)×5 = **380**。⚠️ 本行读数取自分支 `mit-debt-b-poolgate`（MIT-522 B0-3，基线 = `mit-debt-b-shiftmask` tip `608b826`，**未合 main**），不属本表上方那句"main `54db77f` 实测"口径；上一行 360/72 槽不追改（435 append-only），B0-3 合入后以本行为准 |
+| baseline 池总数（C 波 C2 时点 main 复验） | **380 pass / 0 fail** = 76 槽 × 5 seeds（52 x64 + 20 x86 + 4 规则变体）—— B0-3 那行的"未合 main"标注在本时点已失效：`main = 18b354e` 已含 MIT-522，本行是 main 侧现读 | `bash scripts/multiseed_e2e_real.sh` → `[multiseed] TOTAL: 380 pass / 0 fail` exit 0（树 `wvmp-c-tlsabi` @ `mit-debt-c-tlsabi`）；`--selftest` → 29/29 RESULT: PASS；槽数三元组见「MIT-526 (C2 · CR-04 …)」节 |
 | ctest 目标数 | **23**（全绿） | `scripts\test.bat`（MIT-380 起旧 "15/15" 字样已过期） |
+| ctest 目标数（C2 TLS ABI 反证后） | **24**（全绿）＝ 上表 23 + 本单新增 `tls_abi_exec_tests`（真执行反证，子进程跑 `wvmp_tls_abi_probe.exe`） | `scripts\test.bat` → `100% tests passed, 0 tests failed out of 24`（上一行 23 不追改，435 append-only） |
 | x87 (D8-DF) | **x86 ✅ 虚拟化**（L0–L4）/ **x64 ⛔ 架构 gate** | 见下矩阵行；证据链 GAPS MIT-509 / MIT-510 |
 | ymm / VEX.256 | **x64 ✅ 虚拟化**（`vzeroupper`/`vzeroall` + `vmov*` 32B + 18 条 packed 算术）/ **x86 ⛔ 架构 gate** | 见下矩阵行；证据链 GAPS MIT-511~514 |
 | wvmpTest 语料面 | marker 函数 **30 区**（`kernels.cpp` 27 + `avx_kernels.cpp` 3）→ x64 **29 stub** / x86 **26 stub**，缺口 1 区为**语料缺陷**（见下「语料口径」小节，非产品 gate） | `git grep -c PROTECT_BEGIN -- tests/wvmpTest` → `kernels.cpp:28`（含 `:7` 一处文件头用法注释）+ `avx_kernels.cpp:3` + `wvmp_protect.h:2`（宏定义/`#undef`，不是区域）⇒ 真实 marker = 27+3 = 30；`tests\wvmpTest\smoke_test.bat` → `已生成 29 个入口 stub` |
@@ -4890,3 +4892,136 @@ crypt 面两条口径的合计，单面漂移靠 `stubs` + `crypt_*` 三键夹�
 以 `--selftest` 复跑输出为准（MIT-406：单方粘贴不算数）；给样本立"禁止删掉某处以喂饱 ≥1
 断言"那类保护条款（`multiseed_e2e.sh:76` 那条注释就是这种形态）不再是可接受的演进方向 ——
 要宽判据就配 expect 收紧，别为哑锁立宪章。
+
+
+## MIT-526 (C2 · CR-04 x64 TLS 回调 shadow space 与全分支栈平衡，2026-09-20) 落账
+
+> 交付面 = 分支 `mit-debt-c-tlsabi`（D0：未合 main、未 push），**基线 = 开工那一刻 `main` tip
+> `18b354e`（现读，非建单时的 `608b826`）**；两枚 commit：`013710d` 反证测试先行（产品码零改动，
+> 该枚在基线树上必红）+ 第二枚实现 + docs。全程在独立 worktree `../wvmp-c-tlsabi` 取数，
+> 主树 `wvmp` 零写操作。树名 + HEAD + 产物 mtime 三元组随每格读数。
+
+### 病灶（不是"看起来不规范"，是可构造的真毁帧）
+
+`passes/tls_hook/src/tls_hook_pass.cpp` x64 DRx 分支（MIT-470 面）在调 `GetThreadContext` 前只
+`sub rsp, 8`、返回后 `add rsp, 8`：解集只覆盖了 **16B 对齐**（回调入口 rsp ≡ 8 mod 16 → 减 8 后
+call 点 ≡ 0 mod 16 ✓），**没有为被调方预留 32 字节 home 区**（Microsoft x64 调用约定要求调用方
+为前四个寄存器参数各留一个槽）。设回调入口 rsp = S：`sub 8` → `call` push ⇒ 被调入口 rsp = S−16，
+被调合法可写的四个 home slot 是 `[rsp+8]/[+0x10]/[+0x18]/[+0x20]` = `[S−8]/[S]/[S+8]/[S+0x10]`
+—— 其中 `[S]` **正是回调自己的返回地址**（`[S+8]/[S+0x10]` 落在直接 caller 的帧里）。该 call
+位于 IAT 回填序列**之前**，不能复用后者稍后才 `sub` 出的 0x28。
+
+修复 = 该站点 `sub/add rsp, 0x28`（32B shadow + 8B 对齐；`0x28` 与回填站点同值，非新约定）。
+逐出口核对：`sub` 之后共有三类出口（`je drx_cleanup`、四路 `jne drx_fail`、顺序 fall-through），
+`drx_fail` 写零即 FailFast（进程死，不回收），其余全部汇到唯一标签 `drx_cleanup` 的 `add rsp, 0x28`
+⇒ 每条活路径的出口 rsp == 入口 rsp。桩内其余部分（rdtsc 前后块、PEB 块 push/pop rax 成对）不受影响。
+
+### 反证夹具（判据 1：只检查"生成码里有没有 call"= REJECT，故量物理量）
+
+新增 ctest 目标 `tls_abi_exec_tests`（`passes/tls_hook/tests/test_tls_abi_exec.cpp`，6 个 TEST）
+驱动独立探针 exe `wvmp_tls_abi_probe`（`passes/tls_hook/tests/tls_abi_probe.cpp`）：
+
+- 真实 `TlsHookPass::run` 产出 .wvmpc 回调桩字节 → 连同合成 .text（含一个导入
+  `kernel32!GetThreadContext` 的 IMAGE_IMPORT_DESCRIPTOR，用来让 pass 自己定位 IAT 槽）与 .wvmp
+  一起镜像进一块 `VirtualAlloc(PAGE_EXECUTE_READWRITE)` 区，区的 VA 直接当 `image_base` ⇒ 桩里烘焙
+  的绝对 VA（ctx_va / gtc_slot_va / mirror / oldprot）原样可用；夹具另断言这两个 VA 真出现在桩字节里
+  （`ctxva_in_stub=1 / gtcva_in_stub=1`），防"夹具与 pass 布局脱节"式假绿。
+- **模拟被调**（Keystone 现编）：把自己的 4 个 home slot 先存档再全写 `0x4141414141414141`，
+  然后按真 API 语义填 CONTEXT.Dr0..Dr3 并 `ret`。**调用方 thunk**（同法现编）自留 0x28 shadow 后
+  `call` 回调，并在 call 前记 rsp = H；被调入口记 rsp = M。判据 = `gap = H − M`。
+- asm 帧没有 unwind 信息 ⇒ 修前的回飞 AV 在测试进程内用 `__try` 捕获不到 ⇒ 探针独立成 exe，
+  父进程读退出码；崩溃现场由 `AddVectoredExceptionHandler` 逐行 flush 出 rip/rsp/易失寄存器/
+  `[rsp±]` 栈面 + H/M/calls（VEH 在故障线程栈上直接跑，不依赖 unwind）。
+
+### 修前 ↔ 修后读数（同一棵树只差第二枚 commit，`wvmp_tls_abi_probe` 直跑）
+
+| 模式（配置面） | 修前 | 修后 |
+|---|---|---|
+| `drx_clean`（drx=on, rdtsc=off, Dr0-3=0） | `veh_gap=0x18`、`has_sub28=0 has_sub8=1`、崩溃 `0xC0000005`；现场 `rsp=E`、`[rsp]=0x4141414141414141`（**回调返回地址已被写脏**）、`[rsp−16]=cb_va+0x44`（模拟被调自身返回地址完好 ⇒ 毁的是回调帧不是被调帧）、`returned` 永不置位 | `gap=0x38`、`has_sub28=1 has_sub8=0`、`returned=1`、`post_rsp==H`、`cb_ret=0x0`、`gtc_calls=1 gtc_poison=1`、`h_mod16=0 m_mod16=8`、rc=0 |
+| `drx_gtcfail`（被调返回 0 → `je drx_cleanup`） | 同上崩溃 | `gap=0x38`、`post_eq_h=1`、rc=0 |
+| `drx_hit`（Dr0≠0 → `drx_fail`） | 崩在 FailFast 写零，但 `veh_gap=0x18` | 崩在**同一红线**、`veh_gap=0x38`、`fault_addr=0x0`、`fault_rip` 落在桩内（受控崩溃而非回飞）、rc=0xC0000005（设计如此） |
+| `plain` / `rdtsc_only`（drx=off 两象限） | rc=0（无 call 站点，缺陷不显形） | rc=0、`post_eq_h=1`、`cb_ret=0x0` |
+| `drx_rdtsc`（四象限最后一格） | 崩溃 | `gap=0x38`、rc=0 |
+| `backfill`（IAT 回填 + DRx，第二 call 站点） | 崩溃（DRx 站点牵连） | `gap=0x38`、`vp_calls=2 vp_poison=1`（两次 VirtualProtect 都被写脏仍正常返回）、`oldprot=4`、`orig_slot_after=vp_mock`（`rep movsq` 真回填） |
+| `wvmp_tls_abi_exec_tests` 汇总 | **6 tests / 0 PASSED / 6 FAILED**（exit 1） | **6 PASSED**（全池 ctest 24/24） |
+
+### 全文件 call 站点排查（判据 2：不许只改报出来的那一处）
+
+`grep -n "sub rsp\|add rsp\|push \|pop \|sub esp\|add esp" passes/tls_hook/src/tls_hook_pass.cpp`
+逐处判定（call-site 需 shadow；帧保存/参槽不需要）：
+
+| 站点 | 形态 | 判定 | 证据 |
+|---|---|---|---|
+| `build_adb_init_asm` x86 `push eax`/`pop eax`（:141/:153）、x64 `push rax`/`pop rax`（:160/:172） | 帧保存，块内无 call | 不需 shadow；`wvadb_fail` 在 pop 之后写零 = 进程即死不回收 | 现有静态断言 + 探针四象限 `post_eq_h=1`（PEB 位面未开，见下"边界"） |
+| x86 DRx：`push eax` / `push 0xFFFFFFFE` / `call dword ptr [eax]`（:302-306） | x86 stdcall 参槽，callee 清栈 | x86 无 shadow 概念，栈平衡由 stdcall 保证 | `tls_e2e.sh` x86 侧 + 本单 x86 打包产物逐字节未变（见差分表） |
+| **x64 DRx：`sub rsp, 8` / `add rsp, 8` / `call qword ptr [rax]`（:343/:365）** | **call 站点** | **需 32B shadow ⇒ 本枚改 0x28** | 上表 `gap 0x18→0x38` |
+| x86 回填：`push`×4 / `call [vp]` ×2 / `push esi`+`pop esi` / `push edi`+`pop edi`（:411-425） | stdcall 参槽 + callee-saved 成对 | 不需 shadow；`rep movsd` 用 esi/edi 故必须保存（MIT-465 实录） | x86 产物 0 字节差 |
+| **x64 回填：`push rsi`+`push rdi` / `sub rsp, 0x28` / `call [rax]` ×2 / `add rsp, 0x28` / `pop`（:440-460）** | **call 站点** | **已合规**（push×2 0x10 + 0x28 = 0x38 ⇒ 入口 ≡8 保持对齐） | `backfill` 模式：VP 模拟被调两次写脏 4 槽后回调仍 `returned=1 post_eq_h=1` ⇒ 该站点 shadow 与对齐都真够用，不是纸面结论 |
+
+结论：全文件只有 2 个 x64 call 站点，本枚修第 1 个，第 2 个实测已成立；x86 侧无 shadow 语义。
+判据 3 的 CR-05（`build_rdtsc_open_asm` 的 `mov r11, rax` / `close` 的 `sub rax, r11`，:201/:226）
+**本单零改动**（归 C3），未与它并发改同文件。
+
+### 零扰动（判据：涉产物字节者出差分表，禁以 packed sha 恒等论证）
+
+同一 seed=1 / 同一 drx=true rdtsc=true 配置，基线 CLI 与修复后 CLI 各产一枚 x64 `wvmp_tls_sample`
+打包产物（两侧尺寸均 58,880 B，`TimeDateStamp` 两侧同为 `6AAECD38` ⇒ 可比）：
+
+| 偏移 | 区域 | 基线 | 修复后 | 性质 |
+|---|---|---|---|---|
+| `0x000140-0x000141` | PE 头 CheckSum | `0x000177E7` | `0x00019807` | 派生值随码字节变 |
+| `0x00E50F` | `.wvmpc+0x870F` | `08` | `28` | DRx 站点 `sub rsp` imm8 |
+| `0x00E56C` | `.wvmpc+0x876C` | `08` | `28` | DRx 站点 `add rsp` imm8 |
+
+合计 **4 字节 / 2 个码字节**；`.text .rdata .data .pdata .reloc` 与 **`.wvmp`（VM 码体 + handler
+表 + TLS 目录/数组/reloc 站点登记）0 字节差** ⇒ MIT-494 站点登记面与 ASLR 面无扰动。
+码体侧独立机器证明：x64 运行时 handler dump（`WVMP_X64_ASM_DUMP` + `Interpreter.MovdBridgeSemantic`）
+改前改后同为 `sha256 d294f89b018a0442b2597bd1ffec6db35e9091876e95d78f01862a5b66c85068` /
+**184,536 B 逐字节恒等**（`asmgen.cpp` 零 diff，判据 4 成立）。⚠️ 顺带如实报：文档现记的 x64 dump
+底稿 `f8b0ebd6…/164,350B`（GAPS 多处引用）在本树**复现不出**（尺寸差 20,186 B），成因待查——
+本单不改任何码体，故这不是本单引入的漂移，按 435 只追加不追改，登记为下一张工具/底稿单的素材。
+
+### 六件套（时点 = 分支 `mit-debt-c-tlsabi`，基线 `18b354e`，树 `wvmp-c-tlsabi`）
+
+| 格 | 读数 | 命令 |
+|---|---|---|
+| build | `[411/411]` rc=0；项目码 0 警告（全仓 76 条 warning 与基线**计数相等**，唯一非 `.deps` 告警 = 既有 C4335 `sse_bridge_sample_main.cpp`） | `scripts\build.bat` |
+| ctest | **24/24 全绿**（基线现测 23/23 + 本单新增 1 格） | `scripts\test.bat` |
+| x86 电池 | `67 tests PASSED` + ctest `x86_runtime_battery` 1/1 | `scripts\build_x86_tests.bat` 后 `ctest --test-dir build\x86 -R x86_runtime_battery` |
+| multiseed | 树 `wvmp-c-tlsabi` / **76 槽** / **380 pass · 0 fail** exit 0（三元组照写，380 为 MIT-522 已复核数）；门禁自证 `--selftest` **29/29** PASS；池脚本与规则面 `git diff 18b354e..HEAD` **零改动** ⇒ 不再跑 `compare_baseline_cfg.sh`（它证的正是这条未动的路径） | `bash scripts/multiseed_e2e_real.sh` |
+| wvmpTest 双 arch | x64 `SUMMARY passed=106 failed=0` ×2（native/packed）+ `diff count = 0` + `29 个入口 stub`；x86 `105 failed=0` ×2 + `diff 0` + `26 stub`；同二进制 run-vs-run 双跑 4/4 IDENTICAL（x64/x86 × native/packed） | `tests\wvmpTest\smoke_test.bat [x64\|x86]` |
+| dump 门 | x86：`RESULT: PASS` exit 0（掩码 `0xFF` 与 `kTableEntries=256` 对账、138 handler 全解）；x64：xmm 字节门 **exit=2 tooling**（既有，见下）＋ dump sha 恒等作码体零扰动代证 | `verify_x86_dump.py --asm --code` / `dump_handler_xmm_check.py` |
+| 静态扫描 | 三面 PASS exit 0：`asmgen.cpp`（默认）+ `tls_hook_pass.cpp` + `tls_abi_probe.cpp`（新增 Keystone 文本面，立即数全 0x 前缀） | `powershell -File scripts\verifier\static_scan_bare_immediates.ps1 [-TargetFile …]` |
+
+TLS 专项（判据 3）：`scripts/tls_e2e.sh` 新增 `TLS_E2E_DRX`/`TLS_E2E_RDTSC` 覆盖（不设两变量时两处 cfg 的 drx/rdtsc 取值与判据
+逐字不变，仅多一行配置面回显；默认仍"全开"），四象限各跑一次 ⇒ 每象限 x64 正例 + 双 arch skip-backfill 共
+3 PASS；x86 正例格被**既有** `check_import_rewrite.py imm-hits=1` 挡住（基线同形态复现，见下）。
+四象限 native-vs-packed 逐字判据由仓外驱动补齐：**8/8 PASS**（双 arch × 四象限 stdout 逐字节一致、
+`rc=0`），且每格 `tls_selfcheck.sh` 的 EB FE 挂起探针都 PASS ⇒ 回调链在入口前真被执行（不是静态推断）。
+
+### 本单撞到的既有失效（均非本单引入，全部在基线 `18b354e` 同形态复现）
+
+1. `dump_handler_xmm_check.py`（x64 xmm 字节门）两侧（基线 CLI 与本单产物）都 `FAIL tooling:
+   .wvmp raw size < runtime total`、**exit=2** —— 即 🟡-1（码体已迁 `.wvmpc`、门内还认 `.wvmp`）
+   的实测形态。本单不修（无归属单），以 x64 dump sha 恒等作该格的零扰动代证并如实报数。
+2. `check_import_rewrite.py` 对 x86 `wvmp_x86_tls_sample` 报 `imm-hits=1`（exec/data 全 0）
+   ⇒ `tls_e2e.sh` 的 x86 正例格 FAIL。基线 CLI 同配置复现同一条读数，且基线/修复后的 x86 打包产物
+   **逐字节相同**（`cmp` 无差异）⇒ 与本单无关。归属：与 1 同批待拍（工具/语料面，不属 C 波六张）。
+3. `tests\wvmpTest\smoke_test.bat` 首构建路径恒 `exit /b 1`（Architect 01:5x 已转待拍的 🟡-2）：
+   本树两 arch 各实测一次 `[ok] build\<arch>\test_target.exe` 后仍报 `wvmpTest build failed rc=`，
+   第二跑正常出数 ⇒ 六件套读数以第二跑为准，与"双跑 = 同组二进制两次执行"口径一致。
+4. `tls_selfcheck.sh` 的镜像解析面在本机 WARN（cdb 路径 `/c/Program Files (x86)/Windows Kits/10/
+   Debuggers/x64/cdb.exe` 不存在），脚本自己就把它设计成 WARN-not-PASS；EB FE 主判据不受影响。
+
+### 边界与遗留（明写，不当已成立）
+
+- 单测反证面是 **x64**（测试进程即 x64，32 位 asm 反证跑不了）；x86 侧靠 `tls_e2e.sh` + 本单
+  x86 产物零字节差覆盖，缺一条"写脏参槽"式的 x86 等价反证。
+- 探针四象限只开 `kHardwareBreakpoints` / `kTimingRdtsc` 两个 init 位面，**不开** PEB 位（bit0/1）：
+  探针若被调试器附加会先撞 FailFast 把读数搅浑。PEB 面的栈平衡仍只有静态成对 push/pop 论证 +
+  `tls_e2e.sh` 现网覆盖。
+- `rdtsc_fail`（计时超阈）出口未做单测反证：触发需要 >500k 周期的窗内噪声，无法确定性构造；
+  它与 `drx_fail` 共用同一 `drx_cleanup` 汇合点这一结构事实由代码阅读给出，未机器化。
+- 探针的 CONTEXT 是夹具自造的暂存（不是真 `CONTEXT` 全 0x4D0 语义），Dr0..Dr3 偏移按 x64
+  `CONTEXT` 实测 0x48/0x50/0x58/0x60 与 pass 内偏移一致；真 API 面由 `tls_e2e.sh` 四象限跑真
+  `GetThreadContext` 覆盖（该格 native vs packed 逐字节一致）。
