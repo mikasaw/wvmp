@@ -278,6 +278,13 @@ samples=(
     # (B.4 闸, 禁调用) 行为 byte-exact。
     # 单边新增 1 样本 → 50 × 5 = 250 runs。
     "build/passes/marker_scan/tests/wvmp_forkface_sample.exe"
+    # MIT-492 (F3): CR-01 零次移位 flags 活跃性的入池样本 — CL 形零计数
+    # shl/shr/sar + cl=32 掩码归零档 + setcc/jcc 消费前驱 flags 真虚拟化
+    # (7 stub) + 前态 ZF=0 反向对照 + 非零计数控制区。池此前对 CR-01 新语义
+    # 是盲区 (4481 词面 0 处 cond_or_size delta → 全池只证"零回踩"), 本样本
+    # 补上正向约束。x64 池单边新增 1 → 52 × 5 = 260 runs, 全池 71→72 槽
+    # × 5 seeds = 360 runs。
+    "build/passes/marker_scan/tests/wvmp_shift0_flags_sample.exe"
 )
 
 # MIT-442 (X2a) B.7: x86 (PE32) 样本池架子 — X5 收口单填池 (空池不跑)。

@@ -4,8 +4,8 @@
 
 ![x64 direct](https://img.shields.io/badge/x64_direct-99.26%25-brightgreen)
 ![x86 direct](https://img.shields.io/badge/x86_direct-95.15%25-green)
-![wvmpTest x86](https://img.shields.io/badge/wvmpTest_x86-85.7%25-yellowgreen)
-![baseline](https://img.shields.io/badge/baseline-355%2F355-brightgreen)
+![wvmpTest x86](https://img.shields.io/badge/wvmpTest_x86-96.3%25-yellowgreen)
+![baseline](https://img.shields.io/badge/baseline-360%2F360-brightgreen)
 
 > **语言**： [English](README.md) | **简体中文**
 
@@ -72,18 +72,23 @@ scripts\test.bat
 烟测脚本走完整流水线：构建 wvmpTest 靶 → 跑 native → 用 WVmp CLI 打壳 → 跑 packed → diff 输出。
 
 ```bat
-:: tests/wvmpTest/ 已在主仓内（与 WVmp 同源）；直接构建再跑烟测:
+:: tests/wvmpTest/ 已在主仓内（与 WVmp 同源）——干净克隆不需要仓外任何东西:
 cd tests\wvmpTest
 call build.bat x64
 cd ..\..
 tests\wvmpTest\smoke_test.bat
 ```
 
-脚本默认自动探测 `..\wvmpTest`；若放在其他位置用 `set WVMPTEST_DIR=path\to\wvmpTest` 覆盖。期望结果：
+两个架构同一入口：`smoke_test.bat` 默认跑 x64，`smoke_test.bat x86` 走 PE32 一侧（配置 `kernels_x86.toml`）。期望结果：
 
 - native 与 packed 返回码均为 0
-- diff 行数为 0（`image   :` 这一行被排除——它嵌入了绝对路径）
-- native 的 SUMMARY 显示 `passed=94`
+- 两侧 `SUMMARY` 行一致，且 packed 侧报告的是全量语料
+- diff 数为 0（`image   :` 这一行被排除——它嵌入了绝对路径）
+- native 的 SUMMARY 显示 `passed=106`（x64）/ `passed=105`（x86）
+- protect 日志显示标记区域为真虚拟化：`已生成 29 个入口 stub`（x64）/ `26`（x86）
+
+`run_compare.cmd build\x64\test_target.exe build\x64\packed.exe` 走文件日志通道
+（`out\base_*.log`）复跑同一比对，diff 数非 0 即判 FAIL。
 
 靶源码与构建脚本见 [tests/wvmpTest/](tests/wvmpTest/)。
 
@@ -96,7 +101,9 @@ tests\wvmpTest\smoke_test.bat
 | **x64 助记符级 direct 覆盖率**（System32 103 文件 / 17.6M clean 指令）| **99.26%** |
 | **x86 助记符级 direct 覆盖率**（SysWOW64 100 文件 + 第三方 + 扩展 / 27.4M clean 指令）| **95.15%** |
 | **x64 函数级无 gate**（.pdata 函数域，240,277 函数）| **94.74%** |
-| **wvmpTest x86 真虚拟化**（103 kernels，标记区域）| **12/14 = 85.7%** |
+| **wvmpTest 标记区域真虚拟化（x86）**（106 用例靶内 27 个区域）| **26/27 = 96.3%** |
+
+上表 215 行是 2026-09-03 重扫产物；wvmpTest 这一行是 2026-09-19 对仓内 27 区语料的重测（MIT-492）——`wvmp_cli protect --config tests\wvmpTest\kernels_x86.toml`，口径 = stub 数 / marker 函数数。x64 侧为 **29/30 = 96.7%**（多出的 3 区是 x64 专属 AVX 语料）。两侧唯一未虚拟化的都是 `wv_lcg_next`：它的 `PROTECT_BEGIN`/`PROTECT_END` 之间没有指令。
 
 重扫脚本：[`scripts/verifier/mit_x7_rescan.py`](scripts/verifier/mit_x7_rescan.py)，产物在 [`scripts/verifier/mit_x7_rescan_out/`](scripts/verifier/mit_x7_rescan_out/)（215 行 jsonl + summary.json）。约 4 分钟可复跑：
 
@@ -263,16 +270,17 @@ WVmp/
 ├── scripts/
 │   ├── build.bat              # MSVC + Ninja 构建
 │   ├── test.bat               # ctest
-│   ├── multiseed_e2e.sh       # 5-seed × 66 样本回归
+│   ├── multiseed_e2e.sh       # 5 seed × 72 样本回归池
 │   └── verifier/
 │       ├── mit_x7_rescan.py       # 客户态覆盖率扫描器
 │       ├── mit_515_bmi_probe/     # BMI2（mulx/pdep/pext）硬件探针
 │       ├── mit_517_avx_profile/   # AVX/VEX codegen 频率画像
 │       └── dump_handler_xmm_check.py # handler 形状 dump 门
-├── tests/wvmpTest/            # 103-kernel 功能测试靶
+├── tests/wvmpTest/            # 106 用例功能测试靶（30 个标记区域）
 │   ├── src/                   # test kernels 源码
 │   ├── build.bat              # 构建 test_target.exe
-│   ├── kernels.toml           # 靶的 WVmp CLI 配置
+│   ├── kernels.toml           # x64 靶的 WVmp CLI 配置
+│   ├── kernels_x86.toml       # 同一管道，PE32 靶
 │   └── smoke_test.bat         # 端到端烟测入口
 └── LICENSE                    # MIT
 ```

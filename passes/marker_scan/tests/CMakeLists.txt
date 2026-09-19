@@ -1293,3 +1293,21 @@ target_compile_options(wvmp_forkface_sample PRIVATE
 target_link_options(wvmp_forkface_sample PRIVATE
     $<$<CXX_COMPILER_ID:MSVC>:/INCREMENTAL:NO>
 )
+
+# MIT-492 (F3): CR-01 零次移位 flags 活跃性的入池样本 — 7 区 CL 形移位
+# (零计数 shl/shr/sar + 前态 ZF=0 反向对照 + cl=32 掩码归零档 + 非零计数
+# 控制区 + setcc 与 jcc 两档消费前驱 flags) 全真虚拟化 (REQUIRE_REAL 7
+# stub)。修复前 (MIT-490 前基线) 五区 setcc/jcc 捕宿主重写 flags → stdout
+# 分叉必 FAIL; 修复后 byte-exact。自含 MASM marker 桩 (433 同款)。
+# 单边新增 1 样本 → 72 × 5 = 360 runs。
+add_executable(wvmp_shift0_flags_sample
+    wvmp_shift0_flags_sample_main.cpp
+    wvmp_shift0_flags_sample_asm.asm
+)
+target_compile_options(wvmp_shift0_flags_sample PRIVATE
+    $<$<AND:$<CXX_COMPILER_ID:MSVC>,$<COMPILE_LANGUAGE:C,CXX>>:/Od;/Ob0;/utf-8>
+    $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-O0>
+)
+target_link_options(wvmp_shift0_flags_sample PRIVATE
+    $<$<CXX_COMPILER_ID:MSVC>:/INCREMENTAL:NO>
+)

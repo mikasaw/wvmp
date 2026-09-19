@@ -6,8 +6,8 @@ A self-researched PE virtual-machine protector. Translates marked regions of x86
 
 ![x64 direct](https://img.shields.io/badge/x64_direct-99.26%25-brightgreen)
 ![x86 direct](https://img.shields.io/badge/x86_direct-95.15%25-green)
-![wvmpTest x86](https://img.shields.io/badge/wvmpTest_x86-85.7%25-yellowgreen)
-![baseline](https://img.shields.io/badge/baseline-355%2F355-brightgreen)
+![wvmpTest x86](https://img.shields.io/badge/wvmpTest_x86-96.3%25-yellowgreen)
+![baseline](https://img.shields.io/badge/baseline-360%2F360-brightgreen)
 
 ## Targets
 
@@ -72,7 +72,7 @@ scripts\test.bat
 The smoke test exercises the entire pipeline: build wvmpTest target, run native, pack with WVmp CLI, run packed, diff outputs.
 
 ```bat
-:: tests/wvmpTest/ lives inside this repo (no external clone needed).
+:: tests/wvmpTest/ lives inside this repo — a clean clone needs nothing else.
 :: Build the test target, then run the smoke test:
 cd tests\wvmpTest
 call build.bat x64
@@ -80,11 +80,17 @@ cd ..\..
 tests\wvmpTest\smoke_test.bat
 ```
 
-The script auto-detects `..\wvmpTest` by default; override with `set WVMPTEST_DIR=path\to\wvmpTest` if placed elsewhere. Expectation:
+Both architectures run through the same entry point — `smoke_test.bat` defaults to x64, `smoke_test.bat x86` takes the PE32 leg (`kernels_x86.toml`). Expectation:
 
 - both native and packed return code = 0
-- diff line count = 0 (the `image   :` path line is excluded — it embeds an absolute path)
-- native SUMMARY shows `passed=94`
+- `SUMMARY` lines are identical on both sides, and the packed side reports the full corpus
+- diff count = 0 (the `image   :` path line is excluded — it embeds an absolute path)
+- native SUMMARY shows `passed=106` (x64) / `passed=105` (x86)
+- the protect log shows the marked regions truly virtualized: `已生成 29 个入口 stub` (x64) / `26` (x86)
+
+`run_compare.cmd build\x64\test_target.exe build\x64\packed.exe` replays the same
+comparison through the file-logged path (`out\base_*.log`) and fails on a
+non-zero diff count.
 
 See [tests/wvmpTest/](tests/wvmpTest/) for the test target source and build script.
 
@@ -97,7 +103,9 @@ See [tests/wvmpTest/](tests/wvmpTest/) for the test target source and build scri
 | **x64 mnemonic-level direct coverage** (System32 103 files / 17.6M clean insns) | **99.26%** |
 | **x86 mnemonic-level direct coverage** (SysWOW64 100 files + 3rd-party + extras / 27.4M clean insns) | **95.15%** |
 | **x64 function-level no-gate** (.pdata function domain, 240,277 functions) | **94.74%** |
-| **wvmpTest x86 truly virtualized** (103 kernels, marked regions) | **12/14 = 85.7%** |
+| **wvmpTest marked-region truly virtualized, x86** (27 regions in 106-case target) | **26/27 = 96.3%** |
+
+The 215-row table above is the 2026-09-03 rescan; the wvmpTest row was re-measured on 2026-09-19 against the in-repo 27-region corpus (MIT-492) — `wvmp_cli protect --config tests\wvmpTest\kernels_x86.toml`, counted as stubs over marker functions. x64 is **29/30 = 96.7%** (the extra 3 are the x64-only AVX regions). The single non-virtualized region on both sides is `wv_lcg_next`, whose `PROTECT_BEGIN`/`PROTECT_END` pair encloses no instructions.
 
 The rescan script lives at [`scripts/verifier/mit_x7_rescan.py`](scripts/verifier/mit_x7_rescan.py) with output in [`scripts/verifier/mit_x7_rescan_out/`](scripts/verifier/mit_x7_rescan_out/) (215-row jsonl + summary.json). It runs in ~4 minutes and is fully reproducible:
 
@@ -264,16 +272,17 @@ WVmp/
 ├── scripts/
 │   ├── build.bat              # MSVC + Ninja build
 │   ├── test.bat               # ctest
-│   ├── multiseed_e2e.sh       # 5-seed x 66 sample regression
+│   ├── multiseed_e2e.sh       # 5-seed x 72 sample regression pool
 │   └── verifier/
 │       ├── mit_x7_rescan.py       # client-state coverage scanner
 │       ├── mit_515_bmi_probe/     # BMI2 (mulx/pdep/pext) hardware probe
 │       ├── mit_517_avx_profile/   # AVX/VEX codegen frequency profiler
 │       └── dump_handler_xmm_check.py # handler-shape dump gate
-├── tests/wvmpTest/            # 103-kernel functional test target
+├── tests/wvmpTest/            # 106-case functional test target (30 marked regions)
 │   ├── src/                   # test kernels source
 │   ├── build.bat              # builds test_target.exe
-│   ├── kernels.toml           # WVmp CLI config for the test target
+│   ├── kernels.toml           # WVmp CLI config for the x64 test target
+│   ├── kernels_x86.toml       # same pipeline, PE32 test target
 │   └── smoke_test.bat         # end-to-end smoke test entry point
 └── LICENSE                    # MIT
 ```
