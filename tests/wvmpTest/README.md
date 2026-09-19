@@ -104,7 +104,7 @@ test_target.exe --quiet             不打印逐条失败明细
 `src/targets/kernels.{h,cpp}` 是专门为"函数收尾加标记"准备的一层：
 `extern "C"` + `noinline`、纯计算（无 EH/TLS/alloc/锁）、单一职责，
 符号在目标文件里稳定可见。当前 `kernels.cpp` 内 **27 个打标区域**
-（`git grep -c PROTECT_BEGIN` 读 28，多出的 1 处是文件头用法示例注释），
+（按 `git grep -c` 数打标宏起始名会读 28，多出的 1 处是文件头用法示例注释），
 另有 `src/targets/avx_kernels.{h,cpp}` 的 **3 个 x64 专属 AVX 区域**
 （`#if _MSC_VER && _WIN64` 守卫，per-TU `/arch:AVX` 单编，见下）：
 
@@ -119,7 +119,7 @@ test_target.exe --quiet             不打印逐条失败明细
 | 标志/位运算/数组/SSE 词面（T68） | `wv_lcg_next`（区域为空，见下）`wv_crc32_step` `wv_bezier_q8` `wv_hadamard8` `wv_dot4f` |
 | AVX ymm 词面（T72，仅 x64） | `wv_avx_add8` `wv_avx_fma8` `wv_avx_mul8` |
 
-> **`wv_lcg_next` 的标记对之间没有指令** —— `PROTECT_BEGIN` 紧接
+> **`wv_lcg_next` 的标记对之间没有指令** —— 打标起始宏紧接
 > `PROTECT_END`，LCG 式子写在 `PROTECT_END()` 之后，因此该区域不产生
 > stub（protect 日志报 `RVA 区间为空/非法`）。这是回灌时原样保留的
 > 上游语料缺陷，账目口径 = 30 个 marker 函数 / 29 个 stub（x64）、
