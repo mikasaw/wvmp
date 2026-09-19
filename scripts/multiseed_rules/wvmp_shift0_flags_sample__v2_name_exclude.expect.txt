@@ -1,0 +1,11 @@
+# MIT-522 v2_name_exclude —— 跑前预测（R1）
+#
+# 推导链（contracts §6.3 规则 4 + config.cpp:212-213「default_level 省略 = 全部 Virtualize」）：
+#   区域 [2] (marker@0x614)：命中 1 条 level=none ⇒ 豁免 ⇒ 1 条 "按配置 level=none 保持原生" Note。
+#   其余 6 区：0 命中 ⇒ 落缺省 Virtualize ⇒ 6 stub（基线 7 − 1）。
+#   与 v1 合起来钉住 CR-02 的两面：只点名开（1）与只点名关（6），任一面错位即红。
+stubs=6
+selector_waive_notes=1
+selector_arbitration_notes=0
+translate_gate_notes=0
+selector_waive_targets=(marker@0x614)

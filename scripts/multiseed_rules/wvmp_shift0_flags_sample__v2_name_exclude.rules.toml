@@ -1,0 +1,6 @@
+# MIT-522 v2_name_exclude —— 点名排除（缺省 virtualize，只豁免按名字点名的一个函数）
+# 刻意**不写** default_level：省略 = 全部 Virtualize（cli/src/config.cpp:212-213 +
+# docs/contracts.md §6.5 反向配置口径），与 v1 构成正反对照。
+[[functions]]
+name  = "(marker@0x614)"
+level = "none"

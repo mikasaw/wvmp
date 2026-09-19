@@ -1,0 +1,29 @@
+# MIT-522 v4_index_anchor —— index 锚回原始扫描序（前置区域豁免 + crypt 规则按原始序）
+# 本槽位的管道多一个 crypt pass（见同名 .passes.txt）——没有 crypt pass 时 crypt= 规则无人
+# 消费，断言会变死码（R5/R3 反对的那种锁）。
+#
+# 区域 [0] 被 level=none 豁免后，VM 程序列表（kVmProgram）被压缩：vfs[0]=区域[3]、
+# vfs[1]=区域[4]。crypt 面必须按 VirtualizedFunction::src_index（原始扫描序）解释 index，
+# 而不是压缩下标 i（contracts §6.1 ⚠️ 段 / CR-03「要求加密的函数留下明文」）。
+default_level = "none"
+
+# 声明 0 —— 前置区域 [0] 豁免：占掉一个原始扫描序号，其后 index 不得整体漂移
+[[functions]]
+index = 0
+level = "none"
+
+# 声明 1 —— 按原始扫描序点名区域 [3]：level 省略 = virtualize（§6.3 规则 5），
+# crypt=false  ⇒ 进 VM 但留明文。若 crypt 面错用压缩下标，这条不再命中 ⇒ 它被加密 ⇒ 红。
+[[functions]]
+index = 3
+crypt = false
+
+# 声明 2/3 —— 同指区域 [4]（(marker@0x678) = rva 0x1278）的两条 crypt 规则走不同选择器
+# ⇒ 加密面仲裁 Note；后声明（crypt=false）胜 ⇒ 区域 [4] 也留明文。
+[[functions]]
+name  = "(marker@0x678)"
+crypt = true
+
+[[functions]]
+rva   = 0x1278
+crypt = false

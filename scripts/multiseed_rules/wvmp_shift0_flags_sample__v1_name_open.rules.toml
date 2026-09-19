@@ -1,0 +1,7 @@
+# MIT-522 v1_name_open —— 点名开保护（缺省全原生，只放行按名字点名的一个函数）
+# 拼在 [[passes]] 块之前；见本目录 README「拼接位置」。
+default_level = "none"
+
+[[functions]]
+name  = "(marker@0x614)"
+level = "virtualize"

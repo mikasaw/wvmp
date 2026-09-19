@@ -1,0 +1,7 @@
+pe_loader
+marker_scan
+lifter
+virtualize
+crypt
+stub_link
+pe_writer

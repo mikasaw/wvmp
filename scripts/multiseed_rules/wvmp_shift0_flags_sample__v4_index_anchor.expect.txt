@@ -1,0 +1,26 @@
+# MIT-522 v4_index_anchor —— 跑前预测（R1）
+#
+# 推导链（contracts §6.1 ⚠️「index 不是 kVmProgram 下标，由 VirtualizedFunction::src_index
+# 解释——前置区域被跳过不改变后续区域的序号」+ §6.3 规则 2/5 + §6.4 跨选择器披露）：
+#   区域 [0]：命中声明 0（level=none）⇒ 豁免 ⇒ 1 条豁免 Note、0 stub。
+#   区域 [1][2][5][6]：0 命中 ⇒ default_level=none ⇒ 各 1 条豁免 Note ⇒ 合计 5 条。
+#   区域 [3]：命中声明 1（crypt=false，level 省略 = virtualize）⇒ 进 VM；加密面 1 条命中
+#     ⇒ 无仲裁 Note ⇒ 豁免加密。
+#   区域 [4]：声明 2（name）+ 声明 3（rva=0x1278）都命中 ⇒
+#     ① 档位面 hits=2 ⇒ 1 条 "命中 2 条 level 规则" Note；胜者 level=virtualize ⇒ 进 VM；
+#     ② 加密面 hits=2 ⇒ 1 条 "命中 2 条 crypt 规则" Note；后声明者 crypt=false ⇒ 豁免加密。
+#     ⇒ 仲裁 Note 合计 2（virtualize 1 + crypt 1）。
+#   stubs = 区域 [3] + 区域 [4] = 2。7 区基线全可翻译 ⇒ 翻译 gate 0 条。
+#   crypt 摘要行 = 已加密 0 / 总 2（kVmProgram 被压缩成 2 项），豁免 2。
+#
+# 本槽位是 CR-03 的反证：若 crypt 面错按压缩下标 i 解释 index，则声明 1 命中的是
+# 「不存在的第 3 项」⇒ 区域 [3] 被加密、豁免变 1、crypt 仲裁 Note 消失 ⇒
+# crypt_encrypted/crypt_exempt/selector_arbitration_notes 三项同时与预测不符 ⇒ 红。
+stubs=2
+selector_waive_notes=5
+selector_arbitration_notes=2
+translate_gate_notes=0
+selector_waive_targets=(marker@0x5b0),(marker@0x5e2),(marker@0x614),(marker@0x6aa),(marker@0x6dc)
+crypt_encrypted=0
+crypt_total=2
+crypt_exempt=2

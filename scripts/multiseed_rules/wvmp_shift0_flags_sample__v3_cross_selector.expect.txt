@@ -1,0 +1,17 @@
+# MIT-522 v3_cross_selector —— 跑前预测（R1）
+#
+# 推导链（contracts §6.3：单遍扫描、任一选择器命中即覆写、后声明者胜；§6.4：跨选择器
+# 命中 >1 条必须出仲裁 Note）：
+#   区域 [2]：name 条（声明 0）与 index=2 条（声明 1）都命中 ⇒ 2 条命中 ⇒
+#     ① 出 1 条 "命中 2 条 level 规则（跨选择器撞同一函数，按声明序后评胜）" Note；
+#     ② 胜者 = 声明序最后一条 = index=2 level=virtualize ⇒ 进 VM ⇒ 1 stub。
+#     （若实现错成"选择器优先级"或"先声明者胜"，区域 [2] 会被豁免 ⇒ stubs=0，
+#       且豁免 Note 变 7 条 —— 两个计数器同时翻面，钉死。）
+#   其余 6 区：0 命中 ⇒ default_level=none ⇒ 6 条豁免 Note。
+#   与 v1 的差集恰好只有那条仲裁 Note ⇒ 钉"仲裁发生了且只有 1 次"，
+#   与 v1 合看钉"后声明胜 = virtualize"（v1 单条 name=virtualize 出 1 stub 无仲裁）。
+stubs=1
+selector_waive_notes=6
+selector_arbitration_notes=1
+translate_gate_notes=0
+selector_waive_targets=(marker@0x5b0),(marker@0x5e2),(marker@0x646),(marker@0x678),(marker@0x6aa),(marker@0x6dc)

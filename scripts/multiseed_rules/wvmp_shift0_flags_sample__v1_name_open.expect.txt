@@ -1,0 +1,14 @@
+# MIT-522 v1_name_open —— 跑前预测（R1：先于首次带规则实跑提交，实测不符只上报不回写）
+#
+# 推导链（依据 docs/contracts.md §6.3 仲裁序 + §6.1 区域清单口径）：
+#   基线 7 区，规则集只有 1 条 name="(marker@0x614)" level=virtualize。
+#   区域 [2] (marker@0x614)：命中 1 条 ⇒ level=virtualize ⇒ 进 VM ⇒ 1 stub。
+#   区域 [0][1][3][4][5][6]：0 命中 ⇒ 落 default_level=none ⇒ 每个各出 1 条
+#     "按配置 level=none 保持原生（rva=…）" Note ⇒ 6 条豁免、0 stub。
+#   命中数 >1 才出仲裁 Note ⇒ 本槽位 0 条。7 区基线全可翻译 ⇒ 翻译 gate 0 条。
+#   无 crypt pass ⇒ 不声明 crypt_* 键。
+stubs=1
+selector_waive_notes=6
+selector_arbitration_notes=0
+translate_gate_notes=0
+selector_waive_targets=(marker@0x5b0),(marker@0x5e2),(marker@0x646),(marker@0x678),(marker@0x6aa),(marker@0x6dc)

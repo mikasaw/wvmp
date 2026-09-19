@@ -1,0 +1,12 @@
+# MIT-522 v3_cross_selector —— 跨选择器撞车仲裁（§6.3「后声明者胜」，非选择器优先级）
+# 两条同指区域 [2]，声明序 0 = name 口径、声明序 1 = index 口径 ⇒ 第 1 条胜出。
+# 对应 docs/contracts.md §6.5 实例 B 的同款形态（本单换成 shift0 样本的 [2]）。
+default_level = "none"
+
+[[functions]]
+name  = "(marker@0x614)"
+level = "none"
+
+[[functions]]
+index = 2
+level = "virtualize"
