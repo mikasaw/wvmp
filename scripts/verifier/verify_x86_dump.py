@@ -13,6 +13,7 @@ Why this gate exists:
     3. dispatch 含 and <r>, kTableEntries-1 掩码 + 间接 jmp（D3 8B 表项决策的
        落地证据）。掩码不写字面量：由 dump 跳表标记行的项数派生，再与代码侧
        asmgen.cpp 的 kTableEntries 对账（MIT-503：扩容曾把门留在 0x7F 上空转）。
+       对账是硬前置 —— 读不到 asmgen.cpp 时判 INCOMPLETE，不降级为单方派生仍算过。
     4. 电池集 handler（X3c 批次三起 60）全部在 dump 中登记（跳表缺项折叠 Halt 的
        对账面），
        每个登记 handler 的码体反汇编至少含 1 条指令（空 handler 检测）；
@@ -30,9 +31,14 @@ Input:
   dispatch 掩码、handler 码体非空）逐项显式 SKIP 披露，判词为 INCOMPLETE
   而非 PASS（MIT-503：此前三项整段静默跳过仍打裸 PASS，等于没跑）。
 
+  掩码对账是硬前置：本门须在仓内运行，读不到 asmgen.cpp 的 kTableEntries
+  时（仓外副本 / 路径漂移）掩码只剩 dump 单方派生，同样判 INCOMPLETE 而非
+  PASS（MIT-503 判据 8：与上一条同病灶 —— 降级为单方真源后仍与真 PASS 同形）。
+
 Exit codes: 0 = PASS; 1 = FAIL; 2 = tooling error;
-            3 = INCOMPLETE —— 反汇编审未执行（未传 --code，或 capstone 不可用）。
-            3 不得计为通过。
+            3 = INCOMPLETE —— 审项未执行：反汇编审（未传 --code / capstone
+            不可用）或掩码真源对账（读不到 asmgen.cpp kTableEntries）。
+            3 不得计为通过；将来接 runner 一律按「非 0 即不通过」判。
 
 Usage:
   python scripts\\verifier\\verify_x86_dump.py --asm runtime_dump_x86.txt \
@@ -99,6 +105,10 @@ DISASM_ITEMS = (
     "dispatch 掩码 + 寄存器间接 jmp（D3）",
     "每个 handler 码体首条可解码（空 handler 检测）",
 )
+# 依赖仓内 asmgen.cpp 的对账审项 —— 读不到源码时同样不得静默。
+SOURCE_ITEMS = (
+    "掩码真源对账：dump 跳表项数 × asmgen.cpp kTableEntries",
+)
 
 
 def fail(msg: str) -> None:
@@ -106,11 +116,11 @@ def fail(msg: str) -> None:
     sys.exit(1)
 
 
-def incomplete(msg: str) -> None:
-    print(f"[x86-dump-gate] SKIP {msg}")
-    for item in DISASM_ITEMS:
-        print(f"[x86-dump-gate]   SKIP 反汇编审项未执行：{item}")
-    print("[x86-dump-gate] RESULT: INCOMPLETE - 反汇编审未执行，不计为 PASS")
+def incomplete(reason: str, verdict: str, items: tuple[str, ...]) -> None:
+    print(f"[x86-dump-gate] SKIP {reason}")
+    for item in items:
+        print(f"[x86-dump-gate]   SKIP 审项未执行：{item}")
+    print(f"[x86-dump-gate] RESULT: INCOMPLETE - {verdict}，不计为 PASS")
     sys.exit(3)
 
 
@@ -164,14 +174,16 @@ def main() -> None:
     if dump_entries & (dump_entries - 1):
         fail(f"kTableEntries={dump_entries} 非 2 的幂，掩码派生不成立")
     code_entries, asmgen_path = code_side_table_entries()
-    if code_entries is None:
-        print(f"[x86-dump-gate] WARN: 读不到代码侧 kTableEntries（{asmgen_path}），"
-              f"掩码仅由 dump 跳表标记派生，无对账")
-    elif code_entries != dump_entries:
+    # 读不到代码侧真源 = 掩码只剩 dump 单方派生 ⇒ 降级，由 main 末尾统一判
+    # INCOMPLETE（判据 8：此前这里打 WARN 后走到底，与真 PASS 同形）。文本审
+    # 仍跑完，让 FAIL 优先于 INCOMPLETE 出。
+    source_reconciled = code_entries is not None
+    if source_reconciled and code_entries != dump_entries:
         fail(f"掩码真源对账失败：dump 跳表 {dump_entries} 项 != asmgen.cpp "
              f"kTableEntries {code_entries} 项（扩容后须用当前树重采 dump）")
     mask = dump_entries - 1
-    mask_src = "dump 跳表标记" if code_entries is None else "dump 跳表标记 × asmgen.cpp 对账"
+    mask_src = ("dump 跳表标记 × asmgen.cpp 对账" if source_reconciled
+                else "dump 跳表标记（无代码侧对账）")
     # 文本侧 dispatch 的 and 立即数也须等于派生掩码（先于 --code 的交叉证据）。
     dispatch_block = re.search(r"\ndispatch:\n(.*?)(?=\n; ---- handler |\Z)",
                                text, re.S)
@@ -209,7 +221,8 @@ def main() -> None:
         try:
             import capstone
         except ImportError:
-            incomplete("capstone 不可用：--code 已传，但反汇编审无法执行")
+            incomplete("capstone 不可用：--code 已传，但反汇编审无法执行",
+                       "反汇编审未执行", DISASM_ITEMS)
         try:
             with open(args.code, "rb") as f:
                 code = f.read()
@@ -250,7 +263,14 @@ def main() -> None:
         print("[x86-dump-gate] disasm ok: entry idiom / dispatch mask "
               f"0x{mask:X} / {len(handlers)} handler 首条全可解码")
     else:
-        incomplete("未传 --code：只做了 dump 文本静态审，码体反汇编审整段未执行")
+        incomplete("未传 --code：只做了 dump 文本静态审，码体反汇编审整段未执行",
+                   "反汇编审未执行", DISASM_ITEMS)
+
+    # 判据 8：仓外副本 / asmgen.cpp 路径漂移 ⇒ 掩码无代码侧对账，不得与真 PASS 同形。
+    if not source_reconciled:
+        incomplete(f"读不到 {asmgen_path} 的 kTableEntries（本门须在仓内运行），"
+                   "掩码只有 dump 单方真源",
+                   "掩码真源对账未执行", SOURCE_ITEMS)
 
     print("[x86-dump-gate] RESULT: PASS - 文本审 + 反汇编审（掩码 0x%X，%d handler）全过"
           % (mask, len(handlers)))
