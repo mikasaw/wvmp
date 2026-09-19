@@ -188,8 +188,16 @@ std::string hex64(u64 v) {
 // MIT-471：rdtsc 计时检查（包裹检查窗）。open = 第一次读数（存易失寄存
 // 器/x86 存 .wvmp 暂存）；close = 第二次读数 + 64 位差（x64）/ 32 位低差
 // + 进位警戒（x86 用 sbb，进位即超阈——窗口内 TSC 64 位回绕概率≈0）。
-// 阈值以上 → FailFast。寄存器纪律：x64 用 r11（volatile，检查窗内无人用）；
-// x86 全走绝对寻址暂存。
+// 阈值以上 → FailFast。寄存器纪律：x64 用 r11（volatile，检查窗内无人用）
+// 存第一读数、rdx 只作组合临时（rdtsc 刚写完 EDX:EAX，高 32 位在 shl 之前存活）；
+// x86 全走绝对寻址暂存（双 dword 槽）。
+// CR-05（MIT-527）：rdtsc 写的是 EDX:EAX 两个 dword（各自高 32 位被架构清零），
+// 所以 x64 两侧都必须先把 EDX 组合进 RAX 才是完整时间戳——旧形只
+// `mov r11, rax` 存低 32 位，close 段 `sub rax, r11` 于是在低 32 位跨进位时算出
+// 0xFFFFFFFF0000xxxx（真差 0x20 被判超时），反过来高位大跳、低位不回绕时又算出
+// 小差值（真超时被漏）。现语义与 x86 分支同判据：64 位无符号差值与阈值比。
+constexpr u32 kTimeStampHighShiftBits = 32;  // EDX:EAX → 64 位时间戳的组合位移
+
 std::string build_rdtsc_open_asm(bool is_x86, u64 scratch_va) {
     std::string o;
     if (is_x86) {
@@ -198,6 +206,8 @@ std::string build_rdtsc_open_asm(bool is_x86, u64 scratch_va) {
         o += std::string("mov dword ptr [0x" + hex64(scratch_va + 4) + "], edx") + char(10);
     } else {
         o += std::string("rdtsc") + char(10);
+        o += std::string("shl rdx, 0x" + hex64(kTimeStampHighShiftBits)) + char(10);
+        o += std::string("or rax, rdx") + char(10);
         o += std::string("mov r11, rax") + char(10);
     }
     return o;
@@ -223,6 +233,8 @@ std::string build_rdtsc_close_asm(bool is_x86, u64 scratch_va) {
         o += std::string("rdtsc_done:") + char(10);
     } else {
         o += std::string("rdtsc") + char(10);
+        o += std::string("shl rdx, 0x" + hex64(kTimeStampHighShiftBits)) + char(10);
+        o += std::string("or rax, rdx") + char(10);
         o += std::string("sub rax, r11") + char(10);
         o += std::string("cmp rax, 0x" + th) + char(10);
         o += std::string("ja rdtsc_fail") + char(10);
