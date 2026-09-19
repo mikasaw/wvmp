@@ -19,6 +19,23 @@ constexpr u16 kMagicPe32Plus = 0x20B;
 // 解析所需的最小 OptionalHeader 长度：覆盖到 FileAlignment @36+4。
 constexpr u16 kMinOptionalHeaderSize = 64;
 
+// MIT-525 (CR-06): OptionalHeader 内两处绝对偏移，单一真源。
+// 与仓内既有 7 处本地定义数值必须完全一致（pe_writer_pass.cpp:70、
+// tls_hook_pass.cpp:54、import_protect_pass.cpp:30 及其各自测试副本）：
+// PE32 = 96 (0x60) / PE32+ = 112 (0x70)。
+constexpr u64 data_directory_offset(bool pe32_plus) {
+    return pe32_plus ? 112u : 96u;
+}
+// NumberOfRvaAndSizes 紧贴 DataDirectory 之前 4 字节（PE32 = 92 / PE32+ = 108），
+// 同 pe_writer_pass.cpp:69 的 opt_num_rva_sizes_off。
+constexpr u64 num_rva_sizes_offset(bool pe32_plus) {
+    return data_directory_offset(pe32_plus) - 4u;
+}
+
+// DataDirectory 索引与表项宽度。
+constexpr u32 kDirEntrySize = 8u;
+constexpr u32 kExceptionDirIndex = 3u;   // IMAGE_DIRECTORY_ENTRY_EXCEPTION
+
 std::string hex16(u16 v) {
     char buf[8];
     std::snprintf(buf, sizeof(buf), "0x%04X", v);
@@ -84,31 +101,46 @@ PeImage parse_impl(std::span<const u8> image) {
     img.section_alignment = r.read_u32();
     img.file_alignment = r.read_u32();
 
-    // —— MIT-407: 暂存 DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION] (index=3)
-    // 解析 .pdata RUNTIME_FUNCTION 表所需的元数据。实际 .pdata 读取推迟到
-    // 节表解析之后（rva_to_offset 依赖 sections 完成）；此处仅记下 RVA/Size。
+    // —— MIT-407 / MIT-525 (CR-06): 暂存 DataDirectory[IMAGE_DIRECTORY_ENTRY_
+    // EXCEPTION] (index=3) 的 RVA/Size，供节表解析之后读 .pdata 用（rva_to_offset
+    // 依赖 sections，故此处只取目录表项，不读表体）。
     //
-    // PE32+ / PE32 的 OptionalHeader 字节布局到 DataDirectory 起点：
-    //   PE32+: ...| SizeOfHeapCommit(8)| LoaderFlags(4)| NumRvaSizes(4)| DataDir[0]
-    //   PE32 : ...| SizeOfHeapCommit(4)| LoaderFlags(4)| NumRvaSizes(4)| DataDir[0]
-    // 从 file_alignment 之后 (PE32+ 0x28 / PE32 0x24) 跳到 DataDirectory 起
-    // 点：0x70-0x28=0x48 (PE32+) / 0x60-0x24=0x3C (PE32)。
-    // DataDirectory[3] (EXCEPTION) 起点偏移 = 3*8 = 0x18。
+    // CR-06 改法 = 绝对定位：位置只由 opt_start（= pe_off + 24：NT 签名 4B +
+    // FILE_HEADER 20B）+ data_directory_offset 派生，不再依赖前序逐字段读取
+    // 留在 r.off 上的隐含落点。旧码的 `skip_to_dir = plus ? 0x48 : 0x3C` 与
+    // 其注释算式 `0x60-0x24=0x3C` 里的 0x24 是"漏读 BaseOfData"（MIT-414 之前）
+    // 时代 reader 的落点；MIT-414 补读 BaseOfData 后两种格式读完 FileAlignment
+    // (@0x24) 都停在 0x28，PE32 的跳距应为 0x60-0x28=0x38 —— 旧值 0x3C 多跳
+    // 4 字节，把 DataDirectory[3].Size 当成 RVA、把 DataDirectory[4].RVA 当成
+    // Size（PE32+ 侧 0x70-0x28=0x48 本就对，所以只有 PE32 静默读空）。
+    //
+    // CR-07 三层校验，一律先于任何按 Size 派生的分配（下方 .pdata 扫描）：
+    //  层①目录项落位：DataDirectory[0..3] 这 (3+1)*8 字节必须完整落在声明的
+    //     SizeOfOptionalHeader 区间内。不满足即不读——连 NumberOfRvaAndSizes
+    //     那 4 字节本身也在声明区外，读了就是拿节表字节当目录（旧码两问都不问）。
+    //     本函数前面已校验 opt_start + opt_size <= image.size()，故落位即界内。
+    //  层②目录计数：NumberOfRvaAndSizes >= 4，不足则本镜像没有异常目录可谈。
+    //  层③表体可信性：见下方 .pdata 扫描的探尾 + 逐条映射校验。
+    // 任一层不满足都记为"无异常目录"（pdata_rva 留 0 ⇒ 扫描整段跳过 ⇒
+    // pdata_empty 保持初值 true），走调用方既有回退链，不抛错也不扩宽语义。
+    const u64 opt_start = u64(pe_off) + 24;
+    const u64 opt_end = opt_start + opt_size;
+    const u64 dir_start = opt_start + data_directory_offset(img.is_pe32_plus);
+    const u64 dir_slots_needed_end =
+        dir_start + (kExceptionDirIndex + 1) * kDirEntrySize;
     u32 pdata_rva = 0, pdata_size = 0;
-    {
-        const u64 skip_to_dir = img.is_pe32_plus ? 0x48u : 0x3Cu;
-        if (u64(r.off) + skip_to_dir > image.size())
-            throw PeParseError("OptionalHeader 越界（DataDirectory 前）");
-        r.skip(skip_to_dir);
-        if (u64(r.off) + 0x18 + 8 > image.size())
-            throw PeParseError("OptionalHeader 越界（DataDirectory[3]）");
-        r.skip(0x18);
-        pdata_rva = r.read_u32();
-        pdata_size = r.read_u32();
+    if (dir_slots_needed_end <= opt_end) {                       // 层①
+        r.off = num_rva_sizes_offset(img.is_pe32_plus) + opt_start;  // 紧前 4 字节
+        const u32 num_rva_and_sizes = r.read_u32();
+        if (num_rva_and_sizes >= kExceptionDirIndex + 1) {       // 层②
+            r.off = dir_start + kExceptionDirIndex * kDirEntrySize;
+            pdata_rva = r.read_u32();
+            pdata_size = r.read_u32();
+        }
     }
 
     // —— 节表：每项 40 字节，位于 NT 头 + 24 + SizeOfOptionalHeader ——
-    r.off = u64(pe_off) + 24 + opt_size;
+    r.off = opt_end;
     img.sections.reserve(img.num_sections);
     for (u16 i = 0; i < img.num_sections; ++i) {
         char raw_name[8];
@@ -129,6 +161,20 @@ PeImage parse_impl(std::span<const u8> image) {
     // —— MIT-407: 解析 .pdata RUNTIME_FUNCTION 表（节表已就位）——
     // x64 RUNTIME_FUNCTION：12B/条 = BeginAddress(4) + EndAddress(4) +
     // UnwindInfoAddress(4)，按 BeginAddress 升序。
+    //
+    // MIT-525 架构口径（判据 3）：是否按 12B RUNTIME_FUNCTION 解释该目录，
+    // 判据是"目录本身存在且三层校验通过"，**不是** machine 值。
+    //  · x64（machine=0x8664）= 常态：表式 SEH 是 PE32+ 的强制组成，实测池内
+    //    x64 样本 NumberOfRvaAndSizes=16、DataDirectory[3] 恒非空（Size 为 12
+    //    的整倍数）；
+    //  · x86（machine=0x014C）PE32 = 通常无此表：Microsoft 的 x86 SEH 是栈链式
+    //    （.ehdr/_except 代码），没有 RUNTIME_FUNCTION 表，链接器把
+    //    DataDirectory[3] 写成 0/0（dumpbin 实测，见 MIT-453 triage）⇒ 本函数
+    //    在 x86 上自然落到 pdata_empty=true 的回退链，行为与修前逐字节一致。
+    //  这里不设 machine 硬门，是为了不把"目录声明了就当没有"这一新语义塞进
+    //  解析层：任何镜像（含合成夹具、非 MSVC 工具链产物）声明了异常目录，
+    //  都按同一 12B 表式解释；解释不通（探尾/映射/升序/区间任一失败）一律回
+    //  pdata_empty=true，由调用方回退。口径详见 docs/GAPS.md 的 MIT-525 节。
     // 防御：end <= begin 或 begin 逆序视为不可信，标记 pdata_empty=true
     // 回退；条目 RVA 无节内映射 / 超出文件边界同理（rva_to_offset 已做
     // 节映射 + 未初始化尾部防御）。
@@ -138,10 +184,16 @@ PeImage parse_impl(std::span<const u8> image) {
     // 该防御恒为 0 → pdata_empty 恒 true → ExitNative 上界查询永远失败。
     if (pdata_rva != 0 && pdata_size >= 12) {
         const u64 entry_count = u64(pdata_size) / 12u;
-        img.pdata.reserve(static_cast<size_t>(entry_count));
-        bool ok = true;
+        // 层③（MIT-525 CR-07）：先探尾，再决定读不读——声明区间的最后一条也必须
+        // 可映射且 12 字节齐；不满足即整表不可信，一条都不读（pdata 保持空 ⇒
+        // pdata_empty=true 走回退链）。旧码在这里无条件
+        // `reserve(pdata_size/12)`：Size 未经任何校验，0xFFFFFFFF 就是
+        // 357,913,941 条（≈4.3GB）的预分配。
+        const u64 tail_rva = u64(pdata_rva) + (entry_count - 1) * 12u;
+        const auto tail_off = img.rva_to_offset(tail_rva);
+        bool ok = tail_off.has_value() && u64(*tail_off) + 12u <= image.size();
         u32 prev_begin = 0;
-        for (u64 i = 0; i < entry_count; ++i) {
+        for (u64 i = 0; ok && i < entry_count; ++i) {
             const u64 entry_rva = u64(pdata_rva) + i * 12u;
             const auto off = img.rva_to_offset(entry_rva);
             if (!off || u64(*off) + 12 > image.size()) {
