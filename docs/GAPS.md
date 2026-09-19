@@ -4783,6 +4783,14 @@ mit505_handler_diff.sh, mit505_shiftmask_out/}`。
 （MIT-490 改判），从未把旧的 `0x3F` 运行时档写成"支持口径"，故此处是**追加正确口径**
 而非改判。
 
+**行号漂移自报（本单引入）**：为取 `isa::shift_count_mask` 给 asmgen.cpp 加了一枚
+`#include "wvmp/regvm/isa/encoding.hpp"` ⇒ 该文件 `kTableEntries`（原 `:355`）与
+`build_shift`（原 `:1026`）等点位**整体 +1**，本文 MIT-503 (B0-1) 节里引的
+「`asmgen.cpp:355` 是 `constexpr u64 kTableEntries = 256`」这类行号读数按
+`git grep -n kTableEntries mit-debt-b-shiftmask -- vm/regvm/runtime/src/asmgen.cpp`
+现算为准（当前 `:356`）。同族还有派活单正文引的 `asmgen.cpp:1045`（掩码行）现落
+`:1067`。 append-only 不改 MIT-503 原文，只在此登记。
+
 **遗留风险**：① 本单修的是「掩码 → 旁路判定」这一条通路；`flags_tail` 全量装配在
 **其他** 旁路漏触发场景下的污染面未被本网格覆盖（网格只覆盖移位族的计数轴）。② x86
 侧掩码正确性依赖「32 位模式恒 5 位」这一架构事实，若将来引入 64 位模式的 x86 池外
