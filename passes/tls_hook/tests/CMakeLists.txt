@@ -59,3 +59,34 @@ target_link_libraries(wvmp_tls_abi_exec_tests PRIVATE
 wvmp_target_warnings(wvmp_tls_abi_exec_tests)
 add_dependencies(wvmp_tls_abi_exec_tests wvmp_tls_abi_probe)
 add_test(NAME tls_abi_exec_tests COMMAND wvmp_tls_abi_exec_tests)
+
+# MIT-527 (CR-05)：x64 rdtsc 计时面「注入时间戳」真执行反证。探针 = 独立 exe
+# （真实发射的回调桩镜像进 RWX，两处 rdtsc 指令等长换成 int3+nop，VEH 在断点
+# 现场写 EDX:EAX 当返回值；判定比较处用 TF 单步从真机上下文读回代码算出的差值）。
+# 超时判定 = 撞 FailFast 写零红线（asm 帧无 unwind 信息）⇒ 只能子进程观测退出码
+# + readings，gtest 侧只做 spawn + 断言物理量。
+add_executable(wvmp_rdtsc_wrap_probe
+    rdtsc_wrap_probe.cpp
+)
+target_link_libraries(wvmp_rdtsc_wrap_probe PRIVATE
+    wvmp_pass_tls_hook
+    $<TARGET_OBJECTS:wvmp_pass_tls_hook>
+    wvmp_pass_tls_plan
+    wvmp_pass_anti_debug_plan
+    wvmp_pass_pe_loader
+    wvmp::framework
+    wvmp::common
+    wvmp::keystone
+)
+wvmp_target_warnings(wvmp_rdtsc_wrap_probe)
+
+add_executable(wvmp_rdtsc_wrap_tests
+    test_rdtsc_wrap.cpp
+)
+target_link_libraries(wvmp_rdtsc_wrap_tests PRIVATE
+    wvmp::gtest
+    gtest_main
+)
+wvmp_target_warnings(wvmp_rdtsc_wrap_tests)
+add_dependencies(wvmp_rdtsc_wrap_tests wvmp_rdtsc_wrap_probe)
+add_test(NAME rdtsc_wrap_tests COMMAND wvmp_rdtsc_wrap_tests)
