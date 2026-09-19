@@ -1,5 +1,7 @@
 > 更新时间：2026-09-19（**A 波四线收口**：MIT-490 (T74) CR-01 零次移位 flags 活跃性改判条件定义 + MIT-491 CR-02/03 `[[functions]]` 三选择器查询面对等（契约 C-A2 成文）+ MIT-492 wvmpTest 28 区语料内聚入库 + F3 CR-01 样本入池 ⇒ baseline 池 71→72 槽 × 5 seeds = **360/360** + MIT-493 文档真源统一。**支持矩阵单一真源 = `docs/GAPS.md`「指令族支持矩阵（当前口径，2026-09-19 实测 · 单一真源）」节**，本文与 README 均为其镜像。正文逐单节此前停在 MIT-521 (T73) 2026-09-14；上一版头部（2026-09-05 / MIT-464）原文按 435 纪律保留于下，不删。）
 
+> 追记（2026-09-19 · **B 波首张 MIT-503 B0-1**，交付面 = 分支 `mit-debt-b-x86dumpgate`，**未合 main**，故不改上面那行的 main 口径）：x86 dump 门腐化修复 = 掩码单一真源化（门内字面量清零、与 `asmgen.cpp` `kTableEntries` 硬对账）+ 堵住三条空转旁路（未传 `--code` / capstone 缺失 / 仓外副本，一律 `RESULT: INCOMPLETE` + exit=3）+ 两处过期注释翻正 ⇒ **六件套 F2 那一格（x86 dump 门）由「预期不可证」翻为可证**。退出码契约 0/1/2/3 入册，**3 不得计为通过**。逐单节见本文 `### MIT-503 (B0-1 · x86 dump 门腐化修复)`，证据链 GAPS 同名节。
+
 > （**历史头部 2026-09-05，MIT-464 integrity_crc-v1：M3 工作流 5 完整性校验首版——密文 CRC32 + 解密前 FailFast**（无派单直接开发；MIT-456~463 均已合入）：
 IntegrityCrcPass（Transform，crypt 之后，requires kCryptPlan——crypt pass 显式 provide）对每个密文流算 IEEE CRC32（common/crc32.hpp 单一来源，反射式 0xEDB88320），写入尾区 reserved 槽（布局 [flag][crc32] 零变更兑现 MIT-458 预留位）；stub crypt 块解密前 bitwise 校验（mismatch → FailFast）。**安全价值 = 封死 xor 链可延展加密的盲翻密文位面**。**验证**：ctest **21/21**（crc32 已知向量 "123456789"→0xCBF43926 + 分段一致 + plan 写入 + 单字节翻转检测）；wvmpTest 10-pass 全栈（mutate+crypt+integrity+anti_debug）双跑 103/103 byte-identical（14 密文流全校验）；**篡改实验**：密文翻转 1 字节 → 确定性崩溃 rc=139。**D1 边界**：仅覆盖密文流面（头/旗标不在 CRC 内；解密后明文与 .wvmp 其余部分属 init 钩子面 MIT-465 后续）；无 crypt 管道 Note 跳过；bitwise 无表实现 per-call 开销 ~9 指令/字节（表驱动优化留后续））
 
@@ -1388,9 +1390,50 @@ asmgen 零触碰 → dump 锚不受影响（无换代）。
 > 异项；一次查全见本文「MIT-490~493 编号复用登记（同编号双义 · 查单先定族）」节 + `docs/GAPS.md` 同名节。
 - 外部 `../wvmpTest` 28 区语料 + `avx_kernels` 回灌入库（五文件 LF 归一后逐 blob 等值；`kernels.toml` **有意不同** = 原值指向仓外产物），`smoke_test.bat` 补 x86 一腿、toml/脚本不再吃仓外目录、`run_compare.cmd` 补 diff 承重（原先两边 rc=0 即 `[PASS]`，diff 数不参与退出码）。F3 样本 `wvmp_shift0_flags_sample`（7 区，REQUIRE_REAL 下 7/7 真虚拟化、0 条 gate note）入池 ⇒ 池 71→72 槽 × 5 seeds = **360**。语料口径：`git grep -c PROTECT_BEGIN` 的 28 含 1 处文件头用法注释 ⇒ 真实 marker 27 + avx 3 = **30 区**，减 `wv_lcg_next` 空打标区（打标对之间无指令；**语料缺陷，不是产品 gate**）= **x64 29 stub / x86 26 stub**。验证：build `[407/407]` rc0、ctest 23/23、multiseed **360 pass / 0 fail**、wvmpTest x64 106/106 + x86 105/105 双跑 diff-0、x64 dump 门 3 样本 PASS、静态门 PASS、x86 dump 门预期不可证（MIT-495 F2）。
   证据链 GAPS MIT-492 落账节 +「语料口径：30 marker 区 − 1 空区 = 29 stub」小节。
+  **F2 那一格翻面追注（2026-09-19，MIT-503 B0-1）**：上条末尾「x86 dump 门预期不可证
+  （MIT-495 F2）」是该单时点读数、原文未动；该格已由 MIT-503 修好门本体转为**可证**
+  （当前树现采 dump 带 `--code` = `RESULT: PASS` exit=0），见本文 `### MIT-503 (B0-1 · …)` 节。
 
 ### MIT-493 (A波-4 · 文档真源统一) ✅ 2026-09-19
 > 编号复用：本节属**新族（A 波四线，2026-09-19）**，与 2026-09-09 的旧族 T22~T25 同编号
 > 异项；一次查全见本文「MIT-490~493 编号复用登记（同编号双义 · 查单先定族）」节 + `docs/GAPS.md` 同名节。
 - 纯文档单，产品代码 / 构建脚本 / 测试用例零改动。① GAPS 新增「指令族支持矩阵（当前口径，2026-09-19 实测 · 单一真源）」= 支持矩阵单一真源 + 指标↔复算命令表 + gate 三档分档（架构 / 频率 / 永久）+ **挂账偏差**（x64 S32 运行时移位掩码取 6 位，逐字取 MIT-490 交付评论原句，单列一档不入 gate）+ 30−1=29 语料口径小节；② 08-31 矩阵改标「历史快照」并加取代注记、x87「永久 gate」节顶部加翻面注记（两处历史数字一字未改，435 append-only）；③ 代线 1/线 2/线 3 补 GAPS 落账三节 + 本文件上方三行；④ README.md / README.zh-CN.md 与 GAPS 逐指标交叉核对（`kVmOpMax` 164 / 跳表 256 / baseline 360 / x87 x86 / ymm x64 / gate 三档）并互指单一真源。
   证据链 GAPS MIT-493 落账节。
+
+### MIT-503 (B0-1 · x86 dump 门腐化修复) ✅ 2026-09-19
+> 编号复用：本节属**新族（B 波首张 B0-1，2026-09-19，父单 = B 波总单 `MIT-501`）**，与
+> 2026-09-13 的旧族 `### MIT-503 (T57 · measure_perf 挂死修复 + 环境元数据归一化)`
+> **同编号异项**；`grep MIT-503` 会先命中旧族那行。判族三条：父单 → 分支前缀
+> （`mit-debt-b-*` = 新族）→ 落账日期。同号异项另见 `MIT-504`（B 波复核单 ↔ 旧族 T58）。
+- **交付面 = 分支 `mit-debt-b-x86dumpgate`（D0：未合 main、未 push；基线 main `b2e72a4`）**：
+  `e5e39d6` 门本体 + `357e0b6` 判词 token 对齐 + `7bb92a1` 判据 8 + 一枚 docs-only 落账
+  commit。改动面按 commit 分两枚核：代码枚只含 `scripts/verifier/verify_x86_dump.py` +
+  `asmgen.cpp` / `vm_op.hpp` 的两处**注释行**，落账枚只含 `docs/GAPS.md` + `docs/STATUS.md`；
+  `kTableEntries` / `kVmOpMax` / `kCtxSize` / 跳表项数零改动。
+- **根因两条，第二条更根本**：① 门里手抄 `0x7F`，`a9cff8f`（MIT-510）把跳表扩到 256 后
+  无人回改 ⇒ 自扩容起对任何 x86 dump 必 FAIL；② **门可空转** —— entry idiom / dispatch
+  掩码 / handler 码体三项反汇编审全在 `if args.code:` 内，不传 `--code` 就打裸 `PASS` +
+  exit=0 零披露 ⇒ 该格 6 天无人能证的真实成因是 ②（"按 docstring 示例跑等于没跑"）。
+  同病灶残留第三口（判据 8）：读不到代码侧 `kTableEntries` 时打 WARN 后仍判 PASS exit=0。
+- **修复面**：脚本内掩码字面量清零 —— 判据链 = dump 跳表标记行 `(N x u64)` 派生 → 与
+  `asmgen.cpp` 的 `constexpr kTableEntries` **对账（硬前置）** → 再核 dump 文本与 `--code`
+  码体反汇编两侧 `and` 立即数**数值**相等；三条空转旁路（未传 `--code` / capstone 缺失 /
+  仓外副本）一律逐项 SKIP 披露 + `RESULT: INCOMPLETE` + **exit=3**。两处过期注释翻正
+  （`asmgen.cpp:15` `=0x7F` → `=0xFF`、`vm_op.hpp:8` `kTableEntries=128` → `=256`）。
+- **F2 那一格翻面**：六件套的 x86 dump 门由「预期不可证（MIT-495 F2）」→ **可证**。正/反
+  读数：当前树现采 dump 带 `--code` = `RESULT: PASS` exit=0；毁派生掩码 = 文本侧 FAIL
+  exit=1；只毁码体侧期望掩码 = 码体侧 FAIL exit=1（证明缺陷①原句那条断言不是死码）；
+  不带 `--code` = INCOMPLETE exit=3；仓外副本同一份 dump = 改前 PASS exit=0 → 改后
+  INCOMPLETE exit=3；旧 128 项 dump 对当前树 = 真源对账 FAIL exit=1。零回踩：
+  `build_x86_tests.bat` → `[x86] OK`、x86 电池含 `DisasmStaticGate` 全绿、x64
+  `scripts\test.bat` → `100% tests passed, 0 tests failed out of 23`、x64 `build.bat`
+  `[407/407]` rc0、现采 dump 与上一轮逐字节 `cmp` 恒等（注释改动零码体影响）。
+- **防再犯条款**：跳表扩容 = 改 `kTableEntries` + 用当前树重采 dump，**门侧不需要也不允许
+  再手抄掩码**；与「三处齐动」纪律（`test_runtime_x86.cpp` 加 TEST + handler 表加行 + 门
+  `BATTERY_HANDLERS`）并表互指——那条管新增 handler，本条管改容量。
+- **退出码契约入册**：0=PASS / 1=FAIL / 2=tooling / **3=INCOMPLETE（反汇编审或掩码真源
+  对账未执行，不得计为通过）**；将来接 runner 必须按「非 0 即不通过」判，不得沿用
+  「rc=0 即绿」。**该门至今无任何 runner 调用**（这正是腐化存活 6 天的原因），是否接线
+  交项目主拍，本单边界禁接。
+  证据链 GAPS「MIT-503 (B0-1 · x86 dump 门腐化修复，2026-09-19)」节（含四条历史读数的
+  回溯标注：MIT-494s / MIT-494t 两条结构门 PASS 未记 `--code` ⇒ 按新契约归 INCOMPLETE 档）。

@@ -268,6 +268,7 @@
 | x87 (D8-DF) | **x86 ✅ 虚拟化**（L0–L4）/ **x64 ⛔ 架构 gate** | 见下矩阵行；证据链 GAPS MIT-509 / MIT-510 |
 | ymm / VEX.256 | **x64 ✅ 虚拟化**（`vzeroupper`/`vzeroall` + `vmov*` 32B + 18 条 packed 算术）/ **x86 ⛔ 架构 gate** | 见下矩阵行；证据链 GAPS MIT-511~514 |
 | wvmpTest 语料面 | marker 函数 **30 区**（`kernels.cpp` 27 + `avx_kernels.cpp` 3）→ x64 **29 stub** / x86 **26 stub**，缺口 1 区为**语料缺陷**（见下「语料口径」小节，非产品 gate） | `git grep -c PROTECT_BEGIN -- tests/wvmpTest` → `kernels.cpp:28`（含 `:7` 一处文件头用法注释）+ `avx_kernels.cpp:3` + `wvmp_protect.h:2`（宏定义/`#undef`，不是区域）⇒ 真实 marker = 27+3 = 30；`tests\wvmpTest\smoke_test.bat` → `已生成 29 个入口 stub` |
+| x86 dump 门（六件套 F2 格） | `RESULT: PASS` + exit=0：掩码 `0xFF` 由跳表项数派生并× `asmgen.cpp` `kTableEntries=256` 对账、138 handler 登记（电池集 94 全覆盖）。⚠️ 本行读数取自分支 `mit-debt-b-x86dumpgate`（MIT-503 B0-1，**未合 main**），不属本表上方那句"main `54db77f` 实测"口径 | 现采：`WVMP_X86_ASM_DUMP`/`WVMP_X86_CODE_DUMP` 跑 `X86Battery.DisasmStaticGate` → `python scripts\verifier\verify_x86_dump.py --asm <dump.txt> --code <code.bin>`。**退出码契约 0=PASS / 1=FAIL / 2=tooling / 3=INCOMPLETE，3 不得计为通过；不带 `--code` 或 capstone 缺失一律 3** —— 全文见「MIT-503 (B0-1 · x86 dump 门腐化修复，2026-09-19)」节 |
 
 ### gate 分档（三档，与 README「Gate boundaries」表逐行对齐）
 
@@ -890,6 +891,11 @@ CallGate/ExitNative/Ret（3，协议面 4B 化 = X3c 主体；Call 无 x64 行�
 （X3a 设计兑现）：`tests/test_runtime_x86.cpp` 加 TEST + handler 表加行 +
 `scripts/verifier/verify_x86_dump.py` BATTERY_HANDLERS 同步，三处每 handler
 齐动（本单 38 op 全数践行）。
+
+> **互指（2026-09-19，MIT-503 B0-1）**：上面这条纪律管的是*新增 handler* 的漂移；
+> *改跳表容量*（`kTableEntries`）另有一条 —— 门侧从不手抄掩码，扩容只需改 `asmgen.cpp`
+> 的 constexpr + 用当前树重采 dump，两条各补对方一个盲区，见本文「MIT-503 (B0-1 · x86
+> dump 门腐化修复，2026-09-19)」节的防再犯条款。
 
 **X3b 三项裁决（MIT-444 实测钉死）**：
 1. **Push/Pop 4B 槽**：guest esp 步进 4B（S32 栈宽）⨯ ctx rsp 槽 8B（VM 槽
@@ -3272,6 +3278,11 @@ xmm 字节门 PASS；④ **x64 dump 换代**：67cfa727/161,861B →
 **f8b0ebd6/164,350B**（test_runtime.cpp 底稿注释已更新，MIT-474 先例
 同款）；x86 dump 178,527→178,233B（结构门无 sha 底稿）。
 
+> **回溯注记（2026-09-19，MIT-503 B0-1）**：上面「verify_x86_dump 结构门 PASS」这条读数
+> **没记是否带 `--code`**，而三项反汇编审全在 `if args.code:` 块内 —— 按 MIT-503 立的
+> 退出码契约（0/1/2/3）归 **INCOMPLETE 档**，不得当作"该单时点 x86 门为绿"的证据。
+> 原文按 435 纪律一字未动，详见本文「MIT-503 (B0-1 · x86 dump 门腐化修复，2026-09-19)」节。
+
 **边界披露**：setcc/cmovcc/条件 ExitNative 的 cond 链保持原样（本矩阵
 冷面，收益为零白付 128B/handler 静态尺寸；推广收益待真实词流测温）；
 单机单日采样（5 次中位，波动 ~1%）；cond 表 +128B/镜像静态成本（<0.5%
@@ -3330,6 +3341,11 @@ ecx 常驻再 ALU −3.8% / br −2.8% / mem −3.9%。
 x64 面字节恒等（sha 复验）+ 全门绿：ctest 23/23、x64 57+2SKIP、x86 电
 池 46/46（修复两轮后）、x86 结构门 PASS、crypt 20/20、tls 4/4、7 点
 checksum 一致；multiseed_aslr **334/335 + 1 环境项**（见披露）。
+
+> **回溯注记（2026-09-19，MIT-503 B0-1）**：上句「x86 结构门 PASS」同 MIT-494s 节那条
+> ——**没记是否带 `--code`**，按 MIT-503 的退出码契约归 **INCOMPLETE 档**，不得当作
+> 该单时点 x86 门为绿的证据。原文一字未动，见「MIT-503 (B0-1 · x86 dump 门腐化修复，
+> 2026-09-19)」节。
 
 **环境项披露（T38 先例，非语义回归）**：multiseed 池 wvmp_x86_div_
 sample seed=99999 打包哈希被 Defender 云 ML 判定拦截——运行 rc=126 /
@@ -4525,6 +4541,11 @@ x86 `passed=105` + `26 个入口 stub` + diff-0；x64 dump 门 3 样本 `RESULT:
 （47 SSE handler + `vmovups ymm count = 2`）；x86 dump 门预期不可证（F2）；
 静态门 `RESULT: PASS`。
 
+> **F2 那一格翻面追注（2026-09-19，MIT-503 B0-1）**：上句「x86 dump 门预期不可证（F2）」
+> 是该单时点读数，原文一字未动；该格现已**可证** —— 门本体修好后（掩码单一真源 + 堵住
+> `--code` / capstone 两条空转旁路），当前树现采 dump 的正证读数为 `RESULT: PASS` exit=0，
+> 反证读数仍按注入断言出 FAIL。见本文「MIT-503 (B0-1 · x86 dump 门腐化修复，2026-09-19)」节。
+
 ## MIT-493 (A波-4 · 文档真源统一) 落账（2026-09-19）
 > 编号复用：本节属**新族（A 波四线，2026-09-19）**，与 2026-09-09 的旧族 T22~T25 同编号
 > 异项；一次查全见本文「MIT-490~493 编号复用登记（同编号双义 · 查单先定族）」节 + `docs/STATUS.md` 同名节。
@@ -4539,3 +4560,110 @@ x86 `passed=105` + `26 个入口 stub` + diff-0；x64 dump 门 3 样本 `RESULT:
 3. 「x87 (永久 gate, R3 裁决)」节顶部加取代注记（正文与频率表未动）；
 4. 本文件末补线 1 / 线 2 / 线 3 三节的落账（`docs/STATUS.md` 对应补 `### MIT-490 (T74)`
    与 MIT-491 / MIT-492 三行，头部"更新时间"与正文最新条目对齐）。
+
+## MIT-503 (B0-1 · x86 dump 门腐化修复，2026-09-19)
+
+> **编号复用（族标识）**：本节属**新族 = B 波首张 B0-1，2026-09-19**，父单 = B 波总单
+> `MIT-501`（平台单）；与本文 2026-09-13 的
+> `## MIT-503（T57 · measure_perf 采样层挂死修复 + 环境元数据归一化，2026-09-13）`
+> **同编号异项**，`grep MIT-503 docs/GAPS.md` 会先命中旧族那一节。判族三条按优先级：
+> ① 父单（B 波总单 vs 各自 T 批派单）；② 分支前缀（`mit-debt-b-*` = 新族，
+> `mit-5NN-tMM-*` = 旧族）；③ 落账日期（2026-09-19 vs 2026-09-13）。同号异项的
+> 复核单 `MIT-504`（B 波，2026-09-19）↔ 旧族 `## MIT-504（T58 · x86 受控口径墙钟刷新，
+> 2026-09-13）` 同理。本节只登记 B0-1 一族，不回改旧族任何条目（435 append-only）。
+
+**交付面**：分支 `mit-debt-b-x86dumpgate`（D0 未合 main、未 push，基线 = main `b2e72a4`）
+= `e5e39d6`（门本体）+ `357e0b6`（判词 token 对齐项目门约定 `RESULT: PASS|FAIL|INCOMPLETE`）
++ `7bb92a1`（判据 8：掩码真源对账改硬前置）+ 本节的 docs-only commit。代码三枚合起来的
+改动面严格三文件：`scripts/verifier/verify_x86_dump.py` +
+`vm/regvm/runtime/src/asmgen.cpp`（**仅注释**）+
+`vm/regvm/isa/include/wvmp/regvm/isa/vm_op.hpp`（**仅注释**）；`kTableEntries` /
+`kVmOpMax` / `kCtxSize` / 跳表项数**零改动**。
+
+**根因①（字面量漂移）**：`scripts/verifier/verify_x86_dump.py:157` 硬断言 dump 里
+`and <r>, 0x7f`（= `kTableEntries-1` 的 **128 项旧值**），而
+`vm/regvm/runtime/src/asmgen.cpp:355` 是 `constexpr u64 kTableEntries = 256`。扩容落在
+`a9cff8f`（MIT-510，跳表 128→256）：x64/x86 两条 dispatch 都按 `kTableEntries-1`
+**自动导出**掩码（`asmgen.cpp:709` / `:3994`，`imm()` 以 `"0x%llX"` 发射），门侧那个手抄
+字面量无人回改 ⇒ 自扩容起该门对**任何** x86 dump 必 FAIL，读数形如
+`FAIL dispatch 缺 and <r>, 0x7f（kTableEntries-1）`（A 波 MIT-490 / MIT-491 两节的
+「时点六件套」已如实记着这条 FAIL，是本项目现存最好的腐化证据）。
+
+**根因②（门可空转 · 本单真正目标）**：`--code` 是可选参数，而 entry 首四条（D2 idiom）、
+dispatch 掩码（D3）、handler 码体非空**这三项反汇编审全部位于 `if args.code:` 块内**
+（旧版 `:130` 起）。不传 `--code` 时三项整段跳过，脚本直接落到末尾打裸
+`[x86-dump-gate] PASS` + exit=0、**零披露** —— 与脚本自己的 docstring（「跳过并**披露**」）
+正相反。**该格 6 天无人能证的真实成因是 ②，不是 ①：门不是没人跑，而是按 docstring
+示例那样跑就等于没跑。**只把 `0x7f` 改成 `0xff` 会留下一把仍可空转的锁。
+
+**同病灶的残留第三口（判据 8，本役一并堵）**：脚本读不到代码侧 `kTableEntries` 时只打
+一行 WARN 便走到底判 `RESULT: PASS` + exit=0（MIT-504 复核 V-N10 实测）。人眼能从
+`mask ok` 行的源标记分辨降级，但**只看判词 token / 退出码的自动化消费面与真 PASS 同形**。
+
+**修复后的判据链（脚本内不再存任何掩码字面量）**：dump 跳表标记行 `(N x u64)` 派生
+`kTableEntries` → 与 `asmgen.cpp` 的 constexpr **对账**（读不到 ⇒ 判 INCOMPLETE，而不是
+降级后继续跑）→ 再核 dump 文本 dispatch 与 `--code` 码体反汇编两侧 `and` 立即数**数值**
+相等。任一侧单独扩容都会在门口断掉。两条空转旁路（未传 `--code`、capstone 不可用）
+逐项显式 SKIP 披露 + `RESULT: INCOMPLETE` + exit=3，与真 PASS 不再同形。
+
+**防再犯条款（跳表扩容口径）**：扩容 = 改 `asmgen.cpp` 的 `kTableEntries` + **用当前树重采
+dump**（`WVMP_X86_ASM_DUMP=<win 路径>` / `WVMP_X86_CODE_DUMP=<win 路径>` 跑
+`X86Battery.DisasmStaticGate`）；**门侧不需要、也不允许再手抄掩码**。拿旧 dump 蒙混已被
+拦住：旧 128 项 dump 对当前树 = `RESULT: FAIL - 掩码真源对账失败：dump 跳表 128 项 !=
+asmgen.cpp kTableEntries 256 项` + exit=1。本节与本文「asmgen x86 核心：KS_MODE_32 双模
++ 池重构 + x86 runtime 电池（MIT-443 X3a 收口）」节末的既有纪律（`test_runtime_x86.cpp`
+加 TEST + handler 表加行 + 门 `BATTERY_HANDLERS` **三处齐动**）**并表互指**：那条管
+*新增 handler* 的漂移，本条管*改跳表容量* 的漂移，两条各补对方一个盲区，缺一即留一把
+会空转的锁。
+
+**退出码契约（入册）**：
+
+| rc | 判词 | 含义 | 计为通过？ |
+|---|---|---|---|
+| 0 | `RESULT: PASS` | 文本审 + 反汇编审 + 掩码真源对账三项**全部执行**且全过 | ✅ |
+| 1 | `RESULT: FAIL - <msg>` | 任一断言不成立（含真源对账失败） | ❌ |
+| 2 | `FAIL tooling: …` | 输入读不出（`--asm` / `--code` 路径问题），审项未开跑 | ❌ |
+| 3 | `RESULT: INCOMPLETE - …` | 审项**未执行**：未传 `--code` / capstone 不可用 / 读不到 `asmgen.cpp` 的 `kTableEntries`（仓外副本、路径漂移） | ❌ **不得计为通过** |
+
+将来接 runner 必须按「**非 0 即不通过**」判，**不得沿用「rc=0 即绿」**：exit=3 这一档
+存在的唯一理由就是把"没跑成"与"跑过了"分开（前车之鉴 = `run_compare.cmd` 原先两边
+rc=0 即 `[PASS]`、diff 数不参与退出码，到 MIT-492 才补上承重）。
+
+**F2 那一格翻面（六件套 · x86 dump 门：预期不可证 → 可证）**：同一份当前树现采 dump
+（`jump table @ +0x7AF8 (256 x u64`、dispatch `and eax, 0xFF`）的正证读数：
+
+```
+$ python scripts/verifier/verify_x86_dump.py --asm build\mit503b_x86.asm.txt --code build\mit503b_x86.bin
+[x86-dump-gate] header ok: dispatch=+0x1d table=+0x7af8
+[x86-dump-gate] mask ok: kTableEntries=256 → and <r>, 0xFF（源：dump 跳表标记 × asmgen.cpp 对账）
+[x86-dump-gate] handlers ok: 138 登记项（电池集 94 全覆盖）
+[x86-dump-gate] disasm ok: entry idiom / dispatch mask 0xFF / 138 handler 首条全可解码
+[x86-dump-gate] RESULT: PASS - 文本审 + 反汇编审（掩码 0xFF，138 handler）全过
+exit=0
+```
+
+门有效性反证（临时改期望值、**不落树**，两次都带 `--code`）：毁派生掩码 → 文本侧断言
+`RESULT: FAIL` exit=1；只毁码体反汇编侧期望掩码 → 码体侧 `RESULT: FAIL` exit=1（证明
+根因①原句那条断言不是死码）；反证后脚本 sha256 byte-identical 恢复、重跑正证 → PASS。
+判据 8 的单独反证：同一份 dump 把脚本放到仓外跑，改前 `RESULT: PASS` exit=0 →
+改后 `RESULT: INCOMPLETE` exit=3。空转旁路读数（不带 `--code`）见上表 3 档。
+
+**历史读数回溯标注（435：只追加，不回改原文）**——扩容前这两条 x86 结构门 PASS 读数
+**都没记是否带 `--code`**，按上面新契约**补不上标注即归 INCOMPLETE 档**，不得作为
+"当时门是绿的"的证据：① 本文 MIT-494s（T42）节的「verify_x86_dump 结构门 PASS」；
+② 本文 MIT-494t（T43）节的「x86 结构门 PASS」。两处已各自追加一条回溯注记指向本节。
+更早的 X3b/X3c/X5*/X6/X7 各节里「dump 门 N 登记项 PASS」的同族读数**同归该档**（同样
+未记 `--code`），本节按同一口径一次性归档、不逐条追加以免刷屏。扩容后 MIT-490 / MIT-491
+两节记的 `FAIL … 0x7f` 与「预期不可证（MIT-495 F2）」**是诚实读数**，原文不动。
+
+**落账张力澄清（免后人重复排查）**：父单提到的「MIT-519 同日声称 dump 门 PASS，与本部门
+同日起必 FAIL 存在落账张力」，架构复核后**张力不成立**——`9a795c1`（MIT-519，2026-09-14）
+改的是 `scripts/verifier/dump_handler_xmm_check.py`（**x64** 门，行尾归一），从未触碰
+`verify_x86_dump.py` ⇒ 无虚假落账；真正的问题是该格扩容前那条 PASS 读数本身大概就是
+不带 `--code` 的空转读数（见根因②与上面的回溯标注）。
+
+**未接线的根因（交项目主拍，本单边界禁接）**：`grep -rn verify_x86_dump scripts/ tests/
+CMakeLists.txt cmake/` 只命中脚本自身 docstring 与 `test_runtime_x86.cpp` 的两处采集钩子
+注释 ⇒ 该门至今**没有任何自动化 runner 调用**，这正是腐化能存活 6 天的原因。是否接进
+`scripts/test.bat` / ctest 属项目主的口径决定（本单不动接线，接线会撑破改动面预算）；
+若接，按上面的退出码契约判「非 0 即不通过」。
