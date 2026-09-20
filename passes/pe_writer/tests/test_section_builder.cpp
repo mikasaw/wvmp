@@ -196,6 +196,13 @@ void expect_validated_layout_written(const std::vector<NewSection>& reqs,
     const size_t n = expect_rva.size();
     ASSERT_EQ(placed.size(), n) << what;
 
+    // 整表一眼可读：审核那对读数（期望 [0x2000,0x3000] / 实写 [0x4000,0x3000]）
+    // 要能在单条失败信息里同时看到两侧，不靠逐元素断言拼。
+    std::vector<u32> got;
+    got.reserve(placed.size());
+    for (const auto& p : placed) got.push_back(p.rva);
+    EXPECT_EQ(got, expect_rva) << what << " 整表落位（校验通过的那份表）";
+
     u64 run_end = kExistingEnd;
     u64 prev_rva = 0;
     for (size_t i = 0; i < n; ++i) {

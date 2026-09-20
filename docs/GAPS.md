@@ -5261,4 +5261,84 @@ vs packed stdout 逐字节一致 + EB FE 挂起探针 ⇒ 修后在真硬件上�
   caller-saved 会被 callee 合法破坏 ⇒ 该改动必须同步把第一读数挪进 `.wvmp` 暂存（x86 已有形），
   并给本探针加"窗内有 call"的第 5 象限。这条是本单最容易被后人回踩的地方。
 - 阈值策略（变频/深休眠机器的启发式误报面）按判据留给后续单，见上「阈值口径已知边界」。
+## MIT-528 (C4 · CR-08 新节混排落位 + CR-09 输出原子替换，2026-09-20)
+
+交付面 = 分支 `mit-debt-c-pewriter`（取数树 `C:\Users\www\AiCode\WVmp\wvmp-c-pewriter`，
+base = 开工时 `main` tip `18b354eab89f647319b49699e2e118abce24fb0a`），D0 未 push 未 merge。
+派单：MIT-501 C 波 C4；两枚 commit：`84e7279`（判据先行，断言修前必红）→ 修复本体。
+改动面 = `passes/pe_writer/**` 六文件（`section_builder.{cpp,hpp}`、`pe_writer_pass.cpp`、
+新 `output_publish.{hpp,cpp}`、两份 tests）；`git diff --stat 18b354e..HEAD` 除本目录外**零文件**。
+
+**CR-08 病灶**（`section_builder.cpp` base:71/:85 校验推进 → base:127 落位复用）：校验段把指定
+RVA 请求的末端推进进 `max_va_end`，落位段又用这个**被推过的**值初始化 auto 请求的 `next_rva` ⇒
+同一份请求"校验通过 `[0x2000,0x3000]`、实际写出 `[0x4000,0x3000]`"，产物节 RVA 逆序 + 意外 VA
+空洞（正是 MIT-414 G7p2 B.4 那套"加载器拒空洞"判据自己踩的空洞）。`run_end` 那套顺序判定同受
+影响：它校验的是链、写盘用的是另一条链。
+
+**CR-09 病灶**（`pe_writer_pass.cpp` base:510 固定后缀 / base:520 先 remove 再 rename）：删得掉
+目标而改名失败 ⇒ 旧产物已丢；失败分支 `fs::remove(tmp)` ⇒ 新产物也留不下；固定名让同一目标的
+并发写入共用一份 tmp。三条 Windows 语义现测（`C:\Users\www\wvmp-evidence\MIT-528\probe\`，
+`cr09_probe.exe` / `cr09_probe2.exe`）：① 只读目标上原生 `DeleteFileW` gle=5 拒删、`_wremove`
+errno=13 拒删，**但 `std::filesystem::remove` 返回 ok=1 真删**（MSVC 内部清属性）⇒ 修前"旧产物
+被删"不是理论风险；② `MoveFileExW(REPLACE_EXISTING)` 对只读目标 gle=5 失败，且失败后旧目标内容
+仍在、tmp 仍在 ⇒ 原子替换天然给出"双留"；③ 句柄占用（无 `FILE_SHARE_DELETE`）下 remove 与
+rename 双双失败（err=32/gle=5）⇒ 修前那条 `remove(tmp)` 会把新产物一起带走。
+
+**修复口径**：
+- `add_sections` 三段式：①一次走完生成完整 `placed`（`run_end` 是**唯一**顺序游标，起于既有节
+  对齐末端，只被"已落位的这张表"推进；fixed 必须严丝合缝接上 `run_end`，否则显式失败）；
+  重叠判据覆盖既有节与本批已落位节（无既有节时 fixed 可浮动的旧口径下也不许两节叠同一 RVA）；
+  ②对整表断言成文契约（与前一节末端连续 + 表序 RVA 严格单调 —— `stub_link` 固定地址路径按
+  "表序 == 地址序"烘焙 rel32）；③写盘只用这份表，`SizeOfImage` 直接写链末端 `chain`。
+  `max_va_end` 全程只读，第二条游标不复存在。
+- 写出段：`make_temp_output_path`（目标名 + `.wvmp-tmp-` + pid + 进程内递增序号 + 16 位随机尾，
+  与目标同目录）→ 写完关句 → `file_size` 核长（不符即半写，不许顶替好产物）→
+  `publish_atomic_output`（Win `MoveFileExW(REPLACE_EXISTING|WRITE_THROUGH)` / POSIX `rename`）。
+  `remove(目标)` 与失败分支 `remove(tmp)` 双双删除；四条失败诊断一律带"旧产物保留 X，新产物
+  保留 Y"。固定 `.wvmp-tmp` 名在产品里消失。
+
+**修前必 FAIL 的读数**（`sb_prefix_pair.log`：product=`18b354e` / tests=HEAD；`pw_prefix.log`：
+commit `84e7279` 时点整树）：
+- `AddSections` 18 例 **13 PASS / 5 FAIL**，整表断言同时打印两侧：
+  `auto→fixed` got `{16384, 12288}` vs expect `{8192, 12288}` ⇒ 实写 `[0x4000,0x3000]` / 期望
+  `[0x2000,0x3000]`，与审核读数逐位吻合；`fixed→auto→fixed→auto` got `{8192, 20480, 16384,
+  24576}` ⇒ `[0x2000,0x5000,0x4000,0x6000]` 逆序活样本；6 请求交替 got `{32768, 12288, 36864,
+  20480, 40960, 28672}` ⇒ 三枚 auto 全被推到 fixed 之后（0x8000/0x9000/0xA000）。
+- `PeWriterPublish` 3 例 **1 PASS / 2 FAIL**：只读目标那例 `writer.run` "it throws nothing"、
+  目标字节已被换成新产物、目录内 tmp 计数 0 ⇒ 判据 2 的 ①②③ 同时翻红。
+- 修后：`section_builder_tests` 18/18、`pe_writer_tests` 全 PASS、ctest 23/23。
+
+**零扰动证明（C4 专属口径：全池 packed sha 修前/修后逐字节相同）**：`capture_tables.sh` 对
+**冻结样本快照**逐枚 `protect(seed=12345)` + `sectab.py` 出 sha256 与全节表。两侧输入 manifest
+相同（`input_manifest_sha=acec7abca633aec220b6650787e21d69b6ffb56abaf40db9a7dd50b70ac248ec`，
+72 枚样本 exe），唯一变量是 `wvmp_cli.exe`（base cli mtime `2026-09-20 10:01:42` / head cli
+mtime `2026-09-20 09:59:45`）；`diff tables_base.log tables_head.log`（去头两行）**0 行差异**
+⇒ 72/72 枚 packed 文件 sha 与每一节 `VA/VSize/RSize/RPtr` + `SizeOfImage` 逐项相同。
+⚠️ 方法论自报：首轮直接在 `build/` 里取样本被自己否掉 —— 把 `passes/pe_writer` toggle 回 base
+触发样本重链，MSVC 链接器换 `TimeDateStamp` ⇒ 输入侧 manifest 两侧不一致（`b2abd828…` vs
+`15733ac1…`），跨重编的 packed sha 本就不可比（MIT-525 已登记过该陷阱）。改冻结快照后成立。
+
+**六件套（树 `wvmp-c-pewriter`，head = 修复本体 commit）**：
+| 格 | 读数 |
+|---|---|
+| build | `scripts\build.bat` `[408/408]` rc=0，/W4 /WX 下本单触及文件 0 告警（全仓非 `.deps` 唯一告警 = 既有 `sse_bridge_sample_main.cpp` C4335 Mac 行尾，未触碰） |
+| ctest | `100% tests passed, 0 tests failed out of 23`（#8 pe_writer_tests、#9 section_builder_tests 点名在列） |
+| x86 电池 | `wvmp_regvm_runtime_tests_x86.exe` **67/67** PASS（独立 32 位进程，对照组：本单未动码体） |
+| REQUIRE_REAL 全池 | `bash scripts/multiseed_e2e_real.sh` ⇒ `[multiseed] TOTAL: 380 pass / 0 fail` exit 0（76 槽 × 5 seeds） |
+| wvmpTest 双 arch 双跑 | x64 `106/106` + 29 入口 stub、x86 `105/105` + 26 入口 stub，`diff count = 0`；两跑日志逐字节相同（`smoke_x{64,86}_dblrun.diff` 0 行）＝同一组二进制两次执行 |
+| dump 门 | x86 `verify_x86_dump.py --asm --code` `RESULT: PASS` exit=0（138 登记项、掩码真源对账 `kTableEntries=256`、dispatch `and <r>, 0xFF`）；**x64 `dump_handler_xmm_check.py` 三样本一律 `FAIL tooling` exit=2**（`.wvmp` raw 10752/9216/12288 < runtime total 33640 —— 码体已迁 `.wvmpc` 而门只认 `.wvmp`，待拍清单 🟡-1 既有失效，本单未为跑绿改门脚本）。该格替代证据 = 上表零扰动证明（72 样本 packed sha 逐字节相同）+ 改动面除 `passes/pe_writer/**` 零文件 ⇒ 运行时码体不可能漂移 |
+| 静态扫描 | `static_scan_bare_immediates.ps1` `[static-scan] RESULT: PASS`（本单零 Keystone 文本产出，判据 1 的 `imm()` 约束空满足） |
+
+**产物 provenance（`build/` 侧读数各自吃的那一份二进制）**：零扰动两侧各用自己那枚 `build/cli/wvmp_cli.exe`，mtime `2026-09-20 09:59:45`（head）/ `2026-09-20 10:01:42`（base）；六件套（ctest / multiseed / wvmpTest / dump 门）全部吃同一枚 mtime `2026-09-20 10:03:09` 的 head CLI（产品源与 `8b4437d` 逐字节相同）。整表打印与本节文档落地后又重建一次并重跑全量 ctest：`23/23`。
+**冻结面零改动**：`kCtxSize` / `keys.hpp` / `asmgen.cpp` / `ir::Op` / `common/include` /
+`framework/include` / `vm/include/wvmp/vm/backend.hpp` 全部未触碰（`git diff --name-only
+18b354e..HEAD` 只含 `passes/pe_writer/**` 与本文两件文档）。
+
+**遗留风险**：① x64 dump 门那一格本单**不可证**（tooling 既有失效 🟡-1），已按上表给替代证据，
+不拿"跑绿"冒充；② `tests/wvmpTest/smoke_test.bat` 首构建路径恒 fatal（`%RC_BUILD%` 在括号块内
+解析期展开，Architect 01:5x 转待拍、本波无单拥有）——本单先手工 `build.bat <arch>` 造出
+`test_target.exe` 再跑守卫，未改该工具面；③ 新增的两条显式失败（本批新节互叠、表序非单调）只在
+"无既有节 ⇒ fixed 请求可浮动"这条旧口径下可达，真实管道（`stub_link` 双 fixed）走不到 —— 属契约
+成文与防御，不是缺陷复现；④ 原子替换失败时 tmp 一律双留 ⇒ 反复失败会在目标目录累积文件，这是
+"绝不静默丢产物"的代价，清理策略留给上层（本单不自动删，删就等于把可恢复性又赌回去）。
 
