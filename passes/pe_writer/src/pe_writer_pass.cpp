@@ -1,6 +1,7 @@
 #include "wvmp/passes/pe_writer/pe_writer_pass.hpp"
 
 #include "pe_checksum.hpp"
+#include "output_publish.hpp"
 #include "section_builder.hpp"
 
 #include "wvmp/common/bytes.hpp"
@@ -505,26 +506,35 @@ void PeWriterPass::run(ProtectionContext& ctx) {
         }
     }
 
-    // 3) 临时文件 + rename 原子替换，防止半写文件暴露给用户。
-    std::filesystem::path tmp = ctx.output_path;
-    tmp += ".wvmp-tmp";
+    // 3) 唯一临时文件 + 原子替换（CR-09 / MIT-528）。
+    //    旧序"固定名 tmp → remove 目标 → rename"三处不可靠：删得掉目标而改名
+    //    失败 ⇒ 旧产物已丢；失败分支删 tmp ⇒ 新产物也留不下；固定名让同一目标
+    //    的并发写入共用一份 tmp。现序：同目录唯一 tmp → 写满并核长 → 原子替换
+    //    （绝不先动目标）；任一步失败都保持"旧目标 + 新 tmp"双留，诊断点名
+    //    两条路径，由人工/上层决定取舍。
+    const std::filesystem::path tmp = make_temp_output_path(ctx.output_path);
+    const std::string keep_both = "；旧产物保留: " + ctx.output_path.string() +
+                                  "，新产物保留: " + tmp.string();
     {
         std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
-        if (!out) fail(ctx, "无法创建输出文件: " + tmp.string());
+        if (!out) fail(ctx, "无法创建临时输出文件: " + tmp.string() + keep_both);
         out.write(reinterpret_cast<const char*>(ctx.image.data()),
                   static_cast<std::streamsize>(ctx.image.size()));
         out.flush();
-        if (!out) fail(ctx, "输出文件写入不完整: " + tmp.string());
+        if (!out) fail(ctx, "临时输出文件写入不完整: " + tmp.string() + keep_both);
     }
-    std::error_code ec;
-    std::filesystem::remove(ctx.output_path, ec); // 部分平台 rename 不覆盖既有目标
-    ec.clear();
-    std::filesystem::rename(tmp, ctx.output_path, ec);
-    if (ec) {
-        std::error_code cleanup;
-        std::filesystem::remove(tmp, cleanup);
-        fail(ctx, "输出文件重命名失败 (" + ec.message() + "): " + tmp.string());
+    {
+        // 句柄已关，落盘长度对不上就是半写——这种 tmp 一律不许顶替好产物。
+        std::error_code sz_ec;
+        const auto written = std::filesystem::file_size(tmp, sz_ec);
+        if (sz_ec || written != ctx.image.size())
+            fail(ctx, "临时输出文件落盘长度与镜像不符 (" + std::to_string(written) + " != " +
+                          std::to_string(ctx.image.size()) + "): " + tmp.string() + keep_both);
     }
+    std::string pub_err;
+    if (!publish_atomic_output(tmp, ctx.output_path, pub_err))
+        fail(ctx, "输出文件原子替换失败 (" + pub_err + "): " + tmp.string() + " → " +
+                      ctx.output_path.string() + keep_both);
 }
 
 WVMP_REGISTER_PASS(PeWriterPass)

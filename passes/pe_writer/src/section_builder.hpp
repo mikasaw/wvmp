@@ -11,9 +11,12 @@ namespace wvmp::passes {
 //    section_alignment 对齐；requested_rva 非 0 时校验与既有节区间无重叠，
 //    且必须与前一节对齐端连续（无 VA 空洞——Windows 加载器拒绝空洞布局，
 //    MIT-414 G7p2 B.4，triage §3.3 实测）；
-//  - 同步更新 NumberOfSections 与 SizeOfImage；
-//  - 成功返回逐节落位（与请求同序）；失败抛 std::runtime_error（镜像不被
-//    部分修改——所有校验先行，通过后才动字节）。
+//  - 顺序 = 先算完整落位表 → 对这张表做全部校验 → 只按这张表写盘
+//    （CR-08/MIT-528：auto 游标不被 fixed 请求推位，混排下"校验通过的布局
+//    == 实际写入布局"）；混排不成立（留洞/逆序/重叠）一律显式失败；
+//  - 同步更新 NumberOfSections 与 SizeOfImage（后者 == 连续链末端）；
+//  - 成功返回逐节落位（与请求同序，表序即地址序：RVA 严格单调）；失败抛
+//    std::runtime_error（镜像不被部分修改——所有校验先行，通过后才动字节）。
 std::vector<SectionPlacement> add_sections(std::vector<u8>& image,
                                            const std::vector<NewSection>& requests,
                                            u32 section_alignment, u32 file_alignment);

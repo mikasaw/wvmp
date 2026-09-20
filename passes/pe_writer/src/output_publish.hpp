@@ -10,4 +10,11 @@ namespace wvmp::passes {
 //  - 唯一后缀消灭旧"固定 .wvmp-tmp 名 ⇒ 同一目标的并发写入共用一份 tmp"。
 std::filesystem::path make_temp_output_path(const std::filesystem::path& target);
 
+// 原子替换 tmp → target（调用方**不得**先删目标）。失败返回 false 并给出 OS
+// 错误文本；两种结局都不留半成品：成功 ⇒ 目标即新产物、tmp 消失；失败 ⇒ 旧
+// 目标与新 tmp 原地都在，由调用方把两条路径一并报出去。
+bool publish_atomic_output(const std::filesystem::path& tmp,
+                           const std::filesystem::path& target,
+                           std::string& err);
+
 } // namespace wvmp::passes

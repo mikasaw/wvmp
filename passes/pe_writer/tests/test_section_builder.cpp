@@ -83,6 +83,21 @@ NewSection make_section(const char* name, size_t size, u32 requested_rva = 0) {
     return s;
 }
 
+// 头部留量更大的同款最小 PE（.text raw 移到 0x600、SizeOfHeaders 0x600、文件
+// 0x800），使节表容得下 6 枚新表项——混排长链用例只受头部空间限制，与落位
+// 语义无关。既有节末端仍是 align(0x1000+0x200)=0x2000。
+std::vector<u8> build_roomy_pe() {
+    std::vector<u8> img = build_minimal_pe();
+    const size_t sh = 0x40 + 24 + 240;
+    std::fill(img.begin() + 0x200, img.begin() + 0x500, 0); // 原 .text 载荷清零
+    img.resize(0x800, 0);
+    wr32(img, 0x40 + 24 + 60, 0x600); // SizeOfHeaders
+    wr32(img, sh + 16, 0x200);        // SizeOfRawData
+    wr32(img, sh + 20, 0x600);        // PointerToRawData
+    std::fill(img.begin() + 0x600, img.begin() + 0x800, 0xCC);
+    return img;
+}
+
 TEST(AddSections, AppendsSectionAndUpdatesHeaders) {
     std::vector<u8> img = build_minimal_pe();
     const auto placed = add_sections(img, {make_section(".wvmp", 0x123)}, kSecAlign, kFileAlign);
@@ -176,7 +191,7 @@ u64 au(u64 v, u64 a) { return ((v + a - 1) / a) * a; }
 void expect_validated_layout_written(const std::vector<NewSection>& reqs,
                                      const std::vector<u32>& expect_rva,
                                      const char* what) {
-    std::vector<u8> img = build_minimal_pe();
+    std::vector<u8> img = build_roomy_pe(); // 头部留量足够放 6 枚新表项
     const auto placed = add_sections(img, reqs, kSecAlign, kFileAlign);
     const size_t n = expect_rva.size();
     ASSERT_EQ(placed.size(), n) << what;
