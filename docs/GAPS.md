@@ -5261,11 +5261,14 @@ vs packed stdout 逐字节一致 + EB FE 挂起探针 ⇒ 修后在真硬件上�
   caller-saved 会被 callee 合法破坏 ⇒ 该改动必须同步把第一读数挪进 `.wvmp` 暂存（x86 已有形），
   并给本探针加"窗内有 call"的第 5 象限。这条是本单最容易被后人回踩的地方。
 - 阈值策略（变频/深休眠机器的启发式误报面）按判据留给后续单，见上「阈值口径已知边界」。
+
 ## MIT-528 (C4 · CR-08 新节混排落位 + CR-09 输出原子替换，2026-09-20)
 
 交付面 = 分支 `mit-debt-c-pewriter`（取数树 `C:\Users\www\AiCode\WVmp\wvmp-c-pewriter`，
 base = 开工时 `main` tip `18b354eab89f647319b49699e2e118abce24fb0a`），D0 未 push 未 merge。
-派单：MIT-501 C 波 C4；两枚 commit：`84e7279`（判据先行，断言修前必红）→ 修复本体。
+派单：MIT-501 C 波 C4；首轮三枚 commit：`84e7279`（判据先行，断言修前必红）→ `8b4437d`（修复本体）
+→ `c063429`（加固与落账）。回炉轮（复验单 MIT-540 的 MF-1）在 `c063429` 之后**再追加一枚 docs-only
+commit**（`git log -1` 即本枚）：只补对拍与落账，代码面/测试面 `git diff c063429..HEAD` 零文件。
 改动面 = `passes/pe_writer/**` 六文件（`section_builder.{cpp,hpp}`、`pe_writer_pass.cpp`、
 新 `output_publish.{hpp,cpp}`、两份 tests）；`git diff --stat 18b354e..HEAD` 除本目录外**零文件**。
 
@@ -5308,15 +5311,44 @@ commit `84e7279` 时点整树）：
   目标字节已被换成新产物、目录内 tmp 计数 0 ⇒ 判据 2 的 ①②③ 同时翻红。
 - 修后：`section_builder_tests` 18/18、`pe_writer_tests` 全 PASS、ctest 23/23。
 
-**零扰动证明（C4 专属口径：全池 packed sha 修前/修后逐字节相同）**：`capture_tables.sh` 对
+**零扰动证明（C4 专属口径：全池 packed sha 修前/修后逐字节相同；"全池"= 76 槽，槽构成与 4 枚变体槽的补测见下面 MF-1 节）**：`capture_tables.sh` 对
 **冻结样本快照**逐枚 `protect(seed=12345)` + `sectab.py` 出 sha256 与全节表。两侧输入 manifest
 相同（`input_manifest_sha=acec7abca633aec220b6650787e21d69b6ffb56abaf40db9a7dd50b70ac248ec`，
 72 枚样本 exe），唯一变量是 `wvmp_cli.exe`（base cli mtime `2026-09-20 10:01:42` / head cli
 mtime `2026-09-20 09:59:45`）；`diff tables_base.log tables_head.log`（去头两行）**0 行差异**
-⇒ 72/72 枚 packed 文件 sha 与每一节 `VA/VSize/RSize/RPtr` + `SizeOfImage` 逐项相同。
+⇒ 这 72 枚**唯一样本 exe**（76 槽里的 72 槽）的 packed 文件 sha 与每一节 `VA/VSize/RSize/RPtr` + `SizeOfImage` 逐项相同。
 ⚠️ 方法论自报：首轮直接在 `build/` 里取样本被自己否掉 —— 把 `passes/pe_writer` toggle 回 base
 触发样本重链，MSVC 链接器换 `TimeDateStamp` ⇒ 输入侧 manifest 两侧不一致（`b2abd828…` vs
 `15733ac1…`），跨重编的 packed sha 本就不可比（MIT-525 已登记过该陷阱）。改冻结快照后成立。
+
+**MF-1 补对拍（回炉轮，2026-09-20 · 把"全池"从 72 枚样本补成 76/76 槽）**：首轮本节把"全池"与
+"72/72 枚"写在同一段里互相同否 ⇒ 复验单 MIT-540 判 MUST-FIX，裁定走"补对拍"而不是"改措辞"。
+槽数真源 = `scripts/multiseed_e2e.sh:556` 的登记式注释：总槽 = `samples(52)` + `x86_samples(20)` +
+`rule_variants(4)` = **76**；`380` 是 76 槽 × 5 seeds 的**运行通过率**面，与"按槽逐字节对拍"是两面、
+不互相顶替。4 枚规则变体槽 = 同一枚已入池的 `wvmp_shift0_flags_sample.exe` 挂不同 `[[functions]]`
+片段（`v4` 另换 `.passes.txt`），首轮未跑 ⇒ 本轮补：`v1_name_open` / `v4_index_anchor` 由 MIT-540
+独立复算过（两侧相同），本单补 `v2_name_exclude` / `v3_cross_selector`，并把 `v1` 作控制槽重跑
+（复现 MIT-540 的 `f11d82c1…` ⇒ 两套 harness 等价）。base CLI 快照 sha256 `eb3992e0…`（mtime
+`2026-09-20 12:06:33`，product=`18b354e`）/ head CLI 快照 sha256 `b693822d…`（mtime
+`2026-09-20 11:55:39`，树 `c063429`），两份均 `cp -p` 自被引用原件并核过 sha。
+
+| 变体槽 | base = head 的 packed sha256 | 节表 | 判 |
+|---|---|---|---|
+| `v1_name_open`（控制槽） | `f11d82c16fe6581e18f36debfd0d2141970df6c3925f0ff83fbb79d31e326fa1` | 8 节 / `SizeOfImage=0x17000` | SAME，且逐位等于 MIT-540 读数 |
+| `v2_name_exclude` | `9860b1fce3eeaa2a820d1734b824a3425fa9db033814fad202c9ea24a0a899a1` | 8 节 / `0x17000` | SAME |
+| `v3_cross_selector` | `f11d82c16fe6581e18f36debfd0d2141970df6c3925f0ff83fbb79d31e326fa1` | 8 节 / `0x17000` | SAME |
+| `v4_index_anchor`（转录 MIT-540） | `77ca9a9e0d4d4ced4f07deddb1069cc977cee873f1a275a4d6697a01e8ff64e1` | 8 节 / `0x17000` | SAME |
+
+⇒ **全池 76/76 槽在 seed=12345 下 packed sha 逐字节相同**；本节其余读数不变，代码面本轮零改动。
+两处防假绿：① 两枚补测槽的实跑日志按 `scripts/multiseed_rules/*.expect.txt` 核过（`v2` = 6 stub +
+1 条 `level=none` 豁免 Note；`v3` = 1 stub + 6 豁免 + 1 条"命中 2 条 level 规则（跨选择器撞同一函数，
+按声明序后评胜）"仲裁 Note ⇒ 胜者 `index=2 virtualize`），规则确已生效，不是"配置没吃到所以当然相同"；
+`v3` 与 `v1` 同 sha 属预期（两者最终都只虚化区域 [2]）。② 对拍有判别力：同一 head CLI、同输入同 rules，
+只换 seed（12345 → 1）⇒ 立刻 DIFF（`9860b1fc…` vs `c8fb7c61…`），故 `ALL_SAME=1` 不是恒等式。
+留样（仓外，不入仓）：`C:\Users\www\wvmp-evidence\MIT-528\` 下 `mf1_full_pool_proof.md`（汇总，含全部
+64 位 sha 与路径）、`zd_v23.sh`（sha `f3555d00…`）、`zd_v23_run2.log`（sha `43dc0bd8…`，`ALL_SAME=1`）、
+`zd23_{base,head}/<slot>.{packed.exe,table.txt,protect.log,toml}`、`zd_ctrl_seed.sh`（sha `083c0c05…`）/
+`zd_ctrl_seed.log`（sha `68dd7cf2…`）、`cli/shas.txt`（sha `cd9d2ec7…`）。
 
 **六件套（树 `wvmp-c-pewriter`，head = 修复本体 commit）**：
 | 格 | 读数 |
@@ -5326,7 +5358,7 @@ mtime `2026-09-20 09:59:45`）；`diff tables_base.log tables_head.log`（去头
 | x86 电池 | `wvmp_regvm_runtime_tests_x86.exe` **67/67** PASS（独立 32 位进程，对照组：本单未动码体） |
 | REQUIRE_REAL 全池 | `bash scripts/multiseed_e2e_real.sh` ⇒ `[multiseed] TOTAL: 380 pass / 0 fail` exit 0（76 槽 × 5 seeds） |
 | wvmpTest 双 arch 双跑 | x64 `106/106` + 29 入口 stub、x86 `105/105` + 26 入口 stub，`diff count = 0`；两跑日志逐字节相同（`smoke_x{64,86}_dblrun.diff` 0 行）＝同一组二进制两次执行 |
-| dump 门 | x86 `verify_x86_dump.py --asm --code` `RESULT: PASS` exit=0（138 登记项、掩码真源对账 `kTableEntries=256`、dispatch `and <r>, 0xFF`）；**x64 `dump_handler_xmm_check.py` 三样本一律 `FAIL tooling` exit=2**（`.wvmp` raw 10752/9216/12288 < runtime total 33640 —— 码体已迁 `.wvmpc` 而门只认 `.wvmp`，待拍清单 🟡-1 既有失效，本单未为跑绿改门脚本）。该格替代证据 = 上表零扰动证明（72 样本 packed sha 逐字节相同）+ 改动面除 `passes/pe_writer/**` 零文件 ⇒ 运行时码体不可能漂移 |
+| dump 门 | x86 `verify_x86_dump.py --asm --code` `RESULT: PASS` exit=0（138 登记项、掩码真源对账 `kTableEntries=256`、dispatch `and <r>, 0xFF`）；**x64 `dump_handler_xmm_check.py` 三样本一律 `FAIL tooling` exit=2**（`.wvmp` raw 10752/9216/12288 < runtime total 33640 —— 码体已迁 `.wvmpc` 而门只认 `.wvmp`，待拍清单 🟡-1 既有失效，本单未为跑绿改门脚本）。该格替代证据 = 上表零扰动证明（全池 76 槽 packed sha 逐字节相同，见本节与 MF-1 小节）+ 改动面除 `passes/pe_writer/**` 零文件 ⇒ 运行时码体不可能漂移 |
 | 静态扫描 | `static_scan_bare_immediates.ps1` `[static-scan] RESULT: PASS`（本单零 Keystone 文本产出，判据 1 的 `imm()` 约束空满足） |
 
 **产物 provenance（`build/` 侧读数各自吃的那一份二进制）**：零扰动两侧各用自己那枚 `build/cli/wvmp_cli.exe`，mtime `2026-09-20 09:59:45`（head）/ `2026-09-20 10:01:42`（base）；六件套（ctest / multiseed / wvmpTest / dump 门）全部吃同一枚 mtime `2026-09-20 10:03:09` 的 head CLI（产品源与 `8b4437d` 逐字节相同）。整表打印与本节文档落地后又重建一次并重跑全量 ctest：`23/23`。
@@ -5340,5 +5372,14 @@ mtime `2026-09-20 09:59:45`）；`diff tables_base.log tables_head.log`（去头
 `test_target.exe` 再跑守卫，未改该工具面；③ 新增的两条显式失败（本批新节互叠、表序非单调）只在
 "无既有节 ⇒ fixed 请求可浮动"这条旧口径下可达，真实管道（`stub_link` 双 fixed）走不到 —— 属契约
 成文与防御，不是缺陷复现；④ 原子替换失败时 tmp 一律双留 ⇒ 反复失败会在目标目录累积文件，这是
-"绝不静默丢产物"的代价，清理策略留给上层（本单不自动删，删就等于把可恢复性又赌回去）。
+"绝不静默丢产物"的代价，清理策略留给上层（本单不自动删，删就等于把可恢复性又赌回去）；⑤ 同一格
+把**杀软误报面换了形态**：`docs/GAPS.md:3010-3011`（`packedT36.exe.wvmp-tmp` 被清除）与
+`:3085-3087`（`packedT36.wvmp-tmp` / `packedT36b.wvmp-tmp` / `packedT37.wvmp-tmp` 各被检出隔离）
+记的是"一枚固定名 tmp 被反复重扫"的旧形态，唯一名 + 失败双留之后变成"目标目录里可能躺着 N 枚
+`.wvmp-tmp-<pid>-<seq>-<rand>`"（N 随失败次数无界增长）。本单只登记这个新形态，不改行为 —— 显式
+清理入口（成功替换后按目标前缀清陈旧 tmp）等于把可恢复性再赌回去，留给上层单决；⑥
+`output_publish.cpp:60-67` 的 POSIX `rename` 腿在本仓**从未被编译、也从未被测**（全仓只有 MSVC
+x64/x86 两个目标）。两侧失败语义一致（失败即双留、只回错误文本），但失败**集合**不同：POSIX
+`rename` 覆盖只读目标会**成功** ⇒ 判据 2 那枚只读夹具反例在 POSIX 上根本不红。因此本单 CR-09 的
+证明面按实测口径**仅 Windows 腿**，POSIX 腿属未验证的可移植性声明，谁要真上非 Win 目标必须先补那侧的失败注入。
 
