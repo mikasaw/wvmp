@@ -14,6 +14,7 @@
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
+#include <filesystem>
 #include <stdexcept>
 #include <vector>
 
@@ -21,6 +22,7 @@ namespace {
 
 using wvmp::u16;
 using wvmp::u32;
+using wvmp::u64;
 using wvmp::u8;
 using wvmp::passes::NewSection;
 using wvmp::passes::SectionPlacement;
@@ -160,6 +162,135 @@ TEST(AddSections, NoHeaderRoomThrows) {
                  std::runtime_error);
 }
 
+// ── MIT-528 (CR-08)：auto/fixed 混排下"校验通过的布局 == 实际写入布局" ──────
+//
+// 旧缺陷：校验阶段把指定 RVA 请求推进过的 max_va_end 又当作 auto 请求的落位
+// 初值 ⇒ 同一份请求校验一套布局、写盘另一套（审核实测期望 [0x2000,0x3000]、
+// 实写 [0x4000,0x3000]）。本组断言三方向同表比对，任一不符即失败：
+//   ① 手算连续布局 expect   ② add_sections 返回值 placed   ③ 镜像节表读回。
+// 夹具既有 .text：VA 0x1000 + max(0x100,0x200) → 对齐末端 0x2000。
+constexpr u32 kExistingEnd = 0x2000;
+
+u64 au(u64 v, u64 a) { return ((v + a - 1) / a) * a; }
+
+void expect_validated_layout_written(const std::vector<NewSection>& reqs,
+                                     const std::vector<u32>& expect_rva,
+                                     const char* what) {
+    std::vector<u8> img = build_minimal_pe();
+    const auto placed = add_sections(img, reqs, kSecAlign, kFileAlign);
+    const size_t n = expect_rva.size();
+    ASSERT_EQ(placed.size(), n) << what;
+
+    u64 run_end = kExistingEnd;
+    u64 prev_rva = 0;
+    for (size_t i = 0; i < n; ++i) {
+        // ① 落位 == 手算连续布局
+        EXPECT_EQ(placed[i].rva, expect_rva[i])
+            << what << " #" << i << " 校验布局 != 期望（auto 游标被 fixed 请求推走？）";
+        // ② 末端连续性：本节起点必须严丝合缝接在前一节对齐末端（无空洞/无逆序）
+        EXPECT_EQ(placed[i].rva, static_cast<u32>(run_end))
+            << what << " #" << i << " 与前一节对齐端不连续（VA 空洞 → 加载器拒载）";
+        // ③ 节 RVA 表序单调递增
+        if (i > 0) EXPECT_GT(placed[i].rva, prev_rva) << what << " #" << i << " 节 RVA 逆序";
+        prev_rva = placed[i].rva;
+        run_end = au(u64(placed[i].rva) + reqs[i].data.size(), kSecAlign);
+    }
+
+    // ④ 实际写入 == 返回的校验布局（读节表，不是读返回值）
+    const auto model = parse_pe_image(img);
+    ASSERT_EQ(model.num_sections, static_cast<u16>(1 + n)) << what;
+    for (size_t i = 0; i < n; ++i) {
+        EXPECT_EQ(model.sections[1 + i].virtual_addr, placed[i].rva)
+            << what << " #" << i << " 节表实写 RVA != 返回值";
+        EXPECT_EQ(model.sections[1 + i].virtual_addr, expect_rva[i]) << what << " #" << i;
+        EXPECT_EQ(model.sections[1 + i].raw_ptr, placed[i].file_offset) << what << " #" << i;
+        const auto off = model.rva_to_offset(expect_rva[i]);
+        ASSERT_TRUE(off.has_value()) << what << " #" << i << " RVA 无对应文件偏移";
+        EXPECT_EQ(img[*off], 0xAB) << what << " #" << i << " 数据未落在声称的 RVA";
+    }
+
+    // ⑤ SizeOfImage == 连续链末端（不得随游标漂移）
+    EXPECT_EQ(rd32(img, 0x40 + 24 + 56), static_cast<u32>(run_end)) << what;
+}
+
+// 复现审核那对读数：auto 在前、fixed 在后 ⇒ 期望 [0x2000,0x3000]。
+TEST(AddSections, MixedAutoThenFixedKeepsValidatedLayout) {
+    expect_validated_layout_written({make_section(".a", 0x100), make_section(".b", 0x100, 0x3000)},
+                                    {0x2000, 0x3000}, "auto→fixed");
+}
+
+// fixed 在前、auto 在后：auto 接 fixed 的对齐末端。
+TEST(AddSections, MixedFixedThenAutoKeepsValidatedLayout) {
+    expect_validated_layout_written({make_section(".a", 0x100, 0x2000), make_section(".b", 0x100)},
+                                    {0x2000, 0x3000}, "fixed→auto");
+}
+
+// 三请求混排（auto/fixed/auto）：中间那枚 fixed 不得把后面的 auto 推位。
+TEST(AddSections, MixedAutoFixedAutoKeepsValidatedLayout) {
+    expect_validated_layout_written(
+        {make_section(".a", 0x100), make_section(".b", 0x100, 0x3000), make_section(".c", 0x100)},
+        {0x2000, 0x3000, 0x4000}, "auto→fixed→auto");
+}
+
+// 四请求交替混排（fixed/auto/fixed/auto）。
+TEST(AddSections, MixedFixedAutoFixedAutoKeepsValidatedLayout) {
+    expect_validated_layout_written(
+        {make_section(".a", 0x100, 0x2000), make_section(".b", 0x100),
+         make_section(".c", 0x100, 0x4000), make_section(".d", 0x100)},
+        {0x2000, 0x3000, 0x4000, 0x5000}, "fixed→auto→fixed→auto");
+}
+
+// 六请求长链混排：fixed 的推进量最容易被误当成 auto 游标初值。
+TEST(AddSections, MixedSixRequestAlternatingKeepsValidatedLayout) {
+    expect_validated_layout_written(
+        {make_section(".a", 0x100), make_section(".b", 0x100, 0x3000), make_section(".c", 0x100),
+         make_section(".d", 0x100, 0x5000), make_section(".e", 0x100),
+         make_section(".f", 0x100, 0x7000)},
+        {0x2000, 0x3000, 0x4000, 0x5000, 0x6000, 0x7000}, "6 请求交替混排");
+}
+
+// 跨页尺寸（0x1500）混排：auto 游标推进按对齐后末端，fixed 仍须接其后。
+TEST(AddSections, MixedCrossPageAutoThenFixedKeepsValidatedLayout) {
+    expect_validated_layout_written({make_section(".a", 0x1500), make_section(".b", 0x10, 0x4000)},
+                                    {0x2000, 0x4000}, "跨页 auto→fixed");
+}
+
+// 一枚 fixed 之后跟两枚 auto：两处 auto 都不得借用被推过的末端起算。
+TEST(AddSections, MixedFixedThenTwoAutoKeepsValidatedLayout) {
+    expect_validated_layout_written(
+        {make_section(".a", 0x10, 0x2000), make_section(".b", 0x10), make_section(".c", 0x10)},
+        {0x2000, 0x3000, 0x4000}, "fixed→auto→auto");
+}
+
+// 混排不成立时必须显式失败，而不是产出逆序布局：指定 RVA 落在 auto 已占用
+// 区间之后（留洞）或之前（逆序）都属此类。
+TEST(AddSections, MixedInvertedFixedRequestThrowsAndLeavesImageIntact) {
+    std::vector<u8> img = build_minimal_pe();
+    const std::vector<u8> before = img;
+    EXPECT_THROW((void)add_sections(img, {make_section(".a", 0x10), make_section(".b", 0x10, 0x2000)},
+                                    kSecAlign, kFileAlign),
+                 std::runtime_error);
+    EXPECT_EQ(img, before); // 校验先行：失败零修改
+}
+
+TEST(AddSections, MixedFixedAfterAutoGapThrows) {
+    std::vector<u8> img = build_minimal_pe();
+    // .a@0x2000→端 0x3000、.b auto→0x3000 端 0x4000，.c 指定 0x5000 ⇒ 留洞。
+    EXPECT_THROW((void)add_sections(
+                     img,
+                     {make_section(".a", 0x100, 0x2000), make_section(".b", 0x100),
+                      make_section(".c", 0x100, 0x5000)},
+                     kSecAlign, kFileAlign),
+                 std::runtime_error);
+}
+
+// 真实产物形态（stub_link 两枚 fixed 请求）逐字节不变——本单只改混排/失败路径。
+TEST(AddSections, AllFixedRequestsUnchangedUnderMixingFix) {
+    expect_validated_layout_written(
+        {make_section(".wvmp", 0x2100, 0x2000), make_section(".wvmpc", 0x40, 0x5000)},
+        {0x2000, 0x5000}, "stub_link 双 fixed");
+}
+
 TEST(AddSections, WriterPassConsumesSlot) {
     ProtectionContext ctx;
     ctx.image = build_minimal_pe();
@@ -172,8 +303,15 @@ TEST(AddSections, WriterPassConsumesSlot) {
     const auto model = parse_pe_image(ctx.image);
     ASSERT_EQ(model.num_sections, 2);
     EXPECT_EQ(model.sections[1].name, ".wvmp");
+    // pass 结束后工作目录里只该留下产物本身（tmp 已被替换消化，CR-09）
+    int same_prefix = 0;
+    for (const auto& e : std::filesystem::directory_iterator(".")) {
+        if (e.path().filename().string().rfind("m2-section-test-out.exe", 0) != 0) continue;
+        ++same_prefix;
+        EXPECT_EQ(e.path().filename().string(), "m2-section-test-out.exe");
+    }
+    EXPECT_EQ(same_prefix, 1);
     std::remove("m2-section-test-out.exe");
-    std::remove("m2-section-test-out.exe.wvmp-tmp");
 }
 
 } // namespace

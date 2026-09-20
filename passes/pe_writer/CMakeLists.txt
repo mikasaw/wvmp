@@ -1,6 +1,7 @@
 add_library(wvmp_pass_pe_writer OBJECT
     src/pe_writer_pass.cpp
     src/pe_checksum.cpp
+    src/output_publish.cpp
     src/section_builder.cpp
 )
 target_include_directories(wvmp_pass_pe_writer PUBLIC

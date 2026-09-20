@@ -4,6 +4,7 @@
 //  3) 系统 PE（notepad x64/x86）loader→writer 逐字节往返。
 
 #include "pe_checksum.hpp"
+#include "output_publish.hpp"
 
 #include "wvmp/passes/pe_loader/pe_image.hpp"
 #include "wvmp/passes/pe_loader/pe_loader_pass.hpp"
@@ -15,6 +16,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
@@ -159,10 +161,10 @@ void roundtrip_system_pe(const fs::path& src, u16 machine, bool pe32_plus, const
     writer.run(ctx);
 
     ASSERT_TRUE(fs::exists(out)) << out;
-    // 临时文件应已被 rename 消化
-    fs::path leftover = out;
-    leftover += ".wvmp-tmp";
-    EXPECT_FALSE(fs::exists(leftover));
+    // 临时文件必须已被替换消化（CR-09 后 tmp 名带唯一后缀，不再点名固定后缀）
+    for (const auto& e : fs::directory_iterator(out.parent_path()))
+        if (e.path().filename().string().rfind(out.filename().string(), 0) == 0)
+            EXPECT_EQ(e.path(), out) << "写出后残留临时文件: " << e.path();
 
     EXPECT_TRUE(compare_files(copy, out)) << "往返输出应与原文件逐字节一致";
 
@@ -648,4 +650,180 @@ TEST(PeWriterRoundtrip, NotepadX86) {
     const fs::path src = R"(C:\Windows\SysWOW64\notepad.exe)";
     if (!fs::exists(src)) GTEST_SKIP() << "系统 PE 不存在，跳过: " << src.string();
     roundtrip_system_pe(src, kMachineX86, false, "x86");
+}
+
+// —— MIT-528 (CR-09)：输出替换可靠性（禁止先 remove 目标）——————————————
+//
+// 旧流程：写固定名 .wvmp-tmp → fs::remove(目标) → rename。两处不可靠：删得
+// 掉目标却 rename 失败 ⇒ 旧产物已丢、新产物（tmp）也被清掉；固定名 ⇒ 同一
+// 目标的并发写入共用一份 tmp。本组用"只读目标"做失败注入——MSVC 的
+// fs::remove 会清掉只读位真的删掉旧产物（修前可观测：run 反而"成功"、旧
+// 字节消失），而原子替换（MoveFileExW + REPLACE_EXISTING）在只读目标上必须
+// 失败，并把旧目标与新 tmp 双双保留且在诊断里点名。
+
+namespace {
+
+// 临时名唯一后缀的起始标记（.wvmp-tmp 固定名必须已消失）。
+constexpr const char* kTmpMark = ".wvmp-tmp-";
+
+void set_read_only(const fs::path& p, bool ro) {
+    std::error_code ec;
+    fs::permissions(p,
+                    ro ? fs::perms::owner_read
+                       : (fs::perms::owner_read | fs::perms::owner_write |
+                          fs::perms::group_read | fs::perms::group_write |
+                          fs::perms::others_read | fs::perms::others_write),
+                    fs::perm_options::replace, ec);
+    ASSERT_FALSE(ec) << "设置只读属性失败: " << ec.message();
+}
+
+// 夹具自证：只读确实生效（以写方式打开必须失败）。
+void expect_write_blocked(const fs::path& p) {
+    std::ofstream probe(p, std::ios::binary | std::ios::app);
+    EXPECT_FALSE(probe.is_open()) << "只读夹具未生效: " << p.string();
+}
+
+// 目录内除 keep 之外、文件名以 keep 打头的残留（= 本单语义下的 tmp）。
+std::vector<fs::path> tmp_leftovers(const fs::path& dir, const fs::path& keep) {
+    std::vector<fs::path> v;
+    const std::string prefix = keep.filename().string();
+    for (const auto& e : fs::directory_iterator(dir)) {
+        const fs::path p = e.path();
+        if (p == keep) continue;
+        if (p.filename().string().rfind(prefix, 0) == 0) v.push_back(p);
+    }
+    std::sort(v.begin(), v.end());
+    return v;
+}
+
+int count_entries(const fs::path& dir) {
+    return static_cast<int>(std::distance(fs::directory_iterator(dir), fs::directory_iterator{}));
+}
+
+std::string joined_diag(const ProtectionContext& ctx) {
+    std::string all;
+    for (const auto& item : ctx.diag.items()) all += item.message, all += '\n';
+    return all;
+}
+
+fs::path cr09_dir(const char* tag) {
+    const fs::path dir = temp_dir() / (std::string("cr09_") + tag);
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+    fs::create_directories(dir);
+    return dir;
+}
+
+// 造一枚"既有产物"：先正常写出一次（返回写出后的镜像字节）。
+std::vector<u8> seed_previous_product(const fs::path& out) {
+    ProtectionContext seed;
+    seed.image = build_minimal_pe(true, kMachineX64);
+    seed.output_path = out;
+    wvmp::passes::PeWriterPass writer;
+    writer.run(seed);
+    return seed.image;
+}
+
+} // namespace
+
+TEST(PeWriterPublish, ReadOnlyTargetKeepsOldProductAndPreservesTmp) {
+    const fs::path dir = cr09_dir("ro");
+    const fs::path out = dir / "victim.exe";
+    const std::vector<u8> old_bytes = seed_previous_product(out);
+    ASSERT_FALSE(old_bytes.empty());
+    set_read_only(out, true);
+    expect_write_blocked(out);
+
+    ProtectionContext ctx;
+    ctx.image = build_minimal_pe(true, kMachineX64);
+    ctx.image.back() = 0x5A; // 与旧产物可区分的"新产物"
+    ctx.output_path = out;
+    wvmp::passes::PeWriterPass writer;
+
+    // ① 返回码非 0（抛错 + diag 记 Error）
+    EXPECT_THROW(writer.run(ctx), std::runtime_error);
+    EXPECT_TRUE(ctx.diag.has_errors());
+
+    // ② 旧产物字节完好（替换失败一律不得动过它）
+    EXPECT_EQ(read_file(out), old_bytes) << "旧产物被删/被改（先 remove 目标的后果）";
+
+    // ③ 新 tmp 仍在、与目标同目录、内容是完整新镜像；诊断点名两侧路径
+    const auto left = tmp_leftovers(dir, out);
+    ASSERT_EQ(left.size(), static_cast<size_t>(1)) << "失败分支应恰好保留一枚 tmp";
+    EXPECT_EQ(read_file(left[0]), ctx.image) << "tmp 未含完整新产物（半写？）";
+    const std::string texts = joined_diag(ctx);
+    EXPECT_NE(texts.find(left[0].string()), std::string::npos) << "诊断未点名保留的 tmp 路径";
+    EXPECT_NE(texts.find(out.string()), std::string::npos) << "诊断未点名保留的旧目标路径";
+
+    // ④ 无半写文件：目录内除目标 + 一枚 tmp 外别无他物
+    EXPECT_EQ(count_entries(dir), 2);
+
+    set_read_only(out, false);
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+}
+
+TEST(PeWriterPublish, ConsecutiveWritesUseDistinctTmpNames) {
+    const fs::path dir = cr09_dir("uniq");
+    const fs::path out = dir / "victim.exe";
+    const std::vector<u8> old_bytes = seed_previous_product(out);
+    set_read_only(out, true);
+    expect_write_blocked(out);
+
+    const std::string stem = out.filename().string();
+    // 单测直判：临时名生成器连续两次调用必须给出不同字符串（同目录、唯一后缀）
+    const fs::path n0 = wvmp::passes::make_temp_output_path(out);
+    const fs::path n1 = wvmp::passes::make_temp_output_path(out);
+    EXPECT_NE(n0, n1) << "两次生成共用同一 tmp 名";
+    for (const fs::path& n : {n0, n1}) {
+        EXPECT_EQ(n.parent_path(), out.parent_path()) << "tmp 必须与目标同目录";
+        EXPECT_NE(n.filename().string().rfind(stem, 0), std::string::npos)
+            << "tmp 名应仍可归到该目标: " << n.filename();
+        EXPECT_NE(n.filename().string().find(kTmpMark), std::string::npos)
+            << "tmp 名缺少带分隔符的唯一后缀: " << n.filename();
+    }
+
+    for (int i = 0; i < 2; ++i) {
+        ProtectionContext ctx;
+        ctx.image = build_minimal_pe(true, kMachineX64);
+        ctx.image.back() = static_cast<u8>(0x5A + i);
+        ctx.output_path = out;
+        wvmp::passes::PeWriterPass writer;
+        EXPECT_THROW(writer.run(ctx), std::runtime_error);
+    }
+
+    // 旧产物仍在，两枚 tmp 各留一份（落盘实测）
+    EXPECT_EQ(read_file(out), old_bytes);
+    const auto left = tmp_leftovers(dir, out);
+    ASSERT_EQ(left.size(), static_cast<size_t>(2)) << "每次失败各留一枚 tmp";
+    EXPECT_NE(left[0], left[1]) << "两次写入落盘的 tmp 同名";
+    for (const auto& p : left) {
+        EXPECT_NE(p.filename().string().find(kTmpMark), std::string::npos) << p;
+        EXPECT_EQ(p.parent_path(), dir);
+    }
+
+    set_read_only(out, false);
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+}
+
+TEST(PeWriterPublish, NormalOverwriteReplacesTargetAndLeavesNoTmp) {
+    const fs::path dir = cr09_dir("ok");
+    const fs::path out = dir / "plain.exe";
+    const std::vector<u8> old_bytes = seed_previous_product(out);
+
+    ProtectionContext ctx;
+    ctx.image = build_minimal_pe(true, kMachineX64);
+    ctx.image.back() = 0x77;
+    ctx.output_path = out;
+    wvmp::passes::PeWriterPass writer;
+    ASSERT_NO_THROW(writer.run(ctx));
+
+    EXPECT_EQ(read_file(out), ctx.image) << "正常路径应完成替换";
+    EXPECT_NE(read_file(out), old_bytes) << "新产物没写进去";
+    EXPECT_TRUE(tmp_leftovers(dir, out).empty()) << "成功路径不得残留 tmp";
+    EXPECT_FALSE(ctx.diag.has_errors());
+
+    std::error_code ec;
+    fs::remove_all(dir, ec);
 }

@@ -1,0 +1,13 @@
+#pragma once
+// pe_writer 内部工具头：产物写出的"唯一临时名 + 原子替换"（CR-09 / MIT-528）。
+#include <filesystem>
+
+namespace wvmp::passes {
+
+// 目标产物路径 → 同目录唯一临时文件路径。
+// 名字 = <目标文件名> + ".wvmp-tmp-" + <pid> + "-" + <进程内递增序号> + "-" + <16 位随机尾>。
+//  - 与目标同目录是硬要求：跨卷改名不是原子操作（Windows 直接失败）；
+//  - 唯一后缀消灭旧"固定 .wvmp-tmp 名 ⇒ 同一目标的并发写入共用一份 tmp"。
+std::filesystem::path make_temp_output_path(const std::filesystem::path& target);
+
+} // namespace wvmp::passes
