@@ -531,6 +531,13 @@ void PeWriterPass::run(ProtectionContext& ctx) {
             fail(ctx, "临时输出文件落盘长度与镜像不符 (" + std::to_string(written) + " != " +
                           std::to_string(ctx.image.size()) + "): " + tmp.string() + keep_both);
     }
+    {
+        // MIT-530：读回逐字节比对。核长只挡半写，挡不住"等长错字节"（掉电后
+        // 文件系统回滚异常一类）——读回对不上同样保持"旧目标 + 新 tmp"双留。
+        std::string rb_err;
+        if (!verify_written_image(tmp, ctx.image.data(), ctx.image.size(), rb_err))
+            fail(ctx, "临时输出文件读回校验失败 (" + rb_err + "): " + tmp.string() + keep_both);
+    }
     std::string pub_err;
     if (!publish_atomic_output(tmp, ctx.output_path, pub_err))
         fail(ctx, "输出文件原子替换失败 (" + pub_err + "): " + tmp.string() + " → " +

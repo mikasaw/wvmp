@@ -827,3 +827,83 @@ TEST(PeWriterPublish, NormalOverwriteReplacesTargetAndLeavesNoTmp) {
     std::error_code ec;
     fs::remove_all(dir, ec);
 }
+
+// ---------------------------------------------------------------------------
+// MIT-530：写后读回校验（verify_written_image）。核长挡半写，读回挡"等长错
+// 字节"。run() 级的正例由上面 NormalOverwrite* 覆盖（读回是它的必经步骤）；
+// 此处直接钉校验器自身的正反例——等长单字节翻转必须被抓到并点名偏移。
+// ---------------------------------------------------------------------------
+TEST(PeWriterPublish, ReadbackAcceptsExactImage) {
+    const fs::path dir = cr09_dir("rb_ok");
+    const fs::path f = dir / "exact.bin";
+    std::vector<u8> img(300 * 1024 + 7); // 跨多个 64KiB 读回块
+    for (size_t i = 0; i < img.size(); ++i) img[i] = static_cast<u8>(i * 31u + 7u);
+    {
+        std::ofstream o(f, std::ios::binary | std::ios::trunc);
+        o.write(reinterpret_cast<const char*>(img.data()),
+                static_cast<std::streamsize>(img.size()));
+    }
+    std::string err = "untouched";
+    EXPECT_TRUE(wvmp::passes::verify_written_image(f, img.data(), img.size(), err));
+    EXPECT_EQ(err, "untouched") << "成功路径不得改写 err";
+
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+}
+
+TEST(PeWriterPublish, ReadbackCatchesEqualLengthCorruption) {
+    const fs::path dir = cr09_dir("rb_flip");
+    const fs::path f = dir / "flip.bin";
+    std::vector<u8> img(200 * 1024);
+    for (size_t i = 0; i < img.size(); ++i) img[i] = static_cast<u8>(i);
+    std::vector<u8> disk = img;
+    const size_t kFlip = 150 * 1024 + 3; // 落在第 3 个读回块内
+    disk[kFlip] ^= 0xFF;
+
+    {
+        std::ofstream o(f, std::ios::binary | std::ios::trunc);
+        o.write(reinterpret_cast<const char*>(disk.data()),
+                static_cast<std::streamsize>(disk.size()));
+    }
+    std::string err;
+    EXPECT_FALSE(wvmp::passes::verify_written_image(f, img.data(), img.size(), err));
+    EXPECT_NE(err.find("首处差异"), std::string::npos) << err;
+    // 点名偏移：0x%zx 形式（十进制 153603 = 0x25803）
+    EXPECT_NE(err.find("25803"), std::string::npos) << err;
+    EXPECT_NE(err.find("!= image"), std::string::npos) << err;
+
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+}
+
+TEST(PeWriterPublish, ReadbackCatchesTruncatedAndOverlong) {
+    const fs::path dir = cr09_dir("rb_len");
+    const std::vector<u8> img(4096, 0xAB);
+
+    // 短读：磁盘文件比镜像少（核长应先红，读回兜底同样不得放过）
+    const fs::path short_f = dir / "short.bin";
+    {
+        std::ofstream o(short_f, std::ios::binary | std::ios::trunc);
+        o.write(reinterpret_cast<const char*>(img.data()),
+                static_cast<std::streamsize>(img.size() - 1));
+    }
+    std::string err;
+    EXPECT_FALSE(wvmp::passes::verify_written_image(short_f, img.data(), img.size(), err));
+    EXPECT_NE(err.find("短读"), std::string::npos) << err;
+
+    // 超长：磁盘文件比镜像多一个字节
+    const fs::path long_f = dir / "long.bin";
+    {
+        std::ofstream o(long_f, std::ios::binary | std::ios::trunc);
+        o.write(reinterpret_cast<const char*>(img.data()),
+                static_cast<std::streamsize>(img.size()));
+        const u8 extra = 0x01;
+        o.write(reinterpret_cast<const char*>(&extra), 1);
+    }
+    err.clear();
+    EXPECT_FALSE(wvmp::passes::verify_written_image(long_f, img.data(), img.size(), err));
+    EXPECT_NE(err.find("多出字节"), std::string::npos) << err;
+
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+}

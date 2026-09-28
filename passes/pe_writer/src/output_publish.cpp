@@ -1,10 +1,14 @@
 #include "output_publish.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <cstdio>
+#include <cstring>
+#include <fstream>
 #include <random>
 #include <string>
 #include <system_error>
+#include <vector>
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
@@ -45,6 +49,50 @@ std::filesystem::path make_temp_output_path(const std::filesystem::path& target)
     name += '-';
     name += tail;
     return target.parent_path() / std::filesystem::path(name);
+}
+
+bool verify_written_image(const std::filesystem::path& tmp,
+                          const unsigned char* expect_data,
+                          std::size_t expect_size,
+                          std::string& err) {
+    std::ifstream in(tmp, std::ios::binary);
+    if (!in) {
+        err = "读回打开失败: " + tmp.string();
+        return false;
+    }
+    // 分块读回 + 比对，首个差异字节即报（镜像几 MB 量级，无需整体驻留双份）。
+    constexpr std::streamsize kChunk = 1 << 16;
+    std::vector<unsigned char> buf(static_cast<std::size_t>(kChunk));
+    std::size_t off = 0;
+    while (off < expect_size) {
+        const std::size_t want = std::min(kChunk, static_cast<std::streamsize>(expect_size - off));
+        in.read(reinterpret_cast<char*>(buf.data()), static_cast<std::streamsize>(want));
+        if (in.gcount() != static_cast<std::streamsize>(want)) {
+            err = "读回短读 @" + std::to_string(off) + " (got " +
+                  std::to_string(in.gcount()) + " want " + std::to_string(want) + ")";
+            return false;
+        }
+        if (std::memcmp(buf.data(), expect_data + off, want) != 0) {
+            for (std::size_t i = 0; i < want; ++i) {
+                if (buf[i] != expect_data[off + i]) {
+                    char where[32];
+                    std::snprintf(where, sizeof(where), "%zx", off + i);
+                    err = std::string("首处差异 @ 0x") + where + " (disk " +
+                          std::to_string(buf[i]) + " != image " +
+                          std::to_string(expect_data[off + i]) + ")";
+                    return false;
+                }
+            }
+        }
+        off += want;
+    }
+    // 末尾还有多余字节 = 也不是这份镜像（长度核已在调用方做过，此处兜底）。
+    unsigned char extra = 0;
+    if (in.read(reinterpret_cast<char*>(&extra), 1) && in.gcount() == 1) {
+        err = "读回多出字节 @ 0x" + std::to_string(expect_size);
+        return false;
+    }
+    return true;
 }
 
 bool publish_atomic_output(const std::filesystem::path& tmp,
