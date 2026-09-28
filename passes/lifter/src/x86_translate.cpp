@@ -1754,6 +1754,7 @@ TranslateResult translate_movd_movq(const cs_insn& ci, const cs_x86& x, ir::Arch
 TranslateResult translate_ymm_mov(const cs_insn& ci, const cs_x86& x, ir::Arch arch);
 TranslateResult translate_ymm_arith(const cs_insn& ci, const cs_x86& x, ir::Arch arch);
 TranslateResult translate_ymm_bridge(const cs_insn& ci, const cs_x86& x, ir::Arch arch);
+TranslateResult translate_bmi2(const cs_insn& ci, const cs_x86& x, ir::Arch arch);
 
 // V-pair 家族描述: 全部复用既有 translate 函数 (零新 IR 语义)。
 struct VexDesc {
@@ -2028,7 +2029,57 @@ TranslateResult translate_vzero(const cs_insn& ci, const cs_x86& x, ir::Arch arc
 //   YmmMov(d←s1) 前置 (T65 三地址折叠同款); d==s2 两侧不同面 (xmm 面
 //   src2 不会被 ymm 面前置 Mov 触碰) 无需特判。lane imm8 硬件语义 &1
 //   (高位忽略) → ir::Insn.aux bit0。x86 gate + ymm8..15/xmm8..15 gate。
+// MIT-534 (G8b 通路 A): BMI2 mulx/pdep/pext — reg 形式三词 (x64 专属)。
+// mem 形式 gate (备忘录 reg-reg 口径); x86 架构 gate; 槽经 map_reg 全 GP 面
+// (rax..r15)。ir 布局: mulx dst=lo/src=hi/src2=src (乘数=guest rdx 隐式);
+// pdep/pext dst/src=值/src2=掩码。均无 flags (MIT-515 实测)。
+TranslateResult translate_bmi2(const cs_insn& ci, const cs_x86& x, ir::Arch arch) {
+    if (arch != ir::Arch::X64) return unsupported(ci.address, ci.size);
+    for (u8 i = 0; i < x.op_count; ++i)
+        if (x.operands[i].type == X86_OP_MEM)
+            return unsupported(ci.address, ci.size);  // mem 形式 v1 gate
+    TranslateResult r;
+    r.insn.addr = ci.address;
+    r.insn.size = ir::Size::S64;
+    r.insn.updates_flags = false;
+    if (ci.id == X86_INS_MULX) {
+        if (x.op_count != 3) return unsupported(ci.address, ci.size);
+        if (x.operands[0].type != X86_OP_REG || x.operands[1].type != X86_OP_REG ||
+            x.operands[2].type != X86_OP_REG)
+            return unsupported(ci.address, ci.size);
+        // ⚠️ Intel asm 语序 mulx r64a, r64b, r/m 在本汇编器族 (keystone/ML64)
+        // 首操作数 = 高位积、次操作数 = 低位积 (2026-09-28 2×3=6 终审探针;
+        // MSVC _mulx_u64 代码生成器按首=低位写, 两家工具相反——以 CPU 实测
+        // 为准)。ir 语义: dst=lo, src=hi (vm_op 口径不变)。
+        auto hi = map_reg(x.operands[0].reg);
+        auto lo = map_reg(x.operands[1].reg);
+        auto src = map_reg(x.operands[2].reg);
+        if (!lo || !hi || !src) return unsupported(ci.address, ci.size);
+        r.insn.op = Op::Mulx;
+        r.insn.dst = ir::Operand::reg_(*lo);
+        r.insn.src = ir::Operand::reg_(*hi);
+        r.insn.src2 = ir::Operand::reg_(*src);
+        r.status = TranslateStatus::Ok;
+        return r;
+    }
+    if (x.op_count != 3) return unsupported(ci.address, ci.size);
+    if (x.operands[0].type != X86_OP_REG || x.operands[1].type != X86_OP_REG ||
+        x.operands[2].type != X86_OP_REG)
+        return unsupported(ci.address, ci.size);
+    auto d = map_reg(x.operands[0].reg);
+    auto v = map_reg(x.operands[1].reg);
+    auto m = map_reg(x.operands[2].reg);
+    if (!d || !v || !m) return unsupported(ci.address, ci.size);
+    r.insn.op = ci.id == X86_INS_PDEP ? Op::Pdep : Op::Pext;
+    r.insn.dst = ir::Operand::reg_(*d);
+    r.insn.src = ir::Operand::reg_(*v);
+    r.insn.src2 = ir::Operand::reg_(*m);
+    r.status = TranslateStatus::Ok;
+    return r;
+}
+
 TranslateResult translate_ymm_bridge(const cs_insn& ci, const cs_x86& x, ir::Arch arch) {
+
     if (arch != ir::Arch::X64) return unsupported(ci.address, ci.size);
     auto ymm_idx = [](x86_reg r) -> std::optional<u8> {
         if (r >= X86_REG_YMM0 && r <= X86_REG_YMM7)
@@ -3708,6 +3759,9 @@ TranslateResult translate_insn(const cs_insn& ci, ir::Arch arch) {
     // MIT-533: wave2 桥 (混合宽度, vex_desc_of 白名单前分流)。
     case X86_INS_VEXTRACTF128: case X86_INS_VINSERTF128:
         return translate_vex128(ci, x, arch);
+    // MIT-534 (G8b 通路 A): BMI2 三词。
+    case X86_INS_MULX: case X86_INS_PDEP: case X86_INS_PEXT:
+        return translate_bmi2(ci, x, arch);
     // MIT-511 (档B wave1): vzeroupper/vzeroall ABI 词入面 (translate_vzero
     // 内 x64 架构 gate + op_count=0 防御; VexVzeroupperGate 先例翻转)。
     case X86_INS_VZEROUPPER: case X86_INS_VZEROALL:

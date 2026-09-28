@@ -324,7 +324,13 @@ enum class Op : u16 { Mov, Lea, Add, Sub, Adc, Sbb, And, Or, Xor, Not, Neg, Inc,
                       // 归约/broadcast 场景的 gate 解锁)。lane 立即数放
                       // Insn.aux bit0; 寄存器编码: xmm 侧沿用 0..7 (SSE
                       // 惯例), ymm 侧 0..7 (T64 惯例), 翻译期 +24。
-                      VextractF128, VinsertF128 };
+                      VextractF128, VinsertF128,
+
+                      // MIT-534: G8b 通路 A —— BMI2 三词 (reg 形式;
+                      // mulx: dst=lo, src=hi, src2=src (乘数恒为 guest
+                      // rdx 隐式); pdep/pext: dst, src=值, src2=掩码)。
+                      // flag_sem=kNone (MIT-515 实测: 三词均不写 flags)。
+                      Mulx, Pdep, Pext };
 enum class Size : u8 { S8, S16, S32, S64 };
 enum class Cond : u8 { O, No, B, Ae, E, Ne, Be, A, S, Ns, P, Np, L, Ge, Le, G };
 constexpr u64 bits(Size s) { return s==Size::S8?8: s==Size::S16?16: s==Size::S32?32:64; }

@@ -2436,7 +2436,62 @@ public:
     // xmm 面 16B 或 [mem] 16B。aux bit0=lane / bit1=mem(a=addr 槽)。
     // 物理 ymm0/xmm1 = scratch (面为权威)。vextractf128 三操作数原生形态
     // (xmm, ymm, imm8) 直发; lane 分支短 je + jmp 汇合 (T62 惯用法)。
+    // MIT-534 (G8b 通路 A): BMI2 native 直发 —— 读 ctx GP 槽 → 物理 reg
+    // 执行 → 写回, 无 flags 通路 (MIT-515 实测三词均不写 flags)。乘数 mulx
+    // 恒为 guest rdx (handler 固定读槽 2)。scratch 纪律见各 handler 内注。
+    std::string build_mulx(u64 dispatch) const {
+        std::string o = decode_prelude();
+        // scratch 纪律: rax/rdx 都在 14 寄存器分配表内 (pc_/flags_/t_[*] 在
+        // 不同 seed 下可能是它们) —— clobber 前一律 push、用完恢复; rcx 在
+        // 表外恒安全 (槽号取回载体); rdx 是 mulx 隐式乘数位的硬约束 (先装
+        // 乘数、后被高位结果覆写)。栈收支平衡在 advance 前。
+        o += std::string("    push ") + r64(t_[4]) + "\n";
+        o += std::string("    push ") + r64(t_[7]) + "\n";
+        o += "    push rax\n";
+        o += "    push rdx\n";
+        o += std::string("    mov rdx, qword ptr [") + r64(ctx_) + " + " +
+             imm(2 * 8 + 0x10) + "]\n";
+        o += std::string("    mov rcx, qword ptr [") + r64(ctx_) + " + " +
+             r64(t_[5]) + "*8 + 0x10]\n";
+        // ⚠️ keystone 语序: mulx 首目的 = 高位 (reg 字段), 次目的 = 低位
+        // (vvvv) — 与 MASM 同向 (2026-09-28 RWX 探针铁证); 立即数一律
+        // imm(): 裸 "16" 被 keystone 按 16 进制读成 0x16 ⇒ 栈错位 6 字节
+        // ⇒ halt 弹错位 ret 跳飞的非确定崩根源 (坑册 keystone 十六进制
+        // 语义的活案例, MIT-534 实录)。
+        o += "    mulx rax, rdx, rcx\n";
+        o += "    mov rcx, [rsp + 0x10]\n";
+        o += std::string("    mov qword ptr [") + r64(ctx_) + " + rcx*8 + 0x10], rax\n";
+        o += "    mov rcx, [rsp + 0x18]\n";
+        o += std::string("    mov qword ptr [") + r64(ctx_) + " + rcx*8 + 0x10], rdx\n";
+        o += "    pop rdx\n";
+        o += "    pop rax\n";
+        o += "    add rsp, " + imm(16) + "\n";
+        o += advance(dispatch);
+        return o;
+    }
+    std::string build_pdep(u64 dispatch) const { return build_pdp(dispatch, "pdep"); }
+    std::string build_pext(u64 dispatch) const { return build_pdp(dispatch, "pext"); }
+    std::string build_pdp(u64 dispatch, const char* mn) const {
+        std::string o = decode_prelude();
+        // 同 mulx 的 scratch 纪律: 只 clobber rax/rcx (pdp 双源 rax,rcx),
+        // rax 可能是 pc_/flags_ —— push 保全恢复; 值槽 t_[7] 作索引用在
+        // clobber 之前, 读后即弃。
+        o += std::string("    push ") + r64(t_[4]) + "\n";
+        o += "    push rax\n";
+        o += std::string("    mov rcx, qword ptr [") + r64(ctx_) + " + " +
+             r64(t_[5]) + "*8 + 0x10]\n";
+        o += std::string("    mov rax, qword ptr [") + r64(ctx_) + " + " +
+             r64(t_[7]) + "*8 + 0x10]\n";
+        o += std::string("    ") + mn + " rax, rax, rcx\n";
+        o += "    mov rcx, [rsp + 8]\n";
+        o += std::string("    mov qword ptr [") + r64(ctx_) + " + rcx*8 + 0x10], rax\n";
+        o += "    pop rax\n";
+        o += "    add rsp, " + imm(8) + "\n";
+        o += advance(dispatch);
+        return o;
+    }
     std::string build_vextract_f128(u64 dispatch) const {
+
         std::string o = decode_prelude();
         const std::string tag = "vext" + std::to_string(seq());
         o += ymm_offset_into_t9(t_[7]);
@@ -7089,6 +7144,9 @@ RuntimeGenResult generate_runtime_arch(wvmp::Rng& rng, AsmGen::HostArch arch,
         {int(VmOp::Vzeroall), "vzeroall", &AsmGen::build_vzeroall},
         // MIT-512 (档B wave2①): ymm 传送词 (x64 host 专用; 槽 v24..31 =
         // ymm0..7 复用; 混排 gate 见 virtualize_pass)。
+        {int(VmOp::Mulx), "mulx", &AsmGen::build_mulx},
+        {int(VmOp::Pdep), "pdep", &AsmGen::build_pdep},
+        {int(VmOp::Pext), "pext", &AsmGen::build_pext},
         {int(VmOp::VextractF128), "vextractf128", &AsmGen::build_vextract_f128},
         {int(VmOp::VinsertF128), "vinsertf128", &AsmGen::build_vinsert_f128},
         {int(VmOp::YmmMov), "ymmmov", &AsmGen::build_ymm_mov},

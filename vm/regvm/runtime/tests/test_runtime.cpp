@@ -1252,6 +1252,69 @@ TEST(Interpreter, VzeroWordsHardwareTruth) {
 //       YmmMov ymm4←ymm3 (merge base) → insert ymm4+xmm2 lane1 /
 //       YmmMov ymm5←ymm3 → insert ymm5+[bufM] lane0 / halt。
 // 期望: xmm2 面 = L0; buf2 = L1; ymm4 = (L0, L0); ymm5 = (M, L1)。
+// MIT-534 (G8b 通路 A) 硬件真值: mulx/pdep/pext — 软件参考对拍 (pdep 位序
+// 反写坑见 MIT-515: x 的 bit i 取 bit bn)。mulx 乘数 = guest rdx 槽 2。
+TEST(Interpreter, Bmi2HardwareTruth) {
+    {
+        int info[4] = {};
+        __cpuid(info, 0);
+        if (static_cast<unsigned>(info[0]) >= 7) {
+            __cpuidex(info, 7, 0);
+            if ((static_cast<unsigned>(info[1]) & (1u << 8)) == 0)
+                GTEST_SKIP() << "host CPU lacks BMI2";
+        } else {
+            GTEST_SKIP() << "cpuid leaf 7 unavailable";
+        }
+    }
+    const u8 sz64 = isa::size_field(ir::Size::S64);
+    wvmp::Rng rng(20260928);
+    const auto result = rt::generate_runtime(rng);
+    RwxImage rwx(result.image.code);
+    auto entry = rwx.entry();
+
+    const u64 mult = 0x9E37'79B9'7F4A'7C15ull;
+    const u64 src = 0x1234'5678'9ABC'DEF0ull;
+    const u64 val = 0xF0F0'0F0F'55AA'55AAull;
+    const u64 mask = 0x00FF'00FF'00FF'00FFull;
+    u64 hi = 0;
+    const u64 lo = _umul128(mult, src, &hi);
+    u64 pdep_ref = 0, pext_ref = 0;
+    {   // 位序参考 (MIT-515): pdep 第 n 个置位位取 x 的 bit n; pext 反之。
+        int n = 0;
+        for (int i = 0; i < 64; ++i)
+            if ((mask >> i) & 1u) { pdep_ref |= ((val >> n) & 1u) << i; ++n; }
+        n = 0;
+        for (int i = 0; i < 64; ++i)
+            if ((mask >> i) & 1u) { pext_ref |= ((val >> i) & 1u) << n; ++n; }
+    }
+
+    std::vector<u8> s;
+    isa::append_insn(s, isa::make_insn(isa::VmOp::Mulx, isa::OpKind::Reg,
+                                       0, isa::OpKind::Reg, 3, 8, sz64));  // aux=8: src 在独立槽
+    isa::append_insn(s, isa::make_insn(isa::VmOp::Pdep, isa::OpKind::Reg,
+                                       4, isa::OpKind::Reg, 5, 6, sz64));
+    isa::append_insn(s, isa::make_insn(isa::VmOp::Pext, isa::OpKind::Reg,
+                                       7, isa::OpKind::Reg, 5, 1, sz64));
+    isa::append_insn(s, halt());
+
+    rt::VmContext ctx;
+    ctx.bytecode = s.data();
+    ctx.pc = 0;
+    ctx.regs[2] = mult;   // guest rdx = mulx 乘数 (隐式)
+    ctx.regs[8] = src;    // r8 = mulx src 槽 (独立于乘数槽 2)
+    ctx.regs[1] = mask;   // rcx = pext 掩码
+    ctx.regs[5] = val;    // rbp = pdep/pext 值
+    ctx.regs[6] = mask;   // rsi = pdep 掩码
+    entry(&ctx);
+
+    EXPECT_EQ(ctx.regs[0], lo) << "mulx lo";
+    EXPECT_EQ(ctx.regs[3], hi) << "mulx hi";
+    EXPECT_EQ(ctx.regs[4], pdep_ref) << "pdep (位序参考)";
+    EXPECT_EQ(ctx.regs[7], pext_ref) << "pext";
+    EXPECT_EQ(ctx.regs[9], 0ull) << "r9 误写";
+    EXPECT_EQ(ctx.regs[10], 0ull) << "r10 误写";
+}
+
 TEST(Interpreter, YmmBridgeHardwareTruth) {
     {
         int info[4] = {};
@@ -3084,7 +3147,7 @@ TEST(Interpreter, ImulSemantics) {
 // 当前 build_mul 在某些 Rng 种子（如 babef00d）下 regs[Rax]/regs[Rdx]
 // 写回路径存在微妙 bug, v1 lifter 翻译器优先将 mul 路径拆给 Imul
 // 3-op / 2-op（覆盖真实 MSVC codegen）, Mul 单操作数 handler 真实
-// 使用面极窄（__umul128 / __int128 等需 native 调用的场景）。
+// 使用面极窄（_umul128 / __int128 等需 native 调用的场景）。
 //   详见 vm/regvm/runtime/src/asmgen.cpp build_mul 注释——后续 MIT-303+
 //   修复 build_mul 时回填这两个测试。
 TEST(Interpreter, MulSemantics) {

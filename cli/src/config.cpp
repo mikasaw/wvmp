@@ -122,7 +122,7 @@ ConfigResult parse_config(const std::filesystem::path& file) {
     // 必须响，不能静默吞。
     constexpr std::string_view kTopLevelKeys[] = {"input", "output", "seed", "arch",
                                                   "default_level", "functions", "passes",
-                                                  "avx",
+                                                  "avx", "bmi2",
                                                   "mutate", "anti_debug", "tls", "crypt",
                                                   "import", "pe"};
     for (const auto& [key, value] : tbl) {
@@ -449,6 +449,25 @@ ConfigResult parse_config(const std::filesystem::path& file) {
             return fail("config [avx] 'require' 必须是布尔值");
         result.value.rules.has_require_avx = true;
         result.value.rules.require_avx = *req;
+    }
+
+    // [bmi2] require（默认 true；MIT-534 G8b 通路 A：mulx/pdep/pext 词的
+    // 打包期收白名单开关；false = 含 BMI2 词的函数整函数 gate——部署非
+    // BMI2 机器的安全开关，与 [avx] require 同哲学）。
+    if (const toml::node* bmi_node = tbl.get("bmi2")) {
+        const toml::table* bt = bmi_node->as_table();
+        if (!bt) return fail("config 字段 'bmi2' 必须是表（[bmi2]）");
+        for (const auto& [key, value] : *bt)
+            if (key.str() != "require")
+                return fail("config [bmi2] 未知子键 '" + std::string(key.str()) +
+                            "'（允许: require）");
+        const toml::node* rq = bt->get("require");
+        if (rq == nullptr) return fail("config [bmi2] 缺少子键 'require'");
+        auto req = rq->value<bool>();
+        if (!req)
+            return fail("config [bmi2] 'require' 必须是布尔值");
+        result.value.rules.has_require_bmi2 = true;
+        result.value.rules.require_bmi2 = *req;
     }
 
     // [pe] aslr（默认 true；true = 保留 native DYNAMIC_BASE + .reloc 扩展

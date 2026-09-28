@@ -134,15 +134,18 @@ void VirtualizePass::run(ProtectionContext& ctx) {
 
 
             // MIT-518: require_avx 开关（默认 true = 现行为零变化）。
-            // false 时含 AVX 词（Vzeroupper 起的连续值域 = vzero + ymm 全族）
-            // 的函数整函数 gate——部署非 AVX 机器的安全开关。
+            // false 时含 AVX 词的函数整函数 gate——部署非 AVX 机器的安全
+            // 开关。MIT-534 起值域改**闭区间** [Vzeroupper, VinsertF128]
+            // （枚举 append-only，BMI2 词追加在 ymm 族之后，不得被 AVX
+            // 开关误 gate）。
             if (rules != nullptr && rules->has_require_avx &&
                 !rules->require_avx) {
                 bool has_avx = false;
                 const auto& bc0 = vf.program.bytecode;
                 for (size_t off = 32; off + 8 <= bc0.size(); off += 8) {
-                    if (static_cast<int>(bc0[off]) >=
-                        static_cast<int>(isa::VmOp::Vzeroupper)) {
+                    const int w = static_cast<int>(bc0[off]);
+                    if (w >= static_cast<int>(isa::VmOp::Vzeroupper) &&
+                        w <= static_cast<int>(isa::VmOp::VinsertF128)) {
                         has_avx = true;
                         break;
                     }
@@ -153,6 +156,31 @@ void VirtualizePass::run(ProtectionContext& ctx) {
                         "函数 " + fn.name +
                             " 含 AVX 词流且 config require_avx=false，跳过虚拟化"
                             "（保持原生，非 AVX 机器部署安全开关）");
+                    continue;
+                }
+            }
+
+            // MIT-534 (G8b 通路 A): require_bmi2 开关（默认 true = 收白名单
+            // ——产物的最低 BMI2 机器契约由用户显式接受）。false 时含
+            // Mulx/Pdep/Pext 的函数整函数 gate（闭区间，非 BMI2 词不误伤）。
+            if (rules != nullptr && rules->has_require_bmi2 &&
+                !rules->require_bmi2) {
+                bool has_bmi2 = false;
+                const auto& bc0 = vf.program.bytecode;
+                for (size_t off = 32; off + 8 <= bc0.size(); off += 8) {
+                    const int w = static_cast<int>(bc0[off]);
+                    if (w >= static_cast<int>(isa::VmOp::Mulx) &&
+                        w <= static_cast<int>(isa::VmOp::Pext)) {
+                        has_bmi2 = true;
+                        break;
+                    }
+                }
+                if (has_bmi2) {
+                    ctx.diag.report(
+                        Severity::Note, name(),
+                        "函数 " + fn.name +
+                            " 含 BMI2 词流且 config require_bmi2=false，跳过虚拟化"
+                            "（保持原生，非 BMI2 机器部署安全开关）");
                     continue;
                 }
             }

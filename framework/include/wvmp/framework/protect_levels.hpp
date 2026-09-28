@@ -75,7 +75,11 @@ struct ProtectRules {
     bool pe_aslr = true;                 // MIT-494: ASLR 兼容（保留 DYNAMIC_BASE
                                          // + .reloc 扩展；native 未 opt-in 时保守清除）
     bool has_require_avx = false;
-    bool require_avx = true;             // MIT-518: AVX 词面开关（false 时
+    bool require_avx = true;
+    // MIT-534 (G8b 通路 A): BMI2 词面开关（false 时含 Mulx/Pdep/Pext 的
+    // 函数整函数 gate；append-only 追加，既有聚合初始化逐位兼容）。
+    bool has_require_bmi2 = false;
+    bool require_bmi2 = true;             // MIT-518: AVX 词面开关（false 时
                                          // ymm/vzero 词函数级 gate——部署非
                                          // AVX 机器安全开关；G8b require_bmi2
                                          // 同位预留）

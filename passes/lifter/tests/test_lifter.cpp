@@ -3090,6 +3090,53 @@ TEST_F(LifterTranslate, VexVzeroCapstoneProbe) {
 }
 // MIT-533 (wave2 桥): vextractf128/vinsertf128 lift — 编码手算钉板
 // (capstone 反汇为第一道自校验: 字节错则 mnemonic 断言先红)。
+// MIT-534 (G8b 通路 A): BMI2 三词 lift — kstool 钉板编码。
+TEST_F(LifterTranslate, Bmi2Folds) {
+    // mulx rax, rdx, rcx (C4 E2 EB F6 C1) → 首操作数 rax=高位 (keystone/ML64
+    // 语序, 2×3 终审探针) ⇒ ir: lo(dst)=rdx, hi(src)=rax
+    const wvmp::u8 mx[] = {0xC4, 0xE2, 0xEB, 0xF6, 0xC1};
+    auto r = translate_bytes(x64, mx, ir::Arch::X64);
+    ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r.insn.op, ir::Op::Mulx);
+    EXPECT_EQ(r.insn.dst.reg, ir::Reg::Rdx);
+    EXPECT_EQ(r.insn.src.reg, ir::Reg::Rax);
+    EXPECT_EQ(r.insn.src2.reg, ir::Reg::Rcx);
+    EXPECT_FALSE(r.insn.updates_flags);
+
+    // mulx r9, r10, r11 (C4 42 AB F6 CB) → 首=r9=高位
+    const wvmp::u8 mx9[] = {0xC4, 0x42, 0xAB, 0xF6, 0xCB};
+    r = translate_bytes(x64, mx9, ir::Arch::X64);
+    ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r.insn.dst.reg, ir::Reg::R10);
+    EXPECT_EQ(r.insn.src.reg, ir::Reg::R9);
+    EXPECT_EQ(r.insn.src2.reg, ir::Reg::R11);
+
+    // pdep rax, rbx, rcx (C4 E2 E3 F5 C1)
+    const wvmp::u8 pd[] = {0xC4, 0xE2, 0xE3, 0xF5, 0xC1};
+    r = translate_bytes(x64, pd, ir::Arch::X64);
+    ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r.insn.op, ir::Op::Pdep);
+    EXPECT_EQ(r.insn.dst.reg, ir::Reg::Rax);
+    EXPECT_EQ(r.insn.src.reg, ir::Reg::Rbx);
+    EXPECT_EQ(r.insn.src2.reg, ir::Reg::Rcx);
+
+    // pext r8, r9, r10 (C4 42 B2 F5 C2)
+    const wvmp::u8 pe[] = {0xC4, 0x42, 0xB2, 0xF5, 0xC2};
+    r = translate_bytes(x64, pe, ir::Arch::X64);
+    ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r.insn.op, ir::Op::Pext);
+    EXPECT_EQ(r.insn.dst.reg, ir::Reg::R8);
+
+    // gate: mem 形式 (pdep rax, rbx, [rcx]) v1 拒
+    const wvmp::u8 pm[] = {0xC4, 0xE2, 0xE3, 0xF5, 0x01};
+    r = translate_bytes(x64, pm, ir::Arch::X64);
+    EXPECT_NE(r.status, lifter::TranslateStatus::Ok);
+
+    // gate: x86 架构拒
+    r = translate_bytes(x86, mx, ir::Arch::X86);
+    EXPECT_NE(r.status, lifter::TranslateStatus::Ok);
+}
+
 TEST_F(LifterTranslate, YmmBridgeFolds) {
     // vextractf128 xmm2, ymm3, 1 (C4 E3 79 19 D3 01) → VextractF128 reg 形
     const wvmp::u8 ex[] = {0xC4, 0xE3, 0x7D, 0x19, 0xDA, 0x01};
@@ -4011,21 +4058,27 @@ TEST_F(LifterTranslate, BmiAndnAndnpsNoCrossTalk) {
 }
 
 TEST_F(LifterTranslate, BmiNegativeFamilyStillGated) {
-    // 负例族 (D2 裁决: G8b/文档化 gate) 照旧 default → Unsupported:
-    // mulx C4 62 33 F6 C0 / pdep C4 62 33 F5 C0 / pext C4 62 32 F5 C0 /
-    // blsr C4 E2 38 F3 C8 / bextr C4 62 70 F7 C0 / blsi C4 E2 38 F3 D8 /
-    // blsmsk C4 E2 38 F3 D0 — 字节 probe 实测 (probe_forms.obj)。
-    const wvmp::u8 mulx[]   = {0xC4, 0x62, 0x33, 0xF6, 0xC0};
-    const wvmp::u8 pdep[]   = {0xC4, 0x62, 0x33, 0xF5, 0xC0};
-    const wvmp::u8 pext[]   = {0xC4, 0x62, 0x32, 0xF5, 0xC0};
+    // 负例族 (D2 裁决: 文档化 gate) 照旧 default → Unsupported。
+    // MIT-534 (G8b 通路 A, 用户 2026-09-28 批准) 翻正 mulx/pdep/pext 三词
+    // (reg 形式入面, 编码细节见 Bmi2Folds); BMI1 blsr/bextr/blsi/blsmsk
+    // 维持文档化永久 gate。字节 probe 实测 (probe_forms.obj)。
     const wvmp::u8 blsr[]   = {0xC4, 0xE2, 0x38, 0xF3, 0xC8};
     const wvmp::u8 bextr[]  = {0xC4, 0x62, 0x70, 0xF7, 0xC0};
     const wvmp::u8 blsi[]   = {0xC4, 0xE2, 0x38, 0xF3, 0xD8};
     const wvmp::u8 blsmsk[] = {0xC4, 0xE2, 0x38, 0xF3, 0xD0};
-    const std::span<const wvmp::u8> negs[] = {mulx, pdep, pext, blsr, bextr, blsi, blsmsk};
+    const std::span<const wvmp::u8> negs[] = {blsr, bextr, blsi, blsmsk};
     for (const auto& b : negs) {
         auto r = translate_bytes(x64, b, ir::Arch::X64);
         EXPECT_EQ(r.status, lifter::TranslateStatus::Unsupported);
+    }
+    // mulx/pdep/pext 现在应 Ok (同族历史对照, 防 gate 面误扩/漏收)
+    const wvmp::u8 mulx[]   = {0xC4, 0x62, 0x33, 0xF6, 0xC0};
+    const wvmp::u8 pdep[]   = {0xC4, 0x62, 0x33, 0xF5, 0xC0};
+    const wvmp::u8 pext[]   = {0xC4, 0x62, 0x32, 0xF5, 0xC0};
+    const std::span<const wvmp::u8> pos[] = {mulx, pdep, pext};
+    for (const auto& b : pos) {
+        auto r = translate_bytes(x64, b, ir::Arch::X64);
+        EXPECT_EQ(r.status, lifter::TranslateStatus::Ok);
     }
 }
 

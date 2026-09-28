@@ -1183,6 +1183,10 @@ struct Translator {
                        in.op == ir::Op::VinsertF128) {
                 // MIT-533 (wave2 桥): 128 位车道跨界 dispatch。
                 ok = translate_ymm_bridge(em, sc, in, current_rva, next_ip);
+            } else if (in.op == ir::Op::Mulx || in.op == ir::Op::Pdep ||
+                       in.op == ir::Op::Pext) {
+                // MIT-534 (G8b 通路 A): BMI2 三词 dispatch。
+                ok = translate_bmi2(em, sc, in, current_rva, next_ip);
             } else if (in.op == ir::Op::Xorps || in.op == ir::Op::Orps || in.op == ir::Op::Andps) {
                 // MIT-376: SSE 浮点位运算 dispatch — REG-REG 形式 emit 单条
                 // VmOp::Xorps/Orps/Andps; MEM 源 (MIT-408) 折条同 add。
@@ -2920,8 +2924,33 @@ struct Translator {
     // (面 0x140+(s-24)*16); ymm 侧槽 v24..31 (面 0x1C0+(s-24)*32) —— 槽
     // 号同域不同面, VmOp 域消歧 (T64 惯例)。Vinsert 的 merge base 恒=dst
     // (lifter 前置保证), 翻译器不读第二个 ymm 槽。
+    // ---- MIT-534 (G8b 通路 A): BMI2 三词发射 (reg 形式)。 ----
+    // 编码: mulx a=lo 槽 b=hi 槽 aux=src 槽号 (乘数恒 guest rdx 槽 2, handler
+    // 固定读); pdep/pext a=dst 槽 b=src 槽 aux=mask 槽号。GP 槽 0..15 直通。
+    bool translate_bmi2(Emitter& em, Scratch& sc, const ir::Insn& in,
+                        u64 current_rva, u64 next_ip) {
+        (void)sc; (void)current_rva; (void)next_ip;
+        if (in.dst.kind != ir::Operand::Kind::Reg ||
+            in.src.kind != ir::Operand::Kind::Reg ||
+            in.src2.kind != ir::Operand::Kind::Reg)
+            return skip(in, "BMI2 操作数形态未支持 (v1 仅 reg-reg-reg)", nullptr);
+        const u8 a = static_cast<u8>(in.dst.reg);
+        const u8 b = static_cast<u8>(in.src.reg);
+        const u8 c = static_cast<u8>(in.src2.reg);
+        if (a > 15u || b > 15u || c > 15u)
+            return skip(in, "BMI2 槽号越界 (GP 0..15)", nullptr);
+        if (in.op == ir::Op::Mulx) {
+            em.emit(VmOp::Mulx, OpKind::Reg, a, OpKind::Reg, b, c,
+                    isa::size_field(in.size));
+            return true;
+        }
+        em.emit(in.op == ir::Op::Pdep ? VmOp::Pdep : VmOp::Pext,
+                OpKind::Reg, a, OpKind::Reg, b, c, isa::size_field(in.size));
+        return true;
+    }
     bool translate_ymm_bridge(Emitter& em, Scratch& sc, const ir::Insn& in,
                               u64 current_rva, u64 next_ip) {
+
         const u8 lane = in.aux & 1u;
         if (in.op == ir::Op::VextractF128) {
             if (in.src.kind != ir::Operand::Kind::Reg)

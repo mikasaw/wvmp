@@ -423,6 +423,7 @@ samples=(
     # 单边新增 1 样本 → 71 × 5 = 355 runs。
     "build/passes/marker_scan/tests/wvmp_ymm_data_sample.exe"
     "build/passes/marker_scan/tests/wvmp_ymm_bridge_sample.exe"
+    "build/passes/marker_scan/tests/wvmp_bmi2_sample.exe"
     # MIT-427 (G1c): movd/movq GP↔xmm 桥主样本 + ctx.xmm 读回影子样本 —
     # 桥四形 REG (66 0F 6E / 66 REX.W 0F 6E / 66 0F 7E / 66 REX.W 0F 7E,
     # 新 VmOp::XmmFromGp/GpFromXmm) + mem 双向 (408 通路) + all-xmm 双形态
@@ -554,7 +555,7 @@ x86_samples=(
 
 # MIT-522 (B0-3) B0-3: 带 [[functions]] 规则片段的变体槽 —— "<样本>|<变体名>"，
 # 挂点与期望值在 scripts/multiseed_rules/<样本名>__<变体名>.{rules.toml,expect.txt}。
-# 登记式而非目录扫描：总槽数 = samples(53) + x86_samples(20) + 本数组(4) = 77，
+# 登记式而非目录扫描：总槽数 = samples(54) + x86_samples(20) + 本数组(4) = 78，
 # 只读脚本即可算出（架构判据 1），落错文件也不会悄悄多出/少掉槽位。
 # 四个变体全打在已入池的 wvmp_shift0_flags_sample.exe 上（架构判据 3：别新建样本）——
 # 该样本 7 区、无规则基线 7 stub，是唯一"每区各自可翻译"的多区样本，选择器错位

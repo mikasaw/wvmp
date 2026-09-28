@@ -694,9 +694,18 @@ enum class VmOp : u16 {
                     //   bit1=1 时 a=addr 槽写 [mem] 16B)
     VinsertF128,    // ymm dst, ymm src1(=dst 不变量), xmm/mem src2 — 128 位
                     //   车道插入 (aux bit0=lane, bit1=1 时 b=addr 槽读 [mem])
+
+    // ---- MIT-534: G8b 通路 A —— BMI2 三词 (x64 host 专用, reg 形式;
+    //      native 直发 handler, flag_sem=kNone; require_bmi2=false 时
+    //      函数级 gate)。append-only 追加在 ymm 族之后 ⇒ require_avx 的
+    //      值域判据须改闭区间 [Vzeroupper, VinsertF128] (见 virtualize)。----
+    Mulx,           // mulx lo, hi, src — a=lo 槽 b=hi 槽 aux=src 槽号;
+                    //   乘数恒为 guest rdx (handler 固定读槽 2), 无 flags
+    Pdep,           // pdep dst, src, mask — a=dst 槽 b=src 槽 aux=mask 槽号
+    Pext,           // pext dst, src, mask — 同上 (抽取语义)
     };
 
-inline constexpr u16 kVmOpMax = static_cast<u16>(VmOp::VinsertF128);  // MIT-533: 166
+inline constexpr u16 kVmOpMax = static_cast<u16>(VmOp::Pext);  // MIT-534: 169
 inline constexpr u16 kVmOpLimit = 1u << 14;  // 14 位编码空间上限
 
 constexpr const char* to_string(VmOp op) {
@@ -843,6 +852,9 @@ constexpr const char* to_string(VmOp op) {
         case VmOp::YmmStore: return "ymmstore";
         case VmOp::VextractF128: return "vextractf128";
         case VmOp::VinsertF128: return "vinsertf128";
+        case VmOp::Mulx: return "mulx";
+        case VmOp::Pdep: return "pdep";
+        case VmOp::Pext: return "pext";
         case VmOp::YmmAddps: return "ymmaddps";
         case VmOp::YmmAddpd: return "ymmaddpd";
         case VmOp::YmmSubps: return "ymmsubps";
