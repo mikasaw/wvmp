@@ -105,7 +105,13 @@ def tls_callback_windows(packed, secs, dd, plus, ib):
     if tls_off is None or tls_off + (40 if plus else 24) > len(packed):
         return []
     # AddressOfCallBacks 槽内存的是全 VA（TLS 目录字段约定），先归一到 RVA。
-    cb_arr_va = u32(packed, tls_off + (16 if plus else 12))
+    # PE32 目录 24B (AddressOfCallBacks @12, u32); PE32+ 目录 40B (三
+    # ULONGLONG 后 @24, u64——MIT-532 验收 F2: 旧 +16/u32 读到的是
+    # AddressOfIndex 低半, 恒 < ib 空窗 = fail-closed 假红)。
+    if plus:
+        cb_arr_va = int.from_bytes(packed[tls_off + 24:tls_off + 32], "little")
+    else:
+        cb_arr_va = u32(packed, tls_off + 12)
     if cb_arr_va < ib:
         return []
     arr_off = r2o(cb_arr_va - ib)

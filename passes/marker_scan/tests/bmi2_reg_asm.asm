@@ -1,6 +1,6 @@
 ; MIT-534 (G8b 通路 A): BMI2 reg 形样本 — mulx/pdep/pext 全 reg 操作数
 ; (v1 词面; /Od intrinsic 生成 mem 形走 C1 gate, 词面虚拟化由本 asm 证明)。
-; Intel 语序 (MSVC/MASM 权威): mulx 首目的=低位。
+; ML64/keystone 语序 (2026-09-28 终审探针): mulx 首目的=高位。
 ;
 ; bmi2_reg(dst=rcx 16B, a=rdx, m=r8): mulx(a×a) + pdep(a,m) + pext(pdep,m)。
 

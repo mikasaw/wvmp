@@ -3138,7 +3138,7 @@ TEST_F(LifterTranslate, Bmi2Folds) {
 }
 
 TEST_F(LifterTranslate, YmmBridgeFolds) {
-    // vextractf128 xmm2, ymm3, 1 (C4 E3 79 19 D3 01) → VextractF128 reg 形
+    // vextractf128 xmm2, ymm3, 1 (C4 E3 7D 19 DA 01) → VextractF128 reg 形
     const wvmp::u8 ex[] = {0xC4, 0xE3, 0x7D, 0x19, 0xDA, 0x01};
     auto r = translate_bytes(x64, ex, ir::Arch::X64);
     ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
@@ -3148,7 +3148,7 @@ TEST_F(LifterTranslate, YmmBridgeFolds) {
     EXPECT_EQ(r.insn.aux, 1);                          // lane 1
     EXPECT_TRUE(r.extra.empty());
 
-    // vextractf128 xmm1, ymm0, 0 (C4 E3 79 19 C8 00) → lane 0
+    // vextractf128 xmm1, ymm0, 0 (C4 E3 7D 19 C1 00) → lane 0
     const wvmp::u8 ex0[] = {0xC4, 0xE3, 0x7D, 0x19, 0xC1, 0x00};
     r = translate_bytes(x64, ex0, ir::Arch::X64);
     ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
@@ -3156,7 +3156,7 @@ TEST_F(LifterTranslate, YmmBridgeFolds) {
     EXPECT_EQ(static_cast<int>(r.insn.src.reg), 0);
     EXPECT_EQ(r.insn.aux, 0);
 
-    // vextractf128 [rcx], ymm3, 1 (C4 E3 79 19 19 01) → mem dst
+    // vextractf128 [rcx], ymm3, 1 (C4 E3 7D 19 19 01) → mem dst
     const wvmp::u8 exm[] = {0xC4, 0xE3, 0x7D, 0x19, 0x19, 0x01};
     r = translate_bytes(x64, exm, ir::Arch::X64);
     ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
