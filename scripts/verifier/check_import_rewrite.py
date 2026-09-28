@@ -79,6 +79,59 @@ def iat_span(data):
     return (base, end - base, plus) if base else None
 
 
+def tls_callback_windows(packed, secs, dd, plus, ib):
+    """MIT-532：TLS 回调桩窗（RVA 区间列表）。
+
+    import_protect 的回填循环在 tls_hook 生成的回调桩里装载原 IAT 基址作
+    rep movs 目的（设计内的"写方"），与本门要抓的"残留读方"语义相反；该
+    桩是 tls_hook 对代码节的最后一次追加，窗 = [回调 RVA, 所在节末)（与
+    tls_e2e.sh MIT-490 ③ 的扫描窗口径一致）。回调数组从 packed dd[9] 的
+    IMAGE_TLS_DIRECTORY.AddressOfCallBacks 解出（数组以 NULL 结尾，槽内
+    是全 VA，归一到 RVA 后与反汇地址同空间）。解不出 TLS 目录时返回空
+    列表 = 一个窗都不豁免（fail-closed）。
+    """
+    dd9_rva = u32(packed, dd + 9 * 8)
+    dd9_size = u32(packed, dd + 9 * 8 + 4)
+    if not dd9_rva or dd9_size == 0:
+        return []
+
+    def r2o(r):
+        for (_n, va, vs, rp, rs, _c) in secs:
+            if va and va <= r < va + max(vs, rs):
+                return rp + r - va
+        return None
+
+    tls_off = r2o(dd9_rva)
+    if tls_off is None or tls_off + (40 if plus else 24) > len(packed):
+        return []
+    # AddressOfCallBacks 槽内存的是全 VA（TLS 目录字段约定），先归一到 RVA。
+    cb_arr_va = u32(packed, tls_off + (16 if plus else 12))
+    if cb_arr_va < ib:
+        return []
+    arr_off = r2o(cb_arr_va - ib)
+    if arr_off is None:
+        return []
+    wins = []
+    w = 8 if plus else 4
+    i = 0
+    while arr_off + i * w + w <= len(packed):
+        cb = int.from_bytes(packed[arr_off + i * w:arr_off + i * w + w], "little")
+        if cb == 0:
+            break
+        if cb >= ib:
+            cb_rva = cb - ib
+            sec = next((s for s in secs
+                        if s[1] and s[1] <= cb_rva < s[1] + max(s[2], s[4])), None)
+            # 只对 wvmp 生成节（.wvmpc/.wvmp）里的回调建窗：tls_hook 桩永远
+            # 追加在 .wvmpc（它是该节最后一次代码追加，[cb, 节末) 即桩体）；
+            # 原用户回调住在 .text 一类原节中间，"到节末"会罩住整片原代码，
+            # 豁免面不可接受地扩大（MIT-532 反例实测抓到）。
+            if sec is not None and sec[0].startswith(".wvmp"):
+                wins.append((cb_rva, sec[1] + max(sec[2], sec[4])))
+        i += 1
+    return wins
+
+
 def main():
     native = open(sys.argv[1], "rb").read()
     packed = open(sys.argv[2], "rb").read()
@@ -91,11 +144,13 @@ def main():
     ib = struct.unpack_from("<Q" if plus else "<I", packed,
                             u32(packed, 0x3C) + 24 + (24 if plus else 28))[0]
     secs, dd, _p = sections(packed)
+    cb_wins = tls_callback_windows(packed, secs, dd, plus, ib)
     md = capstone.Cs(capstone.CS_ARCH_X86,
                      capstone.CS_MODE_64 if plus else capstone.CS_MODE_32)
     md.detail = True
     exec_hits = 0
     imm_hits = 0
+    backfill_loads = 0
     for (_n, va, vs, rp, rs, chars) in secs:
         if not (chars & 0x20000000) or rs == 0:
             continue
@@ -120,14 +175,24 @@ def main():
             # imm 载荷不经本扫：其 mem 操作数已由 MEM 面覆盖、imm 语义
             # 是"写入槽的值"而非"槽地址引用"。moffs64（A0-A3，long 模式
             # MSVC 不生成）。命中即残面证据。
+            # MIT-532：TLS 回调桩窗内的 imm 装载豁免（计 backfill_loads
+            # 披露）——import_protect 回填循环装载原 IAT 基址作 rep movs
+            # 目的，是设计内的"写方"，与残留"读方"语义相反；桩窗的
+            # rep-movs 有无极性由 tls_e2e.sh 专项断言另行看管。窗由
+            # tls_callback_windows() 从 packed TLS 目录解出（解不出 =
+            # 空列表 = 不豁免，fail-closed）。窗外命中仍是残面证据。
             b = ins.bytes
+            hit = False
             if 0xB8 <= b[0] <= 0xBF and len(b) == 5:
                 v = struct.unpack_from("<I", b, 1)[0]
-                if v >= ib and lo <= v - ib < lo + size:
-                    imm_hits += 1
-            if plus and b[0] in (0xA0, 0xA1, 0xA2, 0xA3) and len(b) == 10:
+                hit = v >= ib and lo <= v - ib < lo + size
+            elif plus and b[0] in (0xA0, 0xA1, 0xA2, 0xA3) and len(b) == 10:
                 v = struct.unpack_from("<Q", b, 2)[0]
-                if v >= ib and lo <= v - ib < lo + size:
+                hit = v >= ib and lo <= v - ib < lo + size
+            if hit:
+                if any(c0 <= ins.address < c1 for (c0, c1) in cb_wins):
+                    backfill_loads += 1
+                else:
                     imm_hits += 1
     # 数据指针残留：packed dd[5] 全扫，非 EXECUTE 节 DIR64/HIGHLOW 站点值
     # 落原 IAT 区（VA 空间）→ 命中。
@@ -169,7 +234,10 @@ def main():
                         data_hits += 1
                 pos += bsz
     print(f"orig_iat=[{lo:#x},{lo + size:#x}) plus={plus} "
-          f"exec-hits={exec_hits} data-hits={data_hits} imm-hits={imm_hits}")
+          f"exec-hits={exec_hits} data-hits={data_hits} imm-hits={imm_hits} "
+          f"backfill-loads={backfill_loads}"
+          + (f" (tls cb windows: {['%#x-%#x' % w for w in cb_wins]})"
+             if backfill_loads else ""))
     # span 自检（MIT-487 验收建议 2）：native dd[12]（IAT 目录 Size）非零
     # 时必须与 INT 步进计数一致——自动捕获 span 分母错误类缺陷。
     _secs, dd_native, _p2 = sections(native)
