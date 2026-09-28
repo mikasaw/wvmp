@@ -756,6 +756,12 @@ selftest() {
             echo "[selftest] BAD 活体正证样本 wvmp_x87_gate_sample 的 protect 没通过" >&2
             ST_BAD=$((ST_BAD + 1))
         fi
+    else
+        # MIT-529：活体正证那一格自身不得 fail-open——样本缺失（未构建/被清理）
+        # 时跳过整个证明仍然 PASS，等于"证明断言不是死码"的格子自己先死了。
+        ST_CHECKS=$((ST_CHECKS + 1))
+        ST_BAD=$((ST_BAD + 1))
+        echo "[selftest] BAD 活体正证样本缺失: $gate_sample（先跑 scripts\\build.bat 再来）" >&2
     fi
     rm -rf "$tmpd"
     echo "[selftest] TOTAL: $((ST_CHECKS - ST_BAD))/$ST_CHECKS 条反证按预期动作"

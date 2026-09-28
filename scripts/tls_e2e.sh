@@ -430,6 +430,77 @@ PYEOF2
     rm -rf "$tmp"
 }
 
+# MIT-529 极性断言：四象限开关必须真的改变产物。同 seed、同样本、同管道，
+# 仅 [anti_debug] drx/rdtsc 全开 vs 全关两跑，产物必须逐字节不同——若产品
+# 忽略该配置（或开关断线），两产物恒等而各象限仍能"行为 byte-exact 全绿"
+# （哑阵），此格当场红。与外层 TLS_E2E_* 环境变量无关（此处字面量写死，
+# 任何象限调用下都做同一对比较）。
+check_polarity() { # $1 = sample
+    local tmp cfg a_win b_win rc out
+    tmp="$(mktemp -d)"
+    local fails=0
+    for quad in on off; do
+        cfg="$tmp/$quad.toml"
+        local win; win="$(cygpath -m "$tmp")/wvmp_tls_$quad.exe"
+        local drx rdtsc
+        if [[ $quad == on ]]; then drx=true; rdtsc=true; else drx=false; rdtsc=false; fi
+        cat > "$cfg" <<EOF
+input  = "$(cygpath -m "$1")"
+output = "$win"
+seed   = 1
+
+[anti_debug]
+drx = ${drx}
+rdtsc = ${rdtsc}
+
+[[passes]]
+name = "pe_loader"
+[[passes]]
+name = "marker_scan"
+[[passes]]
+name = "lifter"
+[[passes]]
+name = "mutate"
+[[passes]]
+name = "virtualize"
+[[passes]]
+name = "crypt"
+[[passes]]
+name = "anti_debug"
+[[passes]]
+name = "stub_link"
+[[passes]]
+name = "import_protect"
+[[passes]]
+name = "tls_hook"
+[[passes]]
+name = "pe_writer"
+EOF
+        rc=0
+        out="$("$CLI" protect --config "$(cygpath -w "$cfg")" 2>&1)" || rc=$?
+        if [[ $rc -ne 0 ]]; then
+            echo "[tls-e2e] FAIL polarity/$quad: protect rc=$rc" >&2; echo "$out" | tail -3 >&2
+            fails=$((fails + 1))
+        fi
+        if [[ ! -s "$tmp/wvmp_tls_$quad.exe" ]]; then
+            echo "[tls-e2e] FAIL polarity/$quad: 产物缺失/为空" >&2
+            fails=$((fails + 1))
+        fi
+    done
+    if [[ $fails -eq 0 ]]; then
+        if cmp -s "$tmp/wvmp_tls_on.exe" "$tmp/wvmp_tls_off.exe"; then
+            echo "[tls-e2e] FAIL polarity: drx/rdtsc 全开与全关产物逐字节相同 —— 开关未进入产物（哑阵）" >&2
+            fail=$((fail + 1))
+        else
+            echo "[tls-e2e] PASS polarity: 全开/全关产物相异（开关真实生效）"
+            pass=$((pass + 1))
+        fi
+    else
+        fail=$((fail + fails))
+    fi
+    rm -rf "$tmp"
+}
+
 [[ -f "$x64_sample" ]] || { echo "[tls-e2e] FAIL: $x64_sample missing (build target wvmp_tls_samples)" >&2; exit 1; }
 [[ -f "$x86_sample" ]] || { echo "[tls-e2e] FAIL: $x86_sample missing (build target wvmp_tls_samples)" >&2; exit 1; }
 
@@ -437,6 +508,7 @@ run_one "$x64_sample" 1 x64
 run_one "$x86_sample" 0 x86
 run_one_skip "$x64_sample" 1 x64
 run_one_skip "$x86_sample" 0 x86
+check_polarity "$x64_sample"
 
 echo "[tls-e2e] === $pass PASS / $fail FAIL ==="
 [[ $fail -eq 0 ]]

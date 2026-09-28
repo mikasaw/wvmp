@@ -258,15 +258,18 @@ def cmd_collect(a: argparse.Namespace) -> int:
         # 顺手落一份码体镜像 bin，供既有 dump 门直接吃：
         #   python scripts\\verifier\\dump_handler_xmm_check.py \
         #       --asm <tag>.asm.txt --bin <tag>.bin
-        # （该门的 --pe 分支还按单节老布局找 .wvmp，双节布局下会报
-        #   "raw size < total"，与本单无关。）
+        # （MIT-529 起 --pe 分支已适配双节布局：优先取 .wvmpc。）
         with open(a.out_bin, "wb") as f:
             f.write(code)
     print(f"[mit490-diff] collect -> {a.out}: {len(rows)} handlers, "
           f"code={len(code)}B, table=0x{table:x}, total=0x{total:x}")
     if len(code) < total:
-        print("[mit490-diff] WARN: 码节短于 image total（切片不完整，别信本表）",
+        # MIT-529：截断从 WARN 升格为 tooling 错（exit 2）。两侧同截断时可掩盖
+        # 尾部区域 delta，产物虽已落盘供取证，但本表不可作为对账依据。
+        print(f"[mit490-diff] FAIL tooling: 码节 {len(code)}B 短于 image total "
+              f"{total}B（切片不完整，CSV/bin 仅作取证，别当对账依据）",
               file=sys.stderr)
+        return 2
     return 0
 
 

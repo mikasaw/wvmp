@@ -25,10 +25,11 @@ Input artifacts (both from ONE protect run of a real sample, same seed):
   --asm <runtime_dump.txt>  text dump produced by setting
                             WVMP_RUNTIME_DUMP=<win path> before wvmp_cli
                             (writes handler names + offsets + total size).
-  --pe  <protected.exe>     the .wvmp section of the protected exe starts
-                            with the runtime image (stub_link_pass.cpp
-                            writes rt.image.code at section offset 0), so
-                            the executed handler bytes are sliced from it.
+  --pe  <protected.exe>     the runtime image sits at offset 0 of the code
+                            section raw data (stub_link_pass.cpp writes
+                            rt.image.code there) — probe .wvmpc first (MIT-472
+                            W^X 拆节后的现网双节布局), fall back to legacy
+                            single-section .wvmp (拆节前产物).
   --bin <wvmp_runtime_dump.bin>  alternative: use a previously extracted
                             image instead of --pe (file is written by
                             --out-bin on first extraction).
@@ -183,21 +184,31 @@ def parse_asm_dump(text: str) -> tuple[int, int, list[tuple[str, int]]]:
     return total, table, handlers
 
 
-def extract_wvmp_section(pe_path: str) -> tuple[int, bytes]:
-    """Return (raw_offset, raw_bytes) of the .wmp section raw data."""
+def extract_wvmp_section(pe_path: str) -> tuple[str, int, bytes]:
+    """Return (section_name, raw_offset, raw_bytes) of the runtime image section.
+
+    Probe order: .wvmpc (MIT-472 W^X 拆节后的代码节，现网布局) → .wvmp
+    (拆节前的单节老产物)。两者皆无 ⇒ tooling 错（没被打包过 / 布局再变）。
+    """
     with open(pe_path, "rb") as f:
         data = f.read()
     e_lfanew = struct.unpack_from("<I", data, 0x3C)[0]
     nsec = struct.unpack_from("<H", data, e_lfanew + 6)[0]
     opt_sz = struct.unpack_from("<H", data, e_lfanew + 20)[0]
     sec0 = e_lfanew + 24 + opt_sz
+    sections: dict[str, tuple[int, int]] = {}
     for i in range(nsec):
         off = sec0 + i * 40
         name = data[off : off + 8].rstrip(b"\0").decode("ascii", "replace")
-        if name == ".wvmp":
-            raw_sz, raw_ptr = struct.unpack_from("<II", data, off + 16)
-            return raw_ptr, data[raw_ptr : raw_ptr + raw_sz]
-    raise ValueError(f".wvmp section not found in {pe_path} (was it protected?)")
+        sections[name] = struct.unpack_from("<II", data, off + 16)
+    for name in (".wvmpc", ".wvmp"):
+        if name in sections:
+            raw_sz, raw_ptr = sections[name]
+            return name, raw_ptr, data[raw_ptr : raw_ptr + raw_sz]
+    raise ValueError(
+        f"runtime section (.wvmpc/.wvmp) not found in {pe_path} "
+        f"(was it protected? sections: {sorted(sections)})"
+    )
 
 
 def parse_imm(text: str) -> int:
@@ -563,7 +574,7 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[1])
     ap.add_argument("--asm", required=True, help="WVMP_RUNTIME_DUMP text file")
     g = ap.add_mutually_exclusive_group(required=True)
-    g.add_argument("--pe", help="protected exe (.wvmp section holds the runtime image)")
+    g.add_argument("--pe", help="protected exe (.wvmpc/.wvmp section holds the runtime image)")
     g.add_argument("--bin", help="previously extracted runtime image bin")
     ap.add_argument(
         "--out-bin",
@@ -581,20 +592,20 @@ def main() -> int:
 
     if args.pe:
         try:
-            _, section = extract_wvmp_section(args.pe)
+            sec_name, _, section = extract_wvmp_section(args.pe)
         except (OSError, ValueError) as e:
             print(f"[dump-check] FAIL tooling: {e}")
             return 2
         if len(section) < total:
             print(
-                f"[dump-check] FAIL tooling: .wvmp raw size {len(section)} "
+                f"[dump-check] FAIL tooling: {sec_name} raw size {len(section)} "
                 f"< runtime total {total} (seed mismatch between --asm and --pe?)"
             )
             return 2
         image = bytes(section[:total])
         with open(args.out_bin, "wb") as f:
             f.write(image)
-        print(f"[dump-check] runtime image {total} bytes -> {args.out_bin}")
+        print(f"[dump-check] runtime image {total} bytes from {sec_name} -> {args.out_bin}")
     else:
         with open(args.bin, "rb") as f:
             image = f.read()
