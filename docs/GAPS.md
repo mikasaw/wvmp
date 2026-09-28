@@ -4943,7 +4943,7 @@ MIT-414 补读 BaseOfData 后该前提已不成立，算式没人回改。后果
 `Pe32SmallNumberOfRvaAndSizesFallsBack` 各误读 1 条。修后 8/8 绿，第 8 条
 `NoDirectoryAtAllStillParsesAndFallsBack` 是既有回退语义的回归保护档（修前修后都绿）。
 
-**待办登记：OptionalHeader 目录偏移仍有 6 处产品码本地定义（本波不抽取）**。数值全部
+**待办登记：OptionalHeader 目录偏移仍有 6 处产品码本地定义（本波不抽取；→ 已由 MIT-531 清偿：抽取 `common/include/wvmp/pe_layout.hpp` 全仓单一真源，产品码 5 处改薄委托 + `test_pe_loader.cpp` 命名副本同步，测试侧夹具字节布局字面量按本表登记留置）**。数值全部
 一致（`DataDirectory` 起点 PE32=96(0x60) / PE32+=112(0x70)；`NumberOfRvaAndSizes`
 = 前者减 4 = 92 / 108），行号现算（HEAD d5690e0）：
 
@@ -5358,7 +5358,7 @@ mtime `2026-09-20 09:59:45`）；`diff tables_base.log tables_head.log`（去头
 | x86 电池 | `wvmp_regvm_runtime_tests_x86.exe` **67/67** PASS（独立 32 位进程，对照组：本单未动码体） |
 | REQUIRE_REAL 全池 | `bash scripts/multiseed_e2e_real.sh` ⇒ `[multiseed] TOTAL: 380 pass / 0 fail` exit 0（76 槽 × 5 seeds） |
 | wvmpTest 双 arch 双跑 | x64 `106/106` + 29 入口 stub、x86 `105/105` + 26 入口 stub，`diff count = 0`；两跑日志逐字节相同（`smoke_x{64,86}_dblrun.diff` 0 行）＝同一组二进制两次执行 |
-| dump 门 | x86 `verify_x86_dump.py --asm --code` `RESULT: PASS` exit=0（138 登记项、掩码真源对账 `kTableEntries=256`、dispatch `and <r>, 0xFF`）；**x64 `dump_handler_xmm_check.py` 三样本一律 `FAIL tooling` exit=2**（`.wvmp` raw 10752/9216/12288 < runtime total 33640 —— 码体已迁 `.wvmpc` 而门只认 `.wvmp`，待拍清单 🟡-1 既有失效，本单未为跑绿改门脚本）。该格替代证据 = 上表零扰动证明（全池 76 槽 packed sha 逐字节相同，见本节与 MF-1 小节）+ 改动面除 `passes/pe_writer/**` 零文件 ⇒ 运行时码体不可能漂移 |
+| dump 门 | x86 `verify_x86_dump.py --asm --code` `RESULT: PASS` exit=0（138 登记项、掩码真源对账 `kTableEntries=256`、dispatch `and <r>, 0xFF`）；**x64 `dump_handler_xmm_check.py` 三样本一律 `FAIL tooling` exit=2**（`.wvmp` raw 10752/9216/12288 < runtime total 33640 —— 码体已迁 `.wvmpc` 而门只认 `.wvmp`，待拍清单 🟡-1 既有失效，本单未为跑绿改门脚本）。**（🟡-1 已翻正：MIT-529 门改优先 `.wvmpc`/回退 `.wvmp`，三样本复绿 exit 0，见 GAPS「MIT-529」节。）**该格替代证据 = 上表零扰动证明（全池 76 槽 packed sha 逐字节相同，见本节与 MF-1 小节）+ 改动面除 `passes/pe_writer/**` 零文件 ⇒ 运行时码体不可能漂移 |
 | 静态扫描 | `static_scan_bare_immediates.ps1` `[static-scan] RESULT: PASS`（本单零 Keystone 文本产出，判据 1 的 `imm()` 约束空满足） |
 
 **产物 provenance（`build/` 侧读数各自吃的那一份二进制）**：零扰动两侧各用自己那枚 `build/cli/wvmp_cli.exe`，mtime `2026-09-20 09:59:45`（head）/ `2026-09-20 10:01:42`（base）；六件套（ctest / multiseed / wvmpTest / dump 门）全部吃同一枚 mtime `2026-09-20 10:03:09` 的 head CLI（产品源与 `8b4437d` 逐字节相同）。整表打印与本节文档落地后又重建一次并重跑全量 ctest：`23/23`。
@@ -5383,3 +5383,24 @@ x64/x86 两个目标）。两侧失败语义一致（失败即双留、只回错
 `rename` 覆盖只读目标会**成功** ⇒ 判据 2 那枚只读夹具反例在 POSIX 上根本不红。因此本单 CR-09 的
 证明面按实测口径**仅 Windows 腿**，POSIX 腿属未验证的可移植性声明，谁要真上非 Win 目标必须先补那侧的失败注入。
 
+## MIT-529（门禁修复批 ×4：x64 dump 门 .wvmpc 适配 + selftest fail-closed + 截断 exit 2 + tls_e2e 极性，2026-09-28）落账
+
+**编号说明**：本批起未走 multica 单据（用户 2026-09-28 指示由会话直做、不派遣小队），MIT 编号沿用流水序（529 起）；git 历史为唯一真源。交付面 = 分支 `mit-529-gatefix` 单提交 `5756d66`（基线 main `a0191b9`）+ 验收意见修复枚 `dc771f9`，**零产品码改动**（`git diff a0191b9..5756d66 --stat` 恰 scripts/ 4 文件）。
+
+1. **x64 dump 门 🟡-1 清偿**：`dump_handler_xmm_check.py` 的 `extract_wvmp_section` 改探测序 `.wvmpc`（MIT-472 W^X 拆节后现网布局）→ `.wvmp`（拆节前老产物回退）→ 皆无报 tooling（错误信息列出实际节名）。实测三样本（rol/cl_shift/snake，seed 12345）全部 `RESULT: PASS` exit 0（改前三样本一律 exit=2）；负例 = 未保护 exe 喂门 exit 2；验收代理另合成单节老布局 PE 证明回退分支非死码（`.wvmp` 路径完整跑 PASS）。
+2. **selftest 活体正证 fail-open 封堵**（`multiseed_e2e.sh`，原 `:745` 缺 else）：`wvmp_x87_gate_sample.exe` 缺失时计 ST_BAD（分母同步 +1，29 格口径不漂移）。反例实测：mv 走样本 → `RESULT: FAIL` exit 1 且点名；复原后 29/29 PASS。
+3. **mit490_flags_delta.py 码节截断升格**：`len(code) < total` 由 WARN+return 0 改 stderr FAIL+`return 2`（CSV/bin 仍落盘作取证）。反例实测：dump total 行改大值 → exit 2；正常采集 exit 0。
+4. **tls_e2e 极性断言**（新增 `check_polarity`）：同 seed=1、同 11-pass 管道、同样本，`[anti_debug] drx/rdtsc` 全开 vs 全关双跑，产物 `cmp` 必须相异（恒等 = 产品忽略配置的哑阵，当场红）。实测 PASS；验收代理补确定性对照（同配置双跑恒等）证明"相异"确由开关贡献。tls_e2e 全量读数 4 PASS / 1 FAIL——唯一 FAIL 仍为 C2/C3 登记在案的 x86 `check_import_rewrite imm-hits=1` 既有工具门（GAPS MIT-526 节），基线同形复现，非本批引入。
+- 验收（本地子代理，非小队）：PASS，零 F 级；Note 修复枚 `dc771f9`（check_polarity 未用变量清理 + quad 补 local）。
+
+## MIT-530（pe_writer 写后读回逐字节校验，2026-09-28）落账
+
+交付面 = 分支 `mit-530-readback` 单提交 `b0550fc`（叠 529 上）。`output_publish` 新增 `verify_written_image`：64KiB 分块读回 tmp 与内存镜像逐字节 memcmp，首差偏移 `%zx` 点名，短读/超长双兜底；接线在"写满→核长→**读回**→原子替换"链条中，失败走 `fail()` 保持旧目标+新 tmp 双留。动机：C4（MIT-528）遗留 P2——核长只挡半写，挡不住等长错字节（掉电后文件系统回滚异常一类）。测试 +3（等长单字节翻转必抓 @0x25803 / 精确镜像必过且 err 不改写 / 截断+超长必拒），pe_writer 24/24、section_builder 18/18、ctest 25/25、E2E 双跑 byte-exact、无 tmp 残留。验收（本地子代理）：PASS；反证 = 验收方临时把校验改恒 true 重编 → 2 枚反例测试红（已复原重验 24/24）；Note"超长消息 0x 前缀接十进制"已随 `dc771f9` 修为真 hex。
+
+## MIT-531（卫生批：pe_layout.hpp 单一真源 + x86 掩码真源收敛，2026-09-28）落账
+
+交付面 = 分支 `mit-531-hygiene` 提交 `4f5f2f7`（叠 530 上）。
+1. **MIT-525"6 处本地定义"待办清偿**：新增 `common/include/wvmp/pe_layout.hpp`（PE32=96/PE32+=112 DataDirectory 起点 + 计数偏移=前者-4，constexpr 全仓单一真源），产品码 5 处改薄委托（pe_image / pe_writer / tls_hook×2 含内联三元式 / import_protect / stub_link dd5 内联三元式）+ `test_pe_loader.cpp` 命名副本；**边界**：测试侧夹具字节布局字面量与格式相关三元式（GAPS MIT-525 登记表全列）仍留置——构 PE 字节流用，收敛扰动面大于收益。头文件已登记入 `docs/contracts.md` §4 清单。
+2. **asmgen build_shift_x86 掩码真源收敛**：手抄 `imm(0x1F)` 改 `isa::shift_count_mask(static_cast<ir::Size>(s))` + 本函数自有枚举序 static_assert（S8==0/S16==1/S32==2，与 ir::Size 实序核过）。s∈{0,1,2} 恒 0x1F 字节零扰动；若将来扩 s==3 自动取 0x3F 不再静默沿用。x64 build_shift 零触碰。
+3. **零扰动证明**：冻结同输入（防样本重链 TimeDateStamp 假差异——首次对比曾撞上，与 MIT-528 落账同坑），base（530 tip 二进制）vs head 双 arch 产物+dump 四项逐字节恒等；x64 dump 184,536B / sha256 `d294f89b…c85068` 与 MIT-527/528 现网记录逐字符相同。ctest 25/25 + x86 dump 门 PASS。
+- 验收（本地子代理）：PASS，零 F 级；4 Note 中 2 条（contracts 登记、GAPS 待办段标清偿）已随本落账枚闭环。

@@ -1632,3 +1632,13 @@ asmgen 零触碰 → dump 锚不受影响（无换代）。
   ⇒ `r11` 作为 caller-saved 被 callee 合法破坏，必须同步把第一读数挪进 `.wvmp` 暂存（x86 已有形）
   并给探针加"窗内有 call"的第 5 象限——注释不是判据，探针那一格才是。
 
+### MIT-529 (门禁修复批 ×4) ✅ 2026-09-28
+- 交付面 = 分支 `mit-529-gatefix` `5756d66` + 验收修复枚 `dc771f9`（main `a0191b9` 基线），**零产品码**。①x64 dump 门 🟡-1 清偿：`extract_wvmp_section` 改 `.wvmpc` 优先/`.wvmp` 回退/皆无报 tooling，三样本复绿 exit 0（改前恒 exit=2），验收方合成老布局 PE 证明回退分支活；②selftest 活体正证 fail-open 封堵（样本缺失计 ST_BAD，mv 反例 FAIL exit 1）；③mit490 码节截断 WARN→exit 2（total 改大反例实测）；④tls_e2e 新增 `check_polarity` 极性断言（同 seed 全开/全关产物必相异，实测 PASS；同配置双跑恒等 = 确定性对照）。验收（本地子代理）PASS 零 F 级。证据链 GAPS「MIT-529」节。
+
+### MIT-530 (pe_writer 写后读回校验) ✅ 2026-09-28
+- 交付面 = 分支 `mit-530-readback` `b0550fc`。`verify_written_image`（64KiB 分块读回 + 首差偏移点名 + 短读/超长兜底）接线在核长后、原子替换前，失败保持旧目标+新 tmp 双留——清偿 C4 遗留 P2"核长挡不住等长错字节"。测试 +3（翻转 @0x25803 必抓/精确镜像必过/截断超长必拒），pe_writer 24/24 + ctest 25/25 + E2E 双跑 byte-exact。验收反证：改恒 true 重编 2 测红（已复原）；hex 文案 Note 随 `dc771f9` 修。证据链 GAPS「MIT-530」节。
+
+### MIT-531 (卫生批：pe_layout 单一真源 + x86 掩码收敛) ✅ 2026-09-28
+- 交付面 = 分支 `mit-531-hygiene` `4f5f2f7`。①新增 `common/include/wvmp/pe_layout.hpp`（96/112 + 计数偏移），产品码 5 处薄委托 + test_pe_loader 副本，**清偿 MIT-525 GAPS「6 处本地定义」待办**（夹具字节布局字面量划出边界留置），头文件入 contracts §4 清单；②asmgen `build_shift_x86` 手抄 0x1F 收敛 `isa::shift_count_mask` 真源 + 枚举序 static_assert。零扰动 = 冻结同输入（防样本重链 TimeDateStamp 假差异）base/head 双 arch 产物+dump 四项逐字节恒等，x64 dump sha256 与 MIT-527/528 现网口径逐字符相同；ctest 25/25 + x86 dump 门 PASS。验收（本地子代理）PASS 零 F 级。证据链 GAPS「MIT-531」节。
+
+> 追记（2026-09-28 · **MIT-529/530/531 会话直做批**，交付面 = 叠枝 `mit-529-gatefix`→`mit-530-readback`→`mit-531-hygiene`，ff 合入 main `dc771f9`）：本批起未走 multica 单据（用户指示会话直做、不派遣小队），编号沿用流水序、git 历史为唯一真源；验收仍按纪律走本地子代理三枚全 PASS。六件套时点读数：build `[416]` rc=0、ctest 25/25、selftest 29/29、x86 dump 门 PASS、x64 dump 门三样本 PASS（🟡-1 清偿后首次复绿）、tls_e2e 4 PASS/1 FAIL（唯一 FAIL = 登记在案 x86 IAT 既有工具门）。待用户裁决项不变（BMI2 契约 / 混排翻面 / Intel mulx 验证）。

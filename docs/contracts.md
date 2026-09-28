@@ -35,6 +35,7 @@
 ## 4. 冻结契约头文件清单
 
 - `common/include/wvmp/common/`：`types.hpp`、`rng.hpp`、`bytes.hpp`
+- `common/include/wvmp/`：`pe_layout.hpp`（MIT-531 起：OptionalHeader 目录偏移全仓单一真源，跨 pass 只读常量）
 - `ir/include/wvmp/ir/`：`arch.hpp`、`reg.hpp`、`operand.hpp`、`insn.hpp`、`region.hpp`
 - `framework/include/wvmp/framework/`：`phase.hpp`、`diagnostics.hpp`、`context.hpp`、`pass.hpp`、`keys.hpp`、`registry.hpp`、`pipeline.hpp`
 - `vm/include/wvmp/vm/`：`backend.hpp`
