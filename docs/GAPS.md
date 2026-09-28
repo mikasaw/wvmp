@@ -5404,3 +5404,21 @@ x64/x86 两个目标）。两侧失败语义一致（失败即双留、只回错
 2. **asmgen build_shift_x86 掩码真源收敛**：手抄 `imm(0x1F)` 改 `isa::shift_count_mask(static_cast<ir::Size>(s))` + 本函数自有枚举序 static_assert（S8==0/S16==1/S32==2，与 ir::Size 实序核过）。s∈{0,1,2} 恒 0x1F 字节零扰动；若将来扩 s==3 自动取 0x3F 不再静默沿用。x64 build_shift 零触碰。
 3. **零扰动证明**：冻结同输入（防样本重链 TimeDateStamp 假差异——首次对比曾撞上，与 MIT-528 落账同坑），base（530 tip 二进制）vs head 双 arch 产物+dump 四项逐字节恒等；x64 dump 184,536B / sha256 `d294f89b…c85068` 与 MIT-527/528 现网记录逐字符相同。ctest 25/25 + x86 dump 门 PASS。
 - 验收（本地子代理）：PASS，零 F 级；4 Note 中 2 条（contracts 登记、GAPS 待办段标清偿）已随本落账枚闭环。
+
+## MIT-532（x86 IAT 工具门修复——C2/C3 起登记在案"待拍工具单"清偿，2026-09-28）落账
+
+**编号说明**：同 529-531 会话直做批（用户批准立项，本地子代理验收）。交付面 = 分支 `mit-532-iatgate` 单提交 `e267c3e`（基线 986f9e5）+ 验收修复枚 `c5bd198`（F2）。
+
+根因（triage 实录）：`check_import_rewrite.py` 的 MIT-487 imm32 负扫把 `import_protect` 回填循环装载原 IAT 基址（`mov edi, 0x403000` + `rep movsd`，tls_hook 桩 @.wvmpc 尾）误判为"残留读方"——它是设计内**写方**；x64 因基址>4GB imm32 结构性装不下天然不撞，x86 必撞（base/head 产物逐字节相同、同读数的"既有失效"即此）。修复 = 新增 `tls_callback_windows`（packed dd[9]→TLS 目录→AddressOfCallBacks→回调数组，VA 归一 RVA，只对 `.wvmp*` 节内回调建 `[cb,节末)` 窗——原用户回调在 .text **不建窗**，防豁免面扩大），窗内 B8+r 命中豁免为 `backfill-loads` 披露不判 FAIL。实测：正例 imm-hits=0/backfill=1 exit 0；负例（.text 节首注入 `mov edi,IAT 基址`，注入点恰为原用户回调 RVA）imm-hits=1 exit 1；**tls_e2e.sh 历史首次 5 PASS/0 FAIL**。验收（本地子代理）PASS；F2 = PE32+ AddressOfCallBacks 偏移旧 +16/u32 实为 AddressOfIndex 低半（恒空窗 fail-closed 假红，非假绿），已随 `c5bd198` 改 +24/u64（与 tls_e2e.sh:390 同口径）。
+
+## MIT-533（vextractf128/vinsertf128 桥——T73 频率门挂账"桥"项清偿，2026-09-28）落账
+
+交付面 = 分支 `mit-533-bridge` 单提交 `1feccb4`（叠 532 上）。+2 VmOp（165/166，kVmOpMax 166→后继 534 增至 169）：128 位车道×ymm 面显式跨界，aux bit0=lane/bit1=mem。lifter 混合宽度专属通路（vex_desc_of 白名单前分流；kstool 钉板 8 编码；x86/ymm8/xmm8 gate）；translator 双词发射（vinsert merge base=dst 不变量，d 独立 lifter 前置 YmmMov 沿 MIT-513 折叠）；asmgen x64 双 handler（ymm 帧 (slot-24)*32+0x1C0 与 xmm 帧 (slot-24)*16+0x140 双公式混用）；ir::Insn append `u8 aux`（沿 302/345 先例）。**混排 gate/stub ymm 同步按值域自动覆盖**：桥词计入 ymm 域——桥+legacy SSE 同函数仍整函数 gate（用户"只立项桥、混排维持"裁决的机械化）。验证：硬件真值（车道双向+mem 双形+merge 链+脏面逼全 32B 写回）1/1、lifter 1/1（验收方独立 capstone 反汇编复核钉板字节）、ctest 25/25、E2E 样本 2 stub 真虚拟化+双跑 byte-exact+混排负例 gate note 精确命中、dump 门桥判据扩展（双帧立即数集合+extract 单读门槛）PASS。样本 wvmp_ymm_bridge_sample 入池（76→77 槽）。验收（本地子代理）PASS 零 F；Note 三条（注释字节串陈旧已随 c5bd198 修）。
+
+## MIT-534（G8b 通路 A mulx/pdep/pext——BMI2 最低机器契约用户批准落地，2026-09-28）落账
+
+交付面 = 分支 `mit-534-bmi2` 单提交 `f10dd53` + 验收修复枚（合入 c5bd198）。+3 VmOp（167/168/169，kVmOpMax 169）native 直发 handler：读 ctx GP 槽→物理 reg 执行→写回，无 flags 通路（MIT-515 实测）。乘数 mulx 恒 guest rdx（handler 固定读槽 2）；src 槽号走 aux。**scratch 纪律**：分配池 14 寄存器表含 rax/rdx（pc_/flags_ 可能是它们）→ clobber 前 push 保全恢复；rcx 在表外恒安全（槽号取回载体）。
+
+⚠️ **两大实录坑（坑册级）**：① keystone 裸立即数按 **16 进制**读——`add rsp, 16` 汇编成 `add rsp, 0x16`（多弹 6 字节→halt 弹错位→ret 跳飞的**非确定崩**；imm() 纪律是唯一防御，本次险些漏网）；② mulx 操作数语序**汇编器分叉**——keystone/ML64 首操作数=**高位积**（2×3=6 终审探针定谳），MSVC `_mulx_u64` 代码生成器按首=低位写（`mulx rax,rcx,[mem]` lo→rax）——同厂工具相反，以 CPU 实测为准。lifter 按首=高位 lift。
+
+config：`[bmi2] require`（默认 true=收白名单，产物契约"最低 BMI2 机器"由用户显式接受；false=含 BMI2 词函数整函数 gate）+ schema 白名单登记 + **require_avx 值域改闭区间 [Vzeroupper, VinsertF128]**（枚举 append-only 后 BMI2 在 ymm 族之后，防 AVX 开关误 gate）。G8a 负例族翻正（mulx/pdep/pext 转正 + BMI1 四词维持文档化 gate）。验证：真值 1/1（_umul128/pdep 位序软件参考）+ lifter 2/2 + ctest 25/25 + E2E（reg 形 asm 样本 bmi2_reg 真虚拟化 **三连 protect+run byte-exact**；intrinsic /Od 生成 **mem 形**→如实 C1 gate 披露，mem 形支持挂账 408 通路同款）+ require_bmi2=false gate note 命中 + require_avx=false 时 BMI2 函数照常虚拟化（闭区间有效性）。样本 wvmp_bmi2_sample 入池（77→78 槽）。**全池终验 390/390 零回踩**（含 529 批 2 败竞态伪败的洗清复跑）。验收（本地子代理）PASS 零 F；Note：mulx dst1==dst2 同寄存器形态（SDM undefined、编译器不生成）v1 不 gate 披露。

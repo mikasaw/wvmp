@@ -1642,3 +1642,14 @@ asmgen 零触碰 → dump 锚不受影响（无换代）。
 - 交付面 = 分支 `mit-531-hygiene` `4f5f2f7`。①新增 `common/include/wvmp/pe_layout.hpp`（96/112 + 计数偏移），产品码 5 处薄委托 + test_pe_loader 副本，**清偿 MIT-525 GAPS「6 处本地定义」待办**（夹具字节布局字面量划出边界留置），头文件入 contracts §4 清单；②asmgen `build_shift_x86` 手抄 0x1F 收敛 `isa::shift_count_mask` 真源 + 枚举序 static_assert。零扰动 = 冻结同输入（防样本重链 TimeDateStamp 假差异）base/head 双 arch 产物+dump 四项逐字节恒等，x64 dump sha256 与 MIT-527/528 现网口径逐字符相同；ctest 25/25 + x86 dump 门 PASS。验收（本地子代理）PASS 零 F 级。证据链 GAPS「MIT-531」节。
 
 > 追记（2026-09-28 · **MIT-529/530/531 会话直做批**，交付面 = 叠枝 `mit-529-gatefix`→`mit-530-readback`→`mit-531-hygiene`，ff 合入 main `dc771f9`）：本批起未走 multica 单据（用户指示会话直做、不派遣小队），编号沿用流水序、git 历史为唯一真源；验收仍按纪律走本地子代理三枚全 PASS。六件套时点读数：build `[416]` rc=0、ctest 25/25、selftest 29/29、x86 dump 门 PASS、x64 dump 门三样本 PASS（🟡-1 清偿后首次复绿）、tls_e2e 4 PASS/1 FAIL（唯一 FAIL = 登记在案 x86 IAT 既有工具门）。待用户裁决项不变（BMI2 契约 / 混排翻面 / Intel mulx 验证）。
+
+### MIT-532 (x86 IAT 工具门修复) ✅ 2026-09-28
+- 交付面 = `mit-532-iatgate` `e267c3e` + 修复枚（合入 c5bd198）。check_import_rewrite 新增 tls_callback_windows 回调窗（.wvmp* 节内回调, VA 归一, 原 .text 回调不豁免），窗内 imm 装载豁免为 backfill-loads 披露。根因 = 回填循环是设计内写方被负扫误判。tls_e2e **历史首次 5 PASS/0 FAIL**。验收 PASS（F2 PE32+ 偏移 +24 已修）。证据链 GAPS「MIT-532」节。
+
+### MIT-533 (vextractf128/vinsertf128 桥) ✅ 2026-09-28
+- 交付面 = `mit-533-bridge` `1feccb4`。+2 VmOp 车道跨界词（aux lane/mem 位图），lifter/translator/asmgen 全链 + 硬件真值 + E2E 样本（2 stub 真虚拟化/双跑 byte-exact/混排负例 gate）+ dump 门扩展；ir::Insn append u8 aux。桥计 ymm 域（桥+SSE 仍 gate = 用户裁决机械化）。样本入池 76→77。验收 PASS 零 F。证据链 GAPS「MIT-533」节。
+
+### MIT-534 (G8b 通路 A mulx/pdep/pext) ✅ 2026-09-28
+- 交付面 = `mit-534-bmi2` `f10dd53` + 修复枚。+3 VmOp native 直发（kVmOpMax 169），[bmi2] require 开关（默认 true，用户批准 BMI2 最低机器契约），require_avx 闭区间化，G8a 负例族翻正。⚠️ 两大实录坑：keystone 裸立即数 16 进制读（add rsp,16→0x16 非确定崩）；mulx 语序汇编器分叉（keystone/ML64 首=高位 vs MSVC 代码生成器首=低位，2×3=6 探针定谳）。E2E reg 形三连 byte-exact + intrinsic mem 形如实 gate。样本入池 77→78。**全池 390/390**。验收 PASS 零 F。证据链 GAPS「MIT-534」节。
+
+> 追记（2026-09-28 · **MIT-532/533/534 会话直做批第二辑**，叠枝 ff 合入 main c5bd198）：用户四项裁决落地完毕——BMI2 通路 A（默认开）/只立项桥/Intel mulx 维持挂账/x86 IAT 工具门立项修复。tls_e2e 首次全绿（C2 起在案工具债清偿）。kVmOpMax 169/跳表 256。待用户：Intel 真机 mulx（挂账非阻塞）；新挂账：mulx/pdep/pext mem 形（408 通路同款）、mulx dst1==dst2 形披露。
