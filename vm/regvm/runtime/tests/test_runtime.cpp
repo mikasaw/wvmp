@@ -1247,6 +1247,75 @@ TEST(Interpreter, VzeroWordsHardwareTruth) {
 // MIT-512 (档B wave2①) 硬件真值: ymm 传送通路 — 面/内存 32B 逐位对拍。
 // 词链: YmmLoad buf→ymm3 / YmmMov ymm5←ymm3 / YmmStore buf2←ymm5 /
 //       YmmStore buf0←预载面 ymm1。
+// MIT-533 (wave2 桥) 硬件真值: vextractf128/vinsertf128 车道双向 + mem 形态。
+// 词链: extract xmm2←ymm3 lane0 / extract [buf2]←ymm3 lane1 /
+//       YmmMov ymm4←ymm3 (merge base) → insert ymm4+xmm2 lane1 /
+//       YmmMov ymm5←ymm3 → insert ymm5+[bufM] lane0 / halt。
+// 期望: xmm2 面 = L0; buf2 = L1; ymm4 = (L0, L0); ymm5 = (M, L1)。
+TEST(Interpreter, YmmBridgeHardwareTruth) {
+    {
+        int info[4] = {};
+        __cpuid(info, 1);
+        const bool avx = (info[2] & (1u << 28)) != 0;
+        const bool osxsave = (info[2] & (1u << 27)) != 0;
+        if (!avx || !osxsave) GTEST_SKIP() << "host CPU/OS lacks AVX";
+        if ((_xgetbv(0) & 0x6) != 0x6) GTEST_SKIP() << "OS XCR0 not AVX-enabled";
+    }
+    const u8 sz32 = isa::size_field(ir::Size::S32);
+    wvmp::Rng rng(20260928);
+    const auto result = rt::generate_runtime(rng);
+    RwxImage rwx(result.image.code);
+    auto entry = rwx.entry();
+
+    alignas(32) std::array<u8, 0x40> buf{};
+    std::array<u8, 16> l0{}, l1{}, m{};
+    for (int i = 0; i < 16; ++i) {
+        l0[i] = static_cast<u8>(0x10 + i);
+        l1[i] = static_cast<u8>(0x70 + i);
+        m[i] = static_cast<u8>(0xC0 + i);
+    }
+    std::memcpy(&buf[0x00], m.data(), 16);        // bufM (insert mem 源)
+    for (int i = 0; i < 16; ++i) buf[0x20 + i] = 0xEE;  // buf2 脏初值
+
+    std::vector<u8> s;
+    // extract lane0 → xmm 面 slot2
+    isa::append_insn(s, isa::make_insn(isa::VmOp::VextractF128, isa::OpKind::Reg,
+                                       24 + 2, isa::OpKind::Reg, 24 + 3, 0, sz32));
+    // extract lane1 → [regs[5]] (mem 形态 aux bit1)
+    isa::append_insn(s, isa::make_insn(isa::VmOp::VextractF128, isa::OpKind::Reg,
+                                       5, isa::OpKind::Reg, 24 + 3, 1 | 2, sz32));
+    // ymm4 ← ymm3 (merge base), insert lane1 ← xmm2
+    isa::append_insn(s, isa::make_insn(isa::VmOp::YmmMov, isa::OpKind::Reg,
+                                       24 + 4, isa::OpKind::Reg, 24 + 3, 0, sz32));
+    isa::append_insn(s, isa::make_insn(isa::VmOp::VinsertF128, isa::OpKind::Reg,
+                                       24 + 4, isa::OpKind::Reg, 24 + 2, 1, sz32));
+    // ymm5 ← ymm3, insert lane0 ← [regs[6]] (mem 形态)
+    isa::append_insn(s, isa::make_insn(isa::VmOp::YmmMov, isa::OpKind::Reg,
+                                       24 + 5, isa::OpKind::Reg, 24 + 3, 0, sz32));
+    isa::append_insn(s, isa::make_insn(isa::VmOp::VinsertF128, isa::OpKind::Reg,
+                                       24 + 5, isa::OpKind::Reg, 6, 0 | 2, sz32));
+    isa::append_insn(s, halt());
+
+    rt::VmContext ctx;
+    ctx.bytecode = s.data();
+    ctx.pc = 0;
+    ctx.regs[5] = reinterpret_cast<u64>(buf.data()) + 0x20;  // buf2
+    ctx.regs[6] = reinterpret_cast<u64>(buf.data());         // bufM
+    std::memcpy(&ctx.ymm[3].q[0], l0.data(), 16);            // 低车道 = L0
+    std::memcpy(&ctx.ymm[3].q[2], l1.data(), 16);            // 高车道 = L1
+    ctx.ymm[4].q[0] = ctx.ymm[4].q[1] = ctx.ymm[4].q[2] =
+        ctx.ymm[4].q[3] = 0xDEAD'BEEF'DEAD'BEEFull;         // 脏面 (写回必须全 32B)
+    entry(&ctx);
+
+    EXPECT_EQ(std::memcmp(&ctx.xmm[2].xmm_lo, l0.data(), 8), 0) << "xmm 面 lo";
+    EXPECT_EQ(std::memcmp(&ctx.xmm[2].xmm_hi, l0.data() + 8, 8), 0) << "xmm 面 hi";
+    EXPECT_EQ(std::memcmp(&buf[0x20], l1.data(), 16), 0) << "extract mem 16B";
+    EXPECT_EQ(std::memcmp(&ctx.ymm[4].q[0], l0.data(), 8), 0) << "ymm4 低车道保持";
+    EXPECT_EQ(std::memcmp(&ctx.ymm[4].q[2], l0.data(), 8), 0) << "ymm4 高车道 = 插入的 xmm2";
+    EXPECT_EQ(std::memcmp(&ctx.ymm[5].q[0], m.data(), 8), 0) << "ymm5 低车道 = mem 插入";
+    EXPECT_EQ(std::memcmp(&ctx.ymm[5].q[2], l1.data(), 8), 0) << "ymm5 高车道保持";
+}
+
 TEST(Interpreter, YmmDataPathHardwareTruth) {
     {
         int info[4] = {};

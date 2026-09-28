@@ -317,7 +317,14 @@ enum class Op : u16 { Mov, Lea, Add, Sub, Adc, Sbb, And, Or, Xor, Not, Neg, Inc,
                       // 算术全谱 (命名/惯例同 T64; 可交换族 =
                       // add/mul/xor/or/and/p* 三地址 swap; sub/
                       // div/pandn 非交换 d==s2 gate)。
-                      YmmAddps, YmmAddpd, YmmSubps, YmmSubpd, YmmMulps, YmmMulpd, YmmDivps, YmmDivpd, YmmXorps, YmmXorpd, YmmOrps, YmmOrpd, YmmAndps, YmmAndpd, YmmPxor, YmmPor, YmmPand, YmmPandn };
+                      YmmAddps, YmmAddpd, YmmSubps, YmmSubpd, YmmMulps, YmmMulpd, YmmDivps, YmmDivpd, YmmXorps, YmmXorpd, YmmOrps, YmmOrpd, YmmAndps, YmmAndpd, YmmPxor, YmmPor, YmmPand, YmmPandn,
+
+                      // MIT-533: wave2 桥 —— vextractf128/vinsertf128
+                      // 128 位车道与 ymm 面之间的显式跨界词 (T72 intrinsic
+                      // 归约/broadcast 场景的 gate 解锁)。lane 立即数放
+                      // Insn.aux bit0; 寄存器编码: xmm 侧沿用 0..7 (SSE
+                      // 惯例), ymm 侧 0..7 (T64 惯例), 翻译期 +24。
+                      VextractF128, VinsertF128 };
 enum class Size : u8 { S8, S16, S32, S64 };
 enum class Cond : u8 { O, No, B, Ae, E, Ne, Be, A, S, Ns, P, Np, L, Ge, Le, G };
 constexpr u64 bits(Size s) { return s==Size::S8?8: s==Size::S16?16: s==Size::S32?32:64; }
@@ -333,6 +340,10 @@ struct Insn {
     // MIT-345: 源操作数宽度（仅 Movzx 用）。0F B6 → S8, 0F B7 → S16。
     // 默认 S8 兼容既有构造路径；movzx asmgen 据此选 byte ptr vs word ptr 读 src。
     Size src_size = Size::S8;
+    // MIT-533: 附加立即数 (沿 MIT-302 src2 / MIT-345 src_size 的
+    // append-only 先例)。当前仅桥词用: bit0 = vextractf128/vinsertf128
+    // 的 lane 选择 (硬件语义 imm8&1, 高位被忽略)。默认 0 不影响既有路径。
+    u8 aux = 0;
 };
 std::string_view to_string(Op); std::string_view to_string(Size); std::string_view to_string(Cond);
 }

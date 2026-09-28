@@ -2432,7 +2432,67 @@ public:
     // bit0 = src 为 mem（b=addr 槽，handler 内读 [addr]）；否则 b=src
     // ymm 槽。keystone jcc 仅 rel8 —— mem 分支用短 je 越过 + jmp 惯用法
     // （T62 先例）。物理 ymm0/ymm1 = scratch（面为权威）。
+    // MIT-533 (wave2 桥): vextractf128 —— ymm 面 32B → 128 位车道抽出 →
+    // xmm 面 16B 或 [mem] 16B。aux bit0=lane / bit1=mem(a=addr 槽)。
+    // 物理 ymm0/xmm1 = scratch (面为权威)。vextractf128 三操作数原生形态
+    // (xmm, ymm, imm8) 直发; lane 分支短 je + jmp 汇合 (T62 惯用法)。
+    std::string build_vextract_f128(u64 dispatch) const {
+        std::string o = decode_prelude();
+        const std::string tag = "vext" + std::to_string(seq());
+        o += ymm_offset_into_t9(t_[7]);
+        o += std::string("    vmovups ymm0, [") + r64(ctx_) + " + " + r64(t_[9]) + "]\n";
+        o += std::string("    test ") + r64(t_[5]) + ", " + imm(1) + "\n";
+        o += std::string("    je vlo_") + tag + "\n";
+        o += "    vextractf128 xmm1, ymm0, 1\n";
+        o += std::string("    jmp vdn_") + tag + "\n";
+        o += std::string("vlo_") + tag + ":\n";
+        o += "    vextractf128 xmm1, ymm0, 0\n";
+        o += std::string("vdn_") + tag + ":\n";
+        o += std::string("    test ") + r64(t_[5]) + ", " + imm(2) + "\n";
+        o += std::string("    je vrg_") + tag + "\n";
+        o += std::string("    mov ") + r64(t_[1]) + ", qword ptr [" + r64(ctx_) + " + " +
+             r64(t_[4]) + "*8 + 0x10]\n";
+        o += std::string("    vmovups [") + r64(t_[1]) + "], xmm1\n";
+        o += std::string("    jmp vtl_") + tag + "\n";
+        o += std::string("vrg_") + tag + ":\n";
+        o += xmm_offset_into_t9_text(t_[4]);
+        o += std::string("    vmovups [") + r64(ctx_) + " + " + r64(t_[9]) + "], xmm1\n";
+        o += std::string("vtl_") + tag + ":\n";
+        o += advance(dispatch);
+        return o;
+    }
+    // MIT-533 (wave2 桥): vinsertf128 —— ymm 面 32B merge base (a 槽, dst)
+    // + 128 位车道源 (xmm 面 b 槽或 [mem] 16B) → 车道插入写回 ymm 面。
+    // aux bit0=lane / bit1=mem(b=addr 槽)。物理 ymm0/xmm1 = scratch。
+    std::string build_vinsert_f128(u64 dispatch) const {
+        std::string o = decode_prelude();
+        const std::string tag = "vins" + std::to_string(seq());
+        o += ymm_offset_into_t9(t_[4]);
+        o += std::string("    vmovups ymm0, [") + r64(ctx_) + " + " + r64(t_[9]) + "]\n";
+        o += std::string("    test ") + r64(t_[5]) + ", " + imm(2) + "\n";
+        o += std::string("    je irg_") + tag + "\n";
+        o += std::string("    mov ") + r64(t_[1]) + ", qword ptr [" + r64(ctx_) + " + " +
+             r64(t_[7]) + "*8 + 0x10]\n";
+        o += std::string("    vmovups xmm1, [") + r64(t_[1]) + "]\n";
+        o += std::string("    jmp iop_") + tag + "\n";
+        o += std::string("irg_") + tag + ":\n";
+        o += xmm_offset_into_t9_text(t_[7]);
+        o += std::string("    vmovups xmm1, [") + r64(ctx_) + " + " + r64(t_[9]) + "]\n";
+        o += std::string("iop_") + tag + ":\n";
+        o += std::string("    test ") + r64(t_[5]) + ", " + imm(1) + "\n";
+        o += std::string("    je ilo_") + tag + "\n";
+        o += "    vinsertf128 ymm0, ymm0, xmm1, 1\n";
+        o += std::string("    jmp iwr_") + tag + "\n";
+        o += std::string("ilo_") + tag + ":\n";
+        o += "    vinsertf128 ymm0, ymm0, xmm1, 0\n";
+        o += std::string("iwr_") + tag + ":\n";
+        o += ymm_offset_into_t9(t_[4]);
+        o += std::string("    vmovups [") + r64(ctx_) + " + " + r64(t_[9]) + "], ymm0\n";
+        o += advance(dispatch);
+        return o;
+    }
     std::string build_ymm_arith(u64 dispatch, const char* mn) const {
+
         std::string o = decode_prelude();
         const std::string tag = std::string(mn) + std::to_string(seq());
         // dst → t9 → ymm0
@@ -7029,6 +7089,8 @@ RuntimeGenResult generate_runtime_arch(wvmp::Rng& rng, AsmGen::HostArch arch,
         {int(VmOp::Vzeroall), "vzeroall", &AsmGen::build_vzeroall},
         // MIT-512 (档B wave2①): ymm 传送词 (x64 host 专用; 槽 v24..31 =
         // ymm0..7 复用; 混排 gate 见 virtualize_pass)。
+        {int(VmOp::VextractF128), "vextractf128", &AsmGen::build_vextract_f128},
+        {int(VmOp::VinsertF128), "vinsertf128", &AsmGen::build_vinsert_f128},
         {int(VmOp::YmmMov), "ymmmov", &AsmGen::build_ymm_mov},
         {int(VmOp::YmmLoad), "ymmload", &AsmGen::build_ymm_load},
         {int(VmOp::YmmStore), "ymmstore", &AsmGen::build_ymm_store},

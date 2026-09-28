@@ -128,6 +128,7 @@ enum class FlagSem { kNone, kRead, kWrite, kWriteReadMerge, kWriteReadReg,
         case VmOp::YmmAndps: case VmOp::YmmAndpd:
         case VmOp::YmmPxor:  case VmOp::YmmPor:
         case VmOp::YmmPand:  case VmOp::YmmPandn:
+        case VmOp::VextractF128: case VmOp::VinsertF128:  // MIT-533: 无 flags 面
             return FlagSem::kNone;
         default:
             return FlagSem::kNone;

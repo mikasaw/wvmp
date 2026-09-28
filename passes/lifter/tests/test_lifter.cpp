@@ -3088,6 +3088,78 @@ TEST_F(LifterTranslate, VexVzeroCapstoneProbe) {
     EXPECT_EQ(ci->detail->x86.op_count, 0u);
     EXPECT_EQ(ci->size, 3u);
 }
+// MIT-533 (wave2 桥): vextractf128/vinsertf128 lift — 编码手算钉板
+// (capstone 反汇为第一道自校验: 字节错则 mnemonic 断言先红)。
+TEST_F(LifterTranslate, YmmBridgeFolds) {
+    // vextractf128 xmm2, ymm3, 1 (C4 E3 79 19 D3 01) → VextractF128 reg 形
+    const wvmp::u8 ex[] = {0xC4, 0xE3, 0x7D, 0x19, 0xDA, 0x01};
+    auto r = translate_bytes(x64, ex, ir::Arch::X64);
+    ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r.insn.op, ir::Op::VextractF128);
+    EXPECT_EQ(static_cast<int>(r.insn.dst.reg), 2);   // xmm2
+    EXPECT_EQ(static_cast<int>(r.insn.src.reg), 3);   // ymm3
+    EXPECT_EQ(r.insn.aux, 1);                          // lane 1
+    EXPECT_TRUE(r.extra.empty());
+
+    // vextractf128 xmm1, ymm0, 0 (C4 E3 79 19 C8 00) → lane 0
+    const wvmp::u8 ex0[] = {0xC4, 0xE3, 0x7D, 0x19, 0xC1, 0x00};
+    r = translate_bytes(x64, ex0, ir::Arch::X64);
+    ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(static_cast<int>(r.insn.dst.reg), 1);
+    EXPECT_EQ(static_cast<int>(r.insn.src.reg), 0);
+    EXPECT_EQ(r.insn.aux, 0);
+
+    // vextractf128 [rcx], ymm3, 1 (C4 E3 79 19 19 01) → mem dst
+    const wvmp::u8 exm[] = {0xC4, 0xE3, 0x7D, 0x19, 0x19, 0x01};
+    r = translate_bytes(x64, exm, ir::Arch::X64);
+    ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r.insn.op, ir::Op::VextractF128);
+    EXPECT_EQ(r.insn.dst.kind, ir::Operand::Kind::Mem);
+    EXPECT_EQ(static_cast<int>(r.insn.src.reg), 3);
+
+    // vinsertf128 ymm1, ymm1, xmm0, 0 (C4 E3 39 18 C8 00) → d==s1 直折
+    const wvmp::u8 ind[] = {0xC4, 0xE3, 0x75, 0x18, 0xC8, 0x00};
+    r = translate_bytes(x64, ind, ir::Arch::X64);
+    ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r.insn.op, ir::Op::VinsertF128);
+    EXPECT_EQ(static_cast<int>(r.insn.dst.reg), 1);
+    EXPECT_EQ(r.insn.src.reg, r.insn.dst.reg);        // merge base 不变量
+    EXPECT_EQ(static_cast<int>(r.insn.src2.reg), 0);  // xmm0
+    EXPECT_EQ(r.insn.aux, 0);
+    EXPECT_TRUE(r.extra.empty());
+
+    // vinsertf128 ymm4, ymm3, xmm2, 1 (C4 E3 3D 18 E2 01) → d 独立 = 前置 YmmMov
+    const wvmp::u8 inx[] = {0xC4, 0xE3, 0x65, 0x18, 0xE2, 0x01};
+    r = translate_bytes(x64, inx, ir::Arch::X64);
+    ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r.insn.op, ir::Op::VinsertF128);
+    ASSERT_EQ(r.extra.size(), 1u);
+    EXPECT_EQ(r.extra[0].op, ir::Op::YmmMov);
+    EXPECT_EQ(static_cast<int>(r.extra[0].dst.reg), 4);
+    EXPECT_EQ(static_cast<int>(r.extra[0].src.reg), 3);
+
+    // vinsertf128 ymm4, ymm3, [rcx], 1 (C4 E3 3D 18 21 01) → mem src2
+    const wvmp::u8 inm[] = {0xC4, 0xE3, 0x65, 0x18, 0x21, 0x01};
+    r = translate_bytes(x64, inm, ir::Arch::X64);
+    ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r.insn.src2.kind, ir::Operand::Kind::Mem);
+
+    // lane imm8 高位被硬件忽略 (imm=3 → &1 = 1): C4 E3 79 19 D3 03
+    const wvmp::u8 ex3[] = {0xC4, 0xE3, 0x7D, 0x19, 0xDA, 0x03};
+    r = translate_bytes(x64, ex3, ir::Arch::X64);
+    ASSERT_EQ(r.status, lifter::TranslateStatus::Ok);
+    EXPECT_EQ(r.insn.aux, 1);
+
+    // gate: ymm8 源 (C4 C3 79 19 C8 00 = vextractf128 xmm1, ymm8, 0) → 拒
+    const wvmp::u8 y8[] = {0xC4, 0x63, 0x7D, 0x19, 0xC1, 0x00};
+    r = translate_bytes(x64, y8, ir::Arch::X64);
+    EXPECT_NE(r.status, lifter::TranslateStatus::Ok);
+
+    // gate: x86 架构 → 拒
+    r = translate_bytes(x86, ex, ir::Arch::X86);
+    EXPECT_NE(r.status, lifter::TranslateStatus::Ok);
+}
+
 TEST_F(LifterTranslate, YmmMovFolds) {
     // MIT-512 (档B wave2①): vmov* ymm 32B 传送折叠 — 编码经 kstool 钉板。
     // vmovups ymm0, ymm1 (C5 FC 10 C1, VEX.256.0F10 reg-reg) → Op::YmmMov

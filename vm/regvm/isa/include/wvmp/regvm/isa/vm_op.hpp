@@ -685,9 +685,18 @@ enum class VmOp : u16 {
     YmmPor,       // vpor (256-bit 整数或)
     YmmPand,       // vpand (256-bit 整数与)
     YmmPandn,       // vpandn (256-bit dst=~dst&src, 非交换)
+
+    // ---- MIT-533: wave2 桥 —— 128 位车道 × ymm 面显式跨界 (x64 host
+    //      专用; aux bit0=lane / bit1=mem 形态; 混排 gate 判据: 计入
+    //      ymm 域 —— 桥+legacy SSE 同函数仍 fail-closed, 桥只解锁
+    //      纯 AVX-256 域内的车道操作)。 ----
+    VextractF128,   // xmm dst, ymm src — 低/高 128 车道抽出 (aux bit0=lane,
+                    //   bit1=1 时 a=addr 槽写 [mem] 16B)
+    VinsertF128,    // ymm dst, ymm src1(=dst 不变量), xmm/mem src2 — 128 位
+                    //   车道插入 (aux bit0=lane, bit1=1 时 b=addr 槽读 [mem])
     };
 
-inline constexpr u16 kVmOpMax = static_cast<u16>(VmOp::YmmPandn);  // MIT-513: 164
+inline constexpr u16 kVmOpMax = static_cast<u16>(VmOp::VinsertF128);  // MIT-533: 166
 inline constexpr u16 kVmOpLimit = 1u << 14;  // 14 位编码空间上限
 
 constexpr const char* to_string(VmOp op) {
@@ -832,6 +841,8 @@ constexpr const char* to_string(VmOp op) {
         case VmOp::YmmMov: return "ymmmov";
         case VmOp::YmmLoad: return "ymmload";
         case VmOp::YmmStore: return "ymmstore";
+        case VmOp::VextractF128: return "vextractf128";
+        case VmOp::VinsertF128: return "vinsertf128";
         case VmOp::YmmAddps: return "ymmaddps";
         case VmOp::YmmAddpd: return "ymmaddpd";
         case VmOp::YmmSubps: return "ymmsubps";

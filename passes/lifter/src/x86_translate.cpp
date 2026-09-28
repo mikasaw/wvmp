@@ -1753,6 +1753,7 @@ TranslateResult translate_movd_movq(const cs_insn& ci, const cs_x86& x, ir::Arch
 
 TranslateResult translate_ymm_mov(const cs_insn& ci, const cs_x86& x, ir::Arch arch);
 TranslateResult translate_ymm_arith(const cs_insn& ci, const cs_x86& x, ir::Arch arch);
+TranslateResult translate_ymm_bridge(const cs_insn& ci, const cs_x86& x, ir::Arch arch);
 
 // V-pair 家族描述: 全部复用既有 translate 函数 (零新 IR 语义)。
 struct VexDesc {
@@ -1880,6 +1881,9 @@ std::optional<YmmArithDesc> ymm_arith_desc_of(x86_insn id) {
 
 // VEX.128 V-pair 入口: 位宽闸 → 2-op 直通 / 3-op 三地址折叠 (见顶部说明块)。
 TranslateResult translate_vex128(const cs_insn& ci, const cs_x86& x, ir::Arch arch) {
+    // MIT-533: 桥词混合宽度, 走专属通路 (vex_desc_of 白名单不含它们)。
+    if (ci.id == X86_INS_VEXTRACTF128 || ci.id == X86_INS_VINSERTF128)
+        return translate_ymm_bridge(ci, x, arch);
     const auto desc = vex_desc_of(static_cast<x86_insn>(ci.id));
     if (!desc) return unsupported(ci.address, ci.size);  // 白名单外 (现状 gate 保持)
     // ---- MIT-512 (T64)/MIT-513 (T65): 32B (ymm) 形态 → ymm 数据通路
@@ -2015,7 +2019,103 @@ TranslateResult translate_vzero(const cs_insn& ci, const cs_x86& x, ir::Arch arc
 //   (Reg,Reg) → Op::YmmMov / (Reg,Mem) → Op::YmmLoad / (Mem,Reg) → Op::YmmStore
 // 对齐语义差异 (aps vs ups / dqa vs dqu) 不模拟 (#GP 不模拟, MIT-428 D2
 // 先例 — face 访问一律 vmovups, ctx 栈基址仅 16B 对齐)。x86 架构 gate。
+// MIT-533 (wave2 桥): vextractf128 / vinsertf128 —— 128 位车道 × ymm 面的
+// 显式跨界词 (T72 intrinsic 归约/broadcast 场景解锁)。混合操作数宽度
+// (xmm 16B / ymm 32B / imm) 不走 all32 通路，在 vex_desc_of 白名单前分流。
+// 形态 (SDM, VEX.256 专属):
+//   vextractf128 xmm/m128, ymm, imm8
+//   vinsertf128  ymm, ymm, xmm/m128, imm8 — d==s1 直折; d 独立 = extra
+//   YmmMov(d←s1) 前置 (T65 三地址折叠同款); d==s2 两侧不同面 (xmm 面
+//   src2 不会被 ymm 面前置 Mov 触碰) 无需特判。lane imm8 硬件语义 &1
+//   (高位忽略) → ir::Insn.aux bit0。x86 gate + ymm8..15/xmm8..15 gate。
+TranslateResult translate_ymm_bridge(const cs_insn& ci, const cs_x86& x, ir::Arch arch) {
+    if (arch != ir::Arch::X64) return unsupported(ci.address, ci.size);
+    auto ymm_idx = [](x86_reg r) -> std::optional<u8> {
+        if (r >= X86_REG_YMM0 && r <= X86_REG_YMM7)
+            return static_cast<u8>(r - X86_REG_YMM0);
+        return std::nullopt;
+    };
+    auto xmm_idx = [](x86_reg r) -> std::optional<u8> {
+        if (r >= X86_REG_XMM0 && r <= X86_REG_XMM7)
+            return static_cast<u8>(r - X86_REG_XMM0);
+        return std::nullopt;
+    };
+    auto lane_of = [&]() -> std::optional<u8> {
+        for (u8 i = 0; i < x.op_count; ++i)
+            if (x.operands[i].type == X86_OP_IMM)
+                return static_cast<u8>(static_cast<u64>(x.operands[i].imm) & 1u);
+        return std::nullopt;
+    };
+    TranslateResult r;
+    r.insn.addr = ci.address;
+    r.insn.size = ir::Size::S64;
+    r.insn.updates_flags = false;
+    if (ci.id == X86_INS_VEXTRACTF128) {
+        if (x.op_count != 3) return unsupported(ci.address, ci.size);
+        const auto lane = lane_of();
+        if (!lane) return unsupported(ci.address, ci.size);
+        if (x.operands[1].type != X86_OP_REG)
+            return unsupported(ci.address, ci.size);
+        auto si = ymm_idx(x.operands[1].reg);
+        if (!si) return unsupported(ci.address, ci.size);
+        r.insn.op = Op::VextractF128;
+        r.insn.aux = *lane;
+        r.insn.src = ir::Operand::reg_(static_cast<ir::Reg>(*si));
+        if (x.operands[0].type == X86_OP_REG) {
+            auto di = xmm_idx(x.operands[0].reg);
+            if (!di) return unsupported(ci.address, ci.size);
+            r.insn.dst = ir::Operand::reg_(static_cast<ir::Reg>(*di));
+        } else if (x.operands[0].type == X86_OP_MEM) {
+            auto m = mem_operand(x.operands[0].mem);
+            if (!m) return unsupported(ci.address, ci.size);
+            r.insn.dst = *m;
+        } else {
+            return unsupported(ci.address, ci.size);
+        }
+        r.status = TranslateStatus::Ok;
+        return r;
+    }
+    if (x.op_count != 4) return unsupported(ci.address, ci.size);
+    const auto lane = lane_of();
+    if (!lane) return unsupported(ci.address, ci.size);
+    if (x.operands[0].type != X86_OP_REG || x.operands[1].type != X86_OP_REG)
+        return unsupported(ci.address, ci.size);
+    auto di = ymm_idx(x.operands[0].reg);
+    auto s1 = ymm_idx(x.operands[1].reg);
+    if (!di || !s1) return unsupported(ci.address, ci.size);
+    const bool s2_reg = x.operands[2].type == X86_OP_REG;
+    const bool s2_mem = x.operands[2].type == X86_OP_MEM;
+    if (!s2_reg && !s2_mem) return unsupported(ci.address, ci.size);
+    r.insn.op = Op::VinsertF128;
+    r.insn.aux = *lane;
+    r.insn.dst = ir::Operand::reg_(static_cast<ir::Reg>(*di));
+    if (*di != *s1) {
+        ir::Insn pre;
+        pre.op = Op::YmmMov;
+        pre.size = ir::Size::S64;
+        pre.updates_flags = false;
+        pre.addr = ci.address;
+        pre.dst = ir::Operand::reg_(static_cast<ir::Reg>(*di));
+        pre.src = ir::Operand::reg_(static_cast<ir::Reg>(*s1));
+        r.extra.push_back(pre);
+    }
+    // 主词 merge base 恒 = dst (不变量: 翻译器据此读 dst 面)
+    r.insn.src = ir::Operand::reg_(static_cast<ir::Reg>(*di));
+    if (s2_reg) {
+        auto s2 = xmm_idx(x.operands[2].reg);
+        if (!s2) return unsupported(ci.address, ci.size);
+        r.insn.src2 = ir::Operand::reg_(static_cast<ir::Reg>(*s2));
+    } else {
+        auto m = mem_operand(x.operands[2].mem);
+        if (!m) return unsupported(ci.address, ci.size);
+        r.insn.src2 = *m;
+    }
+    r.status = TranslateStatus::Ok;
+    return r;
+}
+
 TranslateResult translate_ymm_mov(const cs_insn& ci, const cs_x86& x, ir::Arch arch) {
+
     if (arch != ir::Arch::X64) return unsupported(ci.address, ci.size);
     if (x.op_count != 2) return unsupported(ci.address, ci.size);
     const bool dst_reg = x.operands[0].type == X86_OP_REG;
@@ -3605,6 +3705,8 @@ TranslateResult translate_insn(const cs_insn& ci, ir::Arch arch) {
     case X86_INS_VPAND:
     case X86_INS_VANDNPS: case X86_INS_VANDNPD: case X86_INS_VPANDN:
     case X86_INS_VUCOMISS: case X86_INS_VUCOMISD: case X86_INS_VCOMISS: case X86_INS_VCOMISD:
+    // MIT-533: wave2 桥 (混合宽度, vex_desc_of 白名单前分流)。
+    case X86_INS_VEXTRACTF128: case X86_INS_VINSERTF128:
         return translate_vex128(ci, x, arch);
     // MIT-511 (档B wave1): vzeroupper/vzeroall ABI 词入面 (translate_vzero
     // 内 x64 架构 gate + op_count=0 防御; VexVzeroupperGate 先例翻转)。

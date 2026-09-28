@@ -118,7 +118,8 @@ VZERO_HANDLERS = {"vzeroupper", "vzeroall"}
 # plus pc advance add 1 and >= 2 vmovups with ymm operands (load/store
 # pair; ymmmov has 2 prologues, mem forms 1).  All face accesses must be
 # vmovups (ctx base only 16B-aligned -- MIT-511 F3), so no vmovaps allowed.
-YMM_HANDLERS = {"ymmmov", "ymmload", "ymmstore",
+YMM_HANDLERS = {"vextractf128", "vinsertf128",  # MIT-533 桥
+                   "ymmmov", "ymmload", "ymmstore",
                 # MIT-513 (wave2②): packed arithmetic full set
                 "ymmaddps", "ymmaddpd", "ymmsubps", "ymmsubpd",
                 "ymmmulps", "ymmmulpd", "ymmdivps", "ymmdivpd",
@@ -453,9 +454,15 @@ def check_ymm_handler(name: str, code: bytes, base_va: int, md) -> tuple[bool, l
             ok = False
             lines.append(f"    FAIL: aligned ymm access `{ins.mnemonic} {ops}` (vmovups only)")
 
-    bad_sub = [(r, v) for (r, v) in sub_imms if v != 0x300]
-    bad_shl = [(r, v) for (r, v) in shl_imms if v != 5]
-    bad_add = [(r, v) for (r, v) in add_imms if v not in (0x1C0, 1)]
+    # MIT-533 桥: vextractf128/vinsertf128 跨 xmm 面 — 允许 xmm 帧公式
+    # 立即数 (sub 0x18 / shl 4 / add 0x140) 与 ymm 面公式并存。
+    bridge = name in ("vextractf128", "vinsertf128")
+    ok_sub = (0x300, 0x18) if bridge else (0x300,)
+    ok_shl = (5, 4) if bridge else (5,)
+    ok_add = (0x1C0, 0x140, 1) if bridge else (0x1C0, 1)
+    bad_sub = [(r, v) for (r, v) in sub_imms if v not in ok_sub]
+    bad_shl = [(r, v) for (r, v) in shl_imms if v not in ok_shl]
+    bad_add = [(r, v) for (r, v) in add_imms if v not in ok_add]
     if bad_sub or bad_shl or bad_add:
         ok = False
         lines.append(
@@ -484,9 +491,11 @@ def check_ymm_handler(name: str, code: bytes, base_va: int, md) -> tuple[bool, l
         )
     else:
         lines.append(f"    ok: prologue add 0x1c0 x{n_add1c0}, add 1 x{n_add1}")
-    if vmovups_count < 2:
+    # MIT-533: vextractf128 只读一次 ymm 面 (写出走 xmm 面/内存), 门槛 1。
+    min_movups = 1 if name == "vextractf128" else 2
+    if vmovups_count < min_movups:
         ok = False
-        lines.append(f"    FAIL: vmovups ymm count {vmovups_count} < 2")
+        lines.append(f"    FAIL: vmovups ymm count {vmovups_count} < {min_movups}")
     else:
         lines.append(f"    ok: vmovups ymm count = {vmovups_count}")
 

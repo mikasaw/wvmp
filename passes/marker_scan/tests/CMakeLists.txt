@@ -1120,6 +1120,21 @@ target_link_options(wvmp_ymm_data_sample PRIVATE
     $<$<CXX_COMPILER_ID:MSVC>:/INCREMENTAL:NO>
 )
 
+# MIT-533 (wave2 桥): vextractf128/vinsertf128 样本 — 车道双向 + mem 双形
+# 正例 + 混排 gate 负例 (行为级逐位对拍; 同款构建配方)。
+add_executable(wvmp_ymm_bridge_sample
+    ymm_bridge_sample_main.cpp
+    ymm_bridge_sample_asm.asm
+)
+target_link_libraries(wvmp_ymm_bridge_sample PRIVATE wvmp::sdk)
+target_compile_options(wvmp_ymm_bridge_sample PRIVATE
+    $<$<AND:$<CXX_COMPILER_ID:MSVC>,$<COMPILE_LANGUAGE:C,CXX>>:/Od;/Ob0;/utf-8>
+    $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-O0>
+)
+target_link_options(wvmp_ymm_bridge_sample PRIVATE
+    $<$<CXX_COMPILER_ID:MSVC>:/INCREMENTAL:NO>
+)
+
 # MIT-426 (G6a): 影子样本 — 三态折叠 + D4 拷贝 + mem 通路的 ctx.xmm 运行时
 # 读回断言 (#79 纪律, 与主样本同能力面配对、独立 exe)。9 探针 (位图案全 8
 # 槽预载 + 区域后 8 槽 × 2×u64 全量落盘): d==s1 直走高位残留 / packed

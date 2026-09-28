@@ -1179,6 +1179,10 @@ struct Translator {
                 // (aux=32)。槽位复用 v24..31 = ymm0..7 (VmOp 域消歧);
                 // handler 面访问 vmovups (ctx 基址 16B 对齐)。
                 ok = translate_ymm_mov(em, sc, in, current_rva, next_ip);
+            } else if (in.op == ir::Op::VextractF128 ||
+                       in.op == ir::Op::VinsertF128) {
+                // MIT-533 (wave2 桥): 128 位车道跨界 dispatch。
+                ok = translate_ymm_bridge(em, sc, in, current_rva, next_ip);
             } else if (in.op == ir::Op::Xorps || in.op == ir::Op::Orps || in.op == ir::Op::Andps) {
                 // MIT-376: SSE 浮点位运算 dispatch — REG-REG 形式 emit 单条
                 // VmOp::Xorps/Orps/Andps; MEM 源 (MIT-408) 折条同 add。
@@ -2910,8 +2914,69 @@ struct Translator {
     //
     // 编码: YmmMov a=Reg dst 槽 b=Reg src 槽; YmmLoad a=Reg dst 槽
     // b=Reg addr 槽; YmmStore a=Reg addr 槽 b=Reg src 槽; aux=32。
+    // ---- MIT-533 (wave2 桥): vextractf128/vinsertf128 发射 ----
+    // aux 布局: bit0=lane, bit1=mem 形态 (vextract: a=addr 槽写 [mem]16B;
+    // vinsert: b=addr 槽读 [mem]16B)。xmm 侧槽 = xmm0..7 → v24..31 同号
+    // (面 0x140+(s-24)*16); ymm 侧槽 v24..31 (面 0x1C0+(s-24)*32) —— 槽
+    // 号同域不同面, VmOp 域消歧 (T64 惯例)。Vinsert 的 merge base 恒=dst
+    // (lifter 前置保证), 翻译器不读第二个 ymm 槽。
+    bool translate_ymm_bridge(Emitter& em, Scratch& sc, const ir::Insn& in,
+                              u64 current_rva, u64 next_ip) {
+        const u8 lane = in.aux & 1u;
+        if (in.op == ir::Op::VextractF128) {
+            if (in.src.kind != ir::Operand::Kind::Reg)
+                return skip(in, "桥 操作数形态未支持", nullptr);
+            const u8 ymm_src = static_cast<u8>(in.src.reg);
+            if (ymm_src > 7u)
+                return skip(in, "ymm 索引越界 (仅支持 ymm0..ymm7)", nullptr);
+            if (in.dst.kind == ir::Operand::Kind::Reg) {
+                const u8 xmm_dst = static_cast<u8>(in.dst.reg);
+                if (xmm_dst > 7u)
+                    return skip(in, "xmm 索引越界 (仅支持 xmm0..xmm7)", nullptr);
+                em.emit(VmOp::VextractF128, OpKind::Reg, xmm_dst + 24u,
+                        OpKind::Reg, ymm_src + 24u, lane,
+                        isa::size_field(in.size));
+                return true;
+            }
+            if (in.dst.kind == ir::Operand::Kind::Mem) {
+                u8 acc = 0;
+                if (!emit_sse_mem_addr(em, sc, in.dst.mem, current_rva, next_ip, acc))
+                    return skip(in, "桥 地址形态未支持", &in.dst.mem);
+                em.emit(VmOp::VextractF128, OpKind::Reg, acc, OpKind::Reg,
+                        ymm_src + 24u, lane | 2u, isa::size_field(in.size));
+                return true;
+            }
+            return skip(in, "桥 操作数形态未支持", nullptr);
+        }
+        if (in.dst.kind != ir::Operand::Kind::Reg ||
+            in.src.kind != ir::Operand::Kind::Reg)
+            return skip(in, "桥 操作数形态未支持", nullptr);
+        if (in.dst.reg != in.src.reg)
+            return skip(in, "桥 merge base 不变量被破坏 (lifter 前置缺失)", nullptr);
+        const u8 ymm_dst = static_cast<u8>(in.dst.reg);
+        if (ymm_dst > 7u)
+            return skip(in, "ymm 索引越界 (仅支持 ymm0..ymm7)", nullptr);
+        if (in.src2.kind == ir::Operand::Kind::Reg) {
+            const u8 xmm_s2 = static_cast<u8>(in.src2.reg);
+            if (xmm_s2 > 7u)
+                return skip(in, "xmm 索引越界 (仅支持 xmm0..xmm7)", nullptr);
+            em.emit(VmOp::VinsertF128, OpKind::Reg, ymm_dst + 24u, OpKind::Reg,
+                    xmm_s2 + 24u, lane, isa::size_field(in.size));
+            return true;
+        }
+        if (in.src2.kind == ir::Operand::Kind::Mem) {
+            u8 acc = 0;
+            if (!emit_sse_mem_addr(em, sc, in.src2.mem, current_rva, next_ip, acc))
+                return skip(in, "桥 地址形态未支持", &in.src2.mem);
+            em.emit(VmOp::VinsertF128, OpKind::Reg, ymm_dst + 24u, OpKind::Reg,
+                    acc, lane | 2u, isa::size_field(in.size));
+            return true;
+        }
+        return skip(in, "桥 操作数形态未支持", nullptr);
+    }
     bool translate_ymm_mov(Emitter& em, Scratch& sc, const ir::Insn& in,
                            u64 current_rva, u64 next_ip) {
+
         constexpr u8 kYmmWidth = 32;
         if (in.dst.kind == ir::Operand::Kind::Mem) {
             // store 方向: [mem], ymm — src 必为 ymm REG.
