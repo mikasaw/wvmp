@@ -436,9 +436,10 @@ PYEOF2
 # （哑阵），此格当场红。与外层 TLS_E2E_* 环境变量无关（此处字面量写死，
 # 任何象限调用下都做同一对比较）。
 check_polarity() { # $1 = sample
-    local tmp cfg a_win b_win rc out
+    local tmp cfg rc out
     tmp="$(mktemp -d)"
     local fails=0
+    local quad
     for quad in on off; do
         cfg="$tmp/$quad.toml"
         local win; win="$(cygpath -m "$tmp")/wvmp_tls_$quad.exe"

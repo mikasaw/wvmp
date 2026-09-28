@@ -89,7 +89,9 @@ bool verify_written_image(const std::filesystem::path& tmp,
     // 末尾还有多余字节 = 也不是这份镜像（长度核已在调用方做过，此处兜底）。
     unsigned char extra = 0;
     if (in.read(reinterpret_cast<char*>(&extra), 1) && in.gcount() == 1) {
-        err = "读回多出字节 @ 0x" + std::to_string(expect_size);
+        char where[32];
+        std::snprintf(where, sizeof(where), "%zx", expect_size);
+        err = std::string("读回多出字节 @ 0x") + where;
         return false;
     }
     return true;
