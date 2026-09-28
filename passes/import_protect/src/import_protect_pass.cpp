@@ -3,6 +3,7 @@
 #include "wvmp/passes/import_protect/import_plan.hpp"
 
 #include "wvmp/framework/context.hpp"
+#include "wvmp/pe_layout.hpp"
 #include "wvmp/framework/keys.hpp"
 #include "wvmp/framework/protect_levels.hpp"
 #include "wvmp/framework/registry.hpp"
@@ -27,7 +28,8 @@ constexpr size_t kImportDirIndex = 1;      // DataDirectory[1] = IMAGE_DIRECTORY
 constexpr size_t kMaxDescriptors = 1024;   // 描述符链上限（损坏防御）
 constexpr size_t kMaxSlotsPerDesc = 4096;  // 单描述符槽上限（损坏防御）
 
-size_t opt_data_dir_off(bool plus) { return plus ? 112u : 96u; }
+// 数值本体 MIT-531 起收到 common/include/wvmp/pe_layout.hpp（全仓单一真源）。
+size_t opt_data_dir_off(bool plus) { return wvmp::pe_data_dir_offset(plus); }
 
 u64 rd_le(const u8* p, size_t n) {
     u64 v = 0;

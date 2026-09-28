@@ -5,6 +5,7 @@
 
 #include "wvmp/passes/pe_loader/pe_image.hpp"
 #include "wvmp/passes/pe_loader/pe_loader_pass.hpp"
+#include "wvmp/pe_layout.hpp"
 #include "wvmp/passes/pe_loader/target_arch.hpp"
 
 #include "wvmp/framework/context.hpp"
@@ -110,11 +111,10 @@ constexpr u32 kPfBegin = 0x1100;
 constexpr u32 kPfEnd = 0x1180;
 constexpr u32 kPfUnwind = 0x1190;
 
-// DataDirectory 起点 / NumberOfRvaAndSizes 在 OptionalHeader 内的偏移，与仓内
-// 既有真源同值（pe_writer_pass.cpp:70、tls_hook_pass.cpp:53、
-// import_protect_pass.cpp:30 的 opt_data_dir_off / opt_num_rva_sizes_off）。
-size_t opt_dir_off(bool plus) { return plus ? 112u : 96u; }
-size_t opt_num_dirs_off(bool plus) { return plus ? 108u : 92u; }
+// DataDirectory 起点 / NumberOfRvaAndSizes 偏移：数值本体 MIT-531 起收到
+// common/include/wvmp/pe_layout.hpp（全仓单一真源），此处薄委托。
+size_t opt_dir_off(bool plus) { return wvmp::pe_data_dir_offset(plus); }
+size_t opt_num_dirs_off(bool plus) { return wvmp::pe_num_rva_sizes_offset(plus); }
 
 void put_pdata_dir(std::vector<u8>& img, bool plus, u32 num_dirs, u32 dir3_rva,
                    u32 dir3_size, u32 dir4_rva = 0, u32 dir4_size = 0) {

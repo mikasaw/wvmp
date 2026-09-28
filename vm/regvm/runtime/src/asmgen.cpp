@@ -4751,7 +4751,7 @@ public:
     //      语义）；若沿用 x64 旧 S32 档的 0x3F 掩码，计数 32 会漏进 native
     //      （内部再掩 0）且把 and 的宿主 flags 经 setcc 装配进 guest —— 静默
     //      污染（x64 侧同形缺口已由 MIT-505 清偿：build_shift 改调
-    //      isa::shift_count_mask 单一真源；本函数一直是它的对照组）。电池
+    //      isa::shift_count_mask 单一真源；MIT-531 起本函数同样改调该真源，三档（S8/S16/S32）恒 0x1F、字节零扰动）。电池
     //      ShiftImmMask 实测钉死（count=0x20 值+flags 双不变）。
     //   2. 计数 0 出口在 flags 装配**前**旁路（x64 同构）—— rol/ror 的
     //      partial 装配同理（SDM: count&31 == 0 时 flags 不受影响）。
@@ -4766,6 +4766,13 @@ public:
         const std::string adv_lbl = "xadv_" + tag;
         const std::string tail_lbl = "xtail_" + tag;
         std::string blocks[3];
+        // s=0..2（S8/S16/S32）与 ir::Size 枚举值同序，掩码经真源函数取值
+        //（MIT-531：此前手抄 0x1F，若将来循环扩到 s==3 会静默沿用 0x1F 而非
+        // 真源给出的 0x3F——收敛后这类扩档会自动拿到正确掩码并显式浮出审点）。
+        static_assert(static_cast<int>(ir::Size::S8) == 0 &&
+                          static_cast<int>(ir::Size::S16) == 1 &&
+                          static_cast<int>(ir::Size::S32) == 2,
+                      "ir::Size 枚举序已变：build_shift_x86 的 s=0..2 档位口径需重立");
         for (int s = 0; s < 3; ++s) {
             const std::string stag = std::to_string(s) + "_" + tag;
             std::string o;
@@ -4780,7 +4787,7 @@ public:
             o += "xcnti" + stag + ":\n";
             o += std::string("    mov ") + r32x(t_[1]) + ", " + xf(kX86FAux) + "\n";
             o += "xcntg" + stag + ":\n";
-            // cl 计数装载 + 5 位掩码（32 位模式全宽统一，见上注）。
+            // cl 计数装载 + 计数掩码经 isa::shift_count_mask 真源取值
             // MIT-494t②：pc 常驻 ecx —— 计数即 cl（= ecx 低字节），计数驻
             // 留期间 pc 只存 [ctx+0x8]（sync 于 cl 装载前）；还原在两个出
             // 口（移位路径 writeback 后 / 计数 0 出口 adv_lbl），寄存器
@@ -4788,7 +4795,8 @@ public:
             // cl = 计数（T43 电池实测：ShiftCl 语义全错）。
             o += std::string("    mov dword ptr [") + r32x(ctx_) + " + 0x8], ecx\n";
             o += std::string("    mov cl, ") + rs(t_[1], 0) + "\n";
-            o += std::string("    and cl, ") + imm(0x1F) + "\n";
+            o += std::string("    and cl, ") +
+                 imm(isa::shift_count_mask(static_cast<ir::Size>(s))) + "\n";
             o += "    jz " + adv_lbl + "\n";   // 计数 0：值与 flags 均不变
             o += std::string("    ") + native + " " + rs(t_[0], s) + ", cl\n";
             o += setcc5_x86();

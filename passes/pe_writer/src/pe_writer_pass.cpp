@@ -5,6 +5,7 @@
 #include "section_builder.hpp"
 
 #include "wvmp/common/bytes.hpp"
+#include "wvmp/pe_layout.hpp"
 #include "wvmp/framework/context.hpp"
 #include "wvmp/framework/keys.hpp"
 #include "wvmp/framework/protect_levels.hpp"
@@ -64,11 +65,10 @@ constexpr u16 kImageDllCharacteristicsForceIntegrity = 0x0080;
 constexpr u16 kDllCharsClearMask = static_cast<u16>(
     kImageDllCharacteristicsDynamicBase | kImageDllCharacteristicsForceIntegrity);
 
-// MIT-465: DataDirectory[9] (IMAGE_DIRECTORY_ENTRY_TLS) 表项写入。目录区在
-// 可选头内的偏移 PE32+ = 112 / PE32 = 96，NumberOfRvaAndSizes 在其前 4 字节
-// （108 / 92）；与 tls_hook 侧的读路径同布局独立声明（模块边界约定）。
-size_t opt_num_rva_sizes_off(bool plus) { return plus ? 108u : 92u; }
-size_t opt_data_dir_off(bool plus) { return plus ? 112u : 96u; }
+// MIT-465: DataDirectory[9] (IMAGE_DIRECTORY_ENTRY_TLS) 表项写入。数值本体
+// MIT-531 起收到 common/include/wvmp/pe_layout.hpp（全仓单一真源），此处薄委托。
+size_t opt_num_rva_sizes_off(bool plus) { return wvmp::pe_num_rva_sizes_offset(plus); }
+size_t opt_data_dir_off(bool plus) { return wvmp::pe_data_dir_offset(plus); }
 constexpr size_t kTlsDirIndex = 9;
 
 // MIT-494：小端读（reloc 扩展解析用；与 import_protect 同名 helper 独立

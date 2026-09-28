@@ -4,6 +4,7 @@
 
 #include "wvmp/common/bytes.hpp"
 #include "wvmp/framework/context.hpp"
+#include "wvmp/pe_layout.hpp"
 #include "wvmp/framework/diagnostics.hpp"
 #include "wvmp/framework/keys.hpp"
 #include "wvmp/framework/protect_levels.hpp"
@@ -225,7 +226,7 @@ void StubLinkPass::run(ProtectionContext& ctx) {
         const bool aslr_on =
             rules == nullptr || !rules->has_pe_aslr || rules->pe_aslr;
         const size_t opt = pe->nt_headers_offset + 24;
-        const size_t dd5 = opt + (pe->is_pe32_plus ? 112u : 96u) + 5 * 8;
+        const size_t dd5 = opt + wvmp::pe_data_dir_offset(pe->is_pe32_plus) + 5 * 8;
         if (aslr_on && opt + 0x48 <= ctx.image.size() && dd5 + 8 <= ctx.image.size()) {
             const u32 reloc_rva = static_cast<u32>(rd_le(ctx.image.data() + dd5, 4));
             const u32 reloc_size = static_cast<u32>(rd_le(ctx.image.data() + dd5 + 4, 4));

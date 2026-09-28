@@ -7,6 +7,7 @@
 #include "wvmp/passes/anti_debug/anti_debug_plan.hpp"
 
 #include "wvmp/framework/context.hpp"
+#include "wvmp/pe_layout.hpp"
 #include "wvmp/framework/keys.hpp"
 #include "wvmp/framework/protect_levels.hpp"
 #include "wvmp/framework/registry.hpp"
@@ -50,8 +51,9 @@ struct DrxInfo {
 };
 
 // OptionalHeader 内数据目录区的布局偏移（PE32/PE32+ 可选头定长区不同）。
-size_t opt_num_rva_sizes_off(bool plus) { return plus ? 108u : 92u; }
-size_t opt_data_dir_off(bool plus) { return plus ? 112u : 96u; }
+// 数值本体 MIT-531 起收到 common/include/wvmp/pe_layout.hpp（全仓单一真源）。
+size_t opt_num_rva_sizes_off(bool plus) { return wvmp::pe_num_rva_sizes_offset(plus); }
+size_t opt_data_dir_off(bool plus) { return wvmp::pe_data_dir_offset(plus); }
 
 u64 rd_le(const u8* p, size_t n) {
     u64 v = 0;
@@ -570,7 +572,7 @@ void TlsHookPass::run(ProtectionContext& ctx) {
     const bool drx_requested = (adb_init & wvmp::passes::anti_debug::tech::kHardwareBreakpoints) != 0;
     if (drx_requested) {
         const size_t dd1 = size_t(pe->nt_headers_offset) + 24 +
-                           (plus ? 112u : 96u) + 1u * 8u;
+                           wvmp::pe_data_dir_offset(plus) + 1u * 8u;
         bool gtc_found = false;
         if (dd1 + 8 <= ctx.image.size()) {
             const u32 desc_rva = u32(rd_le(ctx.image.data() + dd1, 4));

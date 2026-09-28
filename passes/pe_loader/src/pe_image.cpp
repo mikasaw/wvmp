@@ -1,6 +1,7 @@
 #include "wvmp/passes/pe_loader/pe_image.hpp"
 
 #include "wvmp/common/bytes.hpp"
+#include "wvmp/pe_layout.hpp"
 
 #include <algorithm>
 #include <cstdio>
@@ -20,17 +21,14 @@ constexpr u16 kMagicPe32Plus = 0x20B;
 constexpr u16 kMinOptionalHeaderSize = 64;
 
 // MIT-525 (CR-06): OptionalHeader 内两处绝对偏移，单一真源。
-// 数值必须与仓内其余本地定义完全一致（清单与现算行号登记在 docs/GAPS.md 的
-// MIT-525 节：pe_writer_pass.cpp:70 / tls_hook_pass.cpp:54 /
-// import_protect_pass.cpp:30 / stub_link_pass.cpp:228 及各自测试副本）：
-// PE32 = 96 (0x60) / PE32+ = 112 (0x70)。
+// MIT-531 起数值本体上收到 common/include/wvmp/pe_layout.hpp（全仓单一真源，
+// 清偿 MIT-525 GAPS「6 处本地定义」待办）；本文件保留同名薄委托，调用面零动。
 constexpr u64 data_directory_offset(bool pe32_plus) {
-    return pe32_plus ? 112u : 96u;
+    return wvmp::pe_data_dir_offset(pe32_plus);
 }
-// NumberOfRvaAndSizes 紧贴 DataDirectory 之前 4 字节（PE32 = 92 / PE32+ = 108），
-// 同 pe_writer_pass.cpp:69 的 opt_num_rva_sizes_off。
+// NumberOfRvaAndSizes 紧贴 DataDirectory 之前 4 字节（PE32 = 92 / PE32+ = 108）。
 constexpr u64 num_rva_sizes_offset(bool pe32_plus) {
-    return data_directory_offset(pe32_plus) - 4u;
+    return wvmp::pe_num_rva_sizes_offset(pe32_plus);
 }
 
 // DataDirectory 索引与表项宽度。
